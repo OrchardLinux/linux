@@ -618,4 +618,11 @@ source "drivers/pinctrl/uniphier/Kconfig"
 source "drivers/pinctrl/visconti/Kconfig"
 source "drivers/pinctrl/vt8500/Kconfig"
 
+config PINCTRL_S5L8940X_GPIO
+	tristate "Apple S5L8940X (A5) GPIO/pinctrl driver"
+	depends on OF
+	select PINMUX
+	select PINCONF
+	select GENERIC_PINCONF
+	default y
 endif
