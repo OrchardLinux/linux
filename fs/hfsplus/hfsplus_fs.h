@@ -250,6 +250,8 @@ struct hfsplus_inode_info {
 	spinlock_t open_dir_lock;
 	loff_t phys_size;
 
+	struct hfsplus_decmpfs *decmpfs;	/* compressed file (decmpfs.c) */
+
 	struct inode vfs_inode;
 };
 
@@ -468,6 +470,11 @@ void hfsplus_file_truncate(struct inode *inode);
 
 /* inode.c */
 extern const struct address_space_operations hfsplus_aops;
+
+/* decmpfs.c */
+#define HFSPLUS_UF_COMPRESSED	0x20	/* BSD UF_COMPRESSED, in the user flags */
+void hfsplus_decmpfs_init(struct inode *inode);
+void hfsplus_decmpfs_evict(struct inode *inode);
 extern const struct address_space_operations hfsplus_btree_aops;
 extern const struct dentry_operations hfsplus_dentry_operations;
 

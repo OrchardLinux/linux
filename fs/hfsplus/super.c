@@ -92,6 +92,8 @@ struct inode *hfsplus_iget(struct super_block *sb, unsigned long ino)
 		iget_failed(inode);
 		return ERR_PTR(err);
 	}
+	if (inode->i_ino >= HFSPLUS_FIRSTUSER_CNID)
+		hfsplus_decmpfs_init(inode);
 
 	unlock_new_inode(inode);
 	return inode;
@@ -166,6 +168,7 @@ static void hfsplus_evict_inode(struct inode *inode)
 {
 	hfs_dbg(INODE, "hfsplus_evict_inode: %lu\n", inode->i_ino);
 	truncate_inode_pages_final(&inode->i_data);
+	hfsplus_decmpfs_evict(inode);
 	clear_inode(inode);
 	if (HFSPLUS_IS_RSRC(inode)) {
 		HFSPLUS_I(HFSPLUS_I(inode)->rsrc_inode)->rsrc_inode = NULL;
@@ -631,7 +634,10 @@ static struct inode *hfsplus_alloc_inode(struct super_block *sb)
 	struct hfsplus_inode_info *i;
 
 	i = alloc_inode_sb(sb, hfsplus_inode_cachep, GFP_KERNEL);
-	return i ? &i->vfs_inode : NULL;
+	if (!i)
+		return NULL;
+	i->decmpfs = NULL;
+	return &i->vfs_inode;
 }
 
 static void hfsplus_free_inode(struct inode *inode)
