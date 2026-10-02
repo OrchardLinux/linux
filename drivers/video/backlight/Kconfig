@@ -451,6 +451,13 @@ config BACKLIGHT_AS3711
 	  If you have an Austrian Microsystems AS3711 say Y to enable the
 	  backlight driver.
 
+config BACKLIGHT_APPLE_PMU_WLED
+	tristate "Apple iPad mini 1 backlight (D1946 PMU white LEDs)"
+	depends on MFD_APPLE_PMU_I2C || COMPILE_TEST
+	help
+	  The iPad mini 1's backlight, driven by the white-LED strings of its
+	  D1946 PMU, as /sys/class/backlight/apple-pmu-wled (0..2047).
+
 config BACKLIGHT_GPIO
 	tristate "Generic GPIO based Backlight Driver"
 	depends on GPIOLIB || COMPILE_TEST
