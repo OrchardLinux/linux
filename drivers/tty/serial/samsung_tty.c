@@ -1896,6 +1896,8 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
 	ret = s3c24xx_serial_enable_baudclk(ourport);
 	if (ret)
 		pr_warn("uart: failed to enable baudclk\n");
+	else if (ourport->baudclk_rate)
+		port->uartclk = ourport->baudclk_rate;
 
 	/* Keep all interrupts masked and cleared */
 	switch (ourport->info->type) {
@@ -2537,7 +2539,7 @@ static const struct s3c24xx_serial_drv_data gs101_serial_drv_data = {
 #define GS101_SERIAL_DRV_DATA NULL
 #endif
 
-#ifdef CONFIG_ARCH_APPLE
+#if defined(CONFIG_ARCH_APPLE) || defined(CONFIG_ARCH_APPLE_S5L)
 static const struct s3c24xx_serial_drv_data s5l_serial_drv_data = {
 	.info = {
 		.name		= "Apple S5L UART",
@@ -2563,8 +2565,46 @@ static const struct s3c24xx_serial_drv_data s5l_serial_drv_data = {
 	},
 };
 #define S5L_SERIAL_DRV_DATA (&s5l_serial_drv_data)
+
+/*
+ * The A5 (S5L8940X) picks a UART's clock with UCON bit 10, which nothing
+ * above knows about.  iBoot sets it on the ports it uses itself -- the
+ * console, and UART5 for the battery's HDQ -- and with it set the port runs
+ * from the 24 MHz reference the dts gives as its baud clock.  A port iBoot
+ * leaves alone has it clear and runs from some other clock: UART1, the
+ * Bluetooth chip's, then sent at a rate nobody understood and the chip never
+ * answered.  So it is part of the reset value here.
+ */
+#define S5L8940X_UCON_CLK_24M	BIT(10)
+
+static const struct s3c24xx_serial_drv_data s5l8940x_serial_drv_data = {
+	.info = {
+		.name		= "Apple S5L UART",
+		.type		= TYPE_APPLE_S5L,
+		.port_type	= PORT_8250,
+		.iotype		= UPIO_MEM32,
+		.fifosize	= 16,
+		.rx_fifomask	= S3C2410_UFSTAT_RXMASK,
+		.rx_fifoshift	= S3C2410_UFSTAT_RXSHIFT,
+		.rx_fifofull	= S3C2410_UFSTAT_RXFULL,
+		.tx_fifofull	= S3C2410_UFSTAT_TXFULL,
+		.tx_fifomask	= S3C2410_UFSTAT_TXMASK,
+		.tx_fifoshift	= S3C2410_UFSTAT_TXSHIFT,
+		.def_clk_sel	= S3C2410_UCON_CLKSEL0,
+		.num_clks	= 1,
+		.clksel_mask	= 0,
+		.clksel_shift	= 0,
+		.ucon_mask	= APPLE_S5L_UCON_MASK,
+	},
+	.def_cfg = {
+		.ucon		= APPLE_S5L_UCON_DEFAULT | S5L8940X_UCON_CLK_24M,
+		.ufcon		= S3C2410_UFCON_DEFAULT,
+	},
+};
+#define S5L8940X_SERIAL_DRV_DATA (&s5l8940x_serial_drv_data)
 #else
 #define S5L_SERIAL_DRV_DATA NULL
+#define S5L8940X_SERIAL_DRV_DATA NULL
 #endif
 
 #if defined(CONFIG_ARCH_ARTPEC)
@@ -2638,6 +2678,8 @@ static const struct of_device_id s3c24xx_uart_dt_match[] = {
 		.data = EXYNOS4210_SERIAL_DRV_DATA },
 	{ .compatible = "samsung,exynos5433-uart",
 		.data = EXYNOS5433_SERIAL_DRV_DATA },
+	{ .compatible = "apple,s5l8940x-uart",
+		.data = S5L8940X_SERIAL_DRV_DATA },
 	{ .compatible = "apple,s5l-uart",
 		.data = S5L_SERIAL_DRV_DATA },
 	{ .compatible = "samsung,exynos850-uart",
