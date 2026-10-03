@@ -1720,4 +1720,8 @@ config REGULATOR_QCOM_LABIBB
 	  boost regulator and IBB can be used as a negative boost regulator
 	  for LCD display panel.
 
+config REGULATOR_APPLE_PMU_PWRSW
+	tristate "Apple PMU power switch"
+	depends on MFD_APPLE_PMU_I2C
+	default y
 endif
