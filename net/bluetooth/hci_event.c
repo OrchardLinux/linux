@@ -6224,7 +6224,15 @@ static void hci_le_adv_report_evt(struct hci_dev *hdev, void *data,
 
 		if (info->length <= max_adv_len(hdev)) {
 			rssi = info->data[info->length];
-			process_adv_report(hdev, info->type, &info->bdaddr,
+			/* The legacy types are 0..4.  Apple's patchram for the
+			 * iPad mini's BCM4334 (iOS's BlueTool) sets bits 4 and
+			 * 5 on top of them -- 0x20 for an ADV_IND, 0x24 for its
+			 * SCAN_RSP, 0x13 for an ADV_NONCONN_IND -- and a type
+			 * this function does not know drops the report: an LE
+			 * keyboard in pairing mode was never found.  Only
+			 * reserved bits are cleared; 5..7 are still refused.
+			 */
+			process_adv_report(hdev, info->type & 0x07, &info->bdaddr,
 					   info->bdaddr_type, NULL, 0,
 					   HCI_ADV_PHY_1M, 0, rssi,
 					   info->data, info->length, false,
