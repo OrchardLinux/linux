@@ -139,6 +139,7 @@ static void i2c_s3c_irq_nextbyte(struct s3c24xx_i2c *i2c, unsigned long iicstat)
 #ifdef CONFIG_OF
 static const struct of_device_id s3c24xx_i2c_match[] = {
 	{ .compatible = "samsung,s3c2410-i2c", .data = (void *)0 },
+	{ .compatible = "apple,s5l8940x-samsung-i2c", .data = (void *)(QUIRK_NO_GPIO | QUIRK_POLL) },
 	{ .compatible = "samsung,s3c2440-i2c", .data = (void *)QUIRK_S3C2440 },
 	{ .compatible = "samsung,s3c2440-hdmiphy-i2c",
 	  .data = (void *)(QUIRK_S3C2440 | QUIRK_HDMIPHY | QUIRK_NO_GPIO) },
@@ -224,7 +225,7 @@ static bool is_ack(struct s3c24xx_i2c *i2c)
 			 * Wait a bit for the bus to stabilize,
 			 * delay estimated experimentally.
 			 */
-			usleep_range(100, 200);
+			udelay(200);
 			return true;
 		}
 		if (tmp & S3C2410_IICCON_IRQPEND) {
@@ -232,7 +233,7 @@ static bool is_ack(struct s3c24xx_i2c *i2c)
 				& S3C2410_IICSTAT_LASTBIT))
 				return true;
 		}
-		usleep_range(1000, 2000);
+		udelay(2000);
 	}
 	dev_err(i2c->dev, "ack was not received\n");
 	return false;
@@ -621,7 +622,7 @@ static int s3c24xx_i2c_set_master(struct s3c24xx_i2c *i2c)
 		if (!(iicstat & S3C2410_IICSTAT_BUSBUSY))
 			return 0;
 
-		msleep(1);
+		mdelay(1);
 	}
 
 	return -ETIMEDOUT;
@@ -668,7 +669,7 @@ static void s3c24xx_i2c_wait_idle(struct s3c24xx_i2c *i2c)
 	delay = 1;
 	while ((iicstat & S3C2410_IICSTAT_START) &&
 	       ktime_us_delta(now, start) < S3C2410_IDLE_TIMEOUT) {
-		usleep_range(delay, 2 * delay);
+		udelay(2 * delay);
 		if (delay < S3C2410_IDLE_TIMEOUT / 10)
 			delay <<= 1;
 		now = ktime_get();
@@ -715,7 +716,19 @@ static int s3c24xx_i2c_doxfer(struct s3c24xx_i2c *i2c,
 				dev_err(i2c->dev, "deal with arbitration loss\n");
 		}
 	} else {
-		time_left = wait_event_timeout(i2c->wait, i2c->msg_num == 0, HZ * 5);
+		/* HACK: hrtimer/jiffies broken on A5, use udelay poll (5 sec cap) */
+		{
+			unsigned long poll_ms = 5000;
+			time_left = 0;
+			while (poll_ms-- > 0) {
+				udelay(1000);
+				if (READ_ONCE(i2c->msg_num) == 0) {
+					time_left = 1;
+					break;
+				}
+			}
+		}
+		pr_err("S3C-I2C: udelay poll time_left=%ld ret=%d\n", time_left, ret);
 	}
 
 	ret = i2c->msg_idx;
