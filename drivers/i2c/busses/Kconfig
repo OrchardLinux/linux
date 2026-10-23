@@ -1530,4 +1530,8 @@ config I2C_VIRTIO
           This driver can also be built as a module. If so, the module
           will be called i2c-virtio.
 
+config I2C_S5L8940X
+	tristate "Apple S5L8940X (A5) I2C controller"
+	depends on OF
+	default y
 endmenu
