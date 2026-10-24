@@ -290,6 +290,8 @@ static int ehci_platform_probe(struct platform_device *dev)
 					  "needs-reset-on-resume"))
 			priv->reset_on_resume = true;
 
+		of_property_read_u32(dev->dev.of_node, "apple,hsic-ports",
+				     &ehci->hsic_ports);
 		if (of_property_read_bool(dev->dev.of_node,
 					  "has-transaction-translator"))
 			hcd->has_tt = 1;

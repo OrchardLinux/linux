@@ -3463,6 +3463,19 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 		GINTSTS_USBSUSP | GINTSTS_WKUPINT |
 		GINTSTS_LPMTRANRCVD;
 
+#ifdef CONFIG_ARCH_APPLE_S5L
+	/* The 125 us Start-of-Frame was P105AP's only tick until the AIC's own
+	 * timer turned up (drivers/irqchip/irq-apple-aic1.c).  It is only a
+	 * fallback now, and it costs 8000 interrupts a second, so ask first --
+	 * see arch/arm/mach-apple/apple_sof_clkevt.c. */
+	{
+		bool apple_s5l_usb_sof_wanted(void);
+
+		if (apple_s5l_usb_sof_wanted())
+			intmsk |= GINTSTS_SOF;
+	}
+#endif
+
 	if (!using_desc_dma(hsotg))
 		intmsk |= GINTSTS_INCOMPL_SOIN | GINTSTS_INCOMPL_SOOUT;
 
@@ -3700,6 +3713,37 @@ static void dwc2_gadget_handle_incomplete_isoc_out(struct dwc2_hsotg *hsotg)
 	dwc2_writel(hsotg, GINTSTS_INCOMPL_SOOUT, GINTSTS);
 }
 
+#ifdef CONFIG_ARCH_APPLE_S5L
+/*
+ * Cascadia: start a new session, as dwc2_hsotg_vbus_session(1) does when a
+ * VBUS detector reports the cable -- P105AP has no such detector, so nothing
+ * ever did.  After the cable was out the core stayed out of L0 (session end,
+ * or suspend with clock gating), every SETUP was refused with -EAGAIN
+ * ("failed queue (-11)"), and the host never got the gadget back (GitHub
+ * issue #1).  Called with hsotg->lock held: from the session request
+ * interrupt when VBUS comes back, and from a USB reset that still finds the
+ * core out of L0.
+ */
+void dwc2_s5l_new_session(struct dwc2_hsotg *hsotg);
+void dwc2_s5l_new_session(struct dwc2_hsotg *hsotg)
+{
+	dev_info(hsotg->dev, "new session (L%d, %s, GOTGCTL %08x)\n", hsotg->lx_state,
+		 hsotg->bus_suspended ? "suspended" : "not suspended",
+		 dwc2_readl(hsotg, GOTGCTL));
+	if (hsotg->bus_suspended &&
+	    hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE &&
+	    !hsotg->params.no_clock_gating)
+		dwc2_gadget_exit_clock_gating(hsotg, 0);
+	dwc2_hsotg_disconnect(hsotg);
+	hsotg->op_state = OTG_STATE_B_PERIPHERAL;
+	dwc2_hsotg_core_init_disconnected(hsotg, false);
+	if (hsotg->enabled) {
+		dwc2_enable_acg(hsotg);
+		dwc2_hsotg_core_connect(hsotg);
+	}
+}
+#endif
+
 /**
  * dwc2_hsotg_irq - handle device interrupt
  * @irq: The IRQ number triggered
@@ -3714,6 +3758,22 @@ static irqreturn_t dwc2_hsotg_irq(int irq, void *pw)
 
 	if (!dwc2_is_device_mode(hsotg))
 		return IRQ_NONE;
+
+#ifdef CONFIG_ARCH_APPLE_S5L
+	/* Handle SOF before taking hsotg->lock on purpose: this walks into the
+	 * clockevent handler, and from there into the timer and scheduler code.
+	 * Holding a USB driver lock across that is asking for a lock-order
+	 * surprise, and the tick path touches nothing in this driver. */
+	{
+		void apple_s5l_usb_sof_tick(void);
+		u32 sof = dwc2_readl(hsotg, GINTSTS) & dwc2_readl(hsotg, GINTMSK);
+
+		if (sof & GINTSTS_SOF) {
+			dwc2_writel(hsotg, GINTSTS_SOF, GINTSTS);
+			apple_s5l_usb_sof_tick();
+		}
+	}
+#endif
 
 	spin_lock(&hsotg->lock);
 irq_retry:
@@ -3746,6 +3806,21 @@ irq_retry:
 	if (gintsts & (GINTSTS_USBRST | GINTSTS_RESETDET)) {
 		u32 usb_status = dwc2_readl(hsotg, GOTGCTL);
 		u32 connected = hsotg->connected;
+
+#ifdef CONFIG_ARCH_APPLE_S5L
+		/* The session request was missed: start the session now.  The
+		 * host sees a disconnect and a connect and enumerates again --
+		 * with the core in L0 this time.  The rest of this pass belongs
+		 * to the core as it was before the reinit; drop it. */
+		if (hsotg->lx_state != DWC2_L0) {
+			dev_info(hsotg->dev, "USB reset out of L0: the session request was missed\n");
+			dwc2_writel(hsotg, GINTSTS_USBRST | GINTSTS_RESETDET |
+				    GINTSTS_ENUMDONE, GINTSTS);
+			dwc2_s5l_new_session(hsotg);
+			spin_unlock(&hsotg->lock);
+			return IRQ_HANDLED;
+		}
+#endif
 
 		dev_dbg(hsotg->dev, "%s: USBRst\n", __func__);
 		dev_dbg(hsotg->dev, "GNPTXSTS=%08x\n",

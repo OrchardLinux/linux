@@ -301,6 +301,9 @@ static void dwc2_handle_session_req_intr(struct dwc2_hsotg *hsotg)
 		hsotg->lx_state);
 
 	if (dwc2_is_device_mode(hsotg)) {
+#ifdef CONFIG_ARCH_APPLE_S5L
+		bool ended = hsotg->lx_state != DWC2_L0;
+#endif
 		if (hsotg->lx_state != DWC2_L0) {
 			if (hsotg->in_ppd) {
 				ret = dwc2_exit_partial_power_down(hsotg, 0,
@@ -322,6 +325,17 @@ static void dwc2_handle_session_req_intr(struct dwc2_hsotg *hsotg)
 		 * established
 		 */
 		dwc2_hsotg_disconnect(hsotg);
+#ifdef CONFIG_ARCH_APPLE_S5L
+		/* VBUS is back after the old session ended (not the first
+		 * session at boot, which udc_start set up): no detector calls
+		 * vbus_session() here, so start it ourselves (gadget.c) */
+		if (ended) {
+			void dwc2_s5l_new_session(struct dwc2_hsotg *hsotg);
+
+			dev_info(hsotg->dev, "VBUS back: session request\n");
+			dwc2_s5l_new_session(hsotg);
+		}
+#endif
 	} else {
 		/* Turn on the port power bit. */
 		hprt0 = dwc2_read_hprt0(hsotg);
