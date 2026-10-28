@@ -9,6 +9,7 @@
 #include <linux/bitfield.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 
@@ -33,6 +34,9 @@
 
 #define DWI_BL_MAX_BRIGHTNESS		2047
 
+/* A command takes well under a millisecond on the wire. */
+#define DWI_BL_SEND_TIMEOUT_US		1000
+
 struct apple_dwi_bl {
 	void __iomem *base;
 };
@@ -44,9 +48,20 @@ static int dwi_bl_update_status(struct backlight_device *bl)
 	int brightness = backlight_get_brightness(bl);
 
 	u32 cmd = 0;
+	u32 ctl;
+	int ret;
 
 	cmd |= FIELD_PREP(DWI_BL_CMD_DATA, brightness);
 	cmd |= FIELD_PREP(DWI_BL_CMD_TYPE, DWI_BL_CMD_TYPE_SET_BRIGHTNESS);
+
+	/* A command written while the previous one is still sent is lost. */
+	ret = readl_poll_timeout(dwi_bl->base + DWI_BL_CTL, ctl,
+				 !(ctl & DWI_BL_CTL_SEND1), 10,
+				 DWI_BL_SEND_TIMEOUT_US);
+	if (ret) {
+		dev_err(&bl->dev, "previous command still pending: %#x\n", ctl);
+		return ret;
+	}
 
 	writel(cmd, dwi_bl->base + DWI_BL_CMD);
 	writel(DWI_BL_CTL_SEND, dwi_bl->base + DWI_BL_CTL);
