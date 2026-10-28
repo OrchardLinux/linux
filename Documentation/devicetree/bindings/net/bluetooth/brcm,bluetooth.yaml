@@ -19,6 +19,9 @@ properties:
           - const: brcm,bcm4355c0-bt
           - const: brcm,bcm4345c5
       - items:
+          - const: apple,j71t-bcm4355c0-bt
+          - const: brcm,bcm4355c0-bt
+      - items:
           - enum:
               - apple,j71b-bcm4355c1-bt
               - apple,j172-bcm4355c1-bt
