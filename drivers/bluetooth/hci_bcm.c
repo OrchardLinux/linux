@@ -1646,6 +1646,14 @@ static struct bcm_device_data bcm4355_device_data = {
 	.drive_rts_on_open = true,
 };
 
+static struct bcm_device_data bcm4355_j71b_device_data = {
+	.no_early_set_baudrate = true,
+	.drive_rts_on_open = true,
+	.set_baudrate_before_patch = true,
+	.broken_read_transmit_power = true,
+	.fixup_le_adv_report_evt_type = true,
+};
+
 static struct bcm_device_data bcm4355_j172_device_data = {
 	.no_early_set_baudrate = true,
 	.wake_before_power_cycle = true,
@@ -1677,6 +1685,8 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
 	{ .compatible = "brcm,bcm43438-bt", .data = &bcm43438_device_data },
 	{ .compatible = "brcm,bcm4349-bt", .data = &bcm43438_device_data },
 	{ .compatible = "brcm,bcm43540-bt", .data = &bcm4354_device_data },
+	{ .compatible = "apple,j71b-bcm4355c1-bt",
+	  .data = &bcm4355_j71b_device_data },
 	{ .compatible = "apple,j172-bcm4355c1-bt",
 	  .data = &bcm4355_j172_device_data },
 	{ .compatible = "brcm,bcm4355c1-bt", .data = &bcm4355_device_data },
