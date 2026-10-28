@@ -143,8 +143,8 @@ EXPORT_SYMBOL_GPL(devm_pci_pwrctrl_device_set_ready);
  * Check whether the pwrctrl device really needs to be created or not. The
  * pwrctrl device will only be created if the node satisfies below requirements:
  *
- * 1. Presence of compatible property with "pci" prefix to match against the
- *    pwrctrl driver (AND)
+ * 1. At least one string in the compatible property has a "pci" prefix to
+ *    match against the pwrctrl driver (AND)
  * 2. At least one of the power supplies defined in the devicetree node of the
  *    device (OR) in the remote endpoint parent node to indicate pwrctrl
  *    requirement.
@@ -152,14 +152,14 @@ EXPORT_SYMBOL_GPL(devm_pci_pwrctrl_device_set_ready);
 static bool pci_pwrctrl_is_required(struct device_node *np)
 {
 	struct device_node *endpoint;
-	const char *compat;
-	int ret;
+	struct property *prop;
+	const char *compat = NULL;
 
-	ret = of_property_read_string(np, "compatible", &compat);
-	if (ret < 0)
-		return false;
+	of_property_for_each_string(np, "compatible", prop, compat)
+		if (strstarts(compat, "pci"))
+			break;
 
-	if (!strstarts(compat, "pci"))
+	if (!compat)
 		return false;
 
 	if (of_pci_supply_present(np))
@@ -234,6 +234,54 @@ void pci_pwrctrl_power_off_devices(struct device *parent)
 		pci_pwrctrl_power_off_device(child);
 }
 EXPORT_SYMBOL_GPL(pci_pwrctrl_power_off_devices);
+
+static int pci_pwrctrl_device_ready(struct device_node *np)
+{
+	struct platform_device *pdev;
+	int ret;
+
+	for_each_available_child_of_node_scoped(np, child) {
+		ret = pci_pwrctrl_device_ready(child);
+		if (ret)
+			return ret;
+	}
+
+	if (!pci_pwrctrl_is_required(np))
+		return 0;
+
+	pdev = of_find_device_by_node(np);
+	if (!pdev)
+		return -EPROBE_DEFER;
+
+	ret = device_is_bound(&pdev->dev) ? 0 : -EPROBE_DEFER;
+	platform_device_put(pdev);
+
+	return ret;
+}
+
+/**
+ * pci_pwrctrl_devices_ready - Check whether all pwrctrl devices are bound
+ *
+ * @parent: PCI host controller device
+ *
+ * Recursively check all pwrctrl devices below the specified PCI host
+ * controller without changing their power state.
+ *
+ * Return: 0 if every required pwrctrl device is bound, -EPROBE_DEFER
+ * otherwise.
+ */
+int pci_pwrctrl_devices_ready(struct device *parent)
+{
+	for_each_available_child_of_node_scoped(parent->of_node, child) {
+		int ret = pci_pwrctrl_device_ready(child);
+
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pci_pwrctrl_devices_ready);
 
 static int __pci_pwrctrl_power_on_device(struct device *dev)
 {
