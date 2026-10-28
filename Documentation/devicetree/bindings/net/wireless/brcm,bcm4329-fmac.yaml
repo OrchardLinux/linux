@@ -56,12 +56,23 @@ properties:
           - pci14e4,4433  # BCM4387
           - pci14e4,4434  # BCM4388
           - pci14e4,449d  # BCM43752
+      - items:
+          - enum:
+              - apple,d11-bcm4355-wifi
+              - apple,d111-bcm4355-wifi
+          - const: pci14e4,43dc
 
   reg:
     description: SDIO function number for the device (for most cases
       this will be 1) or PCI device identifier.
 
   interrupts:
+    maxItems: 1
+    description: Out-of-band (OOB) IRQ line for waking up the host
+      in response to WLAN activity. This corresponds to the HOST_WAKE
+      line into the chip.
+
+  interrupts-extended:
     maxItems: 1
     description: Out-of-band (OOB) IRQ line for waking up the host
       in response to WLAN activity. This corresponds to the HOST_WAKE
@@ -81,6 +92,21 @@ properties:
     maxItems: 1
     description: A GPIO line connected to the WL_RST line, if present
       this shall be flagged as active low.
+
+  device-wake-gpios:
+    maxItems: 1
+    description:
+      Host-to-device wake signal. Its required level during initial PCIe
+      enumeration depends on the Apple module integration.
+
+  vdd-supply:
+    description: Power supply for the Wi-Fi device.
+
+  apple,wlan-uart:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Apple SoC UART/AppleARMIODevice provider associated with the WLAN
+      platform-control function block.
 
   brcm,ccode-map:
     $ref: /schemas/types.yaml#/definitions/string-array
@@ -104,6 +130,24 @@ properties:
     description: A per-device calibration blob for the Wi-Fi radio. This
       should be filled in by the bootloader from platform configuration
       data, if necessary, and will be uploaded to the device if present.
+
+  nvmem-cells:
+    minItems: 1
+    items:
+      - description: Reference to an nvmem cell named in nvmem-cell-names
+      - description: Reference to an nvmem cell named in nvmem-cell-names
+    description:
+      Reference to nvmem nodes for the MAC address and/or calibration data.
+
+  nvmem-cell-names:
+    oneOf:
+      - items:
+          - const: mac-address
+      - items:
+          - const: calibration
+      - items:
+          - const: mac-address
+          - const: calibration
 
   brcm,board-type:
     $ref: /schemas/types.yaml#/definitions/string
@@ -135,6 +179,12 @@ properties:
 required:
   - compatible
   - reg
+
+dependentRequired:
+  nvmem-cells:
+    - nvmem-cell-names
+  nvmem-cell-names:
+    - nvmem-cells
 
 unevaluatedProperties: false
 

@@ -153,7 +153,7 @@
 		};
 
 		serial0: serial@20a0c0000 {
-			compatible = "apple,s5l-uart";
+			compatible = "apple,t8010-uart", "apple,s5l-uart";
 			reg = <0x2 0x0a0c0000 0x0 0x4000>;
 			reg-io-width = <4>;
 			interrupt-parent = <&aic>;
@@ -162,6 +162,45 @@
 			clocks = <&clkref>, <&clkref>;
 			clock-names = "uart", "clk_uart_baud0";
 			power-domains = <&ps_uart0>;
+			status = "disabled";
+		};
+
+		serial1: serial@20a0c4000 {
+			compatible = "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0c4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 219 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart1>;
+			status = "disabled";
+		};
+
+		serial3: serial@20a0cc000 {
+			compatible = "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0cc000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 221 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart3>;
+			status = "disabled";
+		};
+
+		serial5: serial@20a0d4000 {
+			compatible = "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0d4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 223 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart5>;
 			status = "disabled";
 		};
 
@@ -221,6 +260,49 @@
 			status = "disabled";
 		};
 
+		sio: dma-controller@20ae00000 {
+			compatible = "apple,t8010-sio";
+			reg = <0x2 0x0ae00000 0x0 0x10000>,
+			      <0x2 0x0a000000 0x0 0x2000>;
+			reg-names = "a7iop", "shim";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 211 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 210 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 213 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 212 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_sio>;
+			firmware-name = "apple/t8010-smartio.bin";
+			dma-channels = <64>;
+			#dma-cells = <1>;
+			status = "disabled";
+		};
+
+		spi2: spi@20a088000 {
+			compatible = "apple,t8010-spi", "apple,spi";
+			reg = <0x2 0x0a088000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 216 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi3: spi@20a08c000 {
+			compatible = "apple,t8010-spi", "apple,spi";
+			reg = <0x2 0x0a08c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 217 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			pinctrl-0 = <&spi3_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_spi3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		bus@20c000000 {
 			compatible = "apple,t8010-usb-complex", "apple,s5l8960x-usb-complex", "simple-pm-bus";
 			#address-cells = <2>;
@@ -274,6 +356,97 @@
 				power-domains = <&ps_usb2host1>;
 			};
 #endif
+		};
+
+		pcie0_dart0: iommu@601008000 {
+			compatible = "apple,t8010-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x01008000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupts = <AIC_IRQ 271 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			apple,dma-range = <0x0 0x80000000 0x0 0x3c000000>;
+			status = "disabled";
+		};
+
+		pcie0_dart2: iommu@603008000 {
+			compatible = "apple,t8010-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x03008000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupts = <AIC_IRQ 277 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			apple,dma-range = <0x0 0x80000000 0x0 0x3ffff000>;
+			status = "disabled";
+		};
+
+		pcie0_dart3: iommu@604008000 {
+			compatible = "apple,t8010-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x04008000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupts = <AIC_IRQ 280 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			apple,dma-range = <0x0 0x80000000 0x0 0x3ffff000>;
+			status = "disabled";
+		};
+
+		pcie0: pcie@610000000 {
+			compatible = "apple,t8010-pcie";
+			device_type = "pci";
+
+			reg = <0x6 0x10000000 0x0 0x1000000>,
+			      <0x6 0x00000000 0x0 0x8000>,
+			      <0x6 0x00008000 0x0 0x4000>,
+			      <0x6 0x0a000000 0x0 0x40000>,
+			      <0x6 0x01000000 0x0 0x4000>,
+			      <0x6 0x02000000 0x0 0x4000>,
+			      <0x6 0x03000000 0x0 0x4000>,
+			      <0x6 0x04000000 0x0 0x4000>,
+			      <0x6 0x01004000 0x0 0x4000>;
+			reg-names = "config", "rc", "phy", "phy-ip",
+				    "port0", "port1", "port2", "port3",
+				    "nvmmu";
+
+			interrupts = <AIC_IRQ 270 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 273 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 276 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 279 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 272 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "port0", "port1", "port2", "port3",
+					  "nvmmu";
+
+			msi-controller;
+			msi-parent = <&pcie0>;
+			msi-ranges = <&aic AIC_IRQ 288 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-doorbell = <0xbffff000>;
+			apple,nvmmu-iova = <0xbc000000>;
+			apple,nvme-hmb = <&nvme_hmb>;
+
+			iommu-map = <0x100 &pcie0_dart0 0 1>;
+			iommu-map-mask = <0xff00>;
+
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			bus-range = <0x00 0x0f>;
+			ranges = <0x03000000 0x0 0xc0000000
+				  0x7 0xc0000000 0x0 0x40000000>;
+
+			power-domains = <&ps_pcie>;
+			clocks = <&ps_pcie_aux>,
+				 <&ps_pcie_ref>;
+			clock-names = "aux", "ref";
+			status = "disabled";
+
+			pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				reset-gpios = <&pinctrl_ap 12 GPIO_ACTIVE_LOW>;
+				clkreq-gpios = <&pinctrl_ap 16 GPIO_ACTIVE_LOW>;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+			};
 		};
 
 		pmgr: power-management@20e000000 {
@@ -338,6 +511,12 @@
 			i2c3_pins: i2c3-pins {
 				pinmux = <APPLE_PINMUX(41, 1)>,
 					 <APPLE_PINMUX(42, 1)>;
+			};
+
+			spi3_pins: spi3-pins {
+				pinmux = <APPLE_PINMUX(82, 1)>,
+					 <APPLE_PINMUX(83, 1)>,
+					 <APPLE_PINMUX(84, 1)>;
 			};
 		};
 
