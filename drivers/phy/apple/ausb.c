@@ -30,6 +30,7 @@
 /* Tunable registers */
 #define AUSB_CFG0			0x08
 #define AUSB_CFG1			0x0c
+#define AUSB_TRIM			0x1c
 
 struct ausb_usbphy {
 	struct device *dev;
@@ -40,6 +41,9 @@ struct ausb_usbphy {
 	u32 cfg1_device;
 	u32 cfg0_host;
 	u32 cfg1_host;
+	/* Serialized by the PHY core's phy->mutex. */
+	bool host;
+	bool powered;
 };
 
 static inline void mask32(void __iomem *reg, u32 mask, u32 set)
@@ -60,11 +64,23 @@ static inline void clear32(void __iomem *reg, u32 clear)
 	mask32(reg, clear, 0);
 }
 
-#if 0
-static __maybe_unused int ausb_phy_usb2_set_mode(struct phy *phy, enum phy_mode mode,
-				int submode)
+static void ausb_phy_write_tunables(struct ausb_usbphy *aphy)
+{
+	writel(aphy->host ? aphy->cfg0_host : aphy->cfg0_device,
+	       aphy->base + AUSB_CFG0);
+	writel(aphy->host ? aphy->cfg1_host : aphy->cfg1_device,
+	       aphy->base + AUSB_CFG1);
+}
+
+/*
+ * Role change on a running PHY, as iOS does it in both directions: mode
+ * tunables, trim word 0, then a reset pulse. AUSB_SIG is left alone.
+ */
+static int ausb_phy_usb2_set_mode(struct phy *phy, enum phy_mode mode,
+				  int submode)
 {
 	struct ausb_usbphy *aphy = phy_get_drvdata(phy);
+	bool host;
 
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
@@ -72,35 +88,45 @@ static __maybe_unused int ausb_phy_usb2_set_mode(struct phy *phy, enum phy_mode 
 	case PHY_MODE_USB_HOST_FS:
 	case PHY_MODE_USB_HOST_HS:
 	case PHY_MODE_USB_HOST_SS:
-		writel(aphy->cfg0_host, aphy->base + AUSB_CFG0);
-		writel(aphy->cfg1_host, aphy->base + AUSB_CFG1);
-		set32(aphy->base + AUSB_SIG, AUSB_SIG_HOST);
-		return 0;
-
+		host = true;
+		break;
 	case PHY_MODE_USB_DEVICE:
 	case PHY_MODE_USB_DEVICE_LS:
 	case PHY_MODE_USB_DEVICE_FS:
 	case PHY_MODE_USB_DEVICE_HS:
 	case PHY_MODE_USB_DEVICE_SS:
-		writel(aphy->cfg0_device, aphy->base + AUSB_CFG0);
-		writel(aphy->cfg1_device, aphy->base + AUSB_CFG1);
-		clear32(aphy->base + AUSB_SIG, AUSB_SIG_HOST);
-		return 0;
-
+		host = false;
+		break;
 	default:
 		dev_err(aphy->dev, "Unknown mode for usb2 phy: %d\n", mode);
 		return -EINVAL;
 	}
+
+	/* A second host-side user must not pulse the reset again. */
+	if (host == aphy->host)
+		return 0;
+	aphy->host = host;
+	/* A powered-down PHY picks the mode up at its next power-on. */
+	if (!aphy->powered)
+		return 0;
+
+	ausb_phy_write_tunables(aphy);
+	writel(0, aphy->base + AUSB_TRIM);
+	set32(aphy->base + AUSB_CTL, AUSB_CTL_RESET);
+	usleep_range(20, 40);
+	clear32(aphy->base + AUSB_CTL, AUSB_CTL_RESET);
+	usleep_range(1000, 1500);
+	dev_dbg(aphy->dev, "%s mode\n", host ? "host" : "device");
+
+	return 0;
 }
-#endif
 
 static int ausb_phy_usb2_power_on(struct phy *phy)
 {
 	struct ausb_usbphy *aphy = phy_get_drvdata(phy);
 
-	/* set a sane tunable */
-	writel(aphy->cfg0_device, aphy->base + AUSB_CFG0);
-	writel(aphy->cfg1_device, aphy->base + AUSB_CFG1);
+	/* set a sane tunable: device mode unless a host user asked first */
+	ausb_phy_write_tunables(aphy);
 
 	set32(aphy->base + AUSB_CTL, AUSB_CTL_RESET);
 	udelay(20);
@@ -109,6 +135,7 @@ static int ausb_phy_usb2_power_on(struct phy *phy)
 	clear32(aphy->base + AUSB_CTL, AUSB_CTL_RESET);
 	udelay(1500);
 	set32(aphy->base + AUSB_SIG, AUSB_SIG_VBUSDET_FORCE_EN);
+	aphy->powered = true;
 
 	return 0;
 }
@@ -124,6 +151,9 @@ static int ausb_phy_usb2_power_off(struct phy *phy)
 	clear32(aphy->base + AUSB_CTL, AUSB_CTL_RESET);
 	udelay(1500);
 	clear32(aphy->base + AUSB_SIG, AUSB_SIG_VBUSDET_FORCE_EN);
+	aphy->powered = false;
+	/* The device controller never sets a mode: default it for the next user. */
+	aphy->host = false;
 
 	return 0;
 }
@@ -131,7 +161,7 @@ static int ausb_phy_usb2_power_off(struct phy *phy)
 
 static const struct phy_ops ausb_phy_usb2_ops = {
 	.owner = THIS_MODULE,
-	//.set_mode = ausb_phy_usb2_set_mode,
+	.set_mode = ausb_phy_usb2_set_mode,
 	.init = ausb_phy_usb2_power_on,
 	.exit = ausb_phy_usb2_power_off,
 };
