@@ -60,6 +60,16 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: The Tristar (CBTL1610) port controller on its I2C bus.
 
+  apple,usb-role-switch:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      The role switch that gives the Lightning port's PHY to the USB host
+      controllers (apple,s8000-usb-role-switch). When present, the charger
+      also identifies Lightning accessories over the Tristar ID bus and makes
+      the port a USB host while a camera adapter is attached, as iOS does.
+      The device controller linked through port then stays off. Without it,
+      the port stays a USB device and no accessory is identified.
+
   input-current-limit-microamp:
     description: Board maximum input current.
 
