@@ -392,6 +392,17 @@ config APPLE_TRISTAR_CHARGER
 	  This driver can also be built as a module. If so, the module will be
 	  called apple_tristar_charger.
 
+config APPLE_TRISTAR_ACCESSORY
+	bool "Lightning accessory identification"
+	depends on APPLE_TRISTAR_CHARGER
+	depends on USB_ROLE_SWITCH=y || USB_ROLE_SWITCH=APPLE_TRISTAR_CHARGER
+	help
+	  Say Y here to let the Tristar charger master the Lightning ID bus,
+	  over which Lightning accessories identify themselves: it asks an
+	  accessory for its digital ID and runs the exchange iOS runs with
+	  the camera adapter before USB host mode, including the power
+	  handshake.
+
 config BATTERY_BQ27XXX_DT_UPDATES_NVM
 	bool "BQ27xxx support for update of NVM/flash data memory"
 	depends on BATTERY_BQ27XXX_I2C
