@@ -26,4 +26,19 @@ config USB_ROLES_INTEL_XHCI
 	  To compile the driver as a module, choose M here: the module will
 	  be called intel-xhci-usb-role-switch.
 
+config USB_ROLES_APPLE_S8000
+	tristate "Apple A9 and A10 Lightning port role switch"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && I2C && USB_GADGET
+	select REGMAP
+	help
+	  Role switch for the Apple A9 and A10 USB complex, which pairs a
+	  device-only DWC2 with a separate EHCI + OHCI host pair behind one
+	  PHY. Device mode is the default; the Lightning accessory policy of
+	  the Tristar charger enters host mode while the camera adapter is
+	  attached.
+
+	  To compile the driver as a module, choose M here: the module will
+	  be called apple-s8000-usb-role.
+
 endif # USB_ROLE_SWITCH
