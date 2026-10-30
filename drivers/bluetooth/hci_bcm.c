@@ -1688,6 +1688,8 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
 	/* The iPad 5 BCM4355C0 needs the same sequence as the iPad 7 C1. */
 	{ .compatible = "apple,j71t-bcm4355c0-bt",
 	  .data = &bcm4355_j172_device_data },
+	/* The iPad Air 2 BCM4350C2 runs the plain sequence at 115,200 baud. */
+	{ .compatible = "apple,j81-bcm4350c2-bt" },
 	{ .compatible = "apple,j71b-bcm4355c1-bt",
 	  .data = &bcm4355_j71b_device_data },
 	{ .compatible = "apple,j172-bcm4355c1-bt",
