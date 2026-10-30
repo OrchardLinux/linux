@@ -57,7 +57,8 @@ obj-$(CONFIG_APPLE_BELLATRIX_POWER) += apple_bellatrix_power.o
 obj-$(CONFIG_APPLE_D2365_CHARGER) += apple_d2365_charger.o
 obj-$(CONFIG_APPLE_TRISTAR_CHARGER) += apple-tristar-charger.o
 apple-tristar-charger-y		:= apple_tristar_charger.o
-apple-tristar-charger-$(CONFIG_APPLE_TRISTAR_ACCESSORY) += apple_tristar_idbus.o
+apple-tristar-charger-$(CONFIG_APPLE_TRISTAR_ACCESSORY) += apple_tristar_accessory.o \
+							   apple_tristar_idbus.o
 obj-$(CONFIG_BATTERY_DA9030)	+= da9030_battery.o
 obj-$(CONFIG_BATTERY_DA9052)	+= da9052-battery.o
 obj-$(CONFIG_CHARGER_DA9150)	+= da9150-charger.o

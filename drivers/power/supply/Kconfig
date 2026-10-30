@@ -396,12 +396,17 @@ config APPLE_TRISTAR_ACCESSORY
 	bool "Lightning accessory identification"
 	depends on APPLE_TRISTAR_CHARGER
 	depends on USB_ROLE_SWITCH=y || USB_ROLE_SWITCH=APPLE_TRISTAR_CHARGER
+	depends on USB_ROLES_APPLE_S8000=y || USB_ROLES_APPLE_S8000=APPLE_TRISTAR_CHARGER
 	help
-	  Say Y here to let the Tristar charger master the Lightning ID bus,
-	  over which Lightning accessories identify themselves: it asks an
-	  accessory for its digital ID and runs the exchange iOS runs with
-	  the camera adapter before USB host mode, including the power
-	  handshake.
+	  Say Y here to let the Tristar charger identify Lightning
+	  accessories over the Lightning ID bus and make the port a USB host
+	  while a Lightning-to-USB camera adapter is attached, as iOS does.
+	  A charger on the adapter's power port is not identified and is
+	  allowed 500 mA.
+
+	  It needs the port's USB role switch (USB_ROLES_APPLE_S8000) and
+	  is active only on boards whose device tree names that switch for
+	  the charger.
 
 config BATTERY_BQ27XXX_DT_UPDATES_NVM
 	bool "BQ27xxx support for update of NVM/flash data memory"

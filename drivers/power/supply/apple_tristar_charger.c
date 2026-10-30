@@ -54,6 +54,8 @@
 #include <linux/usb/role.h>
 #include <linux/workqueue.h>
 
+#include "apple_tristar_accessory.h"
+
 /* PMIC registers, relative to their banks */
 #define TRISTAR_CHG_STATUS		0x0a	/* status bank */
 #define TRISTAR_CHG_STATUS_ONLINE	0x42
@@ -169,6 +171,10 @@ struct tristar_charger {
 	u64 step_ns;
 	u64 guard_ns;
 	unsigned int epoch_seen;
+	/* Lightning accessory policy, on boards with a role switch */
+	struct tristar_accessory *acc;
+	/* USB data is on, but the device controller is held off for a USB host role. */
+	bool usb_held;
 };
 
 static unsigned int tristar_code_ma(unsigned int code)
@@ -609,6 +615,7 @@ static int tristar_identify_usba(struct tristar_charger *chg, unsigned int orien
 static int tristar_identify(struct tristar_charger *chg, struct tristar_ident *id)
 {
 	unsigned int epoch = READ_ONCE(chg->epoch), orientation;
+	const char *holder;
 	bool usbc;
 	u8 route, state;
 	int ret;
@@ -616,6 +623,18 @@ static int tristar_identify(struct tristar_charger *chg, struct tristar_ident *i
 	id->ma = 0;
 	id->type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	id->sampled = false;
+	holder = tristar_accessory_holds(chg->acc, &id->ma);
+	if (holder) {
+		/*
+		 * The accessory policy holds the port: the mux is not ours to
+		 * sample, and no cable is known to compare after a source event.
+		 */
+		id->type = POWER_SUPPLY_USB_TYPE_ACA;
+		id->usbc = false;
+		id->orientation = 0;
+		strscpy(id->what, holder, sizeof(id->what));
+		return 0;
+	}
 	ret = cbtl_read(chg, CBTL_MUX_ROUTE, &route, 1);
 	if (!ret)
 		ret = cbtl_read(chg, CBTL_MUX_STATE, &state, 1);
@@ -653,13 +672,19 @@ static unsigned int tristar_usb_ma(struct tristar_charger *chg)
 
 /*
  * Turn USB data on or hold it off. A failed hold counts as on: the mux is
- * then left alone. Caller holds lock.
+ * then left alone. While the accessory policy holds the port as a USB host,
+ * the device controller stays off even with USB data on; the next poll after
+ * the policy lets go turns it on. Stopping always turns it on. Caller holds
+ * lock.
  */
 static void tristar_set_usb(struct tristar_charger *chg, bool on)
 {
+	unsigned int ma;
+	bool held = on && !chg->stopping && tristar_accessory_holds(chg->acc, &ma);
 	int ret = usb_role_switch_set_role(chg->role_sw,
-					   on ? USB_ROLE_DEVICE : USB_ROLE_NONE);
+					   on && !held ? USB_ROLE_DEVICE : USB_ROLE_NONE);
 
+	chg->usb_held = held && !ret;
 	if (ret)
 		dev_err(chg->dev, "cannot turn USB data %s (%d)\n", on ? "on" : "off", ret);
 	chg->usb_on = on || ret;
@@ -690,6 +715,15 @@ static void tristar_update_target(struct tristar_charger *chg)
 		chg->phase = TRISTAR_RAMPING;
 		chg->step_ns = 0;
 	}
+}
+
+/* Turn on a device controller held off for a host role the policy gave back. Caller holds lock. */
+static void tristar_unhold_usb(struct tristar_charger *chg)
+{
+	unsigned int ma;
+
+	if (chg->usb_held && !tristar_accessory_holds(chg->acc, &ma))
+		tristar_set_usb(chg, true);
 }
 
 /* Caller holds lock. */
@@ -923,6 +957,38 @@ static void tristar_no_source(struct tristar_charger *chg, unsigned int status, 
 	tristar_set_usb(chg, true);
 }
 
+/*
+ * While the accessory policy holds the port (the camera adapter in USB host
+ * mode), the source behind the adapter cannot be identified: take the
+ * policy's allowance. Once the policy lets go, identify the source again, or
+ * turn on the device controller that tristar_set_usb() held off. Caller
+ * holds lock.
+ */
+static void tristar_follow_accessory(struct tristar_charger *chg, u64 now)
+{
+	bool charging = chg->phase == TRISTAR_RAMPING || chg->phase == TRISTAR_CHARGING;
+	const char *holder;
+	unsigned int ma;
+
+	if (!IS_ENABLED(CONFIG_APPLE_TRISTAR_ACCESSORY))
+		return;
+	holder = tristar_accessory_holds(chg->acc, &ma);
+	if (!holder) {
+		if (charging && chg->usb_type == POWER_SUPPLY_USB_TYPE_ACA)
+			tristar_new_attachment(chg, now);
+		else
+			tristar_unhold_usb(chg);
+		return;
+	}
+	if (!charging || (chg->usb_type == POWER_SUPPLY_USB_TYPE_ACA && chg->source_ma == ma))
+		return;
+	strscpy(chg->source, holder, sizeof(chg->source));
+	chg->source_ma = ma;
+	chg->usb_type = POWER_SUPPLY_USB_TYPE_ACA;
+	tristar_update_target(chg);
+	dev_dbg(chg->dev, "%s: %u mA\n", holder, ma);
+}
+
 static void tristar_poll(struct work_struct *work)
 {
 	struct tristar_charger *chg = container_of(to_delayed_work(work),
@@ -975,6 +1041,8 @@ static void tristar_poll(struct work_struct *work)
 		/* USB data must not depend on charging working. */
 		if (!chg->usb_on)
 			tristar_set_usb(chg, true);
+		else
+			tristar_unhold_usb(chg);
 		goto again;
 	}
 	if (READ_ONCE(chg->epoch) != chg->epoch_seen && chg->phase != TRISTAR_SETTLING) {
@@ -1002,6 +1070,7 @@ static void tristar_poll(struct work_struct *work)
 			chg->step_ns = 0;
 		}
 	}
+	tristar_follow_accessory(chg, now);
 	switch (chg->phase) {
 	case TRISTAR_SETTLING:
 		if ((s64)(now - chg->attach_ns) >= (s64)TRISTAR_LOOK_MS * NSEC_PER_MSEC)
@@ -1017,6 +1086,7 @@ static void tristar_poll(struct work_struct *work)
 		break;
 	}
 again:
+	tristar_accessory_report(chg->acc, chg->usb_ma, chg->phase == TRISTAR_FAULT);
 	mod_delayed_work(chg->wq, &chg->poll_work,
 			 msecs_to_jiffies(TRISTAR_POLL_MS));
 	if (chg->code != old_code || chg->online != old_online)
@@ -1205,7 +1275,9 @@ static const struct power_supply_desc tristar_desc = {
 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_APPLE_BRICK_ID) |
-		     BIT(POWER_SUPPLY_USB_TYPE_C),
+		     BIT(POWER_SUPPLY_USB_TYPE_C) |
+		     (IS_ENABLED(CONFIG_APPLE_TRISTAR_ACCESSORY) ?
+		      BIT(POWER_SUPPLY_USB_TYPE_ACA) : 0),
 	.properties = tristar_properties,
 	.num_properties = ARRAY_SIZE(tristar_properties),
 	.get_property = tristar_get_property,
@@ -1253,6 +1325,7 @@ static void tristar_stop(struct tristar_charger *chg, const char *reason)
 	for (i = 0; i < chg->nirqs; i++)
 		disable_irq(chg->irqs[i]);
 	cancel_delayed_work_sync(&chg->poll_work);
+	tristar_accessory_stop(chg->acc);
 	mutex_lock(&chg->lock);
 	if (tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE))
 		dev_crit(chg->dev, "%s: handoff restore failed\n", reason);
@@ -1346,6 +1419,9 @@ static int tristar_probe(struct platform_device *pdev)
 	if (!chg->wq)
 		return -ENOMEM;
 	INIT_DELAYED_WORK(&chg->poll_work, tristar_poll);
+	ret = tristar_accessory_probe(dev, chg->tristar, &chg->lock, &chg->acc);
+	if (ret)
+		return ret;
 
 	/* Never adopt a limit we cannot explain; anything higher drops to the fallback. */
 	ret = regmap_read(chg->regmap, chg->control_base + TRISTAR_CHG_INPUT_LIMIT, &code);
@@ -1394,6 +1470,7 @@ static int tristar_probe(struct platform_device *pdev)
 	mutex_unlock(&chg->lock);
 
 	mod_delayed_work(chg->wq, &chg->poll_work, 0);
+	tristar_accessory_start(chg->acc);
 	return 0;
 }
 
@@ -1438,11 +1515,13 @@ static int tristar_suspend(struct device *dev)
 	if (ret)
 		return ret;
 	cancel_delayed_work_sync(&chg->poll_work);
+	tristar_accessory_stop(chg->acc);
 	if (chg->plug_irq && device_may_wakeup(dev)) {
 		ret = enable_irq_wake(chg->plug_irq);
 		if (ret)
 			dev_warn(dev, "cannot wake on plug events: %d\n", ret);
 	}
+
 	return 0;
 }
 
@@ -1456,6 +1535,7 @@ static int tristar_resume(struct device *dev)
 	chg->stopping = false;
 	mutex_unlock(&chg->lock);
 	mod_delayed_work(chg->wq, &chg->poll_work, 0);
+	tristar_accessory_start(chg->acc);
 	return 0;
 }
 
