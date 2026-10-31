@@ -684,6 +684,34 @@
 			power-domains = <&ps_ans2>;
 		};
 
+		dart_apcie2: iommu@603008000 {
+			compatible = "apple,t8015-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x03008000 0x0 0x4000>;
+			#iommu-cells = <5>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 347 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			/* ADT dart-apcie2: error-reflector, fetch-config, diag-config */
+			apple,error-reflector = /bits/ 64 <0x233ffc000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x80000100>;
+			status = "disabled";
+		};
+
+		dart_apcie3: iommu@604008000 {
+			compatible = "apple,t8015-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x04008000 0x0 0x4000>;
+			#iommu-cells = <5>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 350 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			/* ADT dart-apcie3: error-reflector, fetch-config, diag-config */
+			apple,error-reflector = /bits/ 64 <0x233ffc000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x80000100>;
+			status = "disabled";
+		};
+
 		nvme@259cc0000 {
 			compatible = "apple,t8015-nvme-ans2";
 			reg = <0x2 0x59cc0000 0x0 0x40000>,
