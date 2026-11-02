@@ -907,6 +907,9 @@ static void apple_h9p_pcie_detach_genpd(struct apple_h9p_pcie *pcie)
 {
 	int i;
 
+	if (!pcie->pd_dev || !pcie->pd_link)
+		return;
+
 	for (i = pcie->pd_count - 1; i >= 0; i--) {
 		if (pcie->pd_link[i])
 			device_link_del(pcie->pd_link[i]);
