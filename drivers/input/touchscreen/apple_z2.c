@@ -56,6 +56,12 @@
 #define APPLE_Z2_CMD_CTRL_READ_LONG      0xE7
 #define APPLE_Z2_CMD_LAST                0xE1
 #define APPLE_Z2_CMD_WAKE                0xEE
+/* A bounded run of control replies is not normal input inactivity. */
+#define APPLE_Z2_CONTROL_STALL_MS        2000
+#define APPLE_Z2_CONTROL_STALL_READS     64
+#define APPLE_Z2_CONTROL_GAP_MS          250
+#define APPLE_Z2_CONTROL_RESTARTS        3
+#define APPLE_Z2_CONTROL_RETRY_MS        1000
 #define APPLE_Z2_CMD_SIZE                16
 #define APPLE_Z2_RAW_XFER_MAX_SIZE       64
 #define APPLE_Z2_GEN2_MIN_RESULT_SIZE    64
@@ -195,6 +201,7 @@ struct apple_z2_n1_info {
  * @cs_hold_us:		generation-1 chip-select hold delay
  * @cs_inactive_us:	generation-1 chip-select inactive delay
  * @n1:			N1 bootloader and runtime parameters
+ * @recover_control_stall: restart after a sustained control-only runtime loop
  */
 struct apple_z2_chip_info {
 	const char *name;
@@ -203,6 +210,7 @@ struct apple_z2_chip_info {
 	unsigned int cs_hold_us;
 	unsigned int cs_inactive_us;
 	const struct apple_z2_n1_info *n1;
+	bool recover_control_stall;
 };
 
 struct apple_z2 {
@@ -224,6 +232,10 @@ struct apple_z2 {
 	struct gpio_desc *attn_gpio;
 	struct delayed_work rearm_work;
 	unsigned int rearm_attempts;
+	unsigned int control_reads;
+	unsigned long control_since;
+	unsigned long control_last;
+	bool recovering;
 	unsigned long last_wake;
 	bool wake_valid;
 	bool ana_enabled;
@@ -371,6 +383,7 @@ static int apple_z2_hbpp_xfer(struct apple_z2 *z2, unsigned int len);
 static int apple_z2_hbpp_nop(struct apple_z2 *z2);
 static void apple_z2_platform_power_off(struct apple_z2 *z2);
 static int apple_z2_j71t_boot(struct apple_z2 *z2);
+static int apple_z2_boot(struct apple_z2 *z2);
 
 static bool apple_z2_float_to_integer(const u8 *raw, s64 *value)
 {
@@ -1012,6 +1025,7 @@ static void apple_z2_reset_protocol(struct apple_z2 *z2)
 	z2->index_parity = 0;
 	z2->runtime_frame_valid = false;
 	z2->surface_descriptor_valid = false;
+	z2->control_reads = 0;
 }
 
 static int apple_z2_advance_protocol(struct apple_z2 *z2,
@@ -1867,6 +1881,34 @@ static int apple_z2_j172_init_writes_locked(struct apple_z2 *z2)
 					 APPLE_Z2_STATE_REPORTS_READY);
 }
 
+/* io_lock is held. Empty queues and valid frames always clear the run. */
+static bool apple_z2_control_stalled(struct apple_z2 *z2)
+{
+	if (!z2->info->recover_control_stall ||
+	    z2->protocol_state != APPLE_Z2_STATE_REPORTS_READY)
+		return false;
+
+	if (!z2->runtime_control_reply || z2->runtime_frame_valid ||
+	    z2->runtime_queue_empty) {
+		z2->control_reads = 0;
+		return false;
+	}
+
+	if (!z2->control_reads ||
+	    time_after(jiffies, z2->control_last +
+		       msecs_to_jiffies(APPLE_Z2_CONTROL_GAP_MS))) {
+		z2->control_reads = 0;
+		z2->control_since = jiffies;
+	}
+	z2->control_last = jiffies;
+	if (z2->control_reads < APPLE_Z2_CONTROL_STALL_READS)
+		z2->control_reads++;
+
+	return z2->control_reads == APPLE_Z2_CONTROL_STALL_READS &&
+	       time_after_eq(jiffies, z2->control_since +
+			     msecs_to_jiffies(APPLE_Z2_CONTROL_STALL_MS));
+}
+
 /*
  * Generation-1 controllers raise a level interrupt while reports are
  * queued. Service it by reading (and so acknowledging) up to four reports.
@@ -1880,6 +1922,8 @@ static int apple_z2_gen1_drain(struct apple_z2 *z2)
 		error = apple_z2_read_packet(z2);
 		if (error)
 			return error;
+		if (apple_z2_control_stalled(z2))
+			return -ETIMEDOUT;
 		if (z2->runtime_queue_empty ||
 		    (!z2->runtime_frame_valid && !z2->runtime_control_reply))
 			break;
@@ -2088,6 +2132,67 @@ static void apple_z2_n1_irq_locked(struct apple_z2 *z2)
 			      msecs_to_jiffies(APPLE_Z2_N1_REARM_DELAY_MS));
 }
 
+/*
+ * Restart outside the IRQ thread and io_lock: boot waits for boot IRQs and
+ * takes io_lock itself. Removal/suspend marks stopping before cancelling us.
+ */
+static void apple_z2_control_rearm_work(struct work_struct *work)
+{
+	struct apple_z2 *z2 = container_of(to_delayed_work(work),
+					   struct apple_z2, rearm_work);
+	bool retry;
+	int error;
+
+	mutex_lock(&z2->io_lock);
+	if (z2->stopping || !z2->recovering) {
+		mutex_unlock(&z2->io_lock);
+		return;
+	}
+	z2->booted = false;
+	z2->rearm_attempts++;
+	mutex_unlock(&z2->io_lock);
+
+	/* The handler which scheduled us must finish before changing power. */
+	synchronize_irq(z2->spidev->irq);
+	gpiod_direction_output(z2->reset_gpio, 1);
+	apple_z2_platform_power_off(z2);
+	error = apple_z2_boot(z2);
+
+	mutex_lock(&z2->io_lock);
+	retry = error && !z2->stopping &&
+		z2->rearm_attempts < APPLE_Z2_CONTROL_RESTARTS;
+	if (!retry)
+		z2->recovering = false;
+	if (retry)
+		schedule_delayed_work(&z2->rearm_work,
+				      msecs_to_jiffies(APPLE_Z2_CONTROL_RETRY_MS));
+	mutex_unlock(&z2->io_lock);
+
+	if (error)
+		dev_err(&z2->spidev->dev,
+			"touch control-stall restart %u failed: %d\n",
+			z2->rearm_attempts, error);
+	else
+		dev_info(&z2->spidev->dev,
+			 "touch recovered from control-only stall\n");
+}
+
+/* io_lock is held; queue at most one restart for this stalled run. */
+static void apple_z2_queue_control_recovery(struct apple_z2 *z2)
+{
+	if (z2->recovering || z2->stopping)
+		return;
+
+	dev_warn_ratelimited(&z2->spidev->dev,
+			     "control-only touch stall, restarting\n");
+	apple_z2_release_contacts(z2);
+	z2->irq_on = false;
+	disable_irq_nosync(z2->spidev->irq);
+	z2->recovering = true;
+	z2->rearm_attempts = 0;
+	schedule_delayed_work(&z2->rearm_work, 0);
+}
+
 static irqreturn_t apple_z2_irq(int irq, void *data)
 {
 	struct apple_z2 *z2 = data;
@@ -2101,8 +2206,15 @@ static irqreturn_t apple_z2_irq(int irq, void *data)
 		mutex_unlock(&z2->io_lock);
 	} else {
 		mutex_lock(&z2->io_lock);
+		if (z2->info->recover_control_stall &&
+		    (z2->stopping || !z2->irq_on)) {
+			mutex_unlock(&z2->io_lock);
+			return IRQ_HANDLED;
+		}
 		error = apple_z2_is_gen1(z2) ? apple_z2_gen1_drain(z2) :
 						 apple_z2_read_packet(z2);
+		if (error == -ETIMEDOUT && z2->info->recover_control_stall)
+			apple_z2_queue_control_recovery(z2);
 		mutex_unlock(&z2->io_lock);
 		if (error)
 			dev_warn_ratelimited(&z2->spidev->dev,
@@ -3956,6 +4068,7 @@ static const struct apple_z2_chip_info apple_z2_j71b_info = {
 	.variant = APPLE_Z2_VARIANT_J71B,
 	.cs_setup_us = 1000,
 	.cs_inactive_us = 1000,
+	.recover_control_stall = true,
 };
 
 /*
@@ -4124,7 +4237,8 @@ static int apple_z2_probe(struct spi_device *spi)
 						    "apple,z2-no-init-ack");
 	init_completion(&z2->boot_irq);
 	mutex_init(&z2->io_lock);
-	INIT_DELAYED_WORK(&z2->rearm_work, apple_z2_n1_rearm_work);
+	INIT_DELAYED_WORK(&z2->rearm_work, info->recover_control_stall ?
+			  apple_z2_control_rearm_work : apple_z2_n1_rearm_work);
 	spi_set_drvdata(spi, z2);
 
 	z2->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
@@ -4312,7 +4426,7 @@ static void apple_z2_stop(struct apple_z2 *z2)
 {
 	bool irq_on;
 
-	if (apple_z2_is_j71t(z2)) {
+	if (apple_z2_is_j71t(z2) || z2->info->recover_control_stall) {
 		mutex_lock(&z2->io_lock);
 		z2->stopping = true;
 		mutex_unlock(&z2->io_lock);
@@ -4349,6 +4463,7 @@ static int apple_z2_resume(struct device *dev)
 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
 
 	z2->stopping = false;
+	z2->recovering = false;
 	return apple_z2_boot(z2);
 }
 
