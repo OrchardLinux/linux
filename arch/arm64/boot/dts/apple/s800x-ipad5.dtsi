@@ -369,6 +369,17 @@
 	status = "okay";
 };
 
+/* Lightning host role: accessory power from LDO5, ACC routing by the Tristar. */
+&tristar_charger {
+	apple,usb-role-switch = <&usb_role>;
+};
+
+&usb_role {
+	apple,pmic = <&d2365_pmic>;
+	apple,tristar = <&tristar>;
+	status = "okay";
+};
+
 &vxd {
 	status = "okay";
 };
