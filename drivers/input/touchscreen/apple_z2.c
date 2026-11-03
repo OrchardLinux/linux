@@ -202,6 +202,8 @@ struct apple_z2_n1_info {
  * @cs_inactive_us:	generation-1 chip-select inactive delay
  * @n1:			N1 bootloader and runtime parameters
  * @recover_control_stall: restart after a sustained control-only runtime loop
+ * @shifted_reply_header: accept an interrupt reply whose header arrives one
+ *			byte late, leaving only the low checksum byte
  */
 struct apple_z2_chip_info {
 	const char *name;
@@ -211,6 +213,7 @@ struct apple_z2_chip_info {
 	unsigned int cs_inactive_us;
 	const struct apple_z2_n1_info *n1;
 	bool recover_control_stall;
+	bool shifted_reply_header;
 };
 
 struct apple_z2 {
@@ -865,6 +868,7 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 	bool strict_counter;
 	bool resynced = false;
 	int error;
+	int i;
 	size_t pkt_len;
 	size_t wire_len;
 	u16 payload_len;
@@ -898,8 +902,24 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 	 */
 	if (apple_z2_is_j71t(z2)) {
 		if ((z2->rx_buf[0] & 0xf0) != 0xe0 ||
-		    !apple_z2_z2_checksum_valid(z2->rx_buf, APPLE_Z2_CMD_SIZE))
-			return -EBADMSG;
+		    !apple_z2_z2_checksum_valid(z2->rx_buf, APPLE_Z2_CMD_SIZE)) {
+			u8 checksum = 0;
+
+			/*
+			 * Some controllers return the reply header one byte
+			 * late, leaving only the low checksum byte.
+			 */
+			if (!z2->info->shifted_reply_header ||
+			    z2->rx_buf[0] > 1 ||
+			    z2->rx_buf[1] != APPLE_Z2_REPLY_INTERRUPT_DATA)
+				return -EBADMSG;
+			for (i = 1; i < APPLE_Z2_CMD_SIZE - 1; i++)
+				checksum += z2->rx_buf[i];
+			if (checksum != z2->rx_buf[APPLE_Z2_CMD_SIZE - 1])
+				return -EBADMSG;
+			payload_len = get_unaligned_le16(z2->rx_buf + 2);
+			goto data_phase;
+		}
 	} else if (z2->rx_buf[0] != APPLE_Z2_REPLY_INTERRUPT_DATA) {
 		return 0;
 	}
@@ -4161,6 +4181,7 @@ static const struct apple_z2_chip_info apple_z2_j81_info = {
 	.cs_setup_us = 10,
 	.cs_hold_us = 10,
 	.n1 = &apple_z2_j81_n1,
+	.shifted_reply_header = true,
 };
 
 static const struct apple_z2_chip_info apple_z2_j172_info = {
