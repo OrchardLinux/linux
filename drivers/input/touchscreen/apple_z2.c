@@ -234,6 +234,8 @@ struct apple_z2 {
 	struct pinctrl_state *sync_inactive;
 	struct gpio_desc *attn_gpio;
 	struct delayed_work rearm_work;
+	struct work_struct resume_work;
+	bool boot_due;		/* resumed: boot once every device is back */
 	unsigned int rearm_attempts;
 	unsigned int control_reads;
 	unsigned long control_since;
@@ -387,6 +389,7 @@ static int apple_z2_hbpp_nop(struct apple_z2 *z2);
 static void apple_z2_platform_power_off(struct apple_z2 *z2);
 static int apple_z2_j71t_boot(struct apple_z2 *z2);
 static int apple_z2_boot(struct apple_z2 *z2);
+static void apple_z2_resume_work(struct work_struct *work);
 
 static bool apple_z2_float_to_integer(const u8 *raw, s64 *value)
 {
@@ -4260,6 +4263,7 @@ static int apple_z2_probe(struct spi_device *spi)
 	mutex_init(&z2->io_lock);
 	INIT_DELAYED_WORK(&z2->rearm_work, info->recover_control_stall ?
 			  apple_z2_control_rearm_work : apple_z2_n1_rearm_work);
+	INIT_WORK(&z2->resume_work, apple_z2_resume_work);
 	spi_set_drvdata(spi, z2);
 
 	z2->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
@@ -4474,26 +4478,83 @@ static void apple_z2_stop(struct apple_z2 *z2)
 
 static void apple_z2_remove(struct spi_device *spi)
 {
-	apple_z2_stop(spi_get_drvdata(spi));
+	struct apple_z2 *z2 = spi_get_drvdata(spi);
+
+	cancel_work_sync(&z2->resume_work);
+	apple_z2_stop(z2);
 }
 
 static int apple_z2_suspend(struct device *dev)
 {
-	apple_z2_stop(spi_get_drvdata(to_spi_device(dev)));
+	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
+
+	/* A controller still booting from the last resume stops first */
+	cancel_work_sync(&z2->resume_work);
+	apple_z2_stop(z2);
 
 	return 0;
 }
 
+#define APPLE_Z2_RESUME_BOOTS		3
+#define APPLE_Z2_RESUME_RETRY_MS	500
+
+static void apple_z2_resume_work(struct work_struct *work)
+{
+	struct apple_z2 *z2 = container_of(work, struct apple_z2, resume_work);
+	int attempt, error = 0;
+
+	for (attempt = 1; attempt <= APPLE_Z2_RESUME_BOOTS; attempt++) {
+		if (attempt > 1) {
+			/* from scratch, as the stall recovery restarts it */
+			gpiod_direction_output(z2->reset_gpio, 1);
+			apple_z2_platform_power_off(z2);
+			apple_z2_reset_protocol(z2);
+			msleep(APPLE_Z2_RESUME_RETRY_MS);
+		}
+		error = apple_z2_boot(z2);
+		if (!error)
+			break;
+		dev_warn(&z2->spidev->dev, "touch start %d/%d after resume failed: %d\n",
+			 attempt, APPLE_Z2_RESUME_BOOTS, error);
+	}
+	if (error)
+		dev_err(&z2->spidev->dev, "touch did not start after resume: %d\n", error);
+	else if (attempt > 1)
+		dev_info(&z2->spidev->dev, "touch started after resume, attempt %d\n", attempt);
+}
+
+/*
+ * Booting the controller uploads its firmware and takes seconds (3.3 s on
+ * the J71b), so it must not hold up resume. Resume only marks it due, and
+ * complete(), which runs once every device has resumed (the SPI controller,
+ * its DMA engine and their co-processor included), starts it in the
+ * background; touch follows when the boot is done.
+ */
 static int apple_z2_resume(struct device *dev)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
 
 	z2->stopping = false;
 	z2->recovering = false;
-	return apple_z2_boot(z2);
+	z2->boot_due = true;
+	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(apple_z2_pm, apple_z2_suspend, apple_z2_resume);
+/* Also runs when sleep was aborted before suspend(): boot only if stopped. */
+static void __maybe_unused apple_z2_complete(struct device *dev)
+{
+	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
+
+	if (!z2->boot_due)
+		return;
+	z2->boot_due = false;
+	queue_work(system_unbound_wq, &z2->resume_work);
+}
+
+static const struct dev_pm_ops apple_z2_pm = {
+	SYSTEM_SLEEP_PM_OPS(apple_z2_suspend, apple_z2_resume)
+	.complete = pm_sleep_ptr(apple_z2_complete),
+};
 
 static const struct of_device_id apple_z2_of_match[] = {
 	{ .compatible = "apple,j293-touchbar", .data = &apple_z2_j293_info },
