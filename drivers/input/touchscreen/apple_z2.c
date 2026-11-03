@@ -4164,7 +4164,7 @@ static const struct apple_z2_chip_info apple_z2_j81_info = {
 };
 
 static const struct apple_z2_chip_info apple_z2_j172_info = {
-	.name = "iPad7,12 Touchscreen",
+	.name = "iPad 7 Touchscreen",
 	.variant = APPLE_Z2_VARIANT_J172,
 };
 
