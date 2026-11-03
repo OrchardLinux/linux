@@ -4269,27 +4269,32 @@ static int apple_z2_probe(struct spi_device *spi)
 					     "unable to get analog supply\n");
 
 		z2->sync_pinctrl = devm_pinctrl_get(dev);
-		if (IS_ERR(z2->sync_pinctrl))
-			return dev_err_probe(dev, PTR_ERR(z2->sync_pinctrl),
-					     "unable to get display-sync pins\n");
+		if (IS_ERR(z2->sync_pinctrl)) {
+			if (PTR_ERR(z2->sync_pinctrl) != -ENODEV)
+				return dev_err_probe(dev, PTR_ERR(z2->sync_pinctrl),
+						     "unable to get display-sync pins\n");
+			z2->sync_pinctrl = NULL;
+		}
 		/*
 		 * Where iOS leaves display sync an input instead of routing it
 		 * to the controller (J81), the board describes no states.
 		 */
-		z2->sync_active = pinctrl_lookup_state(z2->sync_pinctrl,
-						       "display-sync-active");
-		if (PTR_ERR_OR_ZERO(z2->sync_active) == -ENODEV) {
-			z2->sync_active = NULL;
-		} else if (IS_ERR(z2->sync_active)) {
-			return dev_err_probe(dev, PTR_ERR(z2->sync_active),
-					     "missing display-sync-active state\n");
-		} else {
-			z2->sync_inactive =
-				pinctrl_lookup_state(z2->sync_pinctrl,
-						     "display-sync-inactive");
-			if (IS_ERR(z2->sync_inactive))
-				return dev_err_probe(dev, PTR_ERR(z2->sync_inactive),
-						     "missing display-sync-inactive state\n");
+		if (z2->sync_pinctrl) {
+			z2->sync_active = pinctrl_lookup_state(z2->sync_pinctrl,
+							       "display-sync-active");
+			if (PTR_ERR_OR_ZERO(z2->sync_active) == -ENODEV) {
+				z2->sync_active = NULL;
+			} else if (IS_ERR(z2->sync_active)) {
+				return dev_err_probe(dev, PTR_ERR(z2->sync_active),
+						     "missing display-sync-active state\n");
+			} else {
+				z2->sync_inactive =
+					pinctrl_lookup_state(z2->sync_pinctrl,
+							     "display-sync-inactive");
+				if (IS_ERR(z2->sync_inactive))
+					return dev_err_probe(dev, PTR_ERR(z2->sync_inactive),
+							     "missing display-sync-inactive state\n");
+			}
 		}
 	}
 
