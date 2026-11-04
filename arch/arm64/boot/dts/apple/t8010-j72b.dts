@@ -13,6 +13,10 @@
 	model = "Apple iPad 6 (Cellular)";
 };
 
+&speakers {
+	simple-audio-card,name = "J72b Speakers";
+};
+
 &wifi {
 	brcm,board-type = "apple,j72b";
 };

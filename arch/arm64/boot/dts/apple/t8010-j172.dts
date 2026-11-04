@@ -12,3 +12,7 @@
 	compatible = "apple,j172", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPad 7 (Cellular)";
 };
+
+&speakers {
+	simple-audio-card,name = "J172 Speakers";
+};

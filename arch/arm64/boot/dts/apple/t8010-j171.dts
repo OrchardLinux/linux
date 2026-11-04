@@ -12,3 +12,7 @@
 	compatible = "apple,j171", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPad 7 (Wi-Fi)";
 };
+
+&speakers {
+	simple-audio-card,name = "J171 Speakers";
+};
