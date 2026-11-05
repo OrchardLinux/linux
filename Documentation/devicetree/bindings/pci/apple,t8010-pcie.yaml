@@ -29,7 +29,8 @@ description: |
   Apple A8/A8X (T7000/T7001) devices use an earlier version of the same root
   complex, with the same ECAM layout, port register block and MSI block. It
   has no separate PHY register windows and no NVMMU, and its reference and
-  auxiliary clocks are power domains.
+  auxiliary clocks are power domains. The A8 has two root ports and the A8X
+  four, each with its register window and interrupt.
 
   Each enabled root port is represented by a child node. This allows port
   devices to carry their own reset, clock-request, firmware and other
@@ -46,8 +47,10 @@ allOf:
     then:
       properties:
         reg:
+          minItems: 4
           maxItems: 6
         reg-names:
+          minItems: 4
           items:
             - const: config
             - const: rc
@@ -56,8 +59,10 @@ allOf:
             - const: port2
             - const: port3
         interrupts:
+          minItems: 2
           maxItems: 4
         interrupt-names:
+          minItems: 2
           maxItems: 4
         power-domains:
           items:
@@ -152,22 +157,22 @@ properties:
           - const: apple,t8010-pcie
 
   reg:
-    minItems: 6
+    minItems: 4
     maxItems: 9
 
   reg-names:
-    minItems: 6
+    minItems: 4
     maxItems: 9
 
   interrupts:
     description:
       One state interrupt for each root port followed, on the SoCs with a
       storage-port NVMMU, by its fault interrupt.
-    minItems: 4
+    minItems: 2
     maxItems: 5
 
   interrupt-names:
-    minItems: 4
+    minItems: 2
     items:
       - const: port0
       - const: port1
