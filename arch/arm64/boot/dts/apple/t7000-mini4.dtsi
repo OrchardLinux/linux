@@ -41,12 +41,6 @@
 			gpios = <&pinctrl 46 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_VOLUMEDOWN>;
 		};
-
-		switch-mute {
-			label = "Mute Switch";
-			gpios = <&pinctrl 36 GPIO_ACTIVE_LOW>;
-			linux,code = <KEY_MUTE>;
-		};
 	};
 };
 
