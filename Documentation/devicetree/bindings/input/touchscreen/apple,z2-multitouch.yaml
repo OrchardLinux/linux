@@ -20,6 +20,7 @@ properties:
       - apple,j71b-touchscreen
       - apple,j71t-touchscreen
       - apple,j81-touchscreen
+      - apple,j96-touchscreen
       - apple,j172-touchscreen
       - apple,d11-touchscreen
       - apple,d111-touchscreen
@@ -183,6 +184,7 @@ allOf:
           enum:
             - apple,j71t-touchscreen
             - apple,j81-touchscreen
+            - apple,j96-touchscreen
     then:
       properties:
         pinctrl-names:
