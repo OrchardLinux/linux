@@ -171,6 +171,10 @@ struct apple_z2_hbpp_reg {
  * @columns:		expected sensor columns (report 0xd3)
  * @surface_width:	expected surface width (report 0xd9)
  * @surface_height:	expected surface height (report 0xd9)
+ *
+ * A zero @family, @rows or @surface_width leaves that report unchecked:
+ * the value has not been read from that model yet. The driver logs what
+ * the controller reports instead.
  */
 struct apple_z2_n1_info {
 	const struct apple_z2_hbpp_reg *calib_regs;
@@ -1654,7 +1658,9 @@ static int apple_z2_n1_discover_locked(struct apple_z2 *z2)
 					      1, &len);
 	if (error)
 		return error;
-	if (data[0] != n1->family) {
+	if (!n1->family) {
+		dev_info(&z2->spidev->dev, "family %u (not checked)\n", data[0]);
+	} else if (data[0] != n1->family) {
 		dev_err(&z2->spidev->dev, "unexpected family %u\n", data[0]);
 		return -ENODEV;
 	}
@@ -1664,12 +1670,16 @@ static int apple_z2_n1_discover_locked(struct apple_z2 *z2)
 					      5, &len);
 	if (error)
 		return error;
-	if (data[0] != 1 || data[1] != n1->rows || data[2] != n1->columns) {
+	if (data[0] != 1 ||
+	    (n1->rows && (data[1] != n1->rows || data[2] != n1->columns))) {
 		dev_err(&z2->spidev->dev,
 			"unexpected sensor: endianness %u, %ux%u\n",
 			data[0], data[1], data[2]);
 		return -ENODEV;
 	}
+	if (!n1->rows)
+		dev_info(&z2->spidev->dev, "sensor %ux%u (not checked)\n",
+			 data[1], data[2]);
 	dev_dbg(&z2->spidev->dev, "firmware version %#x\n",
 		get_unaligned_be16(data + 3));
 
@@ -1689,8 +1699,11 @@ static int apple_z2_n1_discover_locked(struct apple_z2 *z2)
 					      &len);
 	if (error)
 		return error;
-	if (get_unaligned_le32(data) != n1->surface_width ||
-	    get_unaligned_le32(data + 4) != n1->surface_height) {
+	if (!n1->surface_width) {
+		dev_info(&z2->spidev->dev, "surface %ux%u (not checked)\n",
+			 get_unaligned_le32(data), get_unaligned_le32(data + 4));
+	} else if (get_unaligned_le32(data) != n1->surface_width ||
+		   get_unaligned_le32(data + 4) != n1->surface_height) {
 		dev_err(&z2->spidev->dev, "unexpected surface %ux%u\n",
 			get_unaligned_le32(data), get_unaligned_le32(data + 4));
 		return -ENODEV;
