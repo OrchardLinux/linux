@@ -77,3 +77,11 @@
 		touchscreen-size-y = <2436>;
 	};
 };
+
+/* The OLED panel's brightness, from the ADT's backlight node. */
+&dsi_bl {
+	max-brightness = <2047>;
+	apple,min-dbv = <139>;
+	default-brightness-level = <740>;
+	status = "okay";
+};
