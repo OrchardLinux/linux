@@ -15,6 +15,7 @@
 
 	aliases {
 		serial5 = &serial5;
+		touchscreen0 = &touchscreen;
 		wifi0 = &wifi0;
 	};
 
@@ -108,6 +109,40 @@
 	};
 };
 
+/*
+ * The N1 touchscreen, from the ADT spi1/multi-touch functions: chip select
+ * GPIO 15, reset GPIO 56, interrupt GPIO 106, LDO enable GPIO 47, analog
+ * supply pmuL(0x20e) and the PMGR touch clock at 32768 Hz. Its display
+ * sync (GPIO 78) stays as iBoot left it. The J97's ADT names its
+ * controller multi-touch,j96 too and its J97.mtprops is byte-identical
+ * to J96.mtprops, so both models load the J96 firmware.
+ */
+&spi1 {
+	cs-gpios = <&pinctrl 15 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,j96-touchscreen";
+		reg = <0>;
+		/* N1 selects 83 ns; the controller rounds up to divider 5 */
+		spi-max-frequency = <12048192>;
+		interrupts-extended = <&pinctrl 106 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&pinctrl 56 GPIO_ACTIVE_LOW>;
+		power-ldo-gpios = <&pinctrl 47 GPIO_ACTIVE_HIGH>;
+		ana-supply = <&touch_analog>;
+		clocks = <&touchclk>;
+		firmware-name = "apple/j96-fwstart.z2fw";
+		touchscreen-size-x = <1536>;
+		touchscreen-size-y = <2048>;
+		/* Raw Y runs from the bottom of the panel to the top. */
+		touchscreen-inverted-y;
+	};
+};
+
+&touchclk {
+	status = "okay";
+};
+
 &framebuffer0 {
 	power-domains = <&ps_disp0 &ps_dp>;
 };
@@ -149,6 +184,11 @@
 					reg = <0x4 0x4>;
 				};
 			};
+		};
+
+		touch_analog: regulator-touch-analog {
+			compatible = "apple,d2207-touch-analog-regulator";
+			regulator-name = "touch-analog";
 		};
 
 		pmu_gpio: gpio {
