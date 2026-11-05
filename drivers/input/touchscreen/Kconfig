@@ -103,6 +103,18 @@ config TOUCHSCREEN_ADC
 	  To compile this driver as a module, choose M here: the
 	  module will be called resistive-adc-touch.ko.
 
+config TOUCHSCREEN_APPLE_HIDSPI
+	tristate "Apple HIDSPI touchscreen (iPhone X)"
+	depends on SPI
+	select CRC16
+	help
+	  Say Y here to support the touchscreen of the Apple iPhone X
+	  ("hid-transport,k1"): the HBPP firmware load and the HIDSPI
+	  touch reports.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called apple_hidspi_ts.
+
 config TOUCHSCREEN_APPLE_Z2
 	tristate "Apple Z2 touchscreens"
 	depends on SPI && (ARCH_APPLE || COMPILE_TEST)
