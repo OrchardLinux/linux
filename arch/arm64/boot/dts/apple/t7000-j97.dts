@@ -12,3 +12,8 @@
 	compatible = "apple,j97", "apple,t7000", "apple,arm-platform";
 	model = "Apple iPad mini 4 (Cellular)";
 };
+
+/* ADT uart2/wlan module-instance, for brcmfmac's firmware selection */
+&wifi0 {
+	brcm,board-type = "apple,zinfandelb";
+};
