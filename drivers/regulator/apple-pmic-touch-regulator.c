@@ -9,6 +9,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
+#include <linux/delay.h>
 #include <linux/regmap.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/of_regulator.h>
@@ -106,6 +107,49 @@ static const struct regulator_desc apple_chestnut_touch_hv = {
 	.off_on_delay = 1000,
 };
 
+/*
+ * Acorn (iPhone X display PMU, I2C 0x2a): the touch controller's supply is
+ * register 0x05. The ADT's multi-touch node has function-power_ana = dpLE(0x6)
+ * and function-power_pulldown = dpLE(0x40); its power-sequence turns the
+ * pulldown off and power_ana on. iOS AppleAcornDisplayPMU writes the ADT
+ * init value 0x09 to the same register at start; without bits 0x09 the
+ * controller stays silent. They are shared with the display and stay set.
+ */
+#define APPLE_ACORN_TOUCH_SHARED	0x09
+
+static int apple_acorn_touch_analog_enable(struct regulator_dev *rdev)
+{
+	struct regmap *regmap = rdev_get_regmap(rdev);
+	int ret;
+
+	ret = regmap_update_bits(regmap, rdev->desc->enable_reg,
+				 APPLE_ACORN_TOUCH_SHARED, APPLE_ACORN_TOUCH_SHARED);
+	if (ret)
+		return ret;
+	msleep(50);
+	return regmap_update_bits(regmap, rdev->desc->enable_reg,
+				  rdev->desc->enable_mask, rdev->desc->enable_val);
+}
+
+static const struct regulator_ops apple_acorn_touch_analog_ops = {
+	.enable = apple_acorn_touch_analog_enable,
+	.disable = regulator_disable_regmap,
+	.is_enabled = regulator_is_enabled_regmap,
+};
+
+static const struct regulator_desc apple_acorn_touch_analog = {
+	.name = "acorn-touch-analog",
+	.ops = &apple_acorn_touch_analog_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x05,
+	.enable_mask = 0x46,
+	.enable_val = 0x06,
+	.disable_val = 0x40,
+	.enable_time = 20000,
+	.off_on_delay = 1000000,
+};
+
 static int apple_pmic_touch_regulator_probe(struct platform_device *pdev)
 {
 	const struct regulator_desc *desc;
@@ -148,6 +192,10 @@ static const struct of_device_id apple_pmic_touch_regulator_of_match[] = {
 	{
 		.compatible = "apple,d2207-touch-analog-regulator",
 		.data = &apple_d2207_touch_analog,
+	},
+	{
+		.compatible = "apple,acorn-touch-analog-regulator",
+		.data = &apple_acorn_touch_analog,
 	},
 	{
 		.compatible = "apple,chestnut-touch-hv-regulator",
