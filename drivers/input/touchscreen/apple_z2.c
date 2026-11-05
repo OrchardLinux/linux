@@ -4215,6 +4215,39 @@ static const struct apple_z2_chip_info apple_z2_j81_info = {
 	.shifted_reply_header = true,
 };
 
+/*
+ * iPad mini 4 (J96) N1, personality C1F14,4 (iOS AppleMultitouchN1SPI,
+ * "AppleMultitouchSPI - J96" in iPadOS 15.8.3). It overrides the same two
+ * N1 defaults as the iPad 5's C1F15,1 with the same values, fll-mval
+ * 0x17c9 and clk32-clock-enable 1, and loads the same calibration size
+ * at the same addresses with the same entry point. Its family, sensor
+ * and surface reports have not been read yet.
+ */
+static const struct apple_z2_n1_info apple_z2_j96_n1 = {
+	.calib_regs = apple_z2_j71t_calib_regs,
+	.num_calib_regs = ARRAY_SIZE(apple_z2_j71t_calib_regs),
+	.execute_addr = 0x10003400,
+	.execute_arg = 0x100,
+	.cal_size = 0x400,
+	.cal_chunk_size = 0x3f0,
+	.control_delay_us = 25,
+	.get_delay_us = 2000,
+	.wake_holdoff_ms = 100,
+	.get_attempts = 5,
+	.device_info_attempts = 4,
+	.device_info_retry_us = 3000,
+	.interface = 1,
+};
+
+/* The iPad 5's N1 runtime, SPI timing and power sequence. */
+static const struct apple_z2_chip_info apple_z2_j96_info = {
+	.name = "iPad5,1 Touchscreen",
+	.variant = APPLE_Z2_VARIANT_J71T,
+	.cs_setup_us = 10,
+	.cs_hold_us = 10,
+	.n1 = &apple_z2_j96_n1,
+};
+
 static const struct apple_z2_chip_info apple_z2_j172_info = {
 	.name = "iPad 7 Touchscreen",
 	.variant = APPLE_Z2_VARIANT_J172,
@@ -4590,6 +4623,7 @@ static const struct of_device_id apple_z2_of_match[] = {
 	{ .compatible = "apple,j71b-touchscreen", .data = &apple_z2_j71b_info },
 	{ .compatible = "apple,j71t-touchscreen", .data = &apple_z2_j71t_info },
 	{ .compatible = "apple,j81-touchscreen", .data = &apple_z2_j81_info },
+	{ .compatible = "apple,j96-touchscreen", .data = &apple_z2_j96_info },
 	{ .compatible = "apple,j172-touchscreen", .data = &apple_z2_j172_info },
 	{ .compatible = "apple,d11-touchscreen", .data = &apple_z2_d11_info },
 	{ .compatible = "apple,d111-touchscreen", .data = &apple_z2_d111_info },
@@ -4604,6 +4638,7 @@ static struct spi_device_id apple_z2_of_id[] = {
 	{ .name = "j71b-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j71b_info },
 	{ .name = "j71t-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j71t_info },
 	{ .name = "j81-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j81_info },
+	{ .name = "j96-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j96_info },
 	{ .name = "j172-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j172_info },
 	{ .name = "d11-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_d11_info },
 	{ .name = "d111-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_d111_info },
