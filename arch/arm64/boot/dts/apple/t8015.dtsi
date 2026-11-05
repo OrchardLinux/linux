@@ -431,6 +431,13 @@
 			reg = <0x2 0x32000000 0 0x8c000>;
 		};
 
+		dsi_bl: backlight@218400000 {
+			compatible = "apple,t8015-dsi-bl", "apple,dsi-bl";
+			reg = <0x2 0x18400000 0x0 0x100>;
+			power-domains = <&ps_mipi_dsi>;
+			status = "disabled";
+		};
+
 		dwi_bl: backlight@232200080 {
 			compatible = "apple,t8015-dwi-bl", "apple,dwi-bl";
 			reg = <0x2 0x32200080 0x0 0x8>;
