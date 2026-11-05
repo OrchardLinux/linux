@@ -10,6 +10,11 @@
 
 / {
 	chassis-type = "handset";
+
+	/* m1n1 copies the ADT's touch calibrations to this node. */
+	aliases {
+		touchscreen0 = &touchscreen;
+	};
 };
 
 &apcie {
@@ -35,5 +40,40 @@
 &pinctrl_ap {
 	wifi_clkreq: wifi-clkreq-pins {
 		pinmux = <APPLE_PINMUX(163, 1)>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	pmic@2a {
+		compatible = "apple,acorn-pmic";
+		reg = <0x2a>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		touch_ana: regulator-touch-analog {
+			compatible = "apple,acorn-touch-analog-regulator";
+			regulator-name = "touch-analog";
+		};
+	};
+};
+
+/* The touch controller ("hid-transport,k1"), chip select GPIO 0x8a. */
+&spi1 {
+	cs-gpios = <&pinctrl_ap 138 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,d221-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+		interrupts-extended = <&pinctrl_aop 21 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&pinctrl_ap 33 GPIO_ACTIVE_LOW>;
+		ana-supply = <&touch_ana>;
+		clocks = <&touchclk>;
+		firmware-name = "apple/d221-touch.bin";
+		touchscreen-size-x = <1125>;
+		touchscreen-size-y = <2436>;
 	};
 };
