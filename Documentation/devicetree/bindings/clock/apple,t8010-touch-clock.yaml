@@ -13,7 +13,8 @@ description:
   The T7000 and T8010 PMGR contain a gate and integer divider for the
   reference clock consumed by the touchscreen controller. The S8000 PMGR has
   the same block at the same offset; the iPad 5 N1 touchscreen runs it at
-  32768 Hz.
+  32768 Hz. So has the T8015 PMGR, whose iPhone X touchscreen runs it at
+  24 MHz.
 
 properties:
   compatible:
@@ -22,7 +23,9 @@ properties:
           - apple,t7000-touch-clock
           - apple,t8010-touch-clock
       - items:
-          - const: apple,s8000-touch-clock
+          - enum:
+              - apple,s8000-touch-clock
+              - apple,t8015-touch-clock
           - const: apple,t8010-touch-clock
 
   reg:
