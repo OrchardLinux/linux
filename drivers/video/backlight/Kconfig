@@ -325,6 +325,17 @@ config BACKLIGHT_APPLE
 	  If you have an Intel-based Apple say Y to enable a driver for its
 	  backlight.
 
+config BACKLIGHT_APPLE_DSI
+	tristate "Apple OLED panel brightness over MIPI DSI"
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  Say Y to enable the brightness control of the OLED panels of
+	  Apple iPhones such as the iPhone X, which take the MIPI DCS
+	  brightness command through the SoC's DSI host.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called apple_dsi_bl.
+
 config BACKLIGHT_APPLE_DWI
 	tristate "Apple DWI 2-Wire Interface Backlight Driver"
 	depends on ARCH_APPLE || COMPILE_TEST
