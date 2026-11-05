@@ -46,7 +46,9 @@ properties:
               - apple,agnes-pmic
               - apple,calpe-pmic
           - const: apple,spmi-pmic
-      - const: apple,chestnut-pmic
+      - enum:
+          - apple,acorn-pmic
+          - apple,chestnut-pmic
 
   reg:
     maxItems: 1
