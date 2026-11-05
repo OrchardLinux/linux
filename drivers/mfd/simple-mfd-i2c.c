@@ -139,6 +139,7 @@ static const struct simple_mfd_data spacemit_p1 = {
 };
 
 static const struct of_device_id simple_mfd_i2c_of_match[] = {
+	{ .compatible = "apple,acorn-pmic", .data = &apple_chestnut_pmic },
 	{ .compatible = "apple,chestnut-pmic", .data = &apple_chestnut_pmic },
 	{ .compatible = "apple,i2c-pmic", .data = &apple_i2c_pmic },
 	{ .compatible = "apple,sn2400", .data = &apple_sn2400 },
