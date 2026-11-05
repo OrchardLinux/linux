@@ -323,6 +323,18 @@
 			status = "disabled";
 		};
 
+		spi1: spi@22e404000 {
+			compatible = "apple,t8015-spi", "apple,t8010-spi", "apple,spi";
+			reg = <0x2 0x2e404000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 292 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@22e600000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x2e600000 0x0 0x4000>;
