@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/touchscreen/apple,d221-touchscreen.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple iPhone X HIDSPI touchscreen
+
+maintainers:
+  - Eduardo Martins <eduardo@martins.ws>
+
+description:
+  The iPhone X touch controller (ADT "hid-transport,k1") on an SPI bus. It
+  starts in an HBPP bootloader that loads its firmware from the host, then
+  reports touches over Apple's HIDSPI transport. Its per-unit calibrations
+  come from the ADT's multi-touch node; the bootloader copies them through
+  the touchscreen0 alias.
+
+allOf:
+  - $ref: touchscreen.yaml#
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: apple,d221-touchscreen
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  reset-gpios:
+    maxItems: 1
+
+  ana-supply:
+    description: Analog supply of the touch controller.
+
+  clocks:
+    maxItems: 1
+
+  firmware-name:
+    maxItems: 1
+    description:
+      The controller firmware load, converted from Apple's multitouch
+      firmware.
+
+  apple,z2-cal-blob:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description: The ADT's multi-touch-calibration.
+
+patternProperties:
+  "^apple,luna-[a-z-]+$":
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    description: The ADT's 3D Touch calibrations, under their ADT names.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - reset-gpios
+  - ana-supply
+  - clocks
+  - firmware-name
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        touchscreen@0 {
+            compatible = "apple,d221-touchscreen";
+            reg = <0>;
+            spi-max-frequency = <4000000>;
+            interrupts-extended = <&pinctrl_aop 21 IRQ_TYPE_LEVEL_LOW>;
+            reset-gpios = <&pinctrl_ap 33 GPIO_ACTIVE_LOW>;
+            ana-supply = <&touch_ana>;
+            clocks = <&touchclk>;
+            firmware-name = "apple/d221-touch.bin";
+            touchscreen-size-x = <1125>;
+            touchscreen-size-y = <2436>;
+        };
+    };
+
+...
