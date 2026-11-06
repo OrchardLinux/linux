@@ -42,8 +42,14 @@ properties:
   firmware-name:
     maxItems: 1
     description:
-      The controller firmware load, converted from Apple's multitouch
-      firmware.
+      Start of the controller firmware's file name; the driver appends
+      -<apple,hid-merge-personality>.bin. The firmware is converted from
+      Apple's multitouch firmware.
+
+  apple,hid-merge-personality:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      The ADT's hid-merge-personality, the firmware variant this unit needs.
 
   apple,z2-cal-blob:
     $ref: /schemas/types.yaml#/definitions/uint8-array
@@ -62,6 +68,7 @@ required:
   - ana-supply
   - clocks
   - firmware-name
+  - apple,hid-merge-personality
 
 unevaluatedProperties: false
 
@@ -82,7 +89,8 @@ examples:
             reset-gpios = <&pinctrl_ap 33 GPIO_ACTIVE_LOW>;
             ana-supply = <&touch_ana>;
             clocks = <&touchclk>;
-            firmware-name = "apple/d221-touch.bin";
+            firmware-name = "apple/d221-touch";
+            apple,hid-merge-personality = "C1R1FC0,2";
             touchscreen-size-x = <1125>;
             touchscreen-size-y = <2436>;
         };
