@@ -216,6 +216,9 @@ struct ehci_hcd {			/* one per controller */
 	unsigned		amd_pll_fix:1;
 	unsigned		use_dummy_qh:1;	/* AMD Frame List table quirk*/
 	unsigned		has_synopsys_hc_bug:1; /* Synopsys HC */
+	/* Cascadia: HSIC root ports (bit n = port n + 1) of Apple's S5L
+	 * EHCI, which take longer to end a port reset (ehci-hub.c). */
+	u32			hsic_ports;
 	unsigned		frame_index_bug:1; /* MosChip (AKA NetMos) */
 	unsigned		need_oc_pp_cycle:1; /* MPC834X port power */
 	unsigned		imx28_write_fix:1; /* For Freescale i.MX28 */

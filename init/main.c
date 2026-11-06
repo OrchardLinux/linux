@@ -698,6 +698,12 @@ static void __init setup_command_line(char *command_line)
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
 
+#ifdef CONFIG_ARCH_APPLE_S5L
+void p105_fb_dbg(const char *msg);
+pid_t __init apple_s5l_rest_spawn_init(int (*fn)(void *), void *arg,
+				       unsigned long flags);
+#endif
+
 static noinline void __ref __noreturn rest_init(void)
 {
 	struct task_struct *tsk;
@@ -709,7 +715,13 @@ static noinline void __ref __noreturn rest_init(void)
 	 * the init task will end up wanting to create kthreads, which, if
 	 * we schedule it before we create kthreadd, will OOPS.
 	 */
+#ifdef CONFIG_ARCH_APPLE_S5L
+	p105_fb_dbg("rest_init");
+	p105_fb_dbg("pre_spawn");
+	pid = apple_s5l_rest_spawn_init(kernel_init, NULL, CLONE_FS);
+#else
 	pid = user_mode_thread(kernel_init, NULL, CLONE_FS);
+#endif
 	/*
 	 * Pin init on the boot CPU. Task migration is not properly working
 	 * until sched_init_smp() has been run. It will set the allowed
@@ -1277,7 +1289,10 @@ int __init_or_module do_one_initcall(initcall_t fn)
 	}
 	if (irqs_disabled()) {
 		strlcat(msgbuf, "disabled interrupts ", sizeof(msgbuf));
-		local_irq_enable();
+#ifdef CONFIG_ARCH_APPLE_S5L
+		if (!early_boot_irqs_disabled)
+#endif
+			local_irq_enable();
 	}
 	WARN(msgbuf[0], "initcall %pS returned with %s\n", fn, msgbuf);
 
@@ -1466,6 +1481,64 @@ static int __ref kernel_init(void *unused)
 	 */
 	wait_for_completion(&kthreadd_done);
 
+	/*
+	 * P105AP: AIC bring-up before initcalls.
+	 */
+#ifdef CONFIG_ARCH_APPLE_S5L
+	{
+		void apple_aic1_quiesce(void);
+		void apple_aic1_hw_quiesce(void);
+		void apple_aic1_enable(void);
+		void apple_aic1_arm_cpu0(void);
+		extern bool apple_aic1_early_irq_escape;
+
+		p105_fb_dbg("irq_quiesce");
+		apple_aic1_quiesce();
+		apple_aic1_hw_quiesce();
+		/* CFG off; keep early_irq_escape for sticky nIRQ */
+		p105_fb_dbg("irq_try");
+		early_boot_irqs_disabled = false;
+		local_irq_enable();
+		p105_fb_dbg("irq_on");
+		local_irq_disable();
+		apple_aic1_enable();
+		apple_aic1_arm_cpu0();
+		local_irq_enable();
+		p105_fb_dbg("irq_arm");
+		local_irq_disable();
+		early_boot_irqs_disabled = true;
+		p105_fb_dbg("irq_frz");
+	}
+#else
+#endif
+	p105_fb_dbg("init_go");
+#ifdef CONFIG_ARCH_APPLE_S5L
+	{
+		void apple_aic1_release_escape(void);
+		void apple_aic1_quiesce(void);
+		void apple_aic1_hw_quiesce_quiet(void);
+		void apple_aic1_rearm(void);
+
+		p105_fb_dbg("init_go");
+		apple_aic1_quiesce();
+		apple_aic1_hw_quiesce_quiet();
+		/* FIX (2026-09-14): both quiesce calls above clear CFG.ENABLE and zero
+		 * TARGET_CPU for all 192 lines.  Without this re-arm the AIC stays dead
+		 * for the whole of do_initcalls(), which is why every /proc/interrupts
+		 * counter (incl. IPIs) stayed at 0. */
+		apple_aic1_rearm();
+		p105_fb_dbg("irq_rearm");
+		early_boot_irqs_disabled = false;
+		p105_fb_dbg("irq_thaw");
+		local_irq_enable();
+		p105_fb_dbg("thaw_on");
+		apple_aic1_release_escape();
+		p105_fb_dbg("esc_off");
+	}
+#endif
+#ifdef CONFIG_ARCH_APPLE_S5L
+	p105_fb_dbg("kt_done");
+#endif
 	kernel_init_freeable();
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
@@ -1475,6 +1548,13 @@ static int __ref kernel_init(void *unused)
 	ftrace_free_init_mem();
 	kgdb_free_init_mem();
 	exit_boot_config();
+#ifdef CONFIG_ARCH_APPLE_S5L
+	{
+		void p105_fb_dbg_shutdown(void);
+
+		p105_fb_dbg_shutdown();
+	}
+#endif
 	free_initmem();
 	mark_readonly();
 
@@ -1492,7 +1572,10 @@ static int __ref kernel_init(void *unused)
 	do_sysctl_args();
 
 	if (ramdisk_execute_command) {
-		ret = run_init_process(ramdisk_execute_command);
+	#ifdef CONFIG_ARCH_APPLE_S5L
+	p105_fb_dbg("init_run");
+#endif
+	ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
 			return 0;
 		pr_err("Failed to execute %s (error %d)\n",

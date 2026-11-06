@@ -1987,8 +1987,14 @@ static s32 brcmf_set_auth_type(struct net_device *ndev,
 		brcmf_dbg(CONN, "SAE authentication\n");
 		break;
 	default:
-		val = 2;
-		brcmf_dbg(CONN, "automatic, auth type (%d)\n", sme->auth_type);
+		/* Cascadia: "automatic" only has a choice to make with a WEP
+		 * key (shared or open); without one it is open system.  The
+		 * iPad's BCM4334 firmware, asked for auto (2), never gets
+		 * through authentication at all -- SET_SSID fails after the
+		 * join scan -- where open (0) connects at once. */
+		val = sme->key_len ? 2 : 0;
+		brcmf_dbg(CONN, "automatic, auth type (%d) -> %d\n",
+			  sme->auth_type, val);
 		break;
 	}
 

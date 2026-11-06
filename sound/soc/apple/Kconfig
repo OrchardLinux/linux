@@ -6,3 +6,14 @@ config SND_SOC_APPLE_MCA
 	help
 	  This option enables an ASoC platform driver for MCA peripherals found
 	  on Apple Silicon SoCs.
+
+config SND_SOC_APPLE_S5L_AUDIO
+	tristate "iPad mini 1 speakers (Apple A5 MCA, CDMA, CS35L19)"
+	depends on ARCH_APPLE_S5L || COMPILE_TEST
+	depends on COMMON_CLK && I2C
+	select SND_SOC_CS35L19
+	default ARCH_APPLE_S5L
+	help
+	  The iPad mini 1 (A5, S5L8942X) speakers: the MCA audio port, its
+	  CDMA channel and the clocks and pin routing they need, as an ALSA
+	  card with the two CS35L19 amplifiers.

@@ -149,3 +149,4 @@ endif
 obj-y					+= xilinx/
 obj-$(CONFIG_ARCH_ZYNQ)			+= zynq/
 obj-$(CONFIG_COMMON_CLK_ZYNQMP)         += zynqmp/
+obj-$(CONFIG_S5L8940X_PMGR_CLK)   += clk-s5l8940x-pmgr.o

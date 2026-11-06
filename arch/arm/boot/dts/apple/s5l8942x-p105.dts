@@ -1,0 +1,1007 @@
+// SPDX-License-Identifier: GPL-2.0 OR MIT
+/*
+ * Apple iPad mini, 1st generation -- iPad2,5 / P105AP / S5L8942X (Apple A5).
+ *
+ * GENERATED FILE.  Do not edit by hand; edit scripts/gen_p105ap_dts.py and
+ * re-run "make dts".  Every reg/interrupt below was read out of the iBoot
+ * Apple Device Tree in src/adt-p105ap.bin, not transcribed from a datasheet.
+ *
+ * Scope: the minimum needed to bring Alpine + LXDE up on the glass, per
+ * alpine-lxde-ramdisk-buildplan.md -- UART console, interrupt controller,
+ * timer, simple-framebuffer, and an SPI transport for the touch controller.
+ * NAND, GPU, ISP, audio, cameras and the sensor I2C buses are deliberately
+ * absent; see DECISIONS.md.
+ *
+ * Address model
+ * -------------
+ * The ADT's "arm-io" node is a bus whose children use bus-local addresses:
+ *   ranges = <0x0 0x30000000 0x10000000>
+ * We keep that structure as /soc so unit addresses match the ADT one-for-one
+ * and cross-checking against a fresh dump stays trivial.  usb-complex is a
+ * second, nested bus; its children are flattened into /soc here because
+ * nothing in Linux needs the extra level.
+ *
+ * Boot protocol (32-bit ARM):
+ *   r0 = 0, r1 = ~0 (DT-only boot, no machine ID), r2 = <dtb physical address>
+ */
+
+/dts-v1/;
+
+/ {
+	compatible = "apple,p105ap", "apple,s5l8942x", "apple,s5l8940x", "apple,arm";
+	model = "Apple iPad mini (iPad2,5)";
+	#address-cells = <1>;
+	#size-cells = <1>;
+	interrupt-parent = <&aic>;
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+	};
+
+	chosen {
+		/*
+		 * earlycon uses the Samsung s3c6400 driver: the S5L UART is a
+		 * Samsung derivative with an identical register file (ULCON 0x00,
+		 * UCON 0x04, UFCON 0x08, UTRSTAT 0x10, UTXH 0x20, URXH 0x24,
+		 * UBRDIV 0x28).  See DECISIONS.md #3.
+		 *
+		 * No baud rate is given to earlycon on purpose: that tells it to
+		 * keep whatever divisor iBoot already programmed, which avoids
+		 * needing a clock rate we do not know.
+		 *
+		 * keep_bootcon matters here.  The full ttySAC0 port needs a clock
+		 * provider; without keep_bootcon the kernel would drop earlycon
+		 * if UART probe/baud fails.
+		 *
+		 * console=tty0 only.  Do NOT set stdout-path to serial0 — OF
+		 * would still prefer ttySAC0 on probe (legacy console enabled)
+		 * and /dev/console open fails for init.  UART still probes for
+		 * /dev/ttySAC0; earlycon+keep_bootcon covers pre-fbcon printk.
+		 */
+		/*
+		 * g_cdc.dev_addr / g_cdc.host_addr pin the two ends of the CDC
+		 * ECM link.  Without them u_ether picks a fresh random MAC on
+		 * every boot, and because macOS keys its interface names off the
+		 * MAC, the gadget lands on a NEW enN each time -- en10, en11,
+		 * en12 -- so the host-side ifconfig has to be redone every boot.
+		 * Observed directly: 6e:f1:1c:27:f4:65 on one boot and
+		 * da:5b:e0:9b:ef:1d on the next.
+		 *
+		 * Both are locally-administered unicast (low nibble of the first
+		 * octet is 2), so they cannot collide with a real vendor OUI.
+		 *   ...:01 = host side (the Mac's enN)
+		 *   ...:02 = device side (usb0 here)
+		 *
+		 * apple_pmu_charger.armed=1: the USB input current limit raised
+		 * from boot (apple-pmu-charger.c, 1000 mA, less after a sag until
+		 * unplugged); the driver alone only logs what it would set.
+		 */
+		bootargs = "earlycon=s3c6400,0x32500000 keep_bootcon lpj=5000000 root=/dev/ram0 rw rootwait panic=10 loglevel=8 ignore_loglevel g_cdc.host_addr=02:10:5a:05:00:01 g_cdc.dev_addr=02:10:5a:05:00:02 apple_pmu_charger.armed=1";
+
+		/*
+		 * Placeholders.  The loader MUST overwrite both before jumping;
+		 * scripts/fdt_fixup.py and the pongoOS module in pongo/ do this.
+		 * Leaving them equal means "no initrd", which is a safe default.
+		 */
+		linux,initrd-start = <0x88000000>;
+		linux,initrd-end   = <0x88000000>;
+	};
+
+	/*
+	 * S5L894x maps DRAM at 0x80000000; iPad2,5 populates 512 MiB.
+	 * The static ADT /memory node is zeroed (iBoot fills it at runtime),
+	 * so this is a fixed constant rather than an extracted value.
+	 */
+	/*
+	 * System tick from the Cortex-A9 PMU overflow interrupt.  No reg: the
+	 * whole thing is CP15.
+	 *
+	 * hwirq 135 comes out of the ADT: cpu0 interrupts = <192, 135, 193> and
+	 * cpu1 = <194, 139, 195>, with function-ipi_dispatch pointing at 192 and
+	 * ipi_dispatch_other at 193 -- so the outer two are IPIs and the middle
+	 * one is the per-CPU interrupt.  aic target-destinations = <135 cpu0,
+	 * 139 cpu1> pins each to its own core.  On an A9 with no architected
+	 * timer, that per-CPU line was taken to be nPMUIRQ.
+	 *
+	 * Disabled: its self-test never saw an overflow interrupt, the AIC timer
+	 * is the tick, and with SMP the test itself hung when it ran on CPU1 --
+	 * it waits on PMCCNTR, a per-core counter that only CPU0 runs.
+	 */
+	pmu_timer: pmu-timer {
+		compatible = "apple,s5l8940x-pmu-timer";
+		interrupts = <135>;
+		status = "disabled";
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x80000000 0x1f6fc000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/*
+		 * iBoot's scanout buffer.  Must be no-map so the kernel never
+		 * hands these pages to the allocator while the CLCD is still
+		 * DMA-ing out of them.  Base is patched at boot together with
+		 * the framebuffer node below.
+		 */
+		fb_region: framebuffer@9f6fc000 {
+			reg = <0x9f6fc000 0x400000>;
+			no-map;
+		};
+
+		/*
+		 * The first page of DRAM: a core coming out of reset starts at
+		 * physical 0, which is an alias of it.  XNU keeps its exception
+		 * vectors here (physBase); platsmp.c keeps its trampoline, which
+		 * CPU1 goes through on every start -- including each wake from
+		 * power-down idle, as the PMGR powers it off in WFI.
+		 */
+		cpu_reset_page: cpu-reset@80000000 {
+			reg = <0x80000000 0x1000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * simple-framebuffer over iBoot's already-running CLCD scanout.
+	 *
+	 * The static ADT's /vram node has reg = <0 0>: the base is assigned by
+	 * iBoot at runtime.  The loader reads the LIVE ADT's /vram (pongoOS
+	 * keeps iBoot's device tree in memory) and patches reg[0] here plus
+	 * fb_region above.  Portrait Recovery scanout: 768x1024, stride 3072.
+	 *
+	 * TODO: confirm the pixel order on hardware.  a8r8g8b8 is what iBoot
+	 * uses on every other A5-era device, but if the display comes up with
+	 * red and blue swapped, change this to "x8b8g8r8" -- it is the only
+	 * value here that cannot be checked without looking at the panel.
+	 */
+	framebuffer0: framebuffer@9f6fc000 {
+		compatible = "simple-framebuffer";
+		reg = <0x9f6fc000 0x400000>;
+		width = <768>;
+		height = <1024>;
+		stride = <3072>;
+		format = "a8r8g8b8";
+		memory-region = <&fb_region>;
+		status = "okay";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* Where a core starts when PMGR lets it out of reset -- see
+		 * arch/arm/mach-apple/platsmp.c. */
+		apple,cpu-reset-page = <&cpu_reset_page>;
+
+		/*
+		 * reg is the MPIDR: Cortex-A9 core number in bits 1:0, the A5's
+		 * cluster id 0xa in bits 11:8 ("Booting Linux on physical CPU
+		 * 0xa00").  With 0 and 1 here Linux matched neither to the boot
+		 * CPU and kept one CPU.
+		 */
+		cpu0: cpu@a00 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			reg = <0xa00>;
+			enable-method = "apple,pmgr-core";
+		};
+
+		/*
+		 * Started as iOS starts it: its core mask (2) to PMGR+0x1214 and
+		 * +0x1220 -- the ADT's function-enable_core, docs/research/
+		 * p105-smp-bringup.md.
+		 */
+		cpu1: cpu@a01 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a9";
+			reg = <0xa01>;
+			enable-method = "apple,pmgr-core";
+		};
+	};
+
+	/*
+	 * Cortex-A9 private memory region (SCU + global timer + private timers).
+	 *
+	 * PERIPHBASE is NOT in the ADT.  The candidate below is the second reg
+	 * entry of the ADT "pl310" node -- 0x2000 long, which is exactly the
+	 * size of the A9 private memory map, so it is almost certainly right.
+	 * It is still a guess, so every consumer is disabled by default.
+	 *
+	 * Do not trust this file for it: Cortex-A9 exposes PERIPHBASE in the
+	 * CBAR register (mrc p15, 4, rX, c15, c0, 0).  docs/read-cbar.md shows
+	 * how to print it from a pongoOS shell; once confirmed, flip the three
+	 * nodes below to "okay" (or let the loader do it).
+	 *
+	 * The interrupt numbers are equally provisional: 135 is the middle
+	 * cell of the ADT cpu0 "interrupts" tuple <0xc0 0x87 0xc1>, which by Apple
+	 * convention is <ipi-self, timer, ipi-other>.  That the A9 private timer
+	 * output is what reaches the AIC on that line is an inference, not a fact.
+	 */
+	scu@3e100000 {
+		compatible = "arm,cortex-a9-scu";
+		reg = <0x3e100000 0x100>;
+		status = "disabled";
+	};
+
+	global_timer: timer@3e100200 {
+		compatible = "arm,cortex-a9-global-timer";
+		reg = <0x3e100200 0x20>;
+		interrupts = <135>;
+		clock-frequency = <500000000>;
+		/* Counter + udelay only. Comparator IRQ is not routed like a GIC PPI. */
+		clocksource-only;
+		status = "disabled";
+	};
+
+	twd_timer: timer@3e100600 {
+		compatible = "arm,cortex-a9-twd-timer";
+		reg = <0x3e100600 0x20>;
+		interrupts = <135>;
+		clock-frequency = <500000000>;
+		status = "disabled";
+	};
+
+	l2: cache-controller@3e000000 {
+		compatible = "arm,pl310-cache";
+		/* the PL310, and Apple's CIF next to it (ADT pl310 reg[1]) --
+		 * see apple_s5l_cif_l2_on() in mach-apple/apple.c */
+		reg = <0x3e000000 0x1000>, <0x3fd00000 0x2000>;
+		cache-unified;
+		cache-level = <2>;
+		/*
+		 * 1 MB, 16 ways of 64 KB (AUX 0x02070000 as iBoot leaves it) --
+		 * and iBoot leaves it OFF (CTRL 0): Linux ran without an L2 until
+		 * 2026-09-27.  (An early attempt hung in outer_cache/slab, but the
+		 * kernel was running with SCTLR.C=0 then.)  apple.c's l2c_aux_mask
+		 * is what makes the kernel look at this node at all.
+		 *
+		 * Latencies as iOS programs them from the ADT's pl310 node: tag
+		 * 0x110 and data 0x120, i.e. <2 2 1> and <3 2 1> in cycles (iBoot
+		 * leaves the reset value, 8 cycles each).
+		 * shared-override keeps non-cacheable DMA buffers out of the L2.
+		 *
+		 * As iOS has it otherwise (ADT pl310: auxiliary-features 0x72100000,
+		 * power-features 0x2): no full line of zeros -- with it on in the
+		 * L2 and in both A9s, two cores under load froze the machine --
+		 * and dynamic clock gating without standby mode.
+		 */
+		arm,tag-latency = <2 2 1>;
+		arm,data-latency = <3 2 1>;
+		arm,shared-override;
+		arm,full-line-zero-disable;
+		arm,dynamic-clock-gating = <1>;
+		arm,standby-mode = <0>;
+		status = "okay";
+	};
+
+	/*
+	 * Placeholder UART clock for samsung_tty probe (no PMGR yet).
+	 * Rate is invented; glass console uses tty0 and does not need it.
+	 */
+	uart_clk: clock-24000000 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+
+	/* 24 MHz reference for the touch-clock (Cmwp) block. */
+	refclk24mhz: refclk24mhz {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+
+	/*
+	 * The four buttons, SoC GPIO pins 0-3 (the ADT's /buttons), pull-ups,
+	 * active low -- read live, docs/research/p105-gpio.md.  Hold is the
+	 * power key; Home is KEY_HOMEPAGE, as on Linux phones.  The side switch
+	 * (mute or rotation lock on iOS; the ADT's ringer A/B, pin 4) is a
+	 * switch, SW_MUTE_DEVICE: 1 with its orange mark showing (pin low, iOS's
+	 * "mute"); p105-keys makes it pick what the volume buttons set.  The
+	 * smart-cover sensors are PMU GPIOs, not these.  Codes: KEY_HOMEPAGE
+	 * 172, KEY_POWER 116, KEY_VOLUMEUP 115, KEY_VOLUMEDOWN 114, EV_SW 5,
+	 * SW_MUTE_DEVICE 14; flags 1 = GPIO_ACTIVE_LOW.  Interrupts through the
+	 * GPIO block's group 0 (pinctrl-s5l8940x-gpio).
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+		autorepeat;	/* a held volume button keeps going (volume or backlight) */
+
+		home {
+			label = "Home";
+			gpios = <&gpio 0 1>;
+			linux,code = <172>;
+			debounce-interval = <20>;
+		};
+		hold {
+			label = "Hold";
+			gpios = <&gpio 1 1>;
+			linux,code = <116>;
+			debounce-interval = <20>;
+		};
+		volume-up {
+			label = "Volume Up";
+			gpios = <&gpio 2 1>;
+			linux,code = <115>;
+			debounce-interval = <20>;
+		};
+		volume-down {
+			label = "Volume Down";
+			gpios = <&gpio 3 1>;
+			linux,code = <114>;
+			debounce-interval = <20>;
+		};
+		side-switch {
+			label = "Side Switch";
+			gpios = <&gpio 4 1>;
+			linux,input-type = <5>;
+			linux,code = <14>;
+			debounce-interval = <50>;
+		};
+	};
+
+	soc: soc@30000000 {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x30000000 0x10000000>;
+
+		/*
+		 * Apple Interrupt Controller revision 1 ("aic,1"), per ADT.
+		 *
+		 * Custom driver: drivers/irqchip/irq-apple-aic1.c
+		 * Not compatible with arm64 drivers/irqchip/irq-apple-aic.c.
+		 *
+		 * #interrupt-cells = 1: bare hardware IRQ index (no type/flags).
+		 */
+		aic: interrupt-controller@f200000 {
+			compatible = "aic,1";
+			reg = <0xf200000 0x10000>;
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			#address-cells = <0>;	/* dtc wants it on every interrupt provider */
+			apple,main-cpus = <2>;
+		};
+
+		/*
+		 * GPIO block.  28 ports, 8 interrupt groups
+		 * multiplexed onto a single AIC line.  Driven by
+		 * pinctrl-s5l8940x-gpio (patches/files-sandcastle-port, from
+		 * Corellium's A5 work): Wi-Fi's HOST_READY, the buttons
+		 * (gpio-keys above), the touch controller's lines.
+		 */
+		gpio: gpio@fa00000 {
+            compatible = "apple,s5l8940x-gpio";
+            reg = <0xfa00000 0x100000>;
+            interrupts = <119>;
+            gpio-controller;
+            #gpio-cells = <2>;
+            interrupt-controller;
+            #interrupt-cells = <2>;
+            #address-cells = <0>;
+            pin-count = <224>;
+            interrupt-groups = <1>;
+            status = "okay";
+
+            /* UART1, the Bluetooth chip's: TX 40, RX 41, RTS 42, CTS 43
+             * (the ADT's uart1 function-tx and function-rts name 40 and
+             * 42).  iBoot leaves 42 a GPIO driven high -- RTS deasserted,
+             * so the chip never sends a byte; iOS holds it that way while
+             * the chip powers up and hands it to the UART after. */
+            uart1_pins: uart1-pins {
+                pins = "gpio40", "gpio41", "gpio42", "gpio43";
+                function = "periph";
+            };
+        };
+
+		/*
+		 * Boot console.  The ADT marks this node "boot-console" and gives
+		 * it a "debug-console" child, so iBoot has already configured the
+		 * pin muxing, the clock gate and 115200 8N1 -- we only have to
+		 * keep using it.  compatible lists the Samsung part second so the
+		 * stock samsung_tty driver binds even without our patch.
+		 *
+		 * clocks: samsung_tty requires clk_get("uart") + baud clk.
+		 * PMGR is unmodelled; a fixed 24 MHz placeholder lets the port
+		 * probe.  Baud may be wrong for USB-TTL until the real rate is
+		 * known — on-glass console=tty0 does not depend on it.
+		 */
+		/*
+		 * UART5, as the battery gauge's HDQ bus: a bq27540, the ADT's
+		 * uart5/gas-gauge.  Not a serial port for Linux -- the driver
+		 * talks HDQ through its registers (57600 8N2, one frame per HDQ
+		 * bit), as iBoot set it up; pin 196 is iBoot's mux.
+		 */
+		battery: hdq@2a00000 {
+			compatible = "apple,s5l8940x-hdq-battery";
+			reg = <0x2a00000 0x1000>;
+			status = "okay";
+		};
+
+		uart0: serial@2500000 {
+			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
+			reg = <0x2500000 0x1000>;
+			interrupts = <21>;
+			clocks = <&uart_clk>, <&uart_clk>;
+			clock-names = "uart", "clk_uart_baud0";
+			status = "disabled";
+		};
+
+		/*
+		 * UART1: the BCM4334's Bluetooth half (ADT uart1/bluetooth,
+		 * "bluetooth,n88").  iOS runs it at 3 Mbaud (transport-speed),
+		 * which needs a faster UART clock than the 24 MHz this node
+		 * knows of: 24 MHz / 16 is 1.5 Mbaud, so that is max-speed.  The
+		 * chip starts at 115200; hci_bcm loads the patchram there and
+		 * then raises both ends -- which it only does when it can reset
+		 * the chip, hence REG_ON as a GPIO (shutdown-gpios), not a
+		 * regulator.  From the ADT:
+		 *   function-power_enable  PMU GPIO 2 (0x63), active high
+		 *   function-bt_wake       SoC GPIO 0x0101 = pin 9, active high
+		 * The 32 kHz sleep clock is the Wi-Fi chip's (wlan_lpo), taken as
+		 * vddio-supply so it stays on while either half needs it.  No
+		 * host-wake line in the ADT.
+		 *
+		 * The address: the ADT's local-mac-address is iBoot's to fill
+		 * from syscfg and reads zero in this tree, and with Apple's
+		 * patchram the chip says 43:34:43:34:1F:AC, the same on every
+		 * iPad -- a placeholder, which btbcm.c is taught to treat as one
+		 * so that this property is used.  A fixed address in the same
+		 * family as the gadget's and Wi-Fi's MACs,
+		 * 02:10:5A:05:00:04 (bytes reversed here).  Put the iPad's own
+		 * (Settings > General > About > Bluetooth) here to use that.
+		 */
+		uart1: serial@2600000 {
+			/* s5l8940x: UCON bit 10, the 24 MHz clock, which iBoot sets
+			 * only on the ports it uses (samsung_tty.c) */
+			compatible = "apple,s5l8940x-uart", "apple,s5l-uart",
+				     "samsung,s3c6400-uart";
+			reg = <0x2600000 0x1000>;
+			interrupts = <22>;
+			clocks = <&uart_clk>, <&uart_clk>;
+			clock-names = "uart", "clk_uart_baud0";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart1_pins>;
+			status = "okay";
+
+			bluetooth {
+				compatible = "brcm,bcm4334-bt";
+				shutdown-gpios = <&pmu 2 0>;
+				device-wakeup-gpios = <&gpio 9 0>;
+				vddio-supply = <&wlan_lpo>;
+				max-speed = <1500000>;
+				local-bd-address = [04 00 05 5a 10 02];
+			};
+		};
+
+		/*
+		 * SPI1 -- transport for the multi-touch controller.
+		 *
+		 * Exposed as spidev on purpose.  Per the build plan, v1 drives the
+		 * panel from a userspace daemon that speaks Apple's Z2 protocol
+		 * and injects events via uinput; writing a kernel multitouch
+		 * driver is explicitly out of scope for "LXDE on glass".
+		 *
+		 * Bound by the Sandcastle-port spi-s5l8940x.c (built from
+		 * patches/files-sandcastle-port/).  The ADT records DMA channels
+		 * 11/12 on the cdma controller if PIO ever becomes the bottleneck.
+		 */
+				spi1: spi@2100000 {
+			compatible = "apple,s5l8940x-spi";
+			reg = <0x2100000 0x1000>;
+			interrupts = <29>;
+			clocks = <&spi1_ps>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			touch@0 {
+				compatible = "apple,z2-multitouch";
+				reg = <0>;
+				spi-max-frequency = <5000000>;
+				generation = <1>;
+				hv-supply = <&touch_ana>;
+				core-supply = <&touch_ldo>;
+				/* The ADT writes GPIOs as (port << 8) | pin, eight
+				 * to a port: function-reset 0x0205 is pin 21,
+				 * function-enable_cs 0x0c07 is pin 103.  The ATTN
+				 * interrupt is already a plain number, 22. */
+				reset-gpios = <&gpio 21 0>;
+				cs-gpios = <&gpio 103 0>;
+				irq-gpios = <&gpio 22 1>;
+				/* held upright, Home at the bottom: x grows left to
+				 * right, y bottom to top (corners 810,14945 / 11100,
+				 * 15080 / 11130,315 / 420,425 -- logs/z2-corners.txt) */
+				touchscreen-inverted-y;
+				clocks = <&touchclk>;
+			};
+		};
+
+		/*
+		 * Watchdog block -- used here as the system TICK, not as a watchdog.
+		 *
+		 * ADT /arm-io/wdt: reg = 0x0F103020 size 0x10, interrupts = <4>,
+		 * clock-ids = <4>.  It is a sub-window of PMGR, whose ADT
+		 * device_type is literally "timer".  A userspace scan of the whole
+		 * PMGR window found exactly one free-running word in it, at +0x00
+		 * of this node (phys 0x3F103020) -- CUR_TIME.  BITE/BARK/CTRL
+		 * beside it read 0: iBoot leaves the dog disarmed.
+		 *
+		 * Layout matches what mainline documents for the same IP family in
+		 * drivers/watchdog/apple_wdt.c:
+		 *   +0x00 CUR_TIME  +0x04 BITE_TIME  +0x08 BARK_TIME  +0x0c CTRL
+		 *
+		 * Only the BARK (interrupt) half is used.  CTRL.RESET_EN would
+		 * reset the device mid-debug and is never written -- so this is
+		 * safe to leave enabled, unlike a real watchdog nobody pets.
+		 *
+		 * clock-frequency is the 24 MHz SoC reference.  If the tick runs
+		 * fast or slow, measure CUR_TIME over a wall-clock minute and put
+		 * the real number here; nothing else needs changing.
+		 */
+		wdt: timer@f103020 {
+			compatible = "apple,s5l8940x-wdt-timer";
+			reg = <0xf103020 0x10>;
+			interrupts = <4>;
+			clock-frequency = <24000000>;
+			/* CTRL implemented-bit mask is 0x0d (write 0xff, read 0x0d):
+			 * BIT(0) IRQ_EN, BIT(1) write-1-clear IRQ_STATUS, BIT(2)
+			 * RESET_EN (never set), BIT(3) v1-only and undocumented.
+			 * Which compare is the bark, and whether BIT(3) is needed,
+			 * are swept by the driver at late_initcall -- see
+			 * arch/arm/mach-apple/apple_wdt_clkevt.c. */
+			status = "okay";
+		};
+
+		/*
+		 * Power/clock manager.  Modelled only so the address space is
+		 * documented -- we rely entirely on iBoot having left every clock
+		 * we use already ungated.  Enabling this without a driver that
+		 * understands the ADT device-clocks table would gate the UART.
+		 */
+		pmgr: power-management@f100000 {
+			compatible = "apple,s5l8940x-pmgr", "syscon";
+			reg = <0xf100000 0x7000>;
+			status = "disabled";
+		};
+
+		/*
+		 * Display pipeline, recorded but unused.  simplefb above reuses
+		 * the output of these blocks rather than reprogramming them; a
+		 * real CLCD + MIPI-DSI driver for S5L8940X does not exist and is
+		 * not needed to get a desktop on screen.
+		 */
+		clcd: display-controller@a100000 {
+			compatible = "apple,s5l8940x-clcd";
+			reg = <0xa100000 0x7000>;
+			interrupts = <43 42>;
+			status = "disabled";
+		};
+
+		dsim: dsi@9500000 {
+			compatible = "apple,s5l8940x-mipi-dsim", "samsung,mipi-dsim-1";
+			reg = <0x9500000 0x1000>;
+			interrupts = <41>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			apple,lanes = <4>;
+			status = "disabled";
+
+			panel@0 {
+				compatible = "apple,lcd-pinot";
+				reg = <0>;
+				status = "disabled";
+			};
+		};
+
+		/*
+		 * USB.  The OTG port is dwc2, the gadget.  EHCI is the host
+		 * side, for one device: the BCM4334 Wi-Fi part on HSIC port 3
+		 * (ADT: /wlan under usb-complex/usb-ehci, port 3, port-type 3).
+		 * The PHY driver has two outputs -- <&otgphy 0> for dwc2, as
+		 * before, and <&otgphy 1> for EHCI, whose power-on switches the
+		 * USB 2.0 host block on in PMGR, enables HSIC in usb-complex (the
+		 * second reg) and raises the chip's REG_ON (hsic-supply).  The
+		 * why of each is in drivers/phy/phy-apple-s5l-usb.c.
+		 *
+		 * Addresses are flattened through the usb-complex bus, whose own
+		 * ranges map child 0 to 0x6100000 within arm-io; EHCI's ADT reg of
+		 * 0x300000 therefore lands at 0x6400000 here, 0x36400000 physical.
+		 */
+		otgphy: phy@6000000 {
+			compatible = "apple,s5l8940x-otgphy";
+			reg = <0x6000000 0x1000>,	/* otgphyctrl */
+			      <0xf108000 0x1000>;	/* usb-complex */
+			#phy-cells = <1>;
+			hsic-supply = <&wlan_reg_on>;
+			lpo-supply = <&wlan_lpo>;
+			status = "okay";
+		};
+
+		/* DWC2 USB-OTG device controller.
+		 * ADT: usb-device @ usb-complex+0 = phys 0x36100000, IRQ 11,
+		 * num-of-eps=14, fifo-depth=0x820.
+		 * PMGR gates from usb-complex: 87, 88, 89, 90, 91 (5 gates)
+		 * plus main clock ID 292. */
+		dwc2: usb@6100000 {
+			compatible = "apple,s5l8940x-dwc2", "snps,dwc2";
+			reg = <0x6100000 0x10000>;
+			interrupts = <11>;
+			phys = <&otgphy 0>;
+			phy-names = "usb2-phy";
+			dr_mode = "peripheral";
+			g-rx-fifo-size = <512>;
+			g-np-tx-fifo-size = <128>;
+			g-tx-fifo-size = <128 128 128 128 128 128 128 128>;
+			status = "okay";
+		};
+
+		ehci: usb@6400000 {
+			compatible = "apple,s5l8940x-ehci", "generic-ehci";
+			reg = <0x6400000 0x10000>;
+			interrupts = <12>;
+			phys = <&otgphy 1>;
+			phy-names = "usb";
+			/* Port 3 is HSIC (the Wi-Fi chip), which takes longer
+			 * than EHCI's usual millisecond to end a port reset. */
+			apple,hsic-ports = <0x4>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			/* The Wi-Fi chip, as whatever it enumerates as on port
+			 * 3 (the node goes with the port), and its out-of-band
+			 * lines -- ADT usb-ehci/wlan function-host_ready and
+			 * function-device_ready.  The firmware follows HOST_READY
+			 * with DEVICE_READY and only talks once it has seen the
+			 * host wake; brcmfmac drives it, as iOS's Wi-Fi driver
+			 * does, not the port. */
+			wifi@3 {
+				compatible = "usba5c,bd1a";
+				reg = <3>;
+				apple,host-ready-gpios = <&gpio 50 0>;
+				apple,device-ready-gpios = <&gpio 51 0>;
+			};
+		};
+
+		ohci0: usb@6500000 {
+			compatible = "apple,s5l8940x-ohci", "generic-ohci";
+			reg = <0x6500000 0x10000>;
+			interrupts = <13>;
+			status = "disabled";
+		};
+
+		/* The NAND: Apple's H2FMI driving two Hynix PPN packages, one on
+		 * CE0 of each bus.  Six windows, in the ADT's own order -- FMI,
+		 * FMC, ECC for bus 0, then the same for bus 1 (ADT
+		 * /arm-io/flash-controller0, reg 0x1200000/0x1240000/0x1280000
+		 * and 0x1300000/0x1340000/0x1380000, physical 0x312.. and
+		 * 0x313..).  Interrupts 33 and 34, one per bus; the driver polls
+		 * and does not use them yet.
+		 *
+		 * The clock gates (ADT clock-gates 59-62, PMGR 0x3f1010c4..d0)
+		 * are iBoot's: it booted iOS off this flash and leaves the block
+		 * clocked and the bus in DDR.  The driver does not switch them,
+		 * because the state it would have to restore afterwards is not
+		 * known -- a NAND reset drops the PPN to SDR and only a reboot
+		 * through iBEC gets DDR back.
+		 *
+		 * Read-only.  See docs/research/p105-nand.md. */
+		nand: flash-controller@1200000 {
+			compatible = "apple,s5l8940x-fmi";
+			reg = <0x1200000 0x1000>,	/* FMI0 */
+			      <0x1240000 0x1000>,	/* FMC0 */
+			      <0x1280000 0x1000>,	/* ECC0 */
+			      <0x1300000 0x1000>,	/* FMI1 */
+			      <0x1340000 0x1000>,	/* FMC1 */
+			      <0x1380000 0x1000>;	/* ECC1 */
+			interrupts = <33>, <34>;
+			status = "okay";
+		};
+
+		ohci1: usb@6600000 {
+			compatible = "apple,s5l8940x-ohci", "generic-ohci";
+			reg = <0x6600000 0x10000>;
+			interrupts = <14>;
+			status = "disabled";
+		};
+        /*
+         * ---- Sandcastle-port additions (touch stack) ----
+         *
+         * touchclk is the digitizer's 32 kHz clock, and on A5 it is PWM
+         * channel 2 (ADT /arm-io/pwm, child grape-clk, reg = 2): 366 + 366
+         * ticks of the 24 MHz reference, out on GPIO 63.  reg[1] is the PWM
+         * block's power-state register -- index 73 of the ADT's
+         * device-clocks table, not the clock-gates id 83.
+         * docs/research/p105-pwm-block.md, p105-pmgr-gates.md.
+         */
+        touchclk: touchclk@3500000 {
+            compatible = "apple,s5l8940x-pwm-clk";
+            #clock-cells = <0>;
+            reg = <0x3500000 0x1000>, <0xf101124 0x4>;
+            clocks = <&refclk24mhz>;
+            clock-output-names = "touchclk";
+            clock-frequency = <32768>;
+            apple,pwm-channel = <2>;
+        };
+
+        /* SPI1's power-state switch: device-clocks index 58, clock-gates id
+         * 68.  The SPI driver enables it as its clock. */
+        spi1_ps: spi1-ps@f1010e8 {
+            compatible = "apple,s5l8940x-pmgr-clk-gate";
+            #clock-cells = <0>;
+            reg = <0xf1010e8 0x4>;
+            clocks = <&refclk24mhz>;
+            clock-output-names = "spi1_ps";
+        };
+
+        /* The GPU's two power states: GFX_SYS-CLK and GFX-CLK, device-clocks
+         * index 9 and 10.  The SGX's own gate (id 92) has no register; these
+         * are its parents.  apple-sgx enables them in this order. */
+        gfx_sys_ps: gfx-sys-ps@f101024 {
+            compatible = "apple,s5l8940x-pmgr-clk-gate";
+            #clock-cells = <0>;
+            reg = <0xf101024 0x4>;
+            clocks = <&refclk24mhz>;
+            clock-output-names = "gfx_sys_ps";
+        };
+
+        gfx_ps: gfx-ps@f101028 {
+            compatible = "apple,s5l8940x-pmgr-clk-gate";
+            #clock-cells = <0>;
+            reg = <0xf101028 0x4>;
+            clocks = <&refclk24mhz>;
+            clock-output-names = "gfx_ps";
+        };
+
+        /* The speakers' power states: MCA (device-clocks id 47, index 0x50)
+         * and I2S1 (id 116, index 0x29).  s5l-audio enables them. */
+        mca_ps: mca-ps@f101140 {
+            compatible = "apple,s5l8940x-pmgr-clk-gate";
+            #clock-cells = <0>;
+            reg = <0xf101140 0x4>;
+            clocks = <&refclk24mhz>;
+            clock-output-names = "mca_ps";
+        };
+
+        i2s1_ps: i2s1-ps@f1010a4 {
+            compatible = "apple,s5l8940x-pmgr-clk-gate";
+            #clock-cells = <0>;
+            reg = <0xf1010a4 0x4>;
+            clocks = <&refclk24mhz>;
+            clock-output-names = "i2s1_ps";
+        };
+
+        /* The speakers (docs/research/p105-audio.md, sound/soc/apple/
+         * s5l-audio.c): MCA0 sends the samples, CDMA channel 0x17 (request
+         * 0xb, as the ADT's mca0 dma-channels say) feeds it, NCO 6 clocks it
+         * (342 MHz reference), the i2s-switch puts it on pin group 1, and
+         * I2S1 gives the amps their 12 MHz MCLK -- offered as this node's
+         * clock.  The windows: MCA0, I2S1, AE2's MCS and ACS (the ports'
+         * kernel-clock sources and register gates), the i2s-switch, the
+         * PMGR's NCOs, CDMA. */
+        audio: audio-controller@4196000 {
+            compatible = "apple,s5l8942x-audio";
+            reg = <0x4196000 0x1000>, <0x4191000 0x1000>,
+                  <0x41e0000 0x1000>, <0x41a0000 0x1000>,
+                  <0xfa01000 0x1000>, <0xf100110 0x70>,
+                  <0x7000000 0x2d000>;
+            reg-names = "mca", "i2s", "mcs", "acs", "switch", "nco", "cdma";
+            clocks = <&mca_ps>, <&i2s1_ps>;
+            clock-names = "mca", "i2s";
+            #clock-cells = <0>;
+            #sound-dai-cells = <0>;
+            apple,dma-channel = <0x17 0xb>;
+            apple,nco-reference-hz = <342000000>;
+            apple,speaker-amps = <&spk_left>, <&spk_right>;
+        };
+
+        /* PowerVR SGX543MP2 (ADT /arm-io/sgx, "gpu,s5l8940x", IRQ 49; the
+         * ADT's second window, 0x3f10b000, reads all zero and is left out).
+         * Six 16 KiB banks: 0 is broadcast and WRITE-ONLY -- a read hangs
+         * the bus -- 1 is the master, 2 + n is core n.  The driver switches
+         * the interrupt on only with apple_sgx.irq=1.  docs/research/p105-gpu.md. */
+        sgx: gpu@5100000 {
+            compatible = "apple,s5l8940x-sgx";
+            reg = <0x5100000 0x18000>;
+            interrupts = <49>;
+            clocks = <&gfx_sys_ps>, <&gfx_ps>;
+            clock-names = "gfx_sys", "gfx";
+            apple,brn-31195;
+        };
+
+        i2c0: i2c@3200000 {
+            /* This is Apple's I2C block (REG_SMSTA / REG_MRXFIFO / REG_FIFOLVL),
+             * not a Samsung one.  The node used to say "...-samsung-i2c", which
+             * no driver here matches -- so the generic s3c2410 driver bound to
+             * it and drove Apple registers with Samsung's map.  Transfers then
+             * "succeeded" while every PMU register read back a constant 0x01,
+             * which made regmap_update_bits think the rails were already set
+             * and skip the write entirely: the digitizer was never powered.
+             * i2c-s5l8940x.c matches this compatible. */
+            compatible = "apple,s5l8940x-i2c";
+            reg = <0x3200000 0x1000>;
+            clock-frequency = <100000>;
+            /* The ADT's arm-io/i2c0 says 0x12 (i2c1 0x13, i2c2 0x14), and it
+             * arrives: one per message the driver arms.  This said 10, which
+             * the ADT gives the scaler: its count stayed 0 and the driver
+             * took the interrupt to be lost.  The driver still polls
+             * (i2c-s5l8940x.c, docs/research/p105-sensors.md). */
+            interrupts = <18>;
+            clocks = <&refclk24mhz>;
+            clock-names = "i2c";
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            pmu: pmu@3c {
+                /* the ADT calls this node pmu,d1946, and the chip takes an 8-bit
+                 * register address -- see apple-pmu-i2c.c */
+                compatible = "apple,pmu-d1946";
+                reg = <0x3c>;
+                /* powers the iPad off the way iOS does (apple-pmu-i2c.c) */
+                system-power-controller;
+                /* its output GPIOs, 0x61 + n: Bluetooth's REG_ON is 2 */
+                gpio-controller;
+                #gpio-cells = <2>;
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                /* ADT function-power_ana is 0x020c: flags 0x02 plus index 0x0c,
+                 * i.e. LDO 12 -- not a register address.  AppleD1946PMU::_setLDO
+                 * takes the enable register and bit from its LDO table
+                 * (0x80c95f30, 8 bytes per entry, byte 6 = register, byte 7 =
+                 * mask); entry 12 gives register 0x22 bit 0x04.  A live dump
+                 * reads 0x22 = 0x61, so this rail was off, which is why the
+                 * digitizer never answered.  (The table's index 12 is LDO13 in
+                 * the PMU's own 1-based names: 5.25 V, PP5V25_GRAPE on the
+                 * board, J1700.17.)
+                 *
+                 * Bit 0x02 of the same register is LDO index 15, another 5 V
+                 * LDO (voltage register 0x3e, 5.1 V) that no ADT function names
+                 * and iOS keeps on: its live register dump reads 0x22 = 0x67
+                 * (tools/mtdump, AppleRegisterDump on AppleARMPMUCharger).
+                 * Without it the digitizer boots, answers every command as it
+                 * does under iOS, takes bf/af -- and never scans; with it, 60
+                 * frames a second (docs/research/p105-z2-boot.md).  It goes on
+                 * and off with the analog rail. */
+                touch_ana: touch_ana@22 {
+                    compatible = "apple,pmu-pwrsw";
+                    reg = <0x22>;
+                    mask = <0x06>;
+                    enable = <0x06>;
+                };
+
+                /* function-power_ldo is 0x0213: LDO 19 by the same reading.
+                 * Table entry 19 gives register 0x23 bit 0x40; the dump reads
+                 * 0x23 = 0xa0, so this one was off too. */
+                touch_ldo: touch_ldo@23 {
+                    compatible = "apple,pmu-pwrsw";
+                    reg = <0x23>;
+                    mask = <0x40>;
+                    enable = <0x40>;
+                };
+
+                /* The Wi-Fi chip's REG_ON: the ADT's wlan function-device_reset
+                 * is PMU GPIO 3, whose config register is 0x61 + 3.  Linux
+                 * finds it at 0x09, iOS with Wi-Fi up at 0x0b (the PMU dump,
+                 * logs/ios-mtdump2.txt): bit 1 is the output level.  The
+                 * host PHY takes it as hsic-supply. */
+                wlan_reg_on: wlan_reg_on@64 {
+                    compatible = "apple,pmu-pwrsw";
+                    reg = <0x64>;
+                    mask = <0x02>;
+                    enable = <0x02>;
+                };
+
+                /* PMU GPIO11 (0x61 + 11): 0xb9 under Linux, 0x79 in iOS --
+                 * the same pin in another mode (bits 7:6), which on a
+                 * Broadcom combo board is the 32 kHz sleep clock (LPO) the
+                 * chip's firmware needs and its boot ROM does not.  An
+                 * inference, being tested: with REG_ON alone the firmware
+                 * downloaded and never came up.  The host PHY enables it
+                 * before REG_ON. */
+                wlan_lpo: wlan_lpo@6c {
+                    compatible = "apple,pmu-pwrsw";
+                    reg = <0x6c>;
+                    mask = <0xc0>;
+                    enable = <0x40>;
+                };
+
+                /* The backlight: the PMU's white-LED driver.  An 11-bit
+                 * current DAC, 0xd0 = bits 10:3 and 0xd1 = bits 2:0, 2047 =
+                 * 22.5 mA; 0xd2 switches the strings, on = the ADT pmu's
+                 * wled-enables.  (0x3f and 0x4b..0x53 look like WLED
+                 * registers but do nothing to this panel.)  apple-pmu-wled.c. */
+                backlight: wled@d0 {
+                    compatible = "apple,pmu-wled";
+                    reg = <0xd0>;
+                    apple,enable-reg = <0xd2>;
+                    apple,wled-enables = <0x3f>;
+                };
+
+                /* The USB input current limit, 0x3d: iBEC leaves it at 0x02
+                 * (about 100 mA) and the PMU never moves it itself, so
+                 * without this nothing charges.  The only register
+                 * apple-pmu-charger.c writes; it ramps it the way iBEC does,
+                 * and only once armed. */
+                charger@3d {
+                    compatible = "apple,pmu-d1946-charger";
+                    reg = <0x3d>;
+                };
+
+                /* No PMU GPIO0 here.  The ADT's function-clock_enable-pmu is
+                 * GPIO0 (register 0x61), but iBEC makes it the digitizer's
+                 * clock only on boards of revision <= 1, where it also turns
+                 * grape-clk's GPIO 63 off; on this one the live ADT keeps
+                 * function-clock_enable = Cmwp and iOS leaves 0x61 at 0x11. */
+            };
+
+            /* The speaker amps, CS35L19 (the ADT's audio-speaker0/1).  They
+             * share GPIO 5 (reset, GPIO_SPKAMP_RST_L on the board) and GPIO 6
+             * (KEEPALIVE: the amps stop when nobody toggles it; the left
+             * amp's driver flips it every 20 ms, as iOS does).  The ADT's
+             * speaker-config (20 bytes, the same for both) is the driver's
+             * default; the TDM slots are set by the card. */
+            spk_left: amp@40 {
+                compatible = "cirrus,cs35l19";
+                reg = <0x40>;
+                reset-gpios = <&gpio 5 1>;
+                cirrus,keepalive-gpios = <&gpio 6 0>;
+                clocks = <&audio>;
+                clock-names = "mclk";
+                #sound-dai-cells = <0>;
+                sound-name-prefix = "Left";
+            };
+
+            spk_right: amp@41 {
+                compatible = "cirrus,cs35l19";
+                reg = <0x41>;
+                reset-gpios = <&gpio 5 1>;
+                clocks = <&audio>;
+                clock-names = "mclk";
+                #sound-dai-cells = <0>;
+                sound-name-prefix = "Right";
+            };
+        };
+
+        /* The ADT's arm-io/i2c2, the same block as i2c0, with the motion
+         * sensors on it: accelerometer,ap3dsh at 0x1d (WHO_AM_I 0x3f, an ST
+         * LIS3DSH), gyro,ap3gdl at 0x6a (WHO_AM_I 0xd5, which no st_gyro
+         * part has) and als,tsl2581 at 0x39 (ID 0x93).  Only the first has
+         * a driver here.  Its clock gate (PMGR 0x3f101120) is on from the
+         * boot, its pins muxed as i2c0's are.  Interrupt 20 is the ADT's
+         * 0x14, and it arrives (as i2c0's 18, the ADT's 0x12, does). */
+        i2c2: i2c@3400000 {
+            compatible = "apple,s5l8940x-i2c";
+            reg = <0x3400000 0x1000>;
+            clock-frequency = <100000>;
+            interrupts = <20>;
+            clocks = <&refclk24mhz>;
+            clock-names = "i2c";
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            accelerometer@1d {
+                /* LIS3DSH: added to st_accel by patches/tree */
+                compatible = "st,lis3dsh-accel";
+                reg = <0x1d>;
+                /* the ADT's orientation is minus the identity: it takes the
+                 * chip to iOS's axes, where gravity reads -1 g.  IIO reads
+                 * the push against it, +1 g up, so the chip's axes are the
+                 * screen's: x right, y up (away from Home), z out */
+                mount-matrix = "1", "0", "0",
+                               "0", "1", "0",
+                               "0", "0", "1";
+            };
+        };
+
+	};
+};
