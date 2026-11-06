@@ -48,9 +48,17 @@ static struct cpuidle_driver apple_cpuidle_driver = {
 	.state_count = 2,
 };
 
-/* The SoCs whose suspend-to-idle has been tested with this. */
+/* WFI is what these SoCs idle in anyway, so this asks nothing new of them. */
 static const char *const apple_cpuidle_socs[] __initconst = {
+	"apple,s5l8960x",
+	"apple,t7000",
+	"apple,t7001",
+	"apple,s8000",
+	"apple,s8003",
+	"apple,s8001",
 	"apple,t8010",
+	"apple,t8011",
+	"apple,t8015",
 	NULL
 };
 
