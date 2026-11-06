@@ -10,6 +10,11 @@
  * remain, length, data, CRC-16). Touches arrive on interface 0 as report 0x44
  * with apple_z2 finger records.
  *
+ * Apple's firmware comes in variants ("personalities"), and each unit's ADT
+ * names the one it needs. m1n1 passes that on as apple,hid-merge-personality;
+ * the file is <firmware-name>-<personality>.bin. If it isn't there, the
+ * touchscreen stays off and the log names the variant.
+ *
  * Firmware file ("D221OPS1" + ops, little endian):
  *   'T' u32 len, label       'S' u16 ack (0: none), u32 len, HBPP packet
  *   'P' u32 addr, mask, value, timeout_ms        'R' u32 addr
@@ -418,7 +423,9 @@ static int ahts_boot(struct apple_hidspi_ts *ts)
 
 	ret = request_firmware(&fw, ts->fw_name, dev);
 	if (ret)
-		return dev_err_probe(dev, ret, "no firmware %s\n", ts->fw_name);
+		return dev_err_probe(dev, ret,
+				     "no firmware for this unit's touch variant (%s): touchscreen left off\n",
+				     ts->fw_name);
 	ts->pkt_size = SZ_256K;
 	ts->pkt = kmalloc(ts->pkt_size, GFP_KERNEL);
 	if (!ts->pkt) {
@@ -628,6 +635,7 @@ static int ahts_probe(struct spi_device *spi)
 	struct device *dev = &spi->dev;
 	struct apple_hidspi_ts *ts;
 	struct input_dev *input;
+	const char *fw_prefix, *personality;
 	int ret;
 
 	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
@@ -658,9 +666,18 @@ static int ahts_probe(struct spi_device *spi)
 	ts->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(ts->reset))
 		return dev_err_probe(dev, PTR_ERR(ts->reset), "no reset GPIO\n");
-	ret = device_property_read_string(dev, "firmware-name", &ts->fw_name);
+	ret = device_property_read_string(dev, "firmware-name", &fw_prefix);
 	if (ret)
 		return dev_err_probe(dev, ret, "no firmware-name\n");
+	ret = device_property_read_string(dev, "apple,hid-merge-personality", &personality);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "the bootloader passed no touch firmware variant: touchscreen left off\n");
+	if (strchr(personality, '/'))
+		return dev_err_probe(dev, -EINVAL, "bad touch firmware variant\n");
+	ts->fw_name = devm_kasprintf(dev, GFP_KERNEL, "%s-%s.bin", fw_prefix, personality);
+	if (!ts->fw_name)
+		return -ENOMEM;
 
 	input = devm_input_allocate_device(dev);
 	if (!input)
@@ -732,4 +749,4 @@ module_spi_driver(ahts_driver);
 
 MODULE_DESCRIPTION("Apple HIDSPI touchscreen (iPhone X)");
 MODULE_LICENSE("GPL");
-MODULE_FIRMWARE("apple/d221-touch.bin");
+MODULE_FIRMWARE("apple/d221-touch-*.bin");
