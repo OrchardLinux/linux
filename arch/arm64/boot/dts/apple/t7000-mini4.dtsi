@@ -201,3 +201,14 @@
 		};
 	};
 };
+
+/* The boot loader set up the display; nothing restores it after power loss. */
+&ps_disp0 {
+	apple,always-on;
+	apple,manual-pm;
+};
+
+&ps_dp {
+	apple,always-on;
+	apple,manual-pm;
+};
