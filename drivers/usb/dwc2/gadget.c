@@ -1745,6 +1745,17 @@ static struct dwc2_hsotg_req *get_ep_head(struct dwc2_hsotg_ep *hs_ep)
  * in its handler. Hence we need to unmask it here to be able to do
  * resynchronization.
  */
+/*
+ * The core takes OUT packets into the receive FIFO shared by all OUT endpoints
+ * even with no transfer programmed. They then stay at its head, and every OUT
+ * endpoint stops. NAK while no request is queued; starting a request clears it.
+ */
+static void dwc2_hsotg_nak_idle_out(struct dwc2_hsotg *hsotg, struct dwc2_hsotg_ep *hs_ep)
+{
+	if (!hs_ep->dir_in && hs_ep->index && !hs_ep->isochronous)
+		dwc2_set_bit(hsotg, DOEPCTL(hs_ep->index), DXEPCTL_SNAK);
+}
+
 static void dwc2_gadget_start_next_request(struct dwc2_hsotg_ep *hs_ep)
 {
 	struct dwc2_hsotg *hsotg = hs_ep->parent;
@@ -1756,8 +1767,10 @@ static void dwc2_gadget_start_next_request(struct dwc2_hsotg_ep *hs_ep)
 		dwc2_hsotg_start_req(hsotg, hs_ep, hs_req, false);
 		return;
 	}
-	if (!hs_ep->isochronous)
+	if (!hs_ep->isochronous) {
+		dwc2_hsotg_nak_idle_out(hsotg, hs_ep);
 		return;
+	}
 
 	if (dir_in) {
 		dev_dbg(hsotg->dev, "%s: No more ISOC-IN requests\n",
@@ -4105,6 +4118,10 @@ static int dwc2_hsotg_ep_enable(struct usb_ep *ep,
 	 * transactions entirely for this endpoint
 	 */
 	epctrl |= DXEPCTL_USBACTEP;
+
+	/* No request yet: dwc2_hsotg_nak_idle_out() */
+	if (!dir_in && index && usb_endpoint_type(desc) != USB_ENDPOINT_XFER_ISOC)
+		epctrl |= DXEPCTL_SNAK;
 
 	/* update the endpoint state */
 	dwc2_hsotg_set_ep_maxpacket(hsotg, hs_ep->index, mps, mc, dir_in);
