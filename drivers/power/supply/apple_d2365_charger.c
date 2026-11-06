@@ -427,14 +427,14 @@ static void apple_d2365_charge_policy_work(struct work_struct *work)
 	power_supply_changed(charger->psy);
 	/* Look again soon, in case the attach default follows the write. */
 	if (!charger->shutting_down)
-		mod_delayed_work(system_power_efficient_wq,
+		mod_delayed_work(system_freezable_power_efficient_wq,
 				 &charger->charge_policy_work,
 				 msecs_to_jiffies(D2365_ATTACH_CHECK_MS));
 	goto out_unlock;
 
 out_reschedule:
 	if (!charger->shutting_down)
-		mod_delayed_work(system_power_efficient_wq,
+		mod_delayed_work(system_freezable_power_efficient_wq,
 				 &charger->charge_policy_work,
 				 msecs_to_jiffies(D2365_POLICY_INTERVAL_MS));
 	goto out_unlock;
@@ -591,7 +591,7 @@ apple_d2365_charger_external_power_changed(struct power_supply *psy)
 	struct apple_d2365_charger *charger = power_supply_get_drvdata(psy);
 
 	if (charger->config && !READ_ONCE(charger->shutting_down))
-		mod_delayed_work(system_power_efficient_wq,
+		mod_delayed_work(system_freezable_power_efficient_wq,
 				 &charger->charge_policy_work, 0);
 
 	power_supply_changed(psy);
@@ -693,7 +693,7 @@ static int apple_d2365_charger_probe(struct platform_device *pdev)
 				     "failed to read input-current limit\n");
 
 	if (charger->config) {
-		mod_delayed_work(system_power_efficient_wq,
+		mod_delayed_work(system_freezable_power_efficient_wq,
 				 &charger->charge_policy_work, 0);
 	}
 

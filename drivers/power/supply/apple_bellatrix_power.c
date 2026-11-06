@@ -185,13 +185,13 @@ static void apple_bellatrix_init_work(struct work_struct *work)
 
 	if (!ret) {
 		bellatrix->initialized = true;
-		schedule_delayed_work(&bellatrix->init_work,
+		queue_delayed_work(system_freezable_wq, &bellatrix->init_work,
 				      msecs_to_jiffies(BELLATRIX_POLL_INTERVAL_MS));
 		return;
 	}
 
 	if (bellatrix->initialized) {
-		schedule_delayed_work(&bellatrix->init_work,
+		queue_delayed_work(system_freezable_wq, &bellatrix->init_work,
 				      msecs_to_jiffies(BELLATRIX_POLL_INTERVAL_MS));
 		return;
 	}
@@ -200,7 +200,7 @@ static void apple_bellatrix_init_work(struct work_struct *work)
 
 	if ((ret == -ENXIO || ret == -EIO) &&
 	    bellatrix->init_attempts < BELLATRIX_INIT_ATTEMPTS) {
-		schedule_delayed_work(&bellatrix->init_work,
+		queue_delayed_work(system_freezable_wq, &bellatrix->init_work,
 				      msecs_to_jiffies(BELLATRIX_INIT_RETRY_DELAY_MS));
 		return;
 	}
@@ -247,7 +247,7 @@ static int apple_bellatrix_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
-	schedule_delayed_work(&bellatrix->init_work,
+	queue_delayed_work(system_freezable_wq, &bellatrix->init_work,
 			      msecs_to_jiffies(BELLATRIX_INIT_DELAY_MS));
 
 	return 0;
