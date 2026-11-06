@@ -152,6 +152,7 @@ struct tristar_charger {
 	unsigned int source_ma;
 	/* USB data is on for this attachment: the mux must stay untouched. */
 	bool usb_on;
+	bool source_seen;	/* an attachment since probe */
 	/* What the USB host allows (vbus_draw), valid for usb_epoch only. */
 	unsigned int usb_ma;
 	unsigned int usb_epoch;
@@ -694,6 +695,7 @@ static void tristar_new_attachment(struct tristar_charger *chg, u64 now)
 {
 	/* Before anything else: a host must not start a session yet. */
 	tristar_set_usb(chg, false);
+	chg->source_seen = true;
 	chg->present = true;
 	chg->phase = TRISTAR_SETTLING;
 	chg->attach_ns = now;
@@ -898,6 +900,22 @@ static void tristar_guard(struct tristar_charger *chg, u64 now)
 	}
 }
 
+/*
+ * The hold at probe waits for an attachment, and a bootloader can leave the PMIC
+ * reporting none with a cable in. Nothing else would then turn USB data on, and
+ * the role set at probe has already ended the controller's own fallback, so give
+ * up on the source: USB serial and SSH must not depend on charging. An attachment
+ * later holds USB data off again and identifies as usual. Caller holds lock.
+ */
+static void tristar_no_source(struct tristar_charger *chg, unsigned int status, u64 now)
+{
+	if (chg->usb_on || chg->source_seen ||
+	    (s64)(now - chg->hold_ns) < (s64)TRISTAR_HOLD_MS * NSEC_PER_MSEC)
+		return;
+	dev_warn(chg->dev, "no source seen since probe (status %#x), turning USB data on\n", status);
+	tristar_set_usb(chg, true);
+}
+
 static void tristar_poll(struct work_struct *work)
 {
 	struct tristar_charger *chg = container_of(to_delayed_work(work),
@@ -930,12 +948,14 @@ static void tristar_poll(struct work_struct *work)
 				dev_crit(chg->dev, "Handoff write failed; input limit unverified\n");
 			dev_dbg(chg->dev, "disconnected\n");
 		}
+		tristar_no_source(chg, status, now);
 		goto again;
 	}
 	if (status != TRISTAR_CHG_STATUS_ONLINE) {
 		/* Transitional input state (e.g. 0x40 while attaching): no grant. */
 		if (chg->code > TRISTAR_CHG_FALLBACK_CODE)
 			tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
+		tristar_no_source(chg, status, now);
 		goto again;
 	}
 	if (!chg->present) {
@@ -1350,6 +1370,7 @@ static int tristar_probe(struct platform_device *pdev)
 
 	/* Whatever is attached gets identified before USB data comes on. */
 	mutex_lock(&chg->lock);
+	chg->hold_ns = ktime_get_ns();
 	tristar_set_usb(chg, false);
 	mutex_unlock(&chg->lock);
 
