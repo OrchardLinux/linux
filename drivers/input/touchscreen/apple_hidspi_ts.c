@@ -15,11 +15,12 @@
  * the file is <firmware-name>-<personality>.bin. If it isn't there, the
  * touchscreen stays off and the log names the variant.
  *
- * Firmware file ("D221OPS1" + ops, little endian):
+ * Firmware file ("D221OPS2" + ops, little endian):
  *   'T' u32 len, label       'S' u16 ack (0: none), u32 len, HBPP packet
  *   'P' u32 addr, mask, value, timeout_ms        'R' u32 addr
- *   'C' u32 addr, u32 max, u32 len, DT property name: the unit's calibration,
- *       copied from the ADT by m1n1, sent as an HBPP blob at addr
+ *   'C' u32 addr, u32 max, u32 len, DT property name, u32 len, default: the
+ *       unit's calibration, copied from the ADT by m1n1, sent as an HBPP blob
+ *       at addr; Apple's default from the firmware if the unit has none
  *
  * The CS-to-clock delay of iOS (200 us, "CS Delay") is a zero-length transfer
  * with a delay in front of each message.
@@ -267,7 +268,8 @@ static size_t ahts_build_blob(u8 *out, u32 addr, const u8 *data, size_t len)
 }
 
 static int ahts_send_calibration(struct apple_hidspi_ts *ts, u32 addr,
-				 u32 max, const char *name)
+				 u32 max, const char *name,
+				 const u8 *def, size_t def_len)
 {
 	struct device *dev = &ts->spi->dev;
 	int count = device_property_count_u8(dev, name);
@@ -275,8 +277,16 @@ static int ahts_send_calibration(struct apple_hidspi_ts *ts, u32 addr,
 	int ret;
 
 	if (count <= 0) {
-		dev_info(dev, "no %s; the controller keeps its default\n", name);
-		return 0;
+		if (!def_len) {
+			dev_info(dev, "no %s; the controller keeps its default\n", name);
+			return 0;
+		}
+		dev_info(dev, "no %s; using the firmware's default\n", name);
+		len = min_t(size_t, def_len, max);
+		if (16 + ALIGN(len, 4) > ts->pkt_size)
+			return -EINVAL;
+		return ahts_hbpp_send(ts, ts->pkt,
+				      ahts_build_blob(ts->pkt, addr, def, len), 0x4bc1);
 	}
 	len = min_t(size_t, count, max);
 	if (16 + ALIGN(len, 4) > ts->pkt_size)
@@ -297,7 +307,7 @@ static int ahts_run_ops(struct apple_hidspi_ts *ts, const u8 *d, size_t n)
 	size_t i = 8;
 	int ret;
 
-	if (n < 8 || memcmp(d, "D221OPS1", 8))
+	if (n < 8 || memcmp(d, "D221OPS2", 8))
 		return dev_err_probe(dev, -EINVAL, "bad firmware header\n");
 
 	while (i < n) {
@@ -363,7 +373,14 @@ static int ahts_run_ops(struct apple_hidspi_ts *ts, const u8 *d, size_t n)
 			memcpy(name, d + i, len);
 			name[len] = '\0';
 			i += len;
-			ret = ahts_send_calibration(ts, addr, mask, name);
+			if (n - i < 4)
+				return -EINVAL;
+			len = get_unaligned_le32(d + i);
+			i += 4;
+			if (len > n - i)
+				return -EINVAL;
+			ret = ahts_send_calibration(ts, addr, mask, name, d + i, len);
+			i += len;
 			if (ret)
 				return ret;
 			break;
