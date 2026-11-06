@@ -65,6 +65,8 @@
 #define TRISTAR_IRQ_LINE		0
 #define TRISTAR_IRQ_ADC			1
 #define TRISTAR_IRQ_SOURCE		2
+/* The D2365 event that latches on every plug and unplug. */
+#define TRISTAR_EVENT_PLUG		72
 #define TRISTAR_IRQS_MAX		16
 
 /* Input-current limit encoding: mA = code * 12.5 + 75 */
@@ -122,6 +124,7 @@ struct tristar_charger {
 	struct completion adc_done;
 	int irqs[TRISTAR_IRQS_MAX];
 	unsigned int nirqs;
+	int plug_irq;			/* wakes the system, 0 without one */
 	u32 status_base;
 	u32 control_base;
 	u32 adc_base;
@@ -1323,6 +1326,9 @@ static int tristar_probe(struct platform_device *pdev)
 		chg->irqs[i] = platform_get_irq(pdev, i);
 		if (chg->irqs[i] < 0)
 			return chg->irqs[i];
+		if (i >= TRISTAR_IRQ_SOURCE &&
+		    irqd_to_hwirq(irq_get_irq_data(chg->irqs[i])) == TRISTAR_EVENT_PLUG)
+			chg->plug_irq = chg->irqs[i];
 	}
 
 	ret = devm_mutex_init(dev, &chg->lock);
@@ -1368,6 +1374,12 @@ static int tristar_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	if (chg->plug_irq) {
+		ret = device_init_wakeup(dev, true);
+		if (ret)
+			return ret;
+	}
+
 	/* Whatever is attached gets identified before USB data comes on. */
 	mutex_lock(&chg->lock);
 	chg->hold_ns = ktime_get_ns();
@@ -1387,25 +1399,43 @@ static void tristar_shutdown(struct platform_device *pdev)
 }
 
 /*
- * Sleep can hide a complete source swap: park at the handoff limit and
- * identify again on resume.
+ * A plug or unplug wakes the system, so sleep hides no source swap and an
+ * identified charger keeps its limit: a tablet left on one charges at full
+ * rate. A USB host may be asleep too and is owed no more than the handoff, so
+ * it parks there and is identified again on resume, as is anything without a
+ * plug event to rely on. An identification in progress finishes first.
  */
 static int tristar_suspend(struct device *dev)
 {
 	struct tristar_charger *chg = dev_get_drvdata(dev);
-	int ret;
+	bool keep;
+	int ret = 0;
 
 	mutex_lock(&chg->lock);
+	if (chg->present && (chg->phase == TRISTAR_SETTLING ||
+			     chg->phase == TRISTAR_RAMPING)) {
+		mutex_unlock(&chg->lock);
+		return -EBUSY;
+	}
+	keep = chg->plug_irq && device_may_wakeup(dev) && chg->present &&
+	       chg->phase == TRISTAR_CHARGING && !tristar_usb_ma(chg);
 	chg->stopping = true;
-	chg->present = false;
-	chg->phase = TRISTAR_EMPTY;
-	ret = tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE);
-	if (ret)
-		chg->stopping = false;
+	if (!keep) {
+		chg->present = false;
+		chg->phase = TRISTAR_EMPTY;
+		ret = tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE);
+		if (ret)
+			chg->stopping = false;
+	}
 	mutex_unlock(&chg->lock);
 	if (ret)
 		return ret;
 	cancel_delayed_work_sync(&chg->poll_work);
+	if (chg->plug_irq && device_may_wakeup(dev)) {
+		ret = enable_irq_wake(chg->plug_irq);
+		if (ret)
+			dev_warn(dev, "cannot wake on plug events: %d\n", ret);
+	}
 	return 0;
 }
 
@@ -1413,6 +1443,8 @@ static int tristar_resume(struct device *dev)
 {
 	struct tristar_charger *chg = dev_get_drvdata(dev);
 
+	if (chg->plug_irq && device_may_wakeup(dev))
+		disable_irq_wake(chg->plug_irq);
 	mutex_lock(&chg->lock);
 	chg->stopping = false;
 	mutex_unlock(&chg->lock);
