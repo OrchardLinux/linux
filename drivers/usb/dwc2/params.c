@@ -314,7 +314,8 @@ static void dwc2_set_apple_silicon_params(struct dwc2_hsotg *hsotg)
 	p->host_nperio_tx_fifo_size = 16;
 	p->g_np_tx_fifo_size = 16;
 	p->lpm = false;
-
+	/* As m1n1 runs it on the same controller; shorter bursts hold bulk OUT to about 20 MiB/s. */
+	p->ahbcfg = GAHBCFG_HBSTLEN_INCR16 << GAHBCFG_HBSTLEN_SHIFT;
 
 	fifo_count = dwc2_hsotg_tx_fifo_count(hsotg);
 	p->g_tx_fifo_size[0] = 64;
