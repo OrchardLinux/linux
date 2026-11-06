@@ -34,6 +34,12 @@ properties:
       - const: status
       - const: control
 
+  interrupts:
+    maxItems: 1
+    description: |
+      The PMIC event that latches on every plug and unplug, from the PMIC's
+      event interrupt controller. It wakes the system.
+
   power-supplies:
     maxItems: 1
 
