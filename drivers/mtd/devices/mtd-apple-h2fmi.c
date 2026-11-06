@@ -21,8 +21,10 @@
  * page is 16 KiB of data with 64 bytes of OOB. One MTD is exported per
  * CAU. Raw MTD offsets are independent of the iOS logical block addresses.
  *
- * This interface exposes reads through MTD. Logical-address translation and
- * allocation belong to the shared FTL above the physical page provider.
+ * Pages are read and programmed whole, data and metadata together.  The
+ * driver has no erase: a page is only programmed when it reads back erased,
+ * and every program is read back and compared before it is reported done.
+ * Logical-address translation and allocation belong to the FTL above.
  */
 
 #include <linux/delay.h>
@@ -69,15 +71,18 @@
 #define FMC_NAND_STATUS		0x48
 #define FMC_STATUS_MASK		0x4c
 
-/* The allowlist is the safety property, not a convenience: a sequence that is
- * not on it does not run.  Nothing here programs or erases. */
-static const u8 h2fmi_read_only_ops[][2] = {
+/* Every command sequence the driver issues.  A sequence that is not listed
+ * does not run; in particular there is no erase. */
+static const u8 h2fmi_ops[][2] = {
 	{ 0x70, 0x00 },		/* read status */
 	{ 0x92, 0x97 },		/* PPN device parameters */
 	{ 0x77, 0x7d },		/* PPN operation status */
 	{ 0x77, 0x00 },		/* PPN end of operation */
 	{ 0x7a, 0x00 },		/* PPN data out */
 	{ 0x0a, 0x37 },		/* PPN page read */
+	{ 0x8a, 0x00 },		/* PPN program, address phase */
+	{ 0x17, 0x00 },		/* PPN program confirm */
+	{ 0x79, 0x00 },		/* PPN program status */
 };
 
 struct h2fmi_bus {
@@ -126,20 +131,19 @@ static int h2fmi_wait(struct h2fmi *fmi, void __iomem *base, u32 off,
 
 /*
  * FMC_CMD holds the first command byte, and the second one in bits 15:8.
- * Every command sequence passes through the read-operation allowlist.
+ * Every command sequence passes through the opcode list above.
  */
 static int h2fmi_cmd_write(struct h2fmi *fmi, struct h2fmi_bus *b, u8 op, u8 op2)
 {
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(h2fmi_read_only_ops); i++)
-		if (h2fmi_read_only_ops[i][0] == op &&
-		    h2fmi_read_only_ops[i][1] == op2) {
+	for (i = 0; i < ARRAY_SIZE(h2fmi_ops); i++)
+		if (h2fmi_ops[i][0] == op && h2fmi_ops[i][1] == op2) {
 			writel(op | op2 << 8, b->fmc + FMC_CMD);
 			return 0;
 		}
 
-	dev_err(fmi->dev, "refusing NAND opcodes %02x %02x: not read-only\n", op, op2);
+	dev_err(fmi->dev, "refusing NAND opcodes %02x %02x\n", op, op2);
 	return -EPERM;
 }
 
@@ -184,18 +188,10 @@ static int h2fmi_cmd_addr_cmd(struct h2fmi *fmi, struct h2fmi_bus *b,
  * FMC poll the status byte until it is ready.  iBEC waits on the interrupt;
  * this polls FMC_STATUS bit 5, as the userspace tool does.
  */
-static int h2fmi_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st)
+static int h2fmi_poll_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st)
 {
 	int ret;
 	u32 v;
-
-	ret = h2fmi_cmd_write(fmi, b, 0x77, 0x7d);
-	if (ret)
-		return ret;
-	writel(3, b->fmc + FMC_RW_CTRL);
-	ret = h2fmi_wait(fmi, b->fmc, FMC_STATUS, 3, 3);
-	if (ret)
-		return ret;
 
 	h2fmi_clear_irqs(b);
 	writel(0x100, b->fmi + FMI_INTEN);
@@ -219,6 +215,19 @@ static int h2fmi_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st)
 	writel(0, b->fmc + FMC_RW_CTRL);
 	h2fmi_clear_irqs(b);
 	return 0;
+}
+
+static int h2fmi_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st)
+{
+	int ret = h2fmi_cmd_write(fmi, b, 0x77, 0x7d);
+
+	if (ret)
+		return ret;
+	writel(3, b->fmc + FMC_RW_CTRL);
+	ret = h2fmi_wait(fmi, b->fmc, FMC_STATUS, 3, 3);
+	if (ret)
+		return ret;
+	return h2fmi_poll_status(fmi, b, st);
 }
 
 static int h2fmi_pio_read(struct h2fmi *fmi, struct h2fmi_bus *b,
@@ -358,6 +367,195 @@ static void h2fmi_split_page(const u8 *raw, u8 *data, u8 *oob)
 			memcpy(oob + c * H2FMI_CHUNK_META,
 			       src + H2FMI_CHUNK_LO, H2FMI_CHUNK_META);
 	}
+}
+
+/* Four row-address cycles follow the PPN program command. */
+static int h2fmi_write_address(struct h2fmi *fmi, struct h2fmi_bus *b,
+			       u32 row)
+{
+	int ret = h2fmi_cmd_write(fmi, b, 0x8a, 0);
+
+	if (ret)
+		return ret;
+	writel(row, b->fmc + FMC_ADDR0);
+	writel(3, b->fmc + FMC_ADDRNUM);
+	writel(9, b->fmc + FMC_RW_CTRL);
+	return h2fmi_wait(fmi, b->fmc, FMC_STATUS, 9, 9);
+}
+
+/* Same PIO FIFO used by iBEC's feature writer, with CONTROL=5 for data in.
+ * Every chunk must finish before the next one or the program confirm.
+ */
+static int h2fmi_data_in(struct h2fmi *fmi, struct h2fmi_bus *b,
+			 const u8 *buffer, u32 length)
+{
+	u32 offset, index, value;
+	int ret;
+
+	if (!length || length & 3)
+		return -EINVAL;
+	for (offset = 0; offset < length; ) {
+		u32 bytes = min_t(u32, length - offset, 0x400);
+
+		writel(5, b->fmi + FMI_CONFIG);
+		writel((bytes << 8 & 0x7fc00) | 1,
+		       b->fmi + FMI_PIO_CONFIG);
+		writel(5, b->fmi + FMI_CONTROL);
+		ret = readl_poll_timeout(b->fmi + FMI_DMA_STATUS, value,
+					 value & 0x18, 0, 100000);
+		if (ret)
+			return ret;
+		for (index = 0; index < bytes; index += 4)
+			writel(get_unaligned_le32(buffer + offset + index),
+			       b->fmi + FMI_DATA);
+		ret = h2fmi_wait(fmi, b->fmi, FMI_STATUS, 2, 2);
+		if (ret)
+			return ret;
+		offset += bytes;
+	}
+	return 0;
+}
+
+/* Program status uses 79, as in iBEC's write_bootpage path. */
+static int h2fmi_write_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *status)
+{
+	int ret = h2fmi_cmd1(fmi, b, 0x79);
+
+	if (ret)
+		return ret;
+	return h2fmi_poll_status(fmi, b, status);
+}
+
+/* Caller holds the bus lock. A failed mutation permanently stops this bus. */
+static int h2fmi_program_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
+				     u32 row, const u8 *raw)
+{
+	u32 on, if_ctrl;
+	u8 status = 0;
+	int ret;
+
+	if (b->failed)
+		return -EIO;
+	on = readl(b->fmc + FMC_ON);
+	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
+	if (on != 5)
+		return -EIO;
+	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+	h2fmi_clear_irqs(b);
+	ret = h2fmi_write_address(fmi, b, row);
+	if (!ret)
+		ret = h2fmi_data_in(fmi, b, raw, H2FMI_PAGE_RAW);
+	if (!ret)
+		ret = h2fmi_cmd1(fmi, b, 0x17);
+	if (!ret)
+		ret = h2fmi_write_status(fmi, b, &status);
+	/* CMD 79 returns NAND write status, not the managed read result.
+	 * iBEC 12H321 tests failure bits 0 and 4 after ready bit 6.
+	 */
+	if (!ret)
+		ret = h2fmi_program_status(status);
+	writel(0, b->fmc + FMC_CE_CTRL);
+	h2fmi_device_reset(b, on, if_ctrl);
+	if (ret) {
+		b->failed = true;
+		dev_err(fmi->dev, "PPN program row %08x: status %02x, error %d\n",
+			row, status, ret);
+	}
+	return ret;
+}
+
+static void h2fmi_join_page(u8 *raw, const u8 *data, const u8 *oob)
+{
+	unsigned int chunk;
+
+	for (chunk = 0; chunk < H2FMI_CHUNKS; chunk++) {
+		u8 *dst = raw + chunk * H2FMI_CHUNK_RAW;
+		const u8 *src = data + chunk * 4096;
+
+		memcpy(dst, src, H2FMI_CHUNK_LO);
+		memcpy(dst + H2FMI_CHUNK_LO, oob + chunk * H2FMI_CHUNK_META,
+		       H2FMI_CHUNK_META);
+		memcpy(dst + H2FMI_CHUNK_LO + H2FMI_CHUNK_META,
+		       src + H2FMI_CHUNK_LO, H2FMI_CHUNK_HI);
+	}
+}
+
+/* Canonical data and metadata form one complete PPN program unit. */
+static int h2fmi_program_page(struct h2fmi *fmi, struct h2fmi_bus *b,
+			      unsigned int cau, unsigned int block,
+			      unsigned int page, const u8 *data, const u8 *oob)
+{
+	u32 row;
+	u8 status, *expected;
+	int ret;
+
+	if (!data || !oob)
+		return -EINVAL;
+	ret = h2fmi_page_row(&b->geometry, cau, block, page, &row);
+	if (ret)
+		return ret;
+	/* Preserve the boot block and both package-reserved tail blocks. */
+	if (!block || block >= b->geometry.blocks - 2)
+		return -EPERM;
+	expected = kmalloc(H2FMI_PAGE_RAW, GFP_KERNEL);
+	if (!expected)
+		return -ENOMEM;
+	h2fmi_join_page(expected, data, oob);
+	mutex_lock(&b->lock);
+	ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row, 4,
+				     b->page, H2FMI_PAGE_RAW, &status);
+	if (ret)
+		goto out;
+	if (status != PPN_ST_ERASED ||
+	    memchr_inv(b->page, 0xff, H2FMI_PAGE_RAW)) {
+		ret = -EEXIST;
+		goto out;
+	}
+	ret = h2fmi_program_transaction(fmi, b, row, expected);
+	if (ret)
+		goto out;
+	ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row, 4,
+				     b->page, H2FMI_PAGE_RAW, &status);
+	if (ret || status != PPN_ST_GOOD ||
+	    memcmp(b->page, expected, H2FMI_PAGE_RAW)) {
+		b->failed = true;
+		ret = ret ? ret : -EIO;
+		dev_err(fmi->dev, "PPN readback row %08x: status %02x, error %d\n",
+			row, status, ret);
+		goto out;
+	}
+out:
+	mutex_unlock(&b->lock);
+	kfree(expected);
+	return ret;
+}
+
+/* Publish MTD progress after the whole data/OOB unit passes readback. */
+static int h2fmi_mtd_write_oob(struct mtd_info *mtd, loff_t to,
+			       struct mtd_oob_ops *ops)
+{
+	struct h2fmi_die *die = mtd->priv;
+	struct h2fmi *fmi = die->fmi;
+	struct h2fmi_bus *b = &fmi->bus[die->bus];
+	u64 page = (u64)to >> H2FMI_PAGE_SHIFT;
+	u32 block = page >> b->geometry.page_bits;
+	u32 pg = page & (b->geometry.pages - 1);
+	int ret;
+
+	ops->retlen = 0;
+	ops->oobretlen = 0;
+	if (to < 0 || to >= mtd->size || to & H2FMI_PAGE_MASK ||
+	    ops->mode != MTD_OPS_PLACE_OOB || ops->len != H2FMI_PAGE_DATA ||
+	    ops->ooblen != H2FMI_PAGE_OOB || ops->ooboffs ||
+	    !ops->datbuf || !ops->oobbuf)
+		return -EINVAL;
+	ret = h2fmi_program_page(fmi, b, die->cau, block, pg,
+				 ops->datbuf, ops->oobbuf);
+	if (!ret) {
+		ops->retlen = H2FMI_PAGE_DATA;
+		ops->oobretlen = H2FMI_PAGE_OOB;
+	}
+	return ret;
 }
 
 static int h2fmi_read_page_at(struct mtd_info *mtd, loff_t from,
@@ -552,8 +750,9 @@ static int h2fmi_setup_mtd(struct h2fmi *fmi, int idx)
 		return -ENOMEM;
 
 	mtd->type = MTD_NANDFLASH;
-	/* PPN page reads expose the package metadata through MTD OOB. */
-	mtd->flags = MTD_NO_ERASE;
+	/* Page metadata is MTD OOB.  Pages are programmed whole, data and OOB
+	 * together; there is no erase. */
+	mtd->flags = MTD_WRITEABLE | MTD_NO_ERASE;
 	mtd->erasesize = g->pages * H2FMI_PAGE_DATA;
 	mtd->size = (u64)g->blocks * mtd->erasesize;
 	mtd->writesize = H2FMI_PAGE_DATA;
@@ -571,6 +770,7 @@ static int h2fmi_setup_mtd(struct h2fmi *fmi, int idx)
 
 	/* _read_oob only: add_mtd_device() rejects a driver that has both. */
 	mtd->_read_oob = h2fmi_mtd_read_oob;
+	mtd->_write_oob = h2fmi_mtd_write_oob;
 	mtd->_block_isbad = h2fmi_mtd_block_isbad;
 
 	return mtd_device_register(mtd, NULL, 0);

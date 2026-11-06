@@ -207,7 +207,7 @@ config MTD_ST_SPI_FSM
 	  for a subset of connected Serial Flash devices.
 
 config MTD_APPLE_H2FMI
-	tristate "Apple S5L H2FMI / PPN NAND (read-only)"
+	tristate "Apple S5L H2FMI / PPN NAND"
 	depends on ARCH_APPLE_S5L || COMPILE_TEST
 	help
 	  Apple's flash controller as it appears on the A5 (S5L8940X/8942X),
@@ -215,12 +215,9 @@ config MTD_APPLE_H2FMI
 	  package does its own ECC, so this is a plain MTD and not a raw-NAND
 	  driver.  One MTD per CAU; geometry is read from each package.
 
-	  READ ONLY.  The driver's opcode allowlist contains no program and no
-	  erase, so it cannot damage whatever the NAND already holds -- which
-	  on an un-restored device is somebody's iOS install.
-
-	  Say Y to read the NAND from Linux, for instance to check a dump or
-	  to mount iOS's own partitions.
+	  Pages are programmed whole, only when they read back erased, and
+	  each program is verified by reading it back.  The driver has no
+	  erase operation.
 
 	  If unsure, say N.
 
