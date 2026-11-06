@@ -87,3 +87,24 @@
 		label = "Charger Temp";
 	};
 };
+
+/* The boot loader set up the display; nothing restores it after power loss. */
+&ps_disp0_be {
+	apple,always-on;
+	apple,manual-pm;
+};
+
+&ps_mipi_dsi {
+	apple,always-on;
+	apple,manual-pm;
+};
+
+&ps_disp0_hilo {
+	apple,always-on;
+	apple,manual-pm;
+};
+
+&ps_disp0_ppp {
+	apple,always-on;
+	apple,manual-pm;
+};
