@@ -1164,7 +1164,7 @@ static int poll_interval_param_set(const char *val, const struct kernel_param *k
 	mutex_lock(&bq27xxx_list_lock);
 	list_for_each_entry(di, &bq27xxx_battery_devices, list)
 		if (!di->cache_only)
-			mod_delayed_work(system_percpu_wq, &di->work, 0);
+			mod_delayed_work(system_freezable_wq, &di->work, 0);
 	mutex_unlock(&bq27xxx_list_lock);
 
 	return ret;
@@ -1976,12 +1976,13 @@ static int bq27xxx_battery_current_and_status(
 		val_curr->intval = curr;
 
 	if (val_status) {
-		if (bq27xxx_battery_is_full(di, flags))
+		/* A full flag describes capacity, not whether the pack supplies power. */
+		if (curr < 0)
+			val_status->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+		else if (bq27xxx_battery_is_full(di, flags))
 			val_status->intval = POWER_SUPPLY_STATUS_FULL;
 		else if (curr > 0)
 			val_status->intval = POWER_SUPPLY_STATUS_CHARGING;
-		else if (curr < 0)
-			val_status->intval = POWER_SUPPLY_STATUS_DISCHARGING;
 		else
 			val_status->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
 	}
@@ -2089,7 +2090,7 @@ static void bq27xxx_battery_update_unlocked(struct bq27xxx_device_info *di)
 	di->last_update = jiffies;
 
 	if (!di->removed && !di->cache_only && poll_interval > 0)
-		mod_delayed_work(system_percpu_wq, &di->work, poll_interval * HZ);
+		mod_delayed_work(system_freezable_wq, &di->work, poll_interval * HZ);
 }
 
 void bq27xxx_battery_update(struct bq27xxx_device_info *di)
@@ -2567,7 +2568,7 @@ static void bq27xxx_external_power_changed(struct power_supply *psy)
 	struct bq27xxx_device_info *di = power_supply_get_drvdata(psy);
 
 	/* After charger plug in/out wait 0.5s for things to stabilize */
-	mod_delayed_work(system_percpu_wq, &di->work, HZ / 2);
+	mod_delayed_work(system_freezable_wq, &di->work, HZ / 2);
 }
 
 int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
@@ -2671,7 +2672,7 @@ static int bq27xxx_battery_resume(struct device *dev)
 	if (di->cache_only && di->cache_refresh_ms)
 		queue_delayed_work(system_freezable_wq, &di->work, 0);
 	else if (!di->cache_only)
-		schedule_delayed_work(&di->work, 0);
+		queue_delayed_work(system_freezable_wq, &di->work, 0);
 	return 0;
 }
 #endif /* CONFIG_PM_SLEEP */
