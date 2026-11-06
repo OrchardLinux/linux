@@ -72,7 +72,7 @@
 		reset-gpios = <&pinctrl_ap 33 GPIO_ACTIVE_LOW>;
 		ana-supply = <&touch_ana>;
 		clocks = <&touchclk>;
-		firmware-name = "apple/d221-touch.bin";
+		firmware-name = "apple/d221-touch";
 		touchscreen-size-x = <1125>;
 		touchscreen-size-y = <2436>;
 	};
