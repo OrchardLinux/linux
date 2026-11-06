@@ -16,6 +16,9 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
+#include <linux/interrupt.h>
+#include <linux/pm.h>
+#include <linux/pm_wakeup.h>
 #include <linux/workqueue.h>
 
 #define D2365_STATUS_CHARGE	0x0a
@@ -67,6 +70,7 @@ struct apple_d2365_charger {
 	struct mutex policy_lock;
 	struct delayed_work charge_policy_work;
 	struct device *dev;
+	int plug_irq;			/* wakes the system, 0 without one */
 	struct regmap *regmap;
 	struct power_supply *psy;
 	const struct apple_d2365_config *config;
@@ -613,6 +617,43 @@ static const struct power_supply_desc apple_d2365_charger_desc = {
 	.external_power_changed = apple_d2365_charger_external_power_changed,
 };
 
+/* A plug or unplug: look at the source now, not at the next poll. */
+static irqreturn_t apple_d2365_charger_plug_irq(int irq, void *data)
+{
+	struct apple_d2365_charger *charger = data;
+
+	if (charger->config && !READ_ONCE(charger->shutting_down))
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &charger->charge_policy_work, 0);
+	return IRQ_HANDLED;
+}
+
+static int apple_d2365_charger_suspend(struct device *dev)
+{
+	struct apple_d2365_charger *charger = dev_get_drvdata(dev);
+	int ret;
+
+	if (!charger->plug_irq || !device_may_wakeup(dev))
+		return 0;
+	ret = enable_irq_wake(charger->plug_irq);
+	if (ret)
+		dev_warn(dev, "cannot wake on plug events: %d\n", ret);
+	return 0;
+}
+
+static int apple_d2365_charger_resume(struct device *dev)
+{
+	struct apple_d2365_charger *charger = dev_get_drvdata(dev);
+
+	if (charger->plug_irq && device_may_wakeup(dev))
+		disable_irq_wake(charger->plug_irq);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_d2365_charger_pm_ops,
+				apple_d2365_charger_suspend,
+				apple_d2365_charger_resume);
+
 static int apple_d2365_charger_probe(struct platform_device *pdev)
 {
 	struct power_supply_config config = {};
@@ -697,6 +738,23 @@ static int apple_d2365_charger_probe(struct platform_device *pdev)
 				 &charger->charge_policy_work, 0);
 	}
 
+	ret = platform_get_irq_optional(pdev, 0);
+	if (ret > 0) {
+		charger->plug_irq = ret;
+		ret = devm_request_threaded_irq(dev, charger->plug_irq, NULL,
+						apple_d2365_charger_plug_irq,
+						IRQF_ONESHOT, dev_name(dev),
+						charger);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to request the plug event\n");
+		ret = device_init_wakeup(dev, true);
+		if (ret)
+			return ret;
+	} else if (ret != -ENXIO) {
+		return ret;
+	}
+
 	power_supply_changed(psy);
 
 	return 0;
@@ -762,6 +820,7 @@ static struct platform_driver apple_d2365_charger_driver = {
 	.driver = {
 		.name = "apple-d2365-charger",
 		.of_match_table = apple_d2365_charger_of_match,
+		.pm = pm_sleep_ptr(&apple_d2365_charger_pm_ops),
 	},
 };
 module_platform_driver(apple_d2365_charger_driver);
