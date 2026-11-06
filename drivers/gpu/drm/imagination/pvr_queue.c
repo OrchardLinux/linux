@@ -4,7 +4,9 @@
 #include <drm/drm_managed.h>
 #include <drm/gpu_scheduler.h>
 #include <linux/overflow.h>
+#include <linux/property.h>
 
+#include "pvr_apple.h"
 #include "pvr_cccb.h"
 #include "pvr_context.h"
 #include "pvr_device.h"
@@ -1145,6 +1147,9 @@ int pvr_queue_job_init(struct pvr_job *job, u64 drm_client_id)
 	struct pvr_queue *queue;
 	int err;
 
+	if (pvr_device_is_apple(job->pvr_dev))
+		return pvr_apple_queue_job_init(job, drm_client_id);
+
 	if (atomic_read(&job->ctx->faulty))
 		return -EIO;
 
@@ -1198,6 +1203,11 @@ struct dma_fence *pvr_queue_job_arm(struct pvr_job *job)
  */
 void pvr_queue_job_cleanup(struct pvr_job *job)
 {
+	if (pvr_device_is_apple(job->pvr_dev)) {
+		pvr_apple_queue_job_cleanup(job);
+		return;
+	}
+
 	pvr_queue_fence_put(job->done_fence);
 	pvr_queue_fence_put(job->cccb_fence);
 	pvr_kccb_fence_put(job->kccb_fence);
@@ -1300,6 +1310,9 @@ struct pvr_queue *pvr_queue_create(struct pvr_context *ctx,
 
 	if (WARN_ON(type >= sizeof(props)))
 		return ERR_PTR(-EINVAL);
+
+	if (pvr_device_is_apple(pvr_dev))
+		return pvr_apple_queue_create(ctx, type);
 
 	switch (ctx->type) {
 	case DRM_PVR_CTX_TYPE_RENDER:
@@ -1453,6 +1466,11 @@ void pvr_queue_destroy(struct pvr_queue *queue, bool cleanup_queue_entity)
 	if (!queue)
 		return;
 
+	if (pvr_device_is_apple(queue->ctx->pvr_dev)) {
+		pvr_apple_queue_destroy(queue, cleanup_queue_entity);
+		return;
+	}
+
 	mutex_lock(&queue->ctx->pvr_dev->queues.lock);
 	list_del_init(&queue->node);
 	mutex_unlock(&queue->ctx->pvr_dev->queues.lock);
@@ -1485,6 +1503,9 @@ void pvr_queue_destroy(struct pvr_queue *queue, bool cleanup_queue_entity)
  */
 int pvr_queue_device_init(struct pvr_device *pvr_dev)
 {
+	const struct pvr_device_data *data =
+		device_get_match_data(from_pvr_device(pvr_dev)->dev);
+	bool apple = IS_ENABLED(CONFIG_DRM_POWERVR_APPLE) && data && data->apple_fw;
 	int err;
 
 	INIT_LIST_HEAD(&pvr_dev->queues.active);
@@ -1493,7 +1514,13 @@ int pvr_queue_device_init(struct pvr_device *pvr_dev)
 	if (err)
 		return err;
 
-	pvr_dev->sched_wq = alloc_workqueue("powervr-sched", WQ_UNBOUND, 0);
+	/*
+	 * The Apple GPU stops its firmware for system sleep: no job may reach
+	 * it then, so its schedulers' work freezes with the system. Probe runs
+	 * this before pvr_device_init() sets device_data: read the match data.
+	 */
+	pvr_dev->sched_wq = alloc_workqueue("powervr-sched",
+					    WQ_UNBOUND | (apple ? WQ_FREEZABLE : 0), 0);
 	if (!pvr_dev->sched_wq)
 		return -ENOMEM;
 

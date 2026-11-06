@@ -434,6 +434,10 @@ pvr_power_device_idle(struct device *dev)
 	struct drm_device *drm_dev = platform_get_drvdata(plat_dev);
 	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
 
+	/* Apple: every job holds a reference until it retires, so idle is idle. */
+	if (pvr_device_is_apple(pvr_dev))
+		return 0;
+
 	return pvr_power_is_idle(pvr_dev) ? 0 : -EBUSY;
 }
 
@@ -502,7 +506,9 @@ pvr_power_get_clear(struct pvr_device *pvr_dev)
  * If @hard_reset is %false and the FW processor fails to respond during the reset process, this
  * function will attempt a hard reset.
  *
- * If a hard reset fails then the GPU device is reported as lost.
+ * If a power reference cannot be acquired, return without starting the reset
+ * or changing the device lost state. Otherwise, if a hard reset fails then
+ * the GPU device is reported as lost.
  *
  * Returns:
  *  * 0 on success, or
@@ -518,7 +524,9 @@ pvr_power_reset(struct pvr_device *pvr_dev, bool hard_reset)
 	 * Take a power reference during the reset. This should prevent any interference with the
 	 * power state during reset.
 	 */
-	WARN_ON(pvr_power_get_clear(pvr_dev));
+	err = pvr_power_get_clear(pvr_dev);
+	if (err)
+		return err;
 
 	down_write(&pvr_dev->reset_sem);
 
