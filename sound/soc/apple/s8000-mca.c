@@ -15,7 +15,8 @@
  * one interrupt status word and two interrupt enables instead of a status
  * and a mask register (iOS 15.8 19H422's AppleAE2MCA::_setIISConfig_v1 and its
  * v0/v1 stop and interrupt paths). The offsets that differ are in a
- * per-version table, struct s8000_mca_regs.
+ * per-version table, struct s8000_mca_regs. The S5L8960X (A7) MCA is version
+ * 1 as well.
  *
  * Samples are moved by SmartIO DMA (endpoint 0x28 for MCA0 TX, 0x29 for
  * MCA0 RX) through the generic dmaengine PCM. The SmartIO shim record of
@@ -119,7 +120,8 @@
 #define MCA_V1_TX_SLOTS		0x24
 #define MCA_V1_RX_CFG		0x2c
 #define MCA_V1_RX_CTL		0x30
-#define  MCA_V1_XX_CTL_IOS	0xd	/* written by iOS, meaning unknown */
+#define  MCA_V1_XX_CTL_IOS	0xd	/* written by iOS on T7001, meaning unknown */
+#define  MCA_V1_XX_CTL_A7	0xf	/* the same, on S5L8960X */
 #define MCA_V1_RX_FIFO_CFG	0x34
 #define MCA_V1_RX_SLOTS		0x38
 /* causes latch whether they are enabled or not; write 1 to clear */
@@ -250,6 +252,7 @@ struct s8000_mca_hw {
 	 */
 	bool clocks_at_prepare;
 	unsigned int dai_format;	/* SND_SOC_DAIFMT_* */
+	u32 v1_ctl;			/* version 1: TX/RX_CTL word */
 	unsigned int channels;
 	unsigned int slots;
 	unsigned int frame_bits;	/* 0: slots x slot width, no pad */
@@ -582,7 +585,7 @@ static void mca_write_tx(struct s8000_mca *mca)
 	const struct s8000_mca_regs *regs = mca->regs;
 
 	if (regs->v1)
-		mca_write(mca, MCA_V1_TX_CTL, MCA_V1_XX_CTL_IOS);
+		mca_write(mca, MCA_V1_TX_CTL, mca->hw->v1_ctl);
 	mca_write(mca, regs->tx_fifo_cfg, mca->tx_fifo_cfg);
 	mca_write(mca, regs->tx_slots, mca->tx_slots);
 	if (regs->tx_slots_hi)
@@ -595,7 +598,7 @@ static void mca_write_rx(struct s8000_mca *mca)
 	const struct s8000_mca_regs *regs = mca->regs;
 
 	if (regs->v1)
-		mca_write(mca, MCA_V1_RX_CTL, MCA_V1_XX_CTL_IOS);
+		mca_write(mca, MCA_V1_RX_CTL, mca->hw->v1_ctl);
 	mca_write(mca, regs->rx_fifo_cfg, MCA_RX_FIFO_CFG_IOS);
 	mca_write(mca, regs->rx_slots, mca->rx_slots);
 	if (regs->rx_slots_hi)
@@ -642,8 +645,8 @@ static int mca_init_block(struct s8000_mca *mca)
 	mca_irq_set_mask(mca, MCA_IRQ_ALL);
 	mca_irq_ack(mca, MCA_IRQ_ALL);
 	if (regs->v1) {
-		mca_write(mca, MCA_V1_TX_CTL, MCA_V1_XX_CTL_IOS);
-		mca_write(mca, MCA_V1_RX_CTL, MCA_V1_XX_CTL_IOS);
+		mca_write(mca, MCA_V1_TX_CTL, mca->hw->v1_ctl);
+		mca_write(mca, MCA_V1_RX_CTL, mca->hw->v1_ctl);
 	}
 	mca_write(mca, MCA_SAMPLE, mca->sample);
 	mca_write(mca, regs->tx_fifo_cfg, mca->tx_fifo_cfg);
@@ -1367,6 +1370,7 @@ static const struct s8000_mca_hw t7001_mca_hw = {
 	.regs = &mca_v1_regs,
 	.clock_provider = true,
 	.dai_format = SND_SOC_DAIFMT_DSP_A,
+	.v1_ctl = MCA_V1_XX_CTL_IOS,
 	.channels = 2,
 	.slots = 8,
 	.frame_bits = 256,
@@ -1386,7 +1390,43 @@ static const struct s8000_mca_hw t7001_mca_hw = {
 	.sio_trigger = 0xac,
 };
 
+/*
+ * S5L8960X (A7) MCA0 to the CS42L81 on the iPad Air (J72): the ADT's
+ * /arm-io/mca0/audio-codec iisConfig (iOS 12.5.7 16H81)
+ *
+ *   10 00 00 00 02 00 01 00 ...
+ *
+ * is the J71t link: consumer, I2S, two 16-bit slots, data delay 1. Under
+ * version 1 that is TX_CFG 0x10b, RX_CFG 0x109, FRAME 0x0f101048 + RUN,
+ * PAD 0 and slots 0-1, with 0xf in TX/RX_CTL; the MCLK word 0x58 gives the
+ * codec 12 MHz. Measured against iOS on a J72 at 48 kHz, 16 bit. The
+ * SmartIO shim words are the ADT's dma-channels (FIFO 0xcc, trigger 0xac).
+ * The codec has its own volume, so there is no attenuation.
+ */
+static const struct s8000_mca_hw s5l8960x_mca_hw = {
+	.version = 1,
+	.regs = &mca_v1_regs,
+	.dai_format = SND_SOC_DAIFMT_I2S,
+	.v1_ctl = MCA_V1_XX_CTL_A7,
+	.channels = 2,
+	.slots = 2,
+	.tx_slots = 0x3,
+	.tx_cfg = 0x10b,
+	.rx_cfg = 0x109,
+	.rx_slots = 0x3,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.frame_flags = MCA_FRAME_DUTY | MCA_FRAME_FMT,
+	.mclk_ctl = 0x58,
+	.mclk_rate = 12000000,
+	.sio_xfer16 = 0x21,
+	.sio_xfer32 = 0x22,
+	.sio_timeout = 0,
+	.sio_fifo = 0xcc,
+	.sio_trigger = 0xac,
+};
+
 static const struct of_device_id s8000_mca_of_match[] = {
+	{ .compatible = "apple,s5l8960x-mca", .data = &s5l8960x_mca_hw },
 	{ .compatible = "apple,s8000-mca", .data = &s8000_mca_hw },
 	{ .compatible = "apple,t7001-mca", .data = &t7001_mca_hw },
 	{ .compatible = "apple,t8010-mca", .data = &t8010_mca_hw },
