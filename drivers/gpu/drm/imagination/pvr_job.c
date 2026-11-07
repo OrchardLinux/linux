@@ -713,6 +713,9 @@ pvr_jobs_link_geom_frag(struct pvr_job_data *job_data, u32 *job_count)
  *  * -%EINVAL on invalid arguments, or
  *  * Any other error.
  */
+/* Apple GPUs: one submission arms its jobs at a time (pvr_submit_jobs()) */
+static DEFINE_MUTEX(apple_submit_order);
+
 int
 pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 		struct drm_pvr_ioctl_submit_jobs_args *args)
@@ -757,6 +760,20 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 
 	xa_init_flags(&signal_array, XA_FLAGS_ALLOC);
 
+	/*
+	 * Apple GPUs hold one scene at a time: a geometry job is ordered after the
+	 * last fragment job armed on any context (pvr_apple_job_add_deps()). The
+	 * jobs of a submission are armed one by one, so a submission from another
+	 * file in between let its geometry job run between this geometry job and
+	 * its fragment job, which then rendered the other scene and hung the GPU.
+	 * Submissions are made whole under one lock.
+	 */
+	if (pvr_device_is_apple(pvr_dev)) {
+		err = mutex_lock_interruptible(&apple_submit_order);
+		if (err)
+			goto out_exec_fini_unlocked;
+	}
+
 	err = prepare_job_syncs_for_each(pvr_file, job_data, &args->jobs.count,
 					 &signal_array);
 	if (err)
@@ -779,6 +796,9 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 	err = 0;
 
 out_exec_fini:
+	if (pvr_device_is_apple(pvr_dev))
+		mutex_unlock(&apple_submit_order);
+out_exec_fini_unlocked:
 	drm_exec_fini(&exec);
 	pvr_sync_signal_array_cleanup(&signal_array);
 
