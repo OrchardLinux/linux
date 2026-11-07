@@ -733,3 +733,11 @@ config USB_XEN_HCD
 	  by the Xen host (usually Dom0).
 	  Only needed if the kernel is running in a Xen guest and generic
 	  access to a USB device is needed.
+
+config J72_WLAN_TRANSPORT
+	tristate "Opt-in J72 internal HSIC Wi-Fi transport"
+	depends on ARCH_APPLE && USB_EHCI_HCD && I2C && GPIOLIB && PM_GENERIC_DOMAINS
+	help
+	  Exact J72 measured PHY, radio reset, HOST_READY and EHCI ownership.
+	  Requires explicit confirm_native; checks initial hardware state and
+	  uses the normal USB HCD/DMA APIs. No automatic DT probe.
