@@ -255,6 +255,14 @@ config EFI_PARTITION
 	  Say Y here if you would like to use hard disks under Linux which
 	  were partitioned using EFI GPT.
 
+config LWVM_PARTITION
+	bool "Apple LwVM partition support" if PARTITION_ADVANCED
+	select CRC32
+	help
+	  Say Y here to read the Lightweight Volume Manager (LwVM) partition
+	  table that older iOS releases use on the flash of iPhones and iPads.
+	  Partitions whose chunks are not stored contiguously are skipped.
+
 config SYSV68_PARTITION
 	bool "SYSV68 partition table support" if PARTITION_ADVANCED
 	default y if VME
