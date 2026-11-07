@@ -14,6 +14,32 @@
 / {
 	chassis-type = "tablet";
 
+	/*
+	 * The speakers: the CS42L81 on SPI3 (control) and MCA0 (data), as in
+	 * Apple's /arm-io/spi3/audio-codec and /arm-io/mca0/audio-codec, the
+	 * same in the J71, J72 and J73 trees. The codec drives both speakers
+	 * as one stereo pair. Headphones and microphones are not described
+	 * yet.
+	 */
+	sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "iPad Air Speakers";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,bitclock-master = <&codec_dai>;
+		simple-audio-card,frame-master = <&codec_dai>;
+		simple-audio-card,widgets = "Speaker", "Speakers";
+		simple-audio-card,routing = "Speakers", "SPKOUT";
+		simple-audio-card,pin-switches = "Speakers";
+
+		simple-audio-card,cpu {
+			sound-dai = <&mca0>;
+		};
+
+		codec_dai: simple-audio-card,codec {
+			sound-dai = <&cs42l81>;
+		};
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -90,5 +116,23 @@
 				};
 			};
 		};
+	};
+};
+
+&spi3 {
+	/* ADT function-spi_cs0 */
+	cs-gpios = <&pinctrl 99 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	cs42l81: audio-codec@0 {
+		compatible = "cirrus,cs42l81";
+		reg = <0>;
+		spi-max-frequency = <100000>;
+		clocks = <&mca0>;
+		clock-names = "mclk";
+		/* ADT function-spkr_mute */
+		mute-gpios = <&pinctrl 94 GPIO_ACTIVE_LOW>;
+		cirrus,speaker-max-gain = <(-300)>;
+		#sound-dai-cells = <0>;
 	};
 };
