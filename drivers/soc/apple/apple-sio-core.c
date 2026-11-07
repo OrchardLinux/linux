@@ -33,7 +33,8 @@
 /*
  * AppleA7IOP register layout. Version 2 (S8000, T8010) and version 1 (T7000
  * and T7001, the A8 and A8X) differ only in where the registers sit; iOS's
- * AppleA7IOPV1 and AppleA7IOPV2 program them in the same order.
+ * AppleA7IOPV1 and AppleA7IOPV2 program them in the same order. The A7
+ * (S5L8960X) block has the version 1 layout.
  */
 struct apple_sio_regs {
 	u32 remap_ap_lo;
@@ -50,6 +51,10 @@ struct apple_sio_regs {
 	bool mirror;		/* V2: mask writes are mirrored at 0xc00/0xc04 */
 	bool legacy_status;	/* V2: an older IRQ status at 0xb84 */
 	bool enable_tx;		/* V1: the AP enables the A2I FIFO itself */
+	/* A7: neither set nor wait for the A2I enable bit, as measured on a J72 */
+	bool tx_no_enable;
+	/* A7: the boot loader leaves a remap on; turn it off before replacing it */
+	bool remap_off_first;
 };
 
 #define APPLE_SIO_CPU_RUN		BIT(4)
@@ -98,6 +103,22 @@ static const struct apple_sio_regs apple_sio_regs_v1 = {
 	.enable_tx = true,
 };
 
+static const struct apple_sio_regs apple_sio_regs_s5l8960x = {
+	.remap_ap_lo = 0x08,
+	.remap_ap_hi = 0x0c,
+	.remap_iop_lo = 0x10,
+	.remap_iop_hi = 0x14,
+	.remap_size_lo = 0x18,
+	.remap_size_hi = 0x1c,
+	.remap_enable = 0x20,
+	.cpu_control = 0x28,
+	.time_lo = 0x810,
+	.time_hi = 0x818,
+	.mbox = 0x1000,
+	.tx_no_enable = true,
+	.remap_off_first = true,
+};
+
 #define APPLE_SIO_MBOX_ENABLE		BIT(0)
 #define APPLE_SIO_MBOX_EMPTY		BIT(17)
 #define APPLE_SIO_MBOX_ERROR		GENMASK(19, 18)
@@ -128,6 +149,9 @@ static const struct apple_sio_regs apple_sio_regs_v1 = {
 
 struct apple_sio_hw {
 	const struct apple_sio_regs *regs;
+	/* Region setup commands the firmware takes (NULL: all of them) */
+	const u8 *setup;
+	unsigned int num_setup;
 	const struct apple_sio_dma_range *dma_ranges;
 	unsigned int num_dma_ranges;
 };
@@ -190,6 +214,8 @@ struct apple_sio {
 	/* Protect contiguous Descriptor-0 slot allocation. */
 	spinlock_t desc0_lock;
 	struct platform_device *dma_pdev;
+	const u8 *setup;
+	unsigned int num_setup;
 	unsigned int setup_index;
 	unsigned int irq_count;
 	unsigned int unmatched_count;
@@ -211,6 +237,10 @@ apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 			       void *callback_data, bool atomic, int fixed_tag);
 
 static void apple_sio_submit_setup(struct apple_sio *sio);
+
+static const u8 apple_sio_setup_all[APPLE_SIO_SETUP_COMMANDS] = {
+	0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+};
 
 static unsigned long apple_sio_request_key(u8 endpoint, u8 tag)
 {
@@ -326,9 +356,9 @@ static bool apple_sio_can_read(u32 status)
 	       !(status & (APPLE_SIO_MBOX_ERROR | APPLE_SIO_MBOX_EMPTY));
 }
 
-static bool apple_sio_can_write(u32 status)
+static bool apple_sio_can_write(struct apple_sio *sio, u32 status)
 {
-	return (status & APPLE_SIO_MBOX_ENABLE) &&
+	return (sio->regs->tx_no_enable || (status & APPLE_SIO_MBOX_ENABLE)) &&
 	       !(status & APPLE_SIO_MBOX_ERROR) &&
 	       (status & APPLE_SIO_MBOX_EMPTY);
 }
@@ -446,7 +476,7 @@ static int apple_sio_send(struct apple_sio *sio, u64 message)
 	}
 
 	ret = readl_poll_timeout(sio->mbox + APPLE_SIO_TX_STATUS, status,
-				 apple_sio_can_write(status), 10,
+				 apple_sio_can_write(sio, status), 10,
 				 APPLE_SIO_TX_TIMEOUT_US);
 	if (ret)
 		goto out_unlock;
@@ -458,7 +488,7 @@ static int apple_sio_send(struct apple_sio *sio, u64 message)
 	}
 
 	status = readl_relaxed(sio->mbox + APPLE_SIO_TX_STATUS);
-	if (!apple_sio_can_write(status)) {
+	if (!apple_sio_can_write(sio, status)) {
 		ret = -EBUSY;
 		goto out_hw_unlock;
 	}
@@ -488,7 +518,7 @@ static int apple_sio_send_atomic(struct apple_sio *sio, u64 message)
 
 	status = readl_relaxed(sio->mbox + APPLE_SIO_TX_STATUS);
 	sio->last_tx_status = status;
-	if (!apple_sio_can_write(status)) {
+	if (!apple_sio_can_write(sio, status)) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
@@ -643,7 +673,7 @@ static void apple_sio_setup_done(void *data, int status, u64 response)
 	}
 
 	sio->setup_index++;
-	if (sio->setup_index == APPLE_SIO_SETUP_COMMANDS) {
+	if (sio->setup_index == sio->num_setup) {
 		sio->setup_status = 0;
 		complete_all(&sio->setup_done);
 		return;
@@ -665,9 +695,11 @@ static void apple_sio_submit_setup(struct apple_sio *sio)
 		0x0e, 0x01, 0x02, 0x0b, 0x0c,
 	};
 	struct apple_sio_async *request;
-	u32 index = sio->setup_index;
+	u32 index;
 	u32 value;
 
+	index = sio->setup_index < sio->num_setup ?
+		sio->setup[sio->setup_index] : APPLE_SIO_SETUP_COMMANDS;
 	switch (index) {
 	case 0:
 		value = lower_32_bits(sio->ep0_general.dma >> 12);
@@ -890,6 +922,8 @@ static int apple_sio_start(struct apple_sio *sio, const char *firmware_name)
 	sio->firmware_dma = dma;
 	sio->firmware_size = size;
 
+	if (sio->regs->remap_off_first)
+		writel(0, sio->base + sio->regs->remap_enable);
 	writel(0, sio->base + sio->regs->remap_iop_lo);
 	writel(0, sio->base + sio->regs->remap_iop_hi);
 	writel(lower_32_bits(size), sio->base + sio->regs->remap_size_lo);
@@ -1037,6 +1071,9 @@ static int apple_sio_probe(struct platform_device *pdev)
 	}
 	sio->regs = hw->regs;
 	sio->mbox = sio->base + hw->regs->mbox;
+	sio->setup = hw->setup ?: apple_sio_setup_all;
+	sio->num_setup = hw->setup ? hw->num_setup :
+				     ARRAY_SIZE(apple_sio_setup_all);
 
 	irq = platform_get_irq(pdev, APPLE_SIO_RX_IRQ_INDEX);
 	if (irq < 0) {
@@ -1187,7 +1224,27 @@ static const struct apple_sio_hw apple_sio_t7000_hw = {
 	.num_dma_ranges = ARRAY_SIZE(apple_sio_t7000_dma_ranges),
 };
 
+/* MCA0, the codec's link, as described by the J72 ADT */
+static const struct apple_sio_dma_range apple_sio_s5l8960x_dma_ranges[] = {
+	{ 0x28, 0x29 },
+};
+
+/*
+ * The A7 firmware takes the general region and the two descriptor rings
+ * only, no SPI or endpoint 3 region (setup commands 0, 1 and 6-9).
+ */
+static const u8 apple_sio_s5l8960x_setup[] = { 0, 1, 6, 7, 8, 9 };
+
+static const struct apple_sio_hw apple_sio_s5l8960x_hw = {
+	.regs = &apple_sio_regs_s5l8960x,
+	.setup = apple_sio_s5l8960x_setup,
+	.num_setup = ARRAY_SIZE(apple_sio_s5l8960x_setup),
+	.dma_ranges = apple_sio_s5l8960x_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_s5l8960x_dma_ranges),
+};
+
 static const struct of_device_id apple_sio_of_match[] = {
+	{ .compatible = "apple,s5l8960x-sio", .data = &apple_sio_s5l8960x_hw },
 	{ .compatible = "apple,t7000-sio", .data = &apple_sio_t7000_hw },
 	{ .compatible = "apple,s8000-sio", .data = &apple_sio_s8000_hw },
 	{ .compatible = "apple,t8010-sio", .data = &apple_sio_t8010_hw },
@@ -1207,8 +1264,9 @@ static struct platform_driver apple_sio_driver = {
 };
 module_platform_driver(apple_sio_driver);
 
+MODULE_FIRMWARE("apple/s5l8960x-smartio.bin");
 MODULE_FIRMWARE("apple/t7000-smartio.bin");
 MODULE_FIRMWARE("apple/s8000-smartio.bin");
 MODULE_FIRMWARE("apple/t8010-smartio.bin");
-MODULE_DESCRIPTION("Apple T7000/S8000/T8010 SmartIO coprocessor driver");
+MODULE_DESCRIPTION("Apple S5L8960X/T7000/S8000/T8010 SmartIO coprocessor driver");
 MODULE_LICENSE("Dual MIT/GPL");
