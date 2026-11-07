@@ -40,6 +40,17 @@
 		clock-output-names = "spi2";
 	};
 
+	/*
+	 * SPI3's rate is in the clock table iBoot fills in (clock-id 0x135);
+	 * 60 MHz as for SPI2, the rate the iPad Air's codec link ran at.
+	 */
+	spi3_clk: clock-spi3 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <60000000>;
+		clock-output-names = "spi3";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -114,6 +125,12 @@
 			power-domains = <&ps_ans>;
 		};
 
+		/* Apple's i2s-switch,s5l8960x: AppleAE2I2SSwitch3, as on S8000 */
+		i2s_switch: syscon@20a003000 {
+			compatible = "apple,s5l8960x-i2s-switch", "syscon";
+			reg = <0x2 0x0a003000 0x0 0x1000>;
+		};
+
 		spi1: spi@20a084000 {
 			compatible = "apple,s5l8960x-spi";
 			reg = <0x2 0x0a084000 0x0 0x4000>;
@@ -137,6 +154,19 @@
 			pinctrl-0 = <&spi2_pins>;
 			pinctrl-names = "default";
 			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/* Pins as the boot loader leaves them */
+		spi3: spi@20a08c000 {
+			compatible = "apple,s5l8960x-spi";
+			reg = <0x2 0x0a08c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 139 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&spi3_clk>;
+			power-domains = <&ps_spi3>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
@@ -166,6 +196,26 @@
 			clock-names = "uart", "clk_uart_baud0";
 			power-domains = <&ps_uart5>;
 			status = "disabled";
+		};
+
+		/*
+		 * MCA0: Apple's mca,s5l8960x, mca-version 1. Its i2s_route, aud0 to
+		 * pin0, is the same in the device tree of every A7 iPad.
+		 */
+		mca0: mca@20a0c0000 {
+			compatible = "apple,s5l8960x-mca";
+			reg = <0x2 0x0a0c0000 0x0 0x4000>,
+			      <0x2 0x0a002000 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 147 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca0>;
+			dmas = <&sio 0x28>;
+			dma-names = "tx";
+			apple,i2s-switch = <&i2s_switch 0 0>;
+			#clock-cells = <0>;
+			clock-output-names = "mca0-mclk";
+			#sound-dai-cells = <0>;
 		};
 
 		i2c0: i2c@20a110000 {
@@ -232,6 +282,22 @@
 			#clock-cells = <0>;
 			clock-frequency = <32768>;
 			status = "disabled";
+		};
+
+		/* SmartIO: AppleA7IOP version 1, the DMA engine of the MCAs */
+		sio: dma-controller@20ae00000 {
+			compatible = "apple,s5l8960x-sio";
+			reg = <0x2 0x0ae00000 0x0 0x2000>;
+			reg-names = "a7iop";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 133 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 132 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 135 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 134 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_sio>;
+			firmware-name = "apple/s5l8960x-smartio.bin";
+			dma-channels = <64>;
+			#dma-cells = <1>;
 		};
 
 		bus@20c000000 {
