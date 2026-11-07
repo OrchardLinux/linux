@@ -765,7 +765,16 @@ __pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
 
 	pvr_gem_object_get(pvr_obj);
 
-	mutex_lock(&vm_ctx->lock);
+	/*
+	 * Killable: a process blocked here behind a stuck lock holder can still be
+	 * killed, which closes its files and frees its memory, instead of staying in
+	 * D state with its GPU memory pinned until a reboot.
+	 */
+	err = mutex_lock_killable(&vm_ctx->lock);
+	if (err) {
+		pvr_vm_bind_op_fini(&bind_op);
+		return err;
+	}
 	err = drm_gpuvm_exec_lock(&vm_exec);
 	if (err)
 		goto err_cleanup;
