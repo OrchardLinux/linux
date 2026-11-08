@@ -968,7 +968,7 @@ static int composite_apple_current_limit(struct usb_composite_dev *cdev,
 					 u16 w_value, u16 w_index)
 {
 	cdev->apple_extra_ma = (s16)w_index;
-	DBG(cdev, "Apple host current grant: extra %d mA, suspend %d mA\n",
+	dev_info(&cdev->gadget->dev, "Apple host current grant: extra %d mA, suspend %d mA\n",
 	    (s16)w_index, (s16)w_value);
 	composite_vbus_draw(cdev, cdev->vbus_draw_ma);
 	return 0;
@@ -2221,7 +2221,7 @@ unknown:
 			goto check_value;
 		}
 
-		if (ctrl->bRequestType == (USB_DIR_OUT | USB_TYPE_VENDOR |
+		if ((ctrl->bRequestType & ~USB_DIR_IN) == (USB_TYPE_VENDOR |
 					   USB_RECIP_DEVICE) &&
 		    ctrl->bRequest == USB_APPLE_REQ_CURRENT_LIMIT && !w_length &&
 		    le16_to_cpu(cdev->desc.idVendor) == USB_APPLE_VENDOR_ID) {
