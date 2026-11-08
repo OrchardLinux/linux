@@ -112,3 +112,11 @@ source "drivers/phy/intel/Kconfig"
 source "drivers/phy/xilinx/Kconfig"
 
 endmenu
+
+config PHY_APPLE_S5L_USB
+	tristate "Apple S5L USB PHY"
+	depends on ARCH_APPLE_S5L
+	select GENERIC_PHY
+	help
+	  USB PHY driver for Apple S5L SoCs (A4/A5).
+
