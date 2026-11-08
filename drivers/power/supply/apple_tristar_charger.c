@@ -667,7 +667,12 @@ static int tristar_identify(struct tristar_charger *chg, struct tristar_ident *i
  */
 static unsigned int tristar_usb_ma(struct tristar_charger *chg)
 {
-	return chg->usb_epoch == READ_ONCE(chg->epoch) ? chg->usb_ma : 0;
+	if (chg->usb_epoch != READ_ONCE(chg->epoch)) {
+		dev_dbg(chg->dev, "USB budget stale: report epoch %u, source epoch %u\n",
+			chg->usb_epoch, READ_ONCE(chg->epoch));
+		return 0;
+	}
+	return chg->usb_ma;
 }
 
 /*
@@ -1216,7 +1221,8 @@ static int tristar_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		/* What the identified source or USB host allows; 0 when unknown. */
-		val->intval = max(chg->source_ma, tristar_usb_ma(chg)) * 1000;
+		val->intval = min(max(chg->source_ma, tristar_usb_ma(chg)),
+				  chg->max_ma) * 1000;
 		break;
 	default:
 		mutex_unlock(&chg->lock);
@@ -1239,23 +1245,29 @@ static int tristar_set_property(struct power_supply *psy,
 				const union power_supply_propval *val)
 {
 	struct tristar_charger *chg = power_supply_get_drvdata(psy);
-	unsigned int old_code;
+	unsigned int old_code, old_ma, report_ma;
 
 	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
 		return -EINVAL;
 
 	mutex_lock(&chg->lock);
 	old_code = chg->code;
-	chg->usb_ma = chg->present && chg->usb_on ? max(val->intval, 0) / 1000 : 0;
+	old_ma = tristar_usb_ma(chg);
+	report_ma = max(val->intval, 0) / 1000;
+	chg->usb_ma = chg->present && chg->usb_on ?
+		min(report_ma, chg->max_ma) : 0;
 	chg->usb_epoch = READ_ONCE(chg->epoch);
-	dev_dbg(chg->dev, "USB host allows %u mA\n", chg->usb_ma);
+	dev_dbg(chg->dev,
+		"USB budget: reported %u mA, accepted %u mA, present %u, data %u, epoch %u\n",
+		report_ma, chg->usb_ma, chg->present, chg->usb_on,
+		chg->usb_epoch);
 	if (!chg->stopping) {
 		tristar_update_target(chg);
 		mod_delayed_work(chg->wq, &chg->poll_work, 0);
 	}
 	mutex_unlock(&chg->lock);
 
-	if (READ_ONCE(chg->code) != old_code)
+	if (READ_ONCE(chg->code) != old_code || old_ma != READ_ONCE(chg->usb_ma))
 		power_supply_changed(psy);
 	return 0;
 }
