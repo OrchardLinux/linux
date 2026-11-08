@@ -959,7 +959,7 @@ static void reset_config(struct usb_composite_dev *cdev)
 static void composite_vbus_draw(struct usb_composite_dev *cdev, unsigned int mA)
 {
 	cdev->vbus_draw_ma = mA;
-	if (mA && cdev->apple_extra_ma)
+	if (mA && !cdev->suspended && cdev->apple_extra_ma)
 		mA = max(500 + cdev->apple_extra_ma, 0);
 	usb_gadget_vbus_draw(cdev->gadget, mA);
 }
@@ -2665,6 +2665,7 @@ void composite_resume(struct usb_gadget *gadget)
 	DBG(cdev, "resume\n");
 	if (cdev->driver->resume)
 		cdev->driver->resume(cdev);
+	cdev->suspended = 0;
 	if (cdev->config) {
 		list_for_each_entry(f, &cdev->config->functions, list) {
 			/*
@@ -2695,8 +2696,6 @@ void composite_resume(struct usb_gadget *gadget)
 		maxpower = min(maxpower, 100U);
 		composite_vbus_draw(cdev, maxpower);
 	}
-
-	cdev->suspended = 0;
 }
 
 /*-------------------------------------------------------------------------*/
