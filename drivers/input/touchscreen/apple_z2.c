@@ -214,6 +214,7 @@ struct apple_z2_chip_info {
 	const struct apple_z2_n1_info *n1;
 	bool recover_control_stall;
 	bool shifted_reply_header;
+	unsigned int upload_hz;	/* firmware upload clock, if above the device's */
 };
 
 struct apple_z2 {
@@ -3307,6 +3308,8 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 		blob_xfer.bits_per_word = 16;
 	if (init && apple_z2_is_j71b(z2))
 		blob_xfer.speed_hz = 500000;
+	else
+		blob_xfer.speed_hz = z2->info->upload_hz;
 
 	dev_dbg(&z2->spidev->dev, "firmware blob len=%u bpw=%u\n",
 		size, blob_xfer.bits_per_word);
@@ -3355,7 +3358,8 @@ static int apple_z2_send_firmware_blob(struct apple_z2 *z2, const u8 *data,
 		apple_z2_irq_on(z2);
 	}
 
-	if (!defer_irq_wait)
+	/* J71b firmware sends no interrupt per blob; the wait always ran out. */
+	if (!defer_irq_wait && !apple_z2_is_j71b(z2))
 		wait_for_completion_timeout(&z2->boot_irq,
 					    msecs_to_jiffies(20));
 
@@ -3790,8 +3794,10 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 	 * controller stopped interrupting for good. On a wake from sleep the
 	 * screen is lit while this runs, so the first taps come here. With
 	 * the level interrupt masked they wait in the controller instead.
+	 * The J71b takes the wake command at once; the J172 sequence waits.
 	 */
-	msleep(2260);
+	if (!apple_z2_is_j71b(z2))
+		msleep(2260);
 	mutex_lock(&z2->io_lock);
 	error = apple_z2_j172_init_writes_locked(z2);
 	if (!error && apple_z2_is_j71b(z2) && z2->upload_irq_masked) {
@@ -4100,6 +4106,7 @@ static const struct apple_z2_chip_info apple_z2_j71b_info = {
 	.cs_setup_us = 1000,
 	.cs_inactive_us = 1000,
 	.recover_control_stall = true,
+	.upload_hz = 24000000,
 };
 
 /*
