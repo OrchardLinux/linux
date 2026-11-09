@@ -65,6 +65,7 @@ struct apple_vxd_variant {
 	unsigned int vxd_version;	/* ADT "vxd-version" */
 	u32 num_gart_pts;		/* mapped page tables (512 = 2 GiB) */
 	bool hevc_supported;
+	bool has_integration;		/* second reg range, see VXD_INTEG_CTRL */
 };
 
 /*
@@ -277,6 +278,7 @@ struct apple_vxd_dev {
 
 	void __iomem *regs;
 	resource_size_t regs_size;	/* bounds every ring access */
+	void __iomem *integ;		/* integration registers, or NULL */
 	int irq;
 
 	/* Core state. */
