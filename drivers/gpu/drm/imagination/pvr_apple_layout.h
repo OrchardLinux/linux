@@ -49,6 +49,7 @@ void pvr_apple_layout_write_3d_job(u8 *heap, u32 seq, const struct pvr_apple_3d_
 u32 pvr_apple_layout_3d_producer(void);
 u32 pvr_apple_layout_ring_indices_offset(unsigned int ring);
 u32 pvr_apple_layout_3d_stamp_offset(void);
+u32 pvr_apple_layout_3d_retired_offset(void);
 u32 pvr_apple_layout_mmu_root_offset(unsigned int ctx);
 u32 pvr_apple_layout_mmu_gen_offset(unsigned int ctx);
 u32 pvr_apple_layout_init_offset(void);

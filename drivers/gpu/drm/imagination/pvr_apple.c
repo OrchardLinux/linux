@@ -930,11 +930,27 @@ static void pvr_apple_ack_events(struct pvr_apple *apple)
 	spin_unlock_irqrestore(&apple->event_lock, flags);
 }
 
-/* Fragment-done events posted so far (taking new events off the ring) */
+/*
+ * The last fragment job whose retirement, free-list unregister included, is
+ * done: the retirement stamp every fragment command names (+0x89c), which the
+ * firmware writes before the type-1 event. One event may announce several
+ * retirements, so the stamp is read as a watermark, never counted per event.
+ * Its low byte is the job's sequence number; fewer than 256 are outstanding.
+ */
+static u32 pvr_apple_frag_retired_seq(struct pvr_apple *apple)
+{
+	u32 seq = READ_ONCE(apple->frag_seq), mark;
+
+	rmb();	/* after the events that announced it */
+	mark = heap_read32(apple, pvr_apple_layout_3d_retired_offset());
+	return seq - (u8)(seq - mark);
+}
+
+/* The retirement watermark, taking new events off the ring first */
 static u32 pvr_apple_frag_events(struct pvr_apple *apple)
 {
 	pvr_apple_ack_events(apple);
-	return READ_ONCE(apple->frag_events);
+	return pvr_apple_frag_retired_seq(apple);
 }
 
 /* Drop the runtime-PM references of @n jobs that left the pending lists. */
@@ -967,13 +983,13 @@ static void pvr_apple_poll_work(struct work_struct *work)
 		 * A fragment job's stamp comes before the firmware retires it, so
 		 * its target may not be complete in memory yet for readers that
 		 * do not go through the GPU, such as the display. Its fence also
-		 * waits for the fragment-done event, which follows the retirement.
+		 * waits for the retirement stamp.
 		 */
 		if (engine == APPLE_ENGINE_FRAG) {
-			u32 events = READ_ONCE(apple->frag_events);
+			u32 retired = pvr_apple_frag_retired_seq(apple);
 
-			if ((s32)(events - done) < 0)
-				done = events;
+			if ((s32)(retired - done) < 0)
+				done = retired;
 		}
 		list_for_each_entry_safe(fence, tmp, &apple->pending[engine], node) {
 			if ((s32)(done - (u32)fence->base.seqno) < 0)
@@ -1276,7 +1292,7 @@ static int pvr_apple_queue_render(struct pvr_apple *apple, struct pvr_vm_context
 		 * the free list: a geometry job dispatched in between had its
 		 * registration cleared, and the next Start3D loaded a null entry and
 		 * crashed the firmware (fw 0x16634, Hyprland every few thousand
-		 * renders). The fragment-done event follows the retirement.
+		 * renders). The retirement stamp is written after the unregister.
 		 */
 		if (!err) {
 			u32 events;
@@ -1286,7 +1302,7 @@ static int pvr_apple_queue_render(struct pvr_apple *apple, struct pvr_vm_context
 						apple);
 			if (err) {
 				dev_err(apple_dev(apple),
-					"no fragment-done event for fragment job %u (%u events)\n",
+					"fragment job %u not retired (retirement stamp %u)\n",
 					apple->frag_seq, events);
 				err = 0;
 			}
