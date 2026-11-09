@@ -820,7 +820,12 @@ static int pvr_apple_wait_engine(struct pvr_apple *apple, enum pvr_apple_engine 
 {
 	u32 done;
 
-	return read_poll_timeout(pvr_apple_engine_done, done, (s32)(done - seq) >= 0, 1000,
+	/*
+	 * 20 us steps: this runs before every render job is written and, at a
+	 * switch of GPU VM, for every engine; 1 ms steps cost a scene-heavy
+	 * WebGL page several milliseconds per frame
+	 */
+	return read_poll_timeout(pvr_apple_engine_done, done, (s32)(done - seq) >= 0, 20,
 				 timeout_us, false, apple, engine);
 }
 
@@ -1261,7 +1266,7 @@ static int pvr_apple_queue_render(struct pvr_apple *apple, struct pvr_vm_context
 		u32 retired;
 
 		err = read_poll_timeout(pvr_apple_frag_retired, retired,
-					!((retired ^ apple->frag_seq) & 0xff), 100, 1000000, false,
+					!((retired ^ apple->frag_seq) & 0xff), 20, 1000000, false,
 					apple);
 		if (err)
 			dev_err(apple_dev(apple), "firmware did not retire fragment job %u\n",
