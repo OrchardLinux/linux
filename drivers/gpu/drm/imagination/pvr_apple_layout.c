@@ -101,6 +101,14 @@
  * (0x908), microsequence +0xa00, scratch +0xb00, context +0xc00. Both inside
  * heap descriptor 1 (0x50000-0x90000).
  */
+/*
+ * Fragment retirement stamp: every fragment command's +0x89c names it, and the
+ * firmware writes the command's scheduling token (+0x8a4) there once the
+ * retirement, free-list unregister included, is done, before the type-1
+ * event. One event may announce several retirements: the stamp is the
+ * watermark. In the old single fragment command area.
+ */
+#define HEAP_3D_RETIRED		0x76000u
 #define HEAP_3D_JOBS		0x5d000u
 #define JOBS_3D			4u
 #define JOB_3D_STRIDE		0x1000u
@@ -378,6 +386,7 @@ static const struct { const char *name; u32 start, size; } heap2_areas[] = {
 	{ "power state", HEAP_POWER_STATE, 0x4314 },
 	{ "sku records", HEAP_SKU_RECORDS, 512 * 36 },
 	{ "sku control", HEAP_SKU_CONTROL, 0x100 },
+	{ "3d retirement stamp", HEAP_3D_RETIRED, 0x100 },
 	{ "3d queue..ring", HEAP_3D_QUEUE, HEAP_3D_POOL + 0x2000 - HEAP_3D_QUEUE },
 	{ "pds pt", HEAP_PDS_PT, 0x4000 },
 	{ "compute jobs", HEAP_JOBS, JOB_SLOTS * JOB_STRIDE },
@@ -659,7 +668,7 @@ void pvr_apple_layout_write_3d_job(u8 *heap, u32 seq, const struct pvr_apple_3d_
 	wr32(heap, cmd + 0x018, 0xc8);
 	wr32(heap, cmd + 0x01c, fw_va(ctx));
 	/* Scheduling descriptor, as geometry's +0x550 block */
-	wr32(heap, cmd + 0x89c, fw_va(sc + F_STAMP));
+	wr32(heap, cmd + 0x89c, fw_va(HEAP_3D_RETIRED));
 	wr32(heap, cmd + 0x8a4, sched_token(seq));
 	heap[cmd + 0x8a8] = F_SLOT;
 	wr32(heap, cmd + 0x8b4, seq);
@@ -764,6 +773,11 @@ u32 pvr_apple_layout_event_consumer(void)
 u32 pvr_apple_layout_event_producer(void)
 {
 	return HEAP_EVENT_RING + 0x20;
+}
+
+u32 pvr_apple_layout_3d_retired_offset(void)
+{
+	return HEAP_3D_RETIRED;
 }
 
 u32 pvr_apple_layout_3d_stamp_offset(void)
