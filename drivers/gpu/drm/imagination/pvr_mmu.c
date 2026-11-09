@@ -2277,8 +2277,13 @@ pvr_page_create(struct pvr_mmu_op_context *op_ctx, dma_addr_t dma_addr,
 static void
 pvr_page_destroy(struct pvr_mmu_op_context *op_ctx)
 {
-	/* Do nothing if the page does not exist. */
-	if (!pvr_page_table_l0_entry_is_valid(op_ctx->curr_page.l0_table,
+	/*
+	 * Do nothing if the page does not exist, nor if its L0 table does not:
+	 * pvr_mmu_map() unwinding a failed map (-ENOMEM from a page table
+	 * allocation) walks pages whose tables were never created.
+	 */
+	if (!op_ctx->curr_page.l0_table ||
+	    !pvr_page_table_l0_entry_is_valid(op_ctx->curr_page.l0_table,
 					      op_ctx->curr_page.l0_idx)) {
 		return;
 	}
