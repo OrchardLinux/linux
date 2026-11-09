@@ -473,6 +473,19 @@ void pvr_apple_layout_build_ta(u8 *heap)
 	wr32(heap, HEAP_TA_QUEUE_STATE + 0x50, 256);
 }
 
+/*
+ * Scheduling token: bits 8-14 name the channel's DAG scheduling entry, which
+ * the firmware expects to advance by one, modulo 128, with every command on
+ * the channel (it panics "Non Sequential Stamp Updates" otherwise); a switch
+ * of channel rebinds from the entry given, which is why a constant entry
+ * worked while geometry and fragment commands alternated. @seq counts the
+ * channel's commands; the low byte stays the sequence number.
+ */
+static u32 sched_token(u32 seq)
+{
+	return ((seq % 128) << 8) | (seq & 0xff);
+}
+
 /* Scratch words of the geometry job */
 #define TA_SKIP			0x00	/* StartTA w7: non-zero skips the job */
 #define TA_RESUME		0x10	/* StartTA w16: 0 = fresh parameter state */
@@ -542,7 +555,7 @@ void pvr_apple_layout_write_ta_job(u8 *heap, u32 seq, const struct pvr_apple_ta_
 	 * must match the work-ring entry's.
 	 */
 	wr32(heap, cmd + 0x550, fw_va(sc + TA_STAMP));
-	wr32(heap, cmd + 0x558, seq & 0xff);
+	wr32(heap, cmd + 0x558, sched_token(seq));
 	heap[cmd + 0x55c] = TA_SLOT;
 	wr32(heap, cmd + 0x568, seq);
 
@@ -647,7 +660,7 @@ void pvr_apple_layout_write_3d_job(u8 *heap, u32 seq, const struct pvr_apple_3d_
 	wr32(heap, cmd + 0x01c, fw_va(ctx));
 	/* Scheduling descriptor, as geometry's +0x550 block */
 	wr32(heap, cmd + 0x89c, fw_va(sc + F_STAMP));
-	wr32(heap, cmd + 0x8a4, seq & 0xff);
+	wr32(heap, cmd + 0x8a4, sched_token(seq));
 	heap[cmd + 0x8a8] = F_SLOT;
 	wr32(heap, cmd + 0x8b4, seq);
 
