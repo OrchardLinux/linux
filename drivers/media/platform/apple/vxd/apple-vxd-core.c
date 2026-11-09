@@ -9,7 +9,9 @@
  * on the first open of the video node (apple-vxd-fw.c).
  */
 
+#include <linux/delay.h>
 #include <linux/interrupt.h>
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/pm_runtime.h>
@@ -226,6 +228,15 @@ void apple_vxd_run_postamble(struct apple_vxd_ctx *ctx,
 /* Runtime PM stubs: the genpd (ps_vdec) does all the work. */
 static int apple_vxd_runtime_resume(struct device *dev)
 {
+	struct apple_vxd_dev *vxd = dev_get_drvdata(dev);
+
+	/* The domain is on again: enable the core before anything reads it. */
+	if (vxd->integ) {
+		writel(readl(vxd->integ + VXD_INTEG_CTRL) | VXD_INTEG_CTRL_ENABLE,
+		       vxd->integ + VXD_INTEG_CTRL);
+		udelay(VXD_INTEG_ENABLE_DELAY_US);
+	}
+
 	return 0;
 }
 
@@ -245,8 +256,17 @@ static const struct apple_vxd_variant s8000_vxd_variant = {
 	.hevc_supported	= true,
 };
 
+/* The T8010 core has two pixel pipes; it reports them in CORE_ID. */
+static const struct apple_vxd_variant t8010_vxd_variant = {
+	.vxd_version	= 10,
+	.num_gart_pts	= 512,
+	.hevc_supported	= true,
+	.has_integration = true,
+};
+
 static const struct of_device_id apple_vxd_of_match[] = {
 	{ .compatible = "apple,s8000-vxd", .data = &s8000_vxd_variant },
+	{ .compatible = "apple,t8010-vxd", .data = &t8010_vxd_variant },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_vxd_of_match);
@@ -285,6 +305,13 @@ static int apple_vxd_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, PTR_ERR(vxd->regs),
 				     "failed to map the vxd registers\n");
 	vxd->regs_size = resource_size(res);
+
+	if (variant->has_integration) {
+		vxd->integ = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(vxd->integ))
+			return dev_err_probe(&pdev->dev, PTR_ERR(vxd->integ),
+					     "failed to map the integration registers\n");
+	}
 
 	/* The block has no DART; DMA addresses are physical and the core's
 	 * own GART translates the low 32 bits into device address space.

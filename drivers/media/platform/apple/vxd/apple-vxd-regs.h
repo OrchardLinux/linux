@@ -13,6 +13,17 @@
 
 #include <linux/bits.h>
 
+/*
+ * Integration registers: the second "reg" range of the vxd-version 9 and
+ * 10 blocks ("VDEC0_Integration" in AppleD5500).  The kext sets bit 12 of
+ * the word at offset 4 and waits 50 us at every power-up, before the first
+ * access to the core, and touches nothing else there (iOS 17.7.11
+ * 0xfffffff0063eda28 [E]).
+ */
+#define VXD_INTEG_CTRL			0x0004
+#define  VXD_INTEG_CTRL_ENABLE		BIT(12)
+#define VXD_INTEG_ENABLE_DELAY_US	50
+
 /* Core identification (CPVDECCore::GetCoreRev [E]) */
 #define VXD_REG_CORE_ID			0x0630
 #define  VXD_CORE_ID_MAJOR_SH		16
