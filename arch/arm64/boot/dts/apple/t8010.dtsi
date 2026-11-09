@@ -348,6 +348,20 @@
 			power-domains = <&ps_gfx>;
 		};
 
+		/*
+		 * Imagination MSVDX ("VXD") H.264 decoder, ADT vxd@8100000. It
+		 * has its own two-level GART, so no DART.
+		 */
+		vxd: video-codec@208100000 {
+			compatible = "apple,t8010-vxd";
+			reg = <0x2 0x08100000 0x0 0x30000>,
+			      <0x2 0x08130000 0x0 0x1000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 172 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_vdec0>;
+			status = "disabled";
+		};
+
 		sio: dma-controller@20ae00000 {
 			compatible = "apple,t8010-sio";
 			reg = <0x2 0x0ae00000 0x0 0x10000>,
