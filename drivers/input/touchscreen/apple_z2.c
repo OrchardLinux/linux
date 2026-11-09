@@ -3776,10 +3776,6 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 		error = apple_z2_gen1_drain(z2);
 	if (!error && apple_z2_is_j71b(z2))
 		error = apple_z2_gen1_set_level_irq(z2);
-	if (!error && apple_z2_is_j71b(z2) && z2->upload_irq_masked) {
-		z2->upload_irq_masked = false;
-		apple_z2_irq_on(z2);
-	}
 	mutex_unlock(&z2->io_lock);
 	if (error)
 		return error;
@@ -3787,9 +3783,21 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 	if (!apple_z2_uses_ipad_protocol(z2))
 		return 0;
 
+	/*
+	 * J71b: the interrupt stays masked until the controller has been
+	 * woken. Touches before that are not delivered as frames: every data
+	 * phase answers with another header, and after the wake the
+	 * controller stopped interrupting for good. On a wake from sleep the
+	 * screen is lit while this runs, so the first taps come here. With
+	 * the level interrupt masked they wait in the controller instead.
+	 */
 	msleep(2260);
 	mutex_lock(&z2->io_lock);
 	error = apple_z2_j172_init_writes_locked(z2);
+	if (!error && apple_z2_is_j71b(z2) && z2->upload_irq_masked) {
+		z2->upload_irq_masked = false;
+		apple_z2_irq_on(z2);
+	}
 	mutex_unlock(&z2->io_lock);
 	return error;
 }
