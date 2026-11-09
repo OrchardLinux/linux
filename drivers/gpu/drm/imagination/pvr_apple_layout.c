@@ -25,6 +25,10 @@
 
 #include "pvr_apple_layout.h"
 
+#include <linux/array_size.h>
+#include <linux/bug.h>
+#include <linux/printk.h>
+
 #define FW_VA_HEAP		0x00100000u	/* heap descriptor 0 */
 #define FW_VA_HEAP2		0x00140000u	/* heap descriptor 1, inner non-cacheable */
 #define HEAP2_OFFSET		0x50000u
@@ -53,14 +57,8 @@
 #define HEAP_TA_CMD_RING	0x32400u
 #define HEAP_TA_STATUS		0x32800u
 #define HEAP_TA_POOL		0x33000u	/* scheduling entries, 128 x 44 bytes */
-#define HEAP_TA_CMD		0x35000u	/* geometry command, 0x600 bytes */
-#define HEAP_TA_USEQ		0x35600u	/* microsequence, 0xb0 bytes */
-#define HEAP_TA_REGS32		0x35700u
-#define HEAP_TA_REGS64		0x35800u
-#define HEAP_TA_SCRATCH		0x35a00u	/* flags and pointers the steps name */
 #define HEAP_TA_FREE_LIST	0x36000u	/* free-list descriptor, 0x74 bytes */
 #define HEAP_TA_PM_SLOT		0x36100u	/* parameter-manager slot, 0x100 bytes */
-#define HEAP_TA_CONTEXT		0x36200u	/* geometry context, 0x84 bytes */
 #define HEAP_TA_PM_STATE	0x36300u
 #define HEAP_TA_PM_HEADER	0x36400u
 #define HEAP_TA_UNITS		0x1c000u	/* X+0x134: geometry unit states */
@@ -78,10 +76,6 @@
 #define HEAP_SKU_RECORDS	0x70000u	/* 512 x 36-byte trace records (debug flags) */
 #define HEAP_SKU_CONTROL	0x75000u	/* +0x20: index of the next record */
 #define HEAP_PDS_PD		0x80000u
-#define HEAP_3D_CMD		0x76000u	/* fragment command, 0x908 bytes */
-#define HEAP_3D_USEQ		0x77000u	/* microsequence, 0xc8 bytes */
-#define HEAP_3D_SCRATCH		0x77100u
-#define HEAP_3D_CONTEXT		0x77200u	/* fragment context, 0x84 bytes */
 #define HEAP_3D_QUEUE		0x77300u
 #define HEAP_3D_QUEUE_STATE	0x77400u
 #define HEAP_3D_STATUS		0x77500u
@@ -99,6 +93,26 @@
 #define RING_ENTRIES		256u
 #define WORK_ENTRY_SIZE		20u
 #define HEAP_IO_RAM		0x320000u	/* RAM behind unused I/O entries */
+/*
+ * Render commands, one area per job: the firmware reads a command again when
+ * the job retires, after its completion stamp, so the next job must not clear
+ * it. Geometry: command +0 (0x600 bytes), microsequence +0x600, registers
+ * +0x700/+0x800, scratch +0x900, context +0xa00. Fragment: command +0
+ * (0x908), microsequence +0xa00, scratch +0xb00, context +0xc00. Both inside
+ * heap descriptor 1 (0x50000-0x90000).
+ */
+#define HEAP_3D_JOBS		0x5d000u
+#define JOBS_3D			4u
+#define JOB_3D_STRIDE		0x1000u
+#define HEAP_TA_JOBS		0x61000u
+#define JOBS_TA			3u
+#define JOB_TA_STRIDE		0x1000u
+/* Firmware trace (X+0xf4/+0xf8), mapping rings (V+0x455c/+0x4560), power path page */
+#define HEAP_FW_TRACE_RECORDS	0x64000u
+#define HEAP_FW_TRACE_CONTROL	0x68000u
+#define HEAP_MAP_RING_CONTROL	0x24000u
+#define HEAP_MAP_RING		0x25000u
+#define HEAP_POWER_PATH		0x10000u
 
 /* P: I/O mapping table, 0x18-byte entries {pa lo, pa hi, fw va, size, flags, rw} */
 #define P_IO_TABLE		0x640u
@@ -196,8 +210,8 @@ static void build_main_context(u8 *heap)
 	wr32(heap, HEAP_X + 0xe0, fw_va(HEAP_EVENT_RING + 0x1000));	/* event ring entries */
 	wr32(heap, HEAP_X + 0xec, fw_va(HEAP_SKU_CONTROL));	/* SKU trace control */
 	wr32(heap, HEAP_X + 0xf0, fw_va(HEAP_SKU_RECORDS));	/* SKU trace records */
-	wr32(heap, HEAP_X + 0xf4, fw_va(0x68000));	/* firmware trace control */
-	wr32(heap, HEAP_X + 0xf8, fw_va(0x64000));	/* firmware trace records */
+	wr32(heap, HEAP_X + 0xf4, fw_va(HEAP_FW_TRACE_CONTROL));	/* firmware trace control */
+	wr32(heap, HEAP_X + 0xf8, fw_va(HEAP_FW_TRACE_RECORDS));	/* firmware trace records */
 
 	/*
 	 * X+0x301 (unaligned): the firmware's power-state struct, written by the
@@ -338,15 +352,65 @@ static void build_init_page(u8 *win, u64 win_pa, u64 heap_pa)
 	wr32(win, WIN_INIT + 0x94, 2);			/* descriptor count */
 	wr32(win, WIN_INIT + 0x98, fw_va(HEAP_U));
 	wr32(win, WIN_INIT + 0x9c, fw_va(HEAP_V));
-	wr32(win, WIN_INIT + 0xa0, fw_va(0x10000));	/* power path page */
+	wr32(win, WIN_INIT + 0xa0, fw_va(HEAP_POWER_PATH));	/* power path page */
 
 	mem_desc(win, 0, FW_VA_HEAP, heap_pa, 56);
 	mem_desc(win, 1, FW_VA_HEAP2, heap_pa + HEAP2_OFFSET, 64);
 }
 
+/*
+ * Every allocation in heap descriptor 1 (0x50000-0x90000), with the size the
+ * driver or the firmware uses: checked for overlaps when the layout is built
+ */
+static const struct { const char *name; u32 start, size; } heap2_areas[] = {
+	{ "mmu gen", HEAP_MMU_GEN, 0x1000 },
+	{ "ctx state", HEAP_CTX_STATE, 0x1000 },
+	{ "useq", HEAP_USEQ, 0x1000 },
+	{ "stamps", HEAP_STAMP, 0x1000 },
+	{ "unit state", HEAP_UNIT_STATE, 0x1000 },
+	{ "event ring", HEAP_EVENT_RING, 0x4000 },
+	{ "cdm args", HEAP_CDM_ARGS, 0x1000 },
+	{ "cdm regs", HEAP_CDM_REGS, 0x1000 },
+	{ "3d jobs", HEAP_3D_JOBS, JOBS_3D * JOB_3D_STRIDE },
+	{ "ta jobs", HEAP_TA_JOBS, JOBS_TA * JOB_TA_STRIDE },
+	{ "fw trace records", HEAP_FW_TRACE_RECORDS, 0x3c00 },
+	{ "fw trace control", HEAP_FW_TRACE_CONTROL, 0x1000 },
+	{ "power state", HEAP_POWER_STATE, 0x4314 },
+	{ "sku records", HEAP_SKU_RECORDS, 512 * 36 },
+	{ "sku control", HEAP_SKU_CONTROL, 0x100 },
+	{ "3d queue..ring", HEAP_3D_QUEUE, HEAP_3D_POOL + 0x2000 - HEAP_3D_QUEUE },
+	{ "pds pt", HEAP_PDS_PT, 0x4000 },
+	{ "compute jobs", HEAP_JOBS, JOB_SLOTS * JOB_STRIDE },
+};
+
+static bool heap2_areas_overlap(void)
+{
+	bool bad = false;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(heap2_areas); i++) {
+		u32 a0 = heap2_areas[i].start, a1 = a0 + heap2_areas[i].size;
+
+		if (a0 < HEAP2_OFFSET || a1 > HEAP2_OFFSET + 64 * 0x1000) {
+			pr_err("pvr_apple: heap area %s outside descriptor 1\n", heap2_areas[i].name);
+			bad = true;
+		}
+		for (unsigned int j = i + 1; j < ARRAY_SIZE(heap2_areas); j++) {
+			u32 b0 = heap2_areas[j].start, b1 = b0 + heap2_areas[j].size;
+
+			if (a0 < b1 && b0 < a1) {
+				pr_err("pvr_apple: heap areas %s and %s overlap\n",
+				       heap2_areas[i].name, heap2_areas[j].name);
+				bad = true;
+			}
+		}
+	}
+	return bad;
+}
+
 void pvr_apple_layout_build(u8 *win, u64 win_pa, u8 *heap, u64 heap_pa, u64 gpu_root,
 			    u64 pds_base, u64 usc_base)
 {
+	WARN_ON(heap2_areas_overlap());
 	build_init_page(win, win_pa, heap_pa);
 	build_main_context(heap);
 	build_device_context(heap, heap_pa, pds_base, usc_base);
@@ -361,8 +425,8 @@ void pvr_apple_layout_build(u8 *win, u64 win_pa, u8 *heap, u64 heap_pa, u64 gpu_
 	 * apple_fw_debug parameter.
 	 */
 	wr32(heap, HEAP_U + 0x0, 0);
-	wr32(heap, HEAP_V + 0x455c, fw_va(0x24000));	/* mapping ring control */
-	wr32(heap, HEAP_V + 0x4560, fw_va(0x25000));	/* mapping ring entries */
+	wr32(heap, HEAP_V + 0x455c, fw_va(HEAP_MAP_RING_CONTROL));	/* mapping ring control */
+	wr32(heap, HEAP_V + 0x4560, fw_va(HEAP_MAP_RING));	/* mapping ring entries */
 	wr32(heap, HEAP_V + 0x45b4, 1);			/* engine scheduler init */
 }
 
@@ -425,17 +489,21 @@ void pvr_apple_layout_build_ta(u8 *heap)
  */
 void pvr_apple_layout_write_ta_job(u8 *heap, u32 seq, const struct pvr_apple_ta_job *job)
 {
-	u32 cmd = HEAP_TA_CMD, useq = HEAP_TA_USEQ, sc = HEAP_TA_SCRATCH;
+	u32 base = HEAP_TA_JOBS + ((seq - 1) % JOBS_TA) * JOB_TA_STRIDE;
+	u32 cmd = base, useq = base + 0x600, sc = base + 0x900, ctx = base + 0xa00;
+	u32 regs32 = base + 0x700, regs64 = base + 0x800;
 	u32 fl = HEAP_TA_FREE_LIST, slot = HEAP_TA_PM_SLOT;
 	u32 work = HEAP_TA_RING + ((seq - 1) % RING_ENTRIES) * WORK_ENTRY_SIZE;
 	u32 i;
 
-	for (i = HEAP_TA_CMD; i < HEAP_TA_PM_HEADER + 0x100; i++)
+	for (i = base; i < base + JOB_TA_STRIDE; i++)
+		heap[i] = 0;
+	for (i = HEAP_TA_FREE_LIST; i < HEAP_TA_PM_HEADER + 0x100; i++)
 		heap[i] = 0;
 	for (i = 0; i < 8; i++)
-		wr32(heap, HEAP_TA_REGS32 + 4 * i, job->regs32[i]);
+		wr32(heap, regs32 + 4 * i, job->regs32[i]);
 	for (i = 0; i < 28; i++)
-		wr64(heap, HEAP_TA_REGS64 + 8 * i, job->regs64[i]);
+		wr64(heap, regs64 + 8 * i, job->regs64[i]);
 	wr32(heap, sc + TA_CANCEL, 0xffffffff);
 	wr32(heap, sc + TA_CANCEL + 4, 0xffffffff);
 
@@ -462,7 +530,7 @@ void pvr_apple_layout_write_ta_job(u8 *heap, u32 seq, const struct pvr_apple_ta_
 	/* Command: type 0, context id 0, free list 0 */
 	wr32(heap, cmd + 0x000, 0);
 	wr32(heap, cmd + 0x00c, 0);
-	wr32(heap, cmd + 0x014, fw_va(HEAP_TA_CONTEXT));
+	wr32(heap, cmd + 0x014, fw_va(ctx));
 	wr32(heap, cmd + 0x018, 0);
 	wr32(heap, cmd + 0x020, fw_va(fl));
 	wr32(heap, cmd + 0x024, fw_va(slot));
@@ -480,8 +548,8 @@ void pvr_apple_layout_write_ta_job(u8 *heap, u32 seq, const struct pvr_apple_ta_
 
 	/* StartTA (26 words) */
 	wr32(heap, useq + 0x00, 5);
-	wr32(heap, useq + 0x04, fw_va(HEAP_TA_REGS32));
-	wr32(heap, useq + 0x08, fw_va(HEAP_TA_REGS64));
+	wr32(heap, useq + 0x04, fw_va(regs32));
+	wr32(heap, useq + 0x08, fw_va(regs64));
 	wr32(heap, useq + 0x0c, fw_va(fl));
 	wr32(heap, useq + 0x10, fw_va(slot));
 	wr32(heap, useq + 0x14, fw_va(HEAP_TA_UNITS) + 4);
@@ -551,12 +619,13 @@ void pvr_apple_layout_build_3d(u8 *heap)
  */
 void pvr_apple_layout_write_3d_job(u8 *heap, u32 seq, const struct pvr_apple_3d_job *job)
 {
-	u32 cmd = HEAP_3D_CMD, useq = HEAP_3D_USEQ, sc = HEAP_3D_SCRATCH;
+	u32 base = HEAP_3D_JOBS + ((seq - 1) % JOBS_3D) * JOB_3D_STRIDE;
+	u32 cmd = base, useq = base + 0xa00, sc = base + 0xb00, ctx = base + 0xc00;
 	u32 work = HEAP_3D_RING + ((seq - 1) % RING_ENTRIES) * WORK_ENTRY_SIZE;
 	u32 units = fw_va(HEAP_3D_UNITS) + 8, slot = fw_va(HEAP_TA_PM_SLOT);
 	u32 i;
 
-	for (i = HEAP_3D_CMD; i < HEAP_3D_CONTEXT + 0x100; i++)
+	for (i = base; i < base + JOB_3D_STRIDE; i++)
 		heap[i] = 0;
 	for (i = 0; i < 18; i++)
 		wr32(heap, cmd + 0x3b0 + 4 * i, job->regs32[i]);
@@ -575,7 +644,7 @@ void pvr_apple_layout_write_3d_job(u8 *heap, u32 seq, const struct pvr_apple_3d_
 	wr32(heap, cmd + 0x024, fw_va(HEAP_TA_PM_SLOT));
 	wr32(heap, cmd + 0x014, fw_va(useq));
 	wr32(heap, cmd + 0x018, 0xc8);
-	wr32(heap, cmd + 0x01c, fw_va(HEAP_3D_CONTEXT));
+	wr32(heap, cmd + 0x01c, fw_va(ctx));
 	/* Scheduling descriptor, as geometry's +0x550 block */
 	wr32(heap, cmd + 0x89c, fw_va(sc + F_STAMP));
 	wr32(heap, cmd + 0x8a4, seq & 0xff);
