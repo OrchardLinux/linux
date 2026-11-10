@@ -46,7 +46,7 @@ TRACE_EVENT(pvr_job_submit_ioctl,
 		struct pvr_job *_job = (job);                                          \
 		u32 _hwrt_fw_addr = 0;                                                 \
 										       \
-		if (_job && _job->hwrt)                                                \
+		if (_job && _job->hwrt && _job->hwrt->fw_obj)                         \
 			pvr_fw_object_get_fw_addr(_job->hwrt->fw_obj, &_hwrt_fw_addr); \
 										       \
 		_hwrt_fw_addr;                                                         \
@@ -74,7 +74,10 @@ TRACE_EVENT(pvr_job_create,
 	    TP_fast_assign(__entry->pvr_dev = pvr_dev;
 			   __entry->ctx = job->ctx;
 			   __entry->fw_obj = job->ctx->fw_obj;
-			   pvr_fw_object_get_fw_addr(job->ctx->fw_obj, &__entry->fw_addr);
+			   /* Apple contexts have no IMG firmware object */
+			   __entry->fw_addr = 0;
+			   if (job->ctx->fw_obj)
+				   pvr_fw_object_get_fw_addr(job->ctx->fw_obj, &__entry->fw_addr);
 			   __entry->hwrt_addr = PVR_JOB_GET_HWRT_FW_ADDR(job);
 			   __entry->job = job;
 			   __entry->job_type = job->type;
