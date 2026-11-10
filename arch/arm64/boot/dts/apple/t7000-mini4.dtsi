@@ -13,6 +13,21 @@
 / {
 	chassis-type = "tablet";
 
+	aliases {
+		serial5 = &serial5;
+		touchscreen0 = &touchscreen;
+		wifi0 = &wifi0;
+	};
+
+	/* Wi-Fi REG_ON is D2207 GPIO 3. */
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&pmu_gpio 3 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <100000>;
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -41,13 +56,92 @@
 			gpios = <&pinctrl 46 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_VOLUMEDOWN>;
 		};
+	};
+};
 
-		switch-mute {
-			label = "Mute Switch";
-			gpios = <&pinctrl 36 GPIO_ACTIVE_LOW>;
-			linux,code = <KEY_MUTE>;
+/* The bq27540 gauge on UART5's HDQ line (ADT uart5/gas-gauge). */
+&serial5 {
+	pinctrl-0 = <&uart5_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		fuel-gauge {
+			compatible = "ti,bq27540-hdq";
 		};
 	};
+};
+
+&pcie_dart1 {
+	status = "okay";
+};
+
+/*
+ * The BCM4350 on root port 1 (ADT apcie/pci-bridge1): PERST# GPIO 77,
+ * DEVICE_WAKE GPIO 63, Gen1. Port 0 has nothing attached on either model;
+ * the J97's baseband is not on PCIe. CLKREQ# (GPIO 41) is not described,
+ * as on the T7001. Each board names its Wi-Fi module.
+ */
+&pcie {
+	/* ADT dart-apcie1 vm-offset and vm-size; SID 0 */
+	iommu-map = <0x100 &pcie_dart1 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	status = "okay";
+
+	pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		reset-gpios = <&pinctrl 77 GPIO_ACTIVE_LOW>;
+		max-link-speed = <1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,43a3";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl 63 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+			brcm,ccode-map-trivial;
+		};
+	};
+};
+
+/*
+ * The N1 touchscreen, from the ADT spi1/multi-touch functions: chip select
+ * GPIO 15, reset GPIO 56, interrupt GPIO 106, LDO enable GPIO 47, analog
+ * supply pmuL(0x20e) and the PMGR touch clock at 32768 Hz. Its display
+ * sync (GPIO 78) stays as iBoot left it. The J97's ADT names its
+ * controller multi-touch,j96 too and its J97.mtprops is byte-identical
+ * to J96.mtprops, so both models load the J96 firmware.
+ */
+&spi1 {
+	cs-gpios = <&pinctrl 15 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,j96-touchscreen";
+		reg = <0>;
+		/* N1 selects 83 ns; the controller rounds up to divider 5 */
+		spi-max-frequency = <12048192>;
+		interrupts-extended = <&pinctrl 106 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&pinctrl 56 GPIO_ACTIVE_LOW>;
+		power-ldo-gpios = <&pinctrl 47 GPIO_ACTIVE_HIGH>;
+		ana-supply = <&touch_analog>;
+		clocks = <&touchclk>;
+		firmware-name = "apple/j96-fwstart.z2fw";
+		touchscreen-size-x = <1536>;
+		touchscreen-size-y = <2048>;
+		/* Raw Y runs from the bottom of the panel to the top. */
+		touchscreen-inverted-y;
+	};
+};
+
+&touchclk {
+	status = "okay";
 };
 
 &framebuffer0 {
@@ -91,6 +185,19 @@
 					reg = <0x4 0x4>;
 				};
 			};
+		};
+
+		touch_analog: regulator-touch-analog {
+			compatible = "apple,d2207-touch-analog-regulator";
+			regulator-name = "touch-analog";
+		};
+
+		pmu_gpio: gpio {
+			compatible = "apple,d2207-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			/* Only REG_ON (3) is used; the others stay as iBoot left them. */
+			gpio-reserved-ranges = <0 3>, <4 17>;
 		};
 	};
 };
