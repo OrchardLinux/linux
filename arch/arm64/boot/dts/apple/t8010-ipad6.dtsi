@@ -246,6 +246,7 @@
 			apple,wlan-uart = <&wlan_uart2>;
 			device-wake-gpios = <&pinctrl_ap 23 GPIO_ACTIVE_HIGH>;
 			vdd-supply = <&wlan_vdd>;
+			brcm,ccode-map-trivial;
 		};
 	};
 };

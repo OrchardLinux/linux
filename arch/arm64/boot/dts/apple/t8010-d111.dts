@@ -57,6 +57,7 @@
 			vdd-supply = <&wlan_vdd>;
 			apple,antenna-sku = "XX";
 			brcm,board-type = "apple,olaf";
+			brcm,ccode-map-trivial;
 		};
 	};
 };
