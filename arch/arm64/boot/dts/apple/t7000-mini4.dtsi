@@ -105,6 +105,7 @@
 			reg = <0x10000 0x0 0x0 0x0 0x0>;
 			device-wake-gpios = <&pinctrl 63 GPIO_ACTIVE_HIGH>;
 			vdd-supply = <&wlan_vdd>;
+			brcm,ccode-map-trivial;
 		};
 	};
 };
