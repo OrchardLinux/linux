@@ -19,13 +19,19 @@ properties:
           - const: brcm,bcm4355c0-bt
           - const: brcm,bcm4345c5
       - items:
-          - const: apple,j172-bcm4355c1-bt
+          - const: apple,j71t-bcm4355c0-bt
+          - const: brcm,bcm4355c0-bt
+      - items:
+          - enum:
+              - apple,j71b-bcm4355c1-bt
+              - apple,j172-bcm4355c1-bt
           - const: brcm,bcm4355c1-bt
       - items:
           - enum:
               - infineon,cyw43439-bt
           - const: brcm,bcm4329-bt
       - enum:
+          - apple,j81-bcm4350c2-bt
           - brcm,bcm20702a1
           - brcm,bcm4329-bt
           - brcm,bcm4330-bt
