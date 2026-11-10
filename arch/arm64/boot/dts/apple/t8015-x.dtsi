@@ -10,4 +10,78 @@
 
 / {
 	chassis-type = "handset";
+
+	/* m1n1 copies the ADT's touch calibrations to this node. */
+	aliases {
+		touchscreen0 = &touchscreen;
+	};
+};
+
+&apcie {
+	iommu-map = <0x100 &dart_apcie3 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	pinctrl-0 = <&wifi_clkreq>;
+	pinctrl-names = "default";
+
+	port03: pci@3,0 {
+		device_type = "pci";
+		reg = <0x1800 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		max-link-speed = <2>;
+		apple,manual-availability-iommu = <&dart_apcie3 0>;
+		reset-gpios = <&pinctrl_ap 167 GPIO_ACTIVE_LOW>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+	};
+};
+
+&pinctrl_ap {
+	wifi_clkreq: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(163, 1)>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	pmic@2a {
+		compatible = "apple,acorn-pmic";
+		reg = <0x2a>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		touch_ana: regulator-touch-analog {
+			compatible = "apple,acorn-touch-analog-regulator";
+			regulator-name = "touch-analog";
+		};
+	};
+};
+
+/* The touch controller ("hid-transport,k1"), chip select GPIO 0x8a. */
+&spi1 {
+	cs-gpios = <&pinctrl_ap 138 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,d221-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+		interrupts-extended = <&pinctrl_aop 21 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&pinctrl_ap 33 GPIO_ACTIVE_LOW>;
+		ana-supply = <&touch_ana>;
+		clocks = <&touchclk>;
+		firmware-name = "apple/d221-touch";
+		touchscreen-size-x = <1125>;
+		touchscreen-size-y = <2436>;
+	};
+};
+
+/* The OLED panel's brightness, from the ADT's backlight node. */
+&dsi_bl {
+	max-brightness = <2047>;
+	apple,min-dbv = <139>;
+	default-brightness-level = <740>;
+	status = "okay";
 };
