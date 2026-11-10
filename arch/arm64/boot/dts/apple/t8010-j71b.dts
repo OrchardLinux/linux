@@ -12,3 +12,42 @@
 	compatible = "apple,j71b", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPad 6 (Wi-Fi)";
 };
+
+&speakers {
+	simple-audio-card,name = "J71b Speakers";
+};
+
+&wifi {
+	brcm,board-type = "apple,j71b";
+};
+
+&aop {
+	firmware-name = "apple/aop-ipad7b.bin", "apple/aop-ipad7b-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+/*
+ * The AOP reports the accelerometer in the device frame with y up when the
+ * iPad is upright; desktops (iio-sensor-proxy) take upright as y down and
+ * left/right accordingly, with z unchanged.
+ */
+&aop_accel {
+	mount-matrix = "-1", "0", "0",
+		       "0", "-1", "0",
+		       "0", "0", "1";
+};
+
+&touchscreen {
+	firmware-name = "apple/j71b-fwstart.z2fw";
+};
+
+&d2365_pmic {
+	poweroff {
+		compatible = "apple,d2365-poweroff";
+		power-supplies = <&tristar_charger>;
+	};
+};
