@@ -538,10 +538,8 @@ pvr_gpu_support_level(const struct pvr_gpu_id *gpu_id)
 	case PVR_PACKED_BVNC(33, 15, 11, 3):
 	case PVR_PACKED_BVNC(36, 52, 104, 182):
 	case PVR_PACKED_BVNC(36, 53, 104, 796):
-		return PVR_GPU_SUPPORTED;
-
 	case PVR_PACKED_BVNC(13, 10, 6, 2):	/* Apple A10 (T8010) */
-		return PVR_GPU_EXPERIMENTAL;
+		return PVR_GPU_SUPPORTED;
 
 	default:
 		return PVR_GPU_UNKNOWN;
