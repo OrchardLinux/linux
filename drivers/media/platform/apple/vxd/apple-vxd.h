@@ -11,7 +11,7 @@
  *     IRQ drain, fences (apple-vxd-mbox.c)
  *   - command buffers and their encoders (apple-vxd-cmdbuf.c, -cmd.c)
  *   - the V4L2 stateless node (apple-vxd-v4l2.c) and its codec units:
- *     H.264 (apple-vxd-h264*.c)
+ *     H.264 (apple-vxd-h264*.c) and HEVC (apple-vxd-hevc*.c)
  *
  * [E] marks facts taken from the kext.
  */
@@ -39,6 +39,7 @@
 #include <media/videobuf2-v4l2.h>
 
 #include "apple-vxd-cmd.h"
+#include "apple-vxd-hevc-cmd.h"
 #include "apple-vxd-regs.h"
 
 #define APPLE_VXD_DRV_NAME		"apple-vxd"
@@ -61,7 +62,7 @@ enum apple_vxd_image_fmt {
 	APPLE_VXD_IMG_FMT_420_8BIT,
 };
 
-/* One per codec unit. */
+/* One per codec unit (H.264, HEVC). */
 #define APPLE_VXD_MAX_CODED_FMTS	2
 
 /* SoC variant data (compatible table). */
@@ -70,6 +71,8 @@ struct apple_vxd_variant {
 	u32 num_gart_pts;		/* mapped page tables (512 = 2 GiB) */
 	bool hevc_supported;
 	bool has_integration;		/* second reg range, see VXD_INTEG_CTRL */
+	/* HEVC buffer multiplier and command quirks; zero leaves HEVC off. */
+	struct apple_vxd_hevc_caps hevc;
 };
 
 /*
@@ -498,5 +501,8 @@ extern const struct v4l2_ctrl_ops apple_vxd_ctrl_ops;
 
 /* h264.c */
 int apple_vxd_h264_register(struct apple_vxd_dev *vxd);
+
+/* hevc.c */
+int apple_vxd_hevc_register(struct apple_vxd_dev *vxd);
 
 #endif /* __APPLE_VXD_H__ */

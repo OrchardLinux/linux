@@ -355,6 +355,8 @@ static int apple_vxd_probe(struct platform_device *pdev)
 
 	ret = apple_vxd_h264_register(vxd);
 	if (!ret)
+		ret = apple_vxd_hevc_register(vxd);
+	if (!ret)
 		ret = apple_vxd_v4l2_init(vxd);
 	if (ret)
 		goto err_gart_fini;
