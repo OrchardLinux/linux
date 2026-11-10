@@ -168,6 +168,8 @@
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupts-extended = <&pinctrl_ap 76 IRQ_TYPE_LEVEL_LOW>;
+			/* Smart Cover front hall sensor (line 0): wake only. */
+			apple,wake-events = <0x30>;
 		};
 
 		tristar_charger: charger@180 {
