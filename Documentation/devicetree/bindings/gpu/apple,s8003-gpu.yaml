@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpu/apple,s8003-gpu.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S8003 (A9) GPU
+
+maintainers:
+  - Berkay Kösebay <brkosebay@users.noreply.github.com>
+
+description: |
+  The A9's GPU is a PowerVR Rogue core (GT7600, Apple's G5P) behind Apple's
+  "Fender" power and control block. Apple's firmware runs on the core's own
+  META processor; the host loads it. The node has the shape of the A10's
+  (apple,t8010-gpu), without that chip's coprocessor and mailbox.
+
+properties:
+  compatible:
+    const: apple,s8003-gpu
+
+  reg:
+    items:
+      - description: The Rogue core's registers
+      - description: Fender
+
+  reg-names:
+    items:
+      - const: rgx
+      - const: fender
+
+  interrupts:
+    minItems: 5
+    maxItems: 5
+
+  power-domains:
+    maxItems: 1
+
+  operating-points-v2: true
+
+  firmware-name:
+    maxItems: 1
+    description:
+      The firmware file, Apple's META LDR image from the device's own
+      kernelcache.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        gpu@201000000 {
+            compatible = "apple,s8003-gpu";
+            reg = <0x2 0x01000000 0x0 0x100000>,
+                  <0x2 0x01e00000 0x0 0x100000>;
+            reg-names = "rgx", "fender";
+            power-domains = <&ps_gfx>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 170 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 171 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 172 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 173 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 174 IRQ_TYPE_LEVEL_HIGH>;
+            firmware-name = "apple/gfx-s8003.bin";
+        };
+    };
