@@ -12,6 +12,10 @@
 / {
 	chassis-type = "handset";
 
+	aliases {
+		serial5 = &serial5;
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -45,6 +49,21 @@
 			label = "Mute Switch";
 			gpios = <&pinctrl 131 GPIO_ACTIVE_LOW>;
 			linux,code = <KEY_MUTE>;
+		};
+	};
+};
+
+/* The bq27540 gauge on UART5's HDQ line (ADT uart5/gas-gauge). */
+&serial5 {
+	pinctrl-0 = <&uart5_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		fuel-gauge {
+			compatible = "ti,bq27540-hdq";
 		};
 	};
 };
