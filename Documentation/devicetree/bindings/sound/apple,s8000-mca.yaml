@@ -15,14 +15,19 @@ description: |
   clock feeding the codec's MCLK. Its pads are connected to the outside
   through the i2s-switch, a routing block shared by all MCAs. Samples are
   moved by SmartIO DMA. T8010 uses the same register layout (version 5),
-  with an AP NCO bitclock for the playback-only digital speaker path.
+  with an AP NCO bitclock: apple,t8010-mca is the playback-only digital
+  speaker link (TDM), apple,t8010-mca-i2s the playback-only stereo I2S link
+  to the headphone codec. The MCAs are the same block; the compatible names
+  the link setup iOS programs into it.
 
 allOf:
   - $ref: dai-common.yaml#
   - if:
       properties:
         compatible:
-          const: apple,t8010-mca
+          enum:
+            - apple,t8010-mca
+            - apple,t8010-mca-i2s
     then:
       properties:
         dmas:
@@ -42,6 +47,7 @@ properties:
     enum:
       - apple,s8000-mca
       - apple,t8010-mca
+      - apple,t8010-mca-i2s
 
   clocks:
     maxItems: 1
