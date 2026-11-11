@@ -110,24 +110,51 @@
 	};
 
 	/*
-	 * The speaker link in the iOS TDM mode: eight 16-bit slots with MCA2 as
-	 * clock provider. Each board names its card.
+	 * Link 0 is the speaker link in the iOS TDM mode: eight 16-bit slots
+	 * with MCA2 as clock provider. Link 1 is the headphone jack: stereo I2S
+	 * from MCA4 as clock provider to the CS42L83, which runs its PLL from
+	 * SCLK. The codec is also an auxiliary device, so the card creates its
+	 * jack. Each board names its card.
 	 */
 	speakers: sound {
 		compatible = "simple-audio-card";
-		simple-audio-card,format = "dsp_a";
-		simple-audio-card,bitclock-master = <&speaker_cpu>;
-		simple-audio-card,frame-master = <&speaker_cpu>;
-		simple-audio-card,widgets = "Speaker", "Speakers";
-		simple-audio-card,routing = "Speakers", "Speaker";
-		simple-audio-card,pin-switches = "Speakers";
+		simple-audio-card,widgets = "Speaker", "Speakers",
+					    "Headphone", "Headphones";
+		simple-audio-card,routing = "Speakers", "Speaker",
+					    "Headphones", "Jack HP";
+		simple-audio-card,pin-switches = "Speakers", "Headphones";
+		simple-audio-card,aux-devs = <&jack_codec>;
+		#address-cells = <1>;
+		#size-cells = <0>;
 
-		speaker_cpu: simple-audio-card,cpu {
-			sound-dai = <&mca2>;
+		simple-audio-card,dai-link@0 {
+			reg = <0>;
+			format = "dsp_a";
+			bitclock-master = <&speaker_cpu>;
+			frame-master = <&speaker_cpu>;
+
+			speaker_cpu: cpu {
+				sound-dai = <&mca2>;
+			};
+
+			codec {
+				sound-dai = <&speaker_amps>;
+			};
 		};
 
-		simple-audio-card,codec {
-			sound-dai = <&speaker_amps>;
+		simple-audio-card,dai-link@1 {
+			reg = <1>;
+			format = "i2s";
+			bitclock-master = <&jack_cpu>;
+			frame-master = <&jack_cpu>;
+
+			jack_cpu: cpu {
+				sound-dai = <&mca4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
 		};
 	};
 
@@ -167,6 +194,23 @@
 	tristar: port-controller@1a {
 		compatible = "nxp,cbtl1610";
 		reg = <0x1a>;
+	};
+
+	/*
+	 * The headphone jack codec, /arm-io/i2c0/audio-codec in the ADT: reset
+	 * on AP GPIO 25, interrupt on AP GPIO 71. Its function-aop_mclk (AOP
+	 * GPIO 36) is left to the AOP: the codec takes its clock from SCLK.
+	 * Tip sense is inverted as on Apple's other CS42L83 boards (plug
+	 * detection checked on a J171).
+	 */
+	jack_codec: audio-codec@48 {
+		compatible = "cirrus,cs42l83";
+		reg = <0x48>;
+		reset-gpios = <&pinctrl_ap 25 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 71 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		cirrus,ts-inv = <1>;
+		sound-name-prefix = "Jack";
 	};
 
 	d2365_pmic: pmic@3c {
@@ -298,6 +342,11 @@
 };
 
 &pdm {
+	status = "okay";
+};
+
+&mca4 {
+	apple,i2s-switch = <&i2s_switch 4 4>;
 	status = "okay";
 };
 
