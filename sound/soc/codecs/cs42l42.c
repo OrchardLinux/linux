@@ -1100,8 +1100,19 @@ int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 							       (regval & 1),
 							       CS42L42_PLL_LOCK_POLL_US,
 							       CS42L42_PLL_LOCK_TIMEOUT_US);
-				if (ret < 0)
-					dev_warn(component->dev, "PLL failed to lock: %d\n", ret);
+				if (ret < 0) {
+					/*
+					 * Without SCLK the PLL never locks. Keep the
+					 * internal oscillator: switching to the PLL
+					 * or marking SCLK present would leave the
+					 * codec without a clock, and its control port
+					 * would then hold up the I2C bus it shares.
+					 */
+					dev_err(component->dev, "PLL failed to lock: %d\n", ret);
+					snd_soc_component_update_bits(component, CS42L42_PLL_CTL1,
+								      CS42L42_PLL_START_MASK, 0);
+					return ret;
+				}
 
 				/* PLL must be running to drive glitchless switch logic */
 				snd_soc_component_update_bits(component,
