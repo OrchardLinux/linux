@@ -268,7 +268,7 @@ static void vxd_h264_emit_b(struct apple_vxd_cmdbuf *cb,
 {
 	const struct v4l2_ctrl_h264_decode_params *dp = f->dp;
 	u8 inverse[V4L2_H264_REF_LIST_LEN];
-	unsigned int i, n;
+	unsigned int i, j, n;
 	u8 col = l1[0];
 
 	w[0] = vxd_h264_poc(dp->top_field_order_cnt);
@@ -299,11 +299,26 @@ static void vxd_h264_emit_b(struct apple_vxd_cmdbuf *cb,
 		w[1] = APPLE_VXD_H264_UNUSED_VA;
 	}
 
-	/* Inverse L0: first position of each slot (bottom fields at +16). */
+	/*
+	 * Stored motion names slots from the co-located picture's DPB, not
+	 * this request's DPB. Userspace may reorder dpb[] between pictures.
+	 * Translate those saved slots to the current L0 by CAPTURE timestamp.
+	 * References absent from L0 stay NO_REF; descending order keeps the
+	 * first position when a list contains a reference more than once.
+	 */
 	memset(inverse, APPLE_VXD_H264_NO_REF, sizeof(inverse));
-	for (i = V4L2_H264_REF_LIST_LEN; i--; )
-		if (l0[i] != APPLE_VXD_H264_NO_REF)
-			inverse[(l0[i] >> 3 & 0x10) | (l0[i] & 0x1f)] = i;
+	if (col < V4L2_H264_NUM_DPB_ENTRIES && f->dpb_ref_ts[col]) {
+		for (i = V4L2_H264_REF_LIST_LEN; i--; ) {
+			u8 slot = l0[i];
+
+			if (slot >= V4L2_H264_NUM_DPB_ENTRIES)
+				continue;
+			for (j = 0; j < V4L2_H264_NUM_DPB_ENTRIES; j++)
+				if ((f->dpb_ref_valid[col] & BIT(j)) &&
+				    f->dpb_ref_ts[col][j] == dp->dpb[slot].reference_ts)
+					inverse[j] = i;
+		}
+	}
 	vxd_h264_pack_list(inverse, V4L2_H264_REF_LIST_LEN, &w[2]);
 	n = vxd_h264_pack_list(l1, l1_minus1 + 1, &w[10]);
 	apple_vxd_cmd_block(cb, VXD_H264_BE_COL_PIC0, 0, w, 10 + n);

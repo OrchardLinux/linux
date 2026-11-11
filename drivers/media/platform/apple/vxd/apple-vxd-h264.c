@@ -319,6 +319,7 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
 	struct apple_vxd_run run;
 	const char *why = NULL;
 	struct vb2_queue *cap_q;
+	struct apple_vxd_buffer *dst;
 	unsigned int i, nslices;
 	const u8 *src;
 	size_t src_len;
@@ -406,6 +407,7 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
 	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
 		const struct v4l2_h264_dpb_entry *e = &dp->dpb[i];
 		struct vb2_buffer *ref;
+		struct apple_vxd_buffer *buf;
 
 		if (!(e->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID))
 			continue;
@@ -418,6 +420,10 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
 		f.dpb_luma[i] = apple_vxd_buf_va(to_vb2_v4l2_buffer(ref));
 		f.dpb_chroma[i] = f.dpb_luma[i] + stride * pix->height;
 		f.dpb_colocated[i] = apple_vxd_buf_aux_va(to_vb2_v4l2_buffer(ref));
+		buf = container_of(to_vb2_v4l2_buffer(ref), struct apple_vxd_buffer,
+				   base.vb);
+		f.dpb_ref_ts[i] = buf->h264_ref_ts;
+		f.dpb_ref_valid[i] = buf->h264_ref_valid;
 	}
 	why = apple_vxd_h264_check_refs(h, nslices, &f);
 	if (why) {
@@ -434,6 +440,18 @@ static int apple_vxd_h264_run(struct apple_vxd_ctx *ctx)
 	ret = apple_vxd_h264_build(cb, &f, &why);
 	if (ret)
 		goto out_why;
+
+	/* Keep the slot numbering used by this picture with its stored motion. */
+	dst = container_of(run.dst, struct apple_vxd_buffer, base.vb);
+	dst->h264_ref_valid = 0;
+	for (i = 0; i < V4L2_H264_NUM_DPB_ENTRIES; i++) {
+		const struct v4l2_h264_dpb_entry *e = &dp->dpb[i];
+
+		dst->h264_ref_ts[i] = e->reference_ts;
+		if ((e->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID) &&
+		    (e->flags & V4L2_H264_DPB_ENTRY_FLAG_ACTIVE))
+			dst->h264_ref_valid |= BIT(i);
+	}
 
 	dev_dbg(vxd->dev,
 		"decode: src %u va %#x (%zu bytes, %u slices, first %c NAL %#x+%u, header %u bits), dst %u Y %#x UV %#x stride %u, %zu command bytes in buf %u (va %#x), %u packets\n",

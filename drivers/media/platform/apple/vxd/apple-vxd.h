@@ -244,6 +244,9 @@ struct apple_vxd_buffer {
 	 * register 0x62ec), allocated with the buffer.
 	 */
 	struct apple_vxd_dev_buf aux;
+	/* DPB identity when this CAPTURE's H.264 stored motion was written. */
+	u64 h264_ref_ts[V4L2_H264_NUM_DPB_ENTRIES];
+	u16 h264_ref_valid;
 };
 
 /*

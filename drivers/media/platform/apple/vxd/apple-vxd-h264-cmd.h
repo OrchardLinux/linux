@@ -54,6 +54,9 @@ struct apple_vxd_h264_frame {
 	u32 dpb_chroma[V4L2_H264_NUM_DPB_ENTRIES];
 	/* Each reference's stored-MB buffer: the B co-located picture's. */
 	u32 dpb_colocated[V4L2_H264_NUM_DPB_ENTRIES];
+	/* Saved DPB slot identities belonging to each stored-MB buffer. */
+	const u64 *dpb_ref_ts[V4L2_H264_NUM_DPB_ENTRIES];
+	u16 dpb_ref_valid[V4L2_H264_NUM_DPB_ENTRIES];
 	struct apple_vxd_h264_bufs bufs;
 	bool first_picture;		/* first picture of the context */
 };
