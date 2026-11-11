@@ -135,6 +135,7 @@
  *
  *   J71t mca0 10 00 00 00 02 00 01 00 ...    consumer, I2S, 2 x 16 bit
  *   J71b mca2 01 13 00 00 08 00 01 00 ...    provider, 8 x 16 bit, slots 0-3
+ *   J171 mca4 01 13 00 00 02 00 01 00 ...    provider, 2 slots, slots 0-1
  *
  * Bytes 0xc/0xe of the J71b record are the 128-bit frame and its 1-bit sync
  * pulse: the amplifiers run in TDM mode, as MAX98357 calls it.
@@ -843,6 +844,40 @@ static int s8000_mca_get_route(struct s8000_mca *mca)
 	return 0;
 }
 
+/*
+ * The T8010 headphone link: MCA4 to the CS42L83 jack codec, the ADT's
+ * /arm-io/mca4/audio-codec (iPadOS 17.7.x, identical on J71b, J72b, J171 and
+ * J172): provider (its i2s-switch route has the flags of the speaker MCA2,
+ * not the consumer MCA0), flags 0x13, two slots carrying data, 32-bit samples,
+ * and SmartIO endpoint 0x30 with a 0x180-byte FIFO and a 0xc0 trigger.
+ *
+ * Linux's CS42L42-family driver only takes standard I2S as a clock consumer
+ * and derives its internal MCLK from SCLK with its PLL, so this variant runs
+ * a plain 64 fs I2S frame (two 32-bit slots, LRCLK at half the frame, one bit
+ * of data delay) with the frame bits the S8000 I2S link uses. iOS's frame
+ * length for this link (byte 0xc of the record) has not been decoded and may
+ * differ; the codec does not need it to.
+ */
+static const struct s8000_mca_hw t8010_i2s_mca_hw = {
+	.version = 5,
+	.clock_provider = true,
+	.dai_format = SND_SOC_DAIFMT_I2S,
+	.channels = 2,
+	.slots = 2,
+	.tx_slots = 0x3,
+	.tx_cfg = 0x133,
+	.rx_cfg = 0x137,
+	.rx_slots = 0x3,
+	.formats = SNDRV_PCM_FMTBIT_S32_LE,
+	.frame_flags = MCA_FRAME_DUTY | MCA_FRAME_FMT,
+	.attenuation = 1,
+	.sio_xfer16 = 0x21,
+	.sio_xfer32 = 0x22,
+	.sio_timeout = 0,
+	.sio_fifo = 0x180,
+	.sio_trigger = 0xc0,
+};
+
 static int s8000_mca_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1011,6 +1046,7 @@ static const struct s8000_mca_hw t8010_mca_hw = {
 static const struct of_device_id s8000_mca_of_match[] = {
 	{ .compatible = "apple,s8000-mca", .data = &s8000_mca_hw },
 	{ .compatible = "apple,t8010-mca", .data = &t8010_mca_hw },
+	{ .compatible = "apple,t8010-mca-i2s", .data = &t8010_i2s_mca_hw },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s8000_mca_of_match);
