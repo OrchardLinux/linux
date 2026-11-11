@@ -143,6 +143,12 @@
 struct s8000_mca_hw {
 	u32 version;
 	bool clock_provider;
+	/*
+	 * Run the provider frame from prepare, not trigger: a codec that
+	 * clocks itself from SCLK (CS42L42 family) locks its PLL when ASoC
+	 * unmutes it, which is after prepare and before trigger.
+	 */
+	bool clocks_at_prepare;
 	unsigned int dai_format;	/* SND_SOC_DAIFMT_* */
 	unsigned int channels;
 	unsigned int slots;
@@ -516,7 +522,8 @@ static int mca_prepare(struct snd_pcm_substream *substream,
 			   MCA_IRQ_RX_CAUSES);
 	mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
 	if (first)
-		mca_write(mca, MCA_FRAME, mca->frame);
+		mca_write(mca, MCA_FRAME, mca->frame |
+			  (mca->hw->clocks_at_prepare ? MCA_FRAME_RUN : 0));
 	spin_unlock_irqrestore(&mca->hw_lock, flags);
 
 	if (first)
@@ -861,6 +868,7 @@ static int s8000_mca_get_route(struct s8000_mca *mca)
 static const struct s8000_mca_hw t8010_i2s_mca_hw = {
 	.version = 5,
 	.clock_provider = true,
+	.clocks_at_prepare = true,
 	.dai_format = SND_SOC_DAIFMT_I2S,
 	.channels = 2,
 	.slots = 2,
