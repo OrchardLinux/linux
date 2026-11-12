@@ -144,9 +144,12 @@ struct s8000_mca_hw {
 	u32 version;
 	bool clock_provider;
 	/*
-	 * Run the provider frame from prepare, not trigger: a codec that
-	 * clocks itself from SCLK (CS42L42 family) locks its PLL when ASoC
-	 * unmutes it, which is after prepare and before trigger.
+	 * Run the provider clocks from prepare to hw_free, not from trigger
+	 * to trigger: a codec that clocks itself from SCLK (CS42L42 family)
+	 * locks its PLL when ASoC unmutes it, which is after prepare and
+	 * before trigger, and runs from SCLK until ASoC mutes it again,
+	 * which is after trigger stop and before hw_free. The MCA only
+	 * drives SCLK while TX is enabled, so TX stays enabled as well.
 	 */
 	bool clocks_at_prepare;
 	unsigned int dai_format;	/* SND_SOC_DAIFMT_* */
@@ -213,6 +216,7 @@ struct s8000_mca {
 	spinlock_t hw_lock;
 	unsigned int prep_mask, run_mask;
 	u32 irq_mask;		/* current MCA_IRQ_MASK value */
+	u32 prep_frame;		/* frame the prepared block runs */
 };
 
 static inline void mca_write(struct s8000_mca *mca, u32 off, u32 val)
@@ -499,6 +503,18 @@ static int mca_prepare(struct snd_pcm_substream *substream,
 	/* ASoC serializes prepare/hw_free of the card's streams (pcm_mutex) */
 	spin_lock_irqsave(&mca->hw_lock, flags);
 	first = !(mca->prep_mask & ~BIT(dir));
+	/*
+	 * Prepared again (XRUN recovery, rewind): the codec may be running
+	 * from SCLK, which resetting the block would stop. While the block
+	 * still runs the prepared frame (not after a suspend), keep the
+	 * clocks; trigger restarts the DMA.
+	 */
+	if (mca->hw->clocks_at_prepare && (mca->prep_mask & BIT(dir)) &&
+	    mca->prep_frame == mca->frame &&
+	    mca_read(mca, MCA_FRAME) == (mca->frame | MCA_FRAME_RUN)) {
+		spin_unlock_irqrestore(&mca->hw_lock, flags);
+		return 0;
+	}
 	spin_unlock_irqrestore(&mca->hw_lock, flags);
 
 	if (first && mca->bitclk && !mca->bitclk_enabled) {
@@ -521,14 +537,29 @@ static int mca_prepare(struct snd_pcm_substream *substream,
 	mca->irq_mask &= ~(tx ? MCA_IRQ_TX_CAUSES | mca->hw->stream_irqs :
 			   MCA_IRQ_RX_CAUSES);
 	mca_write(mca, MCA_IRQ_MASK, mca->irq_mask);
+	if (first && tx && mca->hw->clocks_at_prepare)
+		mca_write(mca, MCA_TX_CFG, mca->tx_cfg | MCA_XX_CFG_EN);
 	if (first)
 		mca_write(mca, MCA_FRAME, mca->frame |
 			  (mca->hw->clocks_at_prepare ? MCA_FRAME_RUN : 0));
+	mca->prep_frame = mca->frame;
 	spin_unlock_irqrestore(&mca->hw_lock, flags);
 
 	if (first)
 		mca_route(mca, true);
 	return 0;
+}
+
+/* Called with hw_lock held */
+static void mca_stop_tx(struct s8000_mca *mca)
+{
+	u32 val;
+
+	mca_write(mca, MCA_TX_CFG, 0);
+	mca_write(mca, MCA_RESET, MCA_RESET_TX);
+	if (readl_relaxed_poll_timeout_atomic(mca->base + MCA_RESET, val,
+					      !(val & MCA_RESET_TX), 1, 1000))
+		dev_warn(mca->dev, "TX reset timed out\n");
 }
 
 static int mca_hw_free(struct snd_pcm_substream *substream,
@@ -549,6 +580,8 @@ static int mca_hw_free(struct snd_pcm_substream *substream,
 	if (last) {
 		/* back to the idle state runtime resume sets up: all masked */
 		mca->irq_mask = MCA_IRQ_ALL;
+		if (mca->hw->clocks_at_prepare)
+			mca_stop_tx(mca);
 		mca_write(mca, MCA_FRAME, 0);
 	} else {
 		mca->irq_mask |= dir == SNDRV_PCM_STREAM_PLAYBACK ?
@@ -597,8 +630,13 @@ static int mca_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		spin_lock_irqsave(&mca->hw_lock, flags);
-		mca_write(mca, tx ? MCA_TX_CFG : MCA_RX_CFG, 0);
 		mca->run_mask &= ~BIT(dir);
+		if (tx && mca->hw->clocks_at_prepare) {
+			/* SCLK runs until hw_free: the codec may run from it */
+			spin_unlock_irqrestore(&mca->hw_lock, flags);
+			return 0;
+		}
+		mca_write(mca, tx ? MCA_TX_CFG : MCA_RX_CFG, 0);
 		/*
 		 * MAX98357 asks not to lose LRCLK while BCLK runs and the amp
 		 * is on, and the amp stops after this DAI: a provider keeps
