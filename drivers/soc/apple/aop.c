@@ -1054,7 +1054,14 @@ static int apple_aop_probe(struct platform_device *pdev)
 	       aop->akf + APPLE_AOP_CPU_CONTROL);
 	writel(1, aop->control + APPLE_AOP_CONTROL_AUTO_BOOT);
 
-	ret = apple_rtkit_wake(aop->rtk);
+	/*
+	 * The firmware was just loaded and starts from scratch: wait for its
+	 * hello and its own power state report, as for any freshly started
+	 * coprocessor. Asking for a power state first (apple_rtkit_wake(), for
+	 * firmware that is already running) reaches it before its mailbox is
+	 * up.
+	 */
+	ret = apple_rtkit_boot(aop->rtk);
 	if (ret) {
 		dev_err(dev, "firmware did not boot: %d\n", ret);
 		goto err_halt;
