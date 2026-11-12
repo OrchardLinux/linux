@@ -9,9 +9,13 @@
  *
  *   0  u32 sequence
  *   4  u16 reserved
- *   6  s32 x, y, z in 1/65536 g, in the device frame (x right, y up,
- *      z out of the screen; +1 g opposite to gravity)
+ *   6  s32 x, y, z in 1/65536 g
  *  18  u32 timestamp
+ *
+ * The T8010's firmware reports in the device frame (x right, y up, z out of
+ * the screen; +1 g opposite to gravity). The S8000's firmware first needs the
+ * unit's factory calibration and reports in the sensor's frame; the board's
+ * mount-matrix maps it.
  */
 
 #include <linux/iio/buffer.h>
@@ -21,11 +25,11 @@
 #include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/soc/apple/aop.h>
 #include <linux/spinlock.h>
 #include <linux/unaligned.h>
 
-#define AOP_SET_PROPERTY		0x4
 #define AOP_PROP_REPORT_INTERVAL	0x00
 #define AOP_PROP_BATCH_INTERVAL		0x16
 #define AOP_PROP_RAW_INTERVAL		0x5c
@@ -41,8 +45,16 @@
 /* 9.80665 m/s^2 / 65536 */
 #define AOP_ACCEL_SCALE_NANO		149637
 
+struct apple_aop_accel_hw {
+	const struct apple_aop_calibration *calibration;
+	unsigned int num_calibration;
+	/* No separate raw sample stream (raw interval 0) */
+	bool no_raw_stream;
+};
+
 struct apple_aop_accel {
 	struct device *dev;
+	const struct apple_aop_accel_hw *hw;
 	const struct apple_aop_service *service;
 	struct iio_mount_matrix orientation;
 
@@ -58,13 +70,9 @@ struct apple_aop_accel {
 
 static int apple_aop_accel_set_property(struct apple_aop_accel *accel, u32 tag, u32 value)
 {
-	__le32 buf[3] = { 0, cpu_to_le32(tag), cpu_to_le32(value) };
-	int ret;
+	__le32 le = cpu_to_le32(value);
 
-	ret = apple_aop_call(accel->service, AOP_SET_PROPERTY, buf, sizeof(buf), NULL, 0);
-	if (ret > 0)
-		ret = -EIO;
-	return ret;
+	return apple_aop_set_property(accel->service, tag, &le, sizeof(le));
 }
 
 static int apple_aop_accel_set_interval(struct apple_aop_accel *accel, u32 interval_us)
@@ -75,7 +83,9 @@ static int apple_aop_accel_set_interval(struct apple_aop_accel *accel, u32 inter
 	int i, ret;
 
 	for (i = 0; i < ARRAY_SIZE(tags); i++) {
-		ret = apple_aop_accel_set_property(accel, tags[i], interval_us);
+		ret = apple_aop_accel_set_property(accel, tags[i],
+						   tags[i] == AOP_PROP_RAW_INTERVAL &&
+						   accel->hw->no_raw_stream ? 0 : interval_us);
 		if (ret)
 			return ret;
 	}
@@ -230,6 +240,7 @@ static int apple_aop_accel_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	accel = iio_priv(indio_dev);
 	accel->dev = dev;
+	accel->hw = device_get_match_data(dev);
 	accel->service = service;
 	mutex_init(&accel->lock);
 	spin_lock_init(&accel->sample_lock);
@@ -252,6 +263,15 @@ static int apple_aop_accel_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	if (accel->hw->num_calibration) {
+		ret = apple_aop_calibrate(service, dev, accel->hw->calibration,
+					  accel->hw->num_calibration);
+		if (ret) {
+			apple_aop_unlisten(service);
+			return dev_err_probe(dev, ret, "failed to calibrate\n");
+		}
+	}
+
 	ret = apple_aop_accel_set_interval(accel, AOP_ACCEL_DEFAULT_US);
 	if (ret) {
 		apple_aop_unlisten(service);
@@ -265,8 +285,25 @@ static int apple_aop_accel_probe(struct platform_device *pdev)
 	return devm_iio_device_register(dev, indio_dev);
 }
 
+/* Offset at low temperature, sensitivity (either), interrupt calibration */
+static const struct apple_aop_calibration apple_aop_accel_s8000_calibration[] = {
+	{ "apple,low-temp-accel-offset", 0x1a, 1 },
+	{ "apple,accel-sensitivity-calibration", 0x0b, 2 },
+	{ "apple,accel-range-sensitivity-cal", 0x27, 2 },
+	{ "apple,accel-interrupt-calibration", 0x19, 3 },
+};
+
+static const struct apple_aop_accel_hw apple_aop_accel_s8000 = {
+	.calibration = apple_aop_accel_s8000_calibration,
+	.num_calibration = ARRAY_SIZE(apple_aop_accel_s8000_calibration),
+	.no_raw_stream = true,
+};
+
+static const struct apple_aop_accel_hw apple_aop_accel_t8010 = { };
+
 static const struct of_device_id apple_aop_accel_of_match[] = {
-	{ .compatible = "apple,t8010-aop-accel" },
+	{ .compatible = "apple,s8000-aop-accel", .data = &apple_aop_accel_s8000 },
+	{ .compatible = "apple,t8010-aop-accel", .data = &apple_aop_accel_t8010 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_aop_accel_of_match);
