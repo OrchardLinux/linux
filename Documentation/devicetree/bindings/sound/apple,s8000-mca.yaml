@@ -106,6 +106,19 @@ properties:
       The i2s-switch route between this MCA and the pad its codec is
       connected to. The route is programmed while a stream is prepared.
 
+  apple,aop-i2s-route:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 4
+    items:
+      - items:
+          - description: phandle of an AOP i2s-switch syscon
+          - description: register offset
+          - description: value
+    description:
+      Writes that pass this MCA's link on through the AOP's i2s-switch, for
+      a codec wired to AOP pads. They are written when a stream starts and
+      left in place.
+
 required:
   - compatible
   - reg

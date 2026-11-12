@@ -123,6 +123,13 @@
 #define I2S_SW_CODE_NONE	0x18
 #define I2S_SW_NODE_DEFAULT	0x00181818
 
+/*
+ * The AOP's i2s-switch (ADT aop-i2s-switch,t8010) passes the headphone link
+ * on to the AOP pads the codec is wired to. Its layout is not decoded: the
+ * DT gives the words to write (see apple,aop-i2s-route).
+ */
+#define S8000_MCA_AOP_WRITES	4
+
 #define MCA_RATES	(SNDRV_PCM_RATE_8000 | SNDRV_PCM_RATE_11025 | \
 			 SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_22050 | \
 			 SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 | \
@@ -196,6 +203,16 @@ struct s8000_mca {
 	struct regmap *sw;	/* i2s-switch, NULL if not routed */
 	u32 sw_aud;
 	u32 sw_pin;
+
+	/*
+	 * AOP i2s-switch writes (apple,aop-i2s-route): the pads of a codec
+	 * wired to the AOP are reached through the AOP's own switch.
+	 */
+	struct {
+		struct regmap *map;
+		u32 reg, val;
+	} aop[S8000_MCA_AOP_WRITES];
+	unsigned int n_aop;
 
 	int irq;
 	u32 fifo_tx;
@@ -491,6 +508,18 @@ static int mca_init_dir(struct s8000_mca *mca, bool tx)
 	return 0;
 }
 
+/*
+ * The AOP is always on and Linux does not use its side of the switch, so
+ * the route is (re)written at every start and never taken down.
+ */
+static void mca_aop_route(struct s8000_mca *mca)
+{
+	unsigned int i;
+
+	for (i = 0; i < mca->n_aop; i++)
+		regmap_write(mca->aop[i].map, mca->aop[i].reg, mca->aop[i].val);
+}
+
 static int mca_prepare(struct snd_pcm_substream *substream,
 		       struct snd_soc_dai *dai)
 {
@@ -523,6 +552,8 @@ static int mca_prepare(struct snd_pcm_substream *substream,
 			return ret;
 		mca->bitclk_enabled = true;
 	}
+	if (first)
+		mca_aop_route(mca);
 	ret = first ? mca_init_block(mca) : mca_init_dir(mca, tx);
 	if (ret) {
 		if (first && mca->bitclk_enabled) {
@@ -860,6 +891,35 @@ static int mca_runtime_resume(struct device *dev)
 static DEFINE_RUNTIME_DEV_PM_OPS(mca_pm_ops, mca_runtime_suspend,
 				 mca_runtime_resume, NULL);
 
+static int s8000_mca_get_aop_route(struct s8000_mca *mca)
+{
+	struct device_node *np = mca->dev->of_node;
+	struct of_phandle_args args;
+	struct regmap *map;
+	unsigned int i;
+
+	for (i = 0; ; i++) {
+		if (of_parse_phandle_with_fixed_args(np, "apple,aop-i2s-route",
+						     2, i, &args))
+			break;
+		if (i >= S8000_MCA_AOP_WRITES) {
+			of_node_put(args.np);
+			return dev_err_probe(mca->dev, -EINVAL,
+					     "too many apple,aop-i2s-route entries\n");
+		}
+		map = syscon_node_to_regmap(args.np);
+		of_node_put(args.np);
+		if (IS_ERR(map))
+			return dev_err_probe(mca->dev, PTR_ERR(map),
+					     "failed to get an AOP i2s-switch register\n");
+		mca->aop[i].map = map;
+		mca->aop[i].reg = args.args[0];
+		mca->aop[i].val = args.args[1];
+	}
+	mca->n_aop = i;
+	return 0;
+}
+
 static int s8000_mca_get_route(struct s8000_mca *mca)
 {
 	struct device_node *np = mca->dev->of_node;
@@ -959,6 +1019,10 @@ static int s8000_mca_probe(struct platform_device *pdev)
 	}
 
 	ret = s8000_mca_get_route(mca);
+	if (ret)
+		return ret;
+
+	ret = s8000_mca_get_aop_route(mca);
 	if (ret)
 		return ret;
 
