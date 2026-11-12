@@ -24,10 +24,3 @@
 &touchscreen {
 	firmware-name = "apple/j71b-fwstart.z2fw";
 };
-
-&d2365_pmic {
-	poweroff {
-		compatible = "apple,d2365-poweroff";
-		power-supplies = <&tristar_charger>;
-	};
-};

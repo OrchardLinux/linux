@@ -257,6 +257,14 @@
 		       "0", "0", "1";
 };
 
+/* The PMIC powers the iPad 6 and iPad 7 off; the charger can keep it on. */
+&d2365_pmic {
+	poweroff {
+		compatible = "apple,d2365-poweroff";
+		power-supplies = <&tristar_charger>;
+	};
+};
+
 &i2s_switch {
 	status = "okay";
 };
