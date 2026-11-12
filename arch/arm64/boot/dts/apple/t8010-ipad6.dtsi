@@ -235,6 +235,27 @@
 	};
 };
 
+/* The iPad 6 models (J71b, J72b) use the same AOP firmware (ipad7baop). */
+&aop {
+	firmware-name = "apple/aop-ipad7b.bin", "apple/aop-ipad7b-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+/*
+ * Given the unit's factory calibration (from m1n1), the AOP reports upright
+ * as y = -1 g, as the iPad 5's does and as desktops (iio-sensor-proxy) take
+ * it: no rotation. Measured on a J71b: upright y = -0.93 g.
+ */
+&aop_accel {
+	mount-matrix = "1", "0", "0",
+		       "0", "1", "0",
+		       "0", "0", "1";
+};
+
 &i2s_switch {
 	status = "okay";
 };
