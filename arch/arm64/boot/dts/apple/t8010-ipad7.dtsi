@@ -18,22 +18,12 @@
 	firmware-name = "apple/aop-ipad7c.bin", "apple/aop-ipad7c-ext.bin";
 };
 
-/* The iPad 7 port controller is Bellatrix, with its own charger policy. */
-/delete-node/ &tristar_charger;
-/delete-node/ &tristar;
-
-/* Without the Tristar accessory policy the port stays a USB device. */
-&usb_role {
-	/delete-property/ apple,pmic;
-	/delete-property/ apple,tristar;
-	status = "disabled";
-};
-
-&usbdev {
-	/delete-property/ usb-psy-name;
-	/delete-property/ usb-role-switch;
-	/delete-node/ port;
-};
+/*
+ * The Lightning port is the iPad 6's: Apple's device tree has the same
+ * cbtl1610 Tristar at i2c0 0x1a, USB complex, otgphyctrl and dock
+ * accessory power, so the iPad 6 charger and USB role switch apply.
+ * Bellatrix (i2c1 orion-ic) belongs to dock-orion, the Smart Connector.
+ */
 
 &battery_info {
 	charge-full-design-microamp-hours = <8557000>;
@@ -83,22 +73,12 @@
 	sda-gpios = <&pinctrl_ap 39 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
 	status = "okay";
 
+	/* The Smart Connector's controller (dock-orion), not the Lightning port */
 	usb_power: usb-power@13 {
 		compatible = "apple,bellatrix";
 		reg = <0x13>;
 		interrupt-parent = <&pinctrl_aop>;
 		interrupts = <13 IRQ_TYPE_LEVEL_LOW>;
-	};
-};
-
-&d2365_pmic {
-	d2365_charger: charger@180 {
-		compatible = "apple,j172-d2365-charger", "apple,d2365-charger";
-		reg = <0x180 0x1e>, <0xa00 0x0d>;
-		reg-names = "status", "control";
-		interrupt-parent = <&pmu_gpio>;
-		interrupts = <72 IRQ_TYPE_EDGE_RISING>;
-		power-supplies = <&usb_power>;
 	};
 };
 
