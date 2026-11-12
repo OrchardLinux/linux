@@ -13,6 +13,7 @@
 	chassis-type = "tablet";
 
 	aliases {
+		als0 = &als;
 		bluetooth0 = &bluetooth;
 		touchscreen0 = &touchscreen;
 		wifi0 = &wifi;
@@ -216,6 +217,21 @@
 				};
 			};
 		};
+	};
+};
+
+/*
+ * The ambient light sensor, as in Apple's device tree of the iPad 6 and
+ * iPad 7 (i2c2 als1, als,ct819 at 0x39, GPIO 27 level-low).
+ */
+&i2c2 {
+	status = "okay";
+
+	/* m1n1 adds apple,als-calibration from the ADT */
+	als: light-sensor@39 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x39>;
+		interrupts-extended = <&pinctrl_ap 27 IRQ_TYPE_LEVEL_LOW>;
 	};
 };
 
