@@ -176,6 +176,19 @@
 			status = "disabled";
 		};
 
+		/* ADT aop-i2s-switch,t8010: node registers, pad output enable */
+		aop_i2s_switch: syscon@210540000 {
+			compatible = "apple,t8010-aop-i2s-switch", "syscon";
+			reg = <0x2 0x10540000 0x0 0x1000>;
+			status = "disabled";
+		};
+
+		aop_i2s_oe: syscon@210000600 {
+			compatible = "apple,t8010-aop-i2s-oe", "syscon";
+			reg = <0x2 0x10000600 0x0 0x4>;
+			status = "disabled";
+		};
+
 		mca2: mca@20a0a8000 {
 			compatible = "apple,t8010-mca";
 			reg = <0x2 0x0a0a8000 0x0 0x4000>,

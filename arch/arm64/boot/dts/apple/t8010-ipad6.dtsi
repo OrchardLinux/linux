@@ -345,8 +345,25 @@
 	status = "okay";
 };
 
+&aop_i2s_switch {
+	status = "okay";
+};
+
+&aop_i2s_oe {
+	status = "okay";
+};
+
 &mca4 {
 	apple,i2s-switch = <&i2s_switch 4 4>;
+	/*
+	 * The CS42L83 sits on AOP pads 32-35 behind the AOP's i2s-switch: ADT
+	 * mca4 function-i2s_route_aop 'mca1' to 'pin0' and aop-i2s-switch
+	 * aop_i2s_oe_reg_val 0xf, identical on J71b, J72b, J171 and J172.
+	 * Only with these words set do the AOP pads carry the link (J171).
+	 */
+	apple,aop-i2s-route = <&aop_i2s_switch 0x0 0x00010101>,
+			      <&aop_i2s_switch 0xc 0x00080818>,
+			      <&aop_i2s_oe 0x0 0xf>;
 	status = "okay";
 };
 
