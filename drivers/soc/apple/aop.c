@@ -117,6 +117,12 @@
 #define APPLE_AOP_MAX_CALLS		8
 #define APPLE_AOP_CALL_TIMEOUT		msecs_to_jiffies(1000)
 
+/* Service properties */
+#define APPLE_AOP_PROPERTY_MAX		64
+#define APPLE_AOP_PROP_CALIBRATION	0x3d
+#define APPLE_AOP_CALIBRATION_PARTIAL	1
+#define APPLE_AOP_CALIBRATION_COMPLETE	2
+
 struct afk_qe_header {
 	__le32 magic;
 	__le32 size;
@@ -886,6 +892,58 @@ int apple_aop_call(const struct apple_aop_service *service, u16 subtype, const v
 	return call.retcode > INT_MAX ? -EIO : call.retcode;
 }
 EXPORT_SYMBOL_GPL(apple_aop_call);
+
+int apple_aop_set_property(const struct apple_aop_service *service, u32 key,
+			   const void *value, size_t len)
+{
+	u8 buf[8 + APPLE_AOP_PROPERTY_MAX];
+	int ret;
+
+	if (len > APPLE_AOP_PROPERTY_MAX)
+		return -EINVAL;
+	put_unaligned_le32(0, buf);
+	put_unaligned_le32(key, buf + 4);
+	memcpy(buf + 8, value, len);
+
+	ret = apple_aop_call(service, APPLE_AOP_SET_PROPERTY, buf, 8 + len, NULL, 0);
+	return ret > 0 ? -EIO : ret;
+}
+EXPORT_SYMBOL_GPL(apple_aop_set_property);
+
+int apple_aop_calibrate(const struct apple_aop_service *service, struct device *dev,
+			const struct apple_aop_calibration *cal, unsigned int count)
+{
+	unsigned long needed = 0, applied = 0;
+	__le32 state;
+	unsigned int i;
+	int len, ret;
+
+	for (i = 0; i < count; i++) {
+		const void *blob;
+
+		if (cal[i].group)
+			needed |= BIT(cal[i].group);
+		blob = of_get_property(dev->of_node, cal[i].property, &len);
+		if (!blob)
+			continue;
+		ret = apple_aop_set_property(service, cal[i].key, blob, len);
+		if (ret) {
+			dev_warn(dev, "%s not applied: %d\n", cal[i].property, ret);
+			continue;
+		}
+		if (cal[i].group)
+			applied |= BIT(cal[i].group);
+	}
+
+	if (needed && applied == needed) {
+		state = cpu_to_le32(APPLE_AOP_CALIBRATION_COMPLETE);
+	} else {
+		dev_warn(dev, "factory calibration incomplete\n");
+		state = cpu_to_le32(APPLE_AOP_CALIBRATION_PARTIAL);
+	}
+	return apple_aop_set_property(service, APPLE_AOP_PROP_CALIBRATION, &state, sizeof(state));
+}
+EXPORT_SYMBOL_GPL(apple_aop_calibrate);
 
 /* Driver */
 
