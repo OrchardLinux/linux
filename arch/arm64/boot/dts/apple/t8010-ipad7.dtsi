@@ -22,6 +22,13 @@
 /delete-node/ &tristar_charger;
 /delete-node/ &tristar;
 
+/* Without the Tristar accessory policy the port stays a USB device. */
+&usb_role {
+	/delete-property/ apple,pmic;
+	/delete-property/ apple,tristar;
+	status = "disabled";
+};
+
 &usbdev {
 	/delete-property/ usb-psy-name;
 	/delete-property/ usb-role-switch;
