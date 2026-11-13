@@ -157,6 +157,9 @@ struct apple_pmic_gpio_info {
 	unsigned int input_mode;
 	unsigned int output_mode;
 	unsigned int function_mask;
+	/* Some PMICs only have a verified, boot-configured output mode. */
+	bool preserve_boot_direction;
+	unsigned int output_update_mask;
 	unsigned int (*config_reg)(unsigned int offset);
 	const struct apple_pmic_event_info *events;
 };
@@ -908,6 +911,25 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_pmic_gpio_pm_ops, apple_pmic_gpio_suspend,
 
 /* ---- GPIO ---- */
 
+/* D2401: only alter the level/function bits used by native _setGPIOFunction. */
+static int apple_pmic_gpio_set_boot_output(struct apple_pmic_gpio *gpio,
+					   unsigned int offset, int value)
+{
+	const struct apple_pmic_gpio_info *info = gpio->info;
+	unsigned int config;
+	int ret;
+
+	ret = regmap_read(gpio->regmap, info->config_reg(offset), &config);
+	if (ret)
+		return ret;
+	if ((config & info->direction_mask) != info->output_mode)
+		return -EOPNOTSUPP;
+
+	return regmap_update_bits(gpio->regmap, info->config_reg(offset),
+				  info->output_update_mask,
+				  value ? info->value_mask : 0);
+}
+
 static int apple_pmic_gpio_get_direction(struct gpio_chip *chip,
 					 unsigned int offset)
 {
@@ -921,6 +943,9 @@ static int apple_pmic_gpio_get_direction(struct gpio_chip *chip,
 		return ret;
 	if (value & info->function_mask)
 		return -EINVAL;
+	if (info->preserve_boot_direction &&
+	    (value & info->direction_mask) != info->output_mode)
+		return -EOPNOTSUPP;
 
 	if ((value & info->direction_mask) == info->input_mode)
 		return GPIO_LINE_DIRECTION_IN;
@@ -936,6 +961,9 @@ static int apple_pmic_gpio_direction_input(struct gpio_chip *chip,
 	struct apple_pmic_gpio *gpio = gpiochip_get_data(chip);
 	const struct apple_pmic_gpio_info *info = gpio->info;
 
+	if (info->preserve_boot_direction)
+		return -EOPNOTSUPP;
+
 	return regmap_update_bits(gpio->regmap,
 				  info->config_reg(offset),
 				  info->direction_mask | info->value_mask,
@@ -947,6 +975,9 @@ static int apple_pmic_gpio_direction_output(struct gpio_chip *chip,
 {
 	struct apple_pmic_gpio *gpio = gpiochip_get_data(chip);
 	const struct apple_pmic_gpio_info *info = gpio->info;
+
+	if (info->preserve_boot_direction)
+		return apple_pmic_gpio_set_boot_output(gpio, offset, value);
 
 	return regmap_update_bits(gpio->regmap,
 				  info->config_reg(offset),
@@ -967,6 +998,8 @@ static int apple_pmic_gpio_get(struct gpio_chip *chip, unsigned int offset)
 		return ret;
 	if ((value & info->direction_mask) == info->output_mode)
 		return !!(value & info->value_mask);
+	if (info->preserve_boot_direction)
+		return -EOPNOTSUPP;
 	if ((value & info->direction_mask) != info->input_mode)
 		return -EINVAL;
 
@@ -983,6 +1016,9 @@ static int apple_pmic_gpio_set(struct gpio_chip *chip, unsigned int offset,
 {
 	struct apple_pmic_gpio *gpio = gpiochip_get_data(chip);
 	const struct apple_pmic_gpio_info *info = gpio->info;
+
+	if (info->preserve_boot_direction)
+		return apple_pmic_gpio_set_boot_output(gpio, offset, value);
 
 	return regmap_update_bits(gpio->regmap,
 				  info->config_reg(offset),
@@ -1116,6 +1152,27 @@ static const struct apple_pmic_gpio_info d2365_gpio_info = {
 	.events = &d2365_event_info,
 };
 
+/*
+ * Autumn/D2401 has 20 GPIOs with linear, two-byte configuration slots.
+ * J120 radio enables inherit mode 0x80. Direction switching is not established;
+ * preserve that mode, reject other modes and leave the PMU event block alone.
+ */
+static unsigned int d2401_gpio_config_reg(unsigned int offset)
+{
+	return 0x900 + 2 * offset;
+}
+
+static const struct apple_pmic_gpio_info d2401_gpio_info = {
+	.label = "d2401-pmic-gpio",
+	.ngpio = 20,
+	.value_mask = BIT(0),
+	.direction_mask = GENMASK(7, 6),
+	.output_mode = BIT(7),
+	.config_reg = d2401_gpio_config_reg,
+	.preserve_boot_direction = true,
+	.output_update_mask = BIT(4) | BIT(3) | BIT(0),
+};
+
 static const struct of_device_id d2365_gpio_of_match[] = {
 	{
 		.compatible = "apple,d2089-pmic-gpio",
@@ -1124,6 +1181,10 @@ static const struct of_device_id d2365_gpio_of_match[] = {
 	{
 		.compatible = "apple,d2186-pmic-gpio",
 		.data = &d2186_gpio_info,
+	},
+	{
+		.compatible = "apple,d2401-pmic-gpio",
+		.data = &d2401_gpio_info,
 	},
 	{
 		.compatible = "apple,d2207-pmic-gpio",
