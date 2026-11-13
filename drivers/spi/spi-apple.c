@@ -127,6 +127,8 @@
 struct apple_spi_hw {
 	bool legacy_status;
 	bool has_descriptor_dma;
+	/* Restore native STATUS setup before long PIO as well as short transfers. */
+	bool pio_status_config;
 	/* T7000: the SPI version 1 configuration register layout. */
 	bool spi_v1;
 	/*
@@ -183,7 +185,7 @@ static bool apple_spi_t8010_uses_descriptor(struct spi_transfer *t,
 static void apple_spi_t8010_write_status_config(struct apple_spi *spi,
 						bool use_descriptor)
 {
-	if (use_descriptor)
+	if (use_descriptor || spi->hw->pio_status_config)
 		reg_write(spi, APPLE_SPI_STATUS,
 			  APPLE_SPI_T8010_DESC_STATUS_CFG);
 }
@@ -1415,6 +1417,14 @@ static const struct apple_spi_hw apple_spi_hw_t8010 = {
 	.cfg_base = APPLE_SPI_CFG_T8010_BASE,
 };
 
+static const struct apple_spi_hw apple_spi_hw_t8011 = {
+	.legacy_status = true,
+	.has_descriptor_dma = true,
+	.pio_status_config = true,
+	.min_clk_div = 2,
+	.cfg_base = APPLE_SPI_CFG_T8010_BASE,
+};
+
 static const struct apple_spi_hw apple_spi_hw_t7000 = {
 	.legacy_status = true,
 	.spi_v1 = true,
@@ -1430,6 +1440,7 @@ static const struct of_device_id apple_spi_of_match[] = {
 	{ .compatible = "apple,s5l8960x-spi", .data = &apple_spi_hw_s5l8960x, },
 	{ .compatible = "apple,t7000-spi", .data = &apple_spi_hw_t7000, },
 	{ .compatible = "apple,s8000-spi", .data = &apple_spi_hw_s8000, },
+	{ .compatible = "apple,t8011-spi", .data = &apple_spi_hw_t8011, },
 	{ .compatible = "apple,t8010-spi", .data = &apple_spi_hw_t8010, },
 	{ .compatible = "apple,t8103-spi", .data = &apple_spi_hw_default, },
 	{ .compatible = "apple,spi", .data = &apple_spi_hw_default, },
