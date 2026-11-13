@@ -14,7 +14,8 @@ description:
   reference clock consumed by the touchscreen controller. The S8000 PMGR has
   the same block at the same offset; the iPad 5 N1 touchscreen runs it at
   32768 Hz. So has the T8015 PMGR, whose iPhone X touchscreen runs it at
-  24 MHz.
+  24 MHz. The T8011 PMGR also uses this block at offset 0x78000; its J120
+  touchscreen runs from the 24 MHz reference.
 
 properties:
   compatible:
@@ -25,6 +26,7 @@ properties:
       - items:
           - enum:
               - apple,s8000-touch-clock
+              - apple,t8011-touch-clock
               - apple,t8015-touch-clock
           - const: apple,t8010-touch-clock
 
