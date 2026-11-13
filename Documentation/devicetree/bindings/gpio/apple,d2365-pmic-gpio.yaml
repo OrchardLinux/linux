@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/gpio/apple,d2365-pmic-gpio.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple A7/A8/A9/A10 PMIC GPIO and event interrupt controller
+title: Apple A7/A8/A9/A10/A10X PMIC GPIO and event interrupt controller
 
 maintainers:
   - Paul Praschl <praschlpaul@g-p.at>
@@ -14,6 +14,10 @@ description: |
   D2255, D2333 and D2365 PMICs used in Apple A9 and A10 devices provide 21,
   21, 21, 21 and 24 GPIOs respectively. The controller is accessed through the regmap exported by the
   parent Apple I2C PMIC device.
+
+  The Autumn D2401 provides 20 GPIOs. Only boot-configured outputs are
+  currently supported; direction switching and PMU event interrupts are not.
+  Boards must reserve lines that must remain under firmware control.
 
   The D2207 and D2365 also latch 112 and 240 PMU events respectively
   (charger, ADC, GPIO edges and others) in one read-to-clear block and
@@ -45,6 +49,7 @@ properties:
       - apple,d2255-pmic-gpio
       - apple,d2333-pmic-gpio
       - apple,d2365-pmic-gpio
+      - apple,d2401-pmic-gpio
 
   gpio-controller: true
 
@@ -52,6 +57,7 @@ properties:
     const: 2
 
   gpio-reserved-ranges:
+    minItems: 1
     maxItems: 3
 
   interrupt-controller: true
@@ -111,6 +117,7 @@ allOf:
             - apple,d2186-pmic-gpio
             - apple,d2255-pmic-gpio
             - apple,d2333-pmic-gpio
+            - apple,d2401-pmic-gpio
     then:
       properties:
         interrupt-controller: false
