@@ -28,7 +28,9 @@ properties:
   compatible:
     oneOf:
       - items:
-          - const: apple,t8015-spi
+          - enum:
+              - apple,t8011-spi
+              - apple,t8015-spi
           - const: apple,t8010-spi
           - const: apple,spi
       - items:
