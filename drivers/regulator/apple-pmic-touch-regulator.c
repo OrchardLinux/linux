@@ -64,6 +64,24 @@ static const struct regulator_desc apple_d2089_touch_core = {
 	.disable_val = 0,
 };
 
+/*
+ * August (D2400, J120) pmuL(0x30c) encodes LDO index 12 and options 3,
+ * not a register address. In iPadOS 17.7.11 (21H461), _setLDO at
+ * 0xfffffff0064bd8b0 indexes 12-byte entries at 0xfffffff005551a54.
+ * Entry 12 selects control register 0x312 and enable mask 0x01; the
+ * native read/modify/write at 0xfffffff0064bdaac preserves the other bits.
+ */
+static const struct regulator_desc apple_august_touch_analog = {
+	.name = "august-touch-analog",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x312,
+	.enable_mask = 0x01,
+	.enable_val = 0x01,
+	.disable_val = 0,
+};
+
 static const struct regulator_desc apple_d2186_touch_core = {
 	.name = "d2186-touch-core",
 	.ops = &apple_pmic_touch_regulator_ops,
@@ -247,6 +265,10 @@ static const struct of_device_id apple_pmic_touch_regulator_of_match[] = {
 	{
 		.compatible = "apple,d2089-touch-core-regulator",
 		.data = &apple_d2089_touch_core,
+	},
+	{
+		.compatible = "apple,august-touch-analog-regulator",
+		.data = &apple_august_touch_analog,
 	},
 	{
 		.compatible = "apple,d2186-touch-core-regulator",
