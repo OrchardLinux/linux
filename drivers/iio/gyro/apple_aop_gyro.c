@@ -2,9 +2,9 @@
 /*
  * Gyroscope served by the Apple Always-On Processor (AOP)
  *
- * The AOP firmware samples the gyroscope itself. Once it has the unit's
- * factory calibration and its batch, raw and report intervals (EPIC
- * set-property tags 0x16, 0x5c and 0), it sends one motion report (EPIC
+ * The AOP firmware of the A9 and A10 samples the gyroscope itself. Once it
+ * has the unit's factory calibration and its batch, raw and report intervals
+ * (EPIC set-property tags 0x16, 0x5c and 0), it sends one motion report (EPIC
  * subtype 0xc1) per report interval, laid out like the accelerometer's:
  *
  *   0  u16 sequence
@@ -273,6 +273,7 @@ static int apple_aop_gyro_probe(struct platform_device *pdev)
 
 static const struct of_device_id apple_aop_gyro_of_match[] = {
 	{ .compatible = "apple,s8000-aop-gyro" },
+	{ .compatible = "apple,t8010-aop-gyro" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_aop_gyro_of_match);

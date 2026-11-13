@@ -2,10 +2,10 @@
 /*
  * Barometric pressure sensor served by the Apple Always-On Processor (AOP)
  *
- * The AOP firmware samples the pressure sensor itself. Once it has the unit's
- * factory calibration and its batch, raw and report intervals (EPIC
- * set-property tags 0x16, 0x5c and 0), it sends one report (EPIC subtype
- * 0xc4) per report interval:
+ * The AOP firmware of the A9 and A10 samples the pressure sensor itself. Once
+ * it has the unit's factory calibration and its batch, raw and report
+ * intervals (EPIC set-property tags 0x16, 0x5c and 0), it sends one report
+ * (EPIC subtype 0xc4) per report interval:
  *
  *   0  u16 sequence
  *   2  u32 pressure in 1/65536 kPa
@@ -239,6 +239,7 @@ static int apple_aop_pressure_probe(struct platform_device *pdev)
 
 static const struct of_device_id apple_aop_pressure_of_match[] = {
 	{ .compatible = "apple,s8000-aop-pressure" },
+	{ .compatible = "apple,t8010-aop-pressure" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_aop_pressure_of_match);
