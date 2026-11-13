@@ -12,10 +12,10 @@
  *   6  s32 x, y, z in 1/65536 g
  *  18  u32 timestamp
  *
- * The T8010's firmware reports in the device frame (x right, y up, z out of
- * the screen; +1 g opposite to gravity). The S8000's firmware first needs the
- * unit's factory calibration and reports in the sensor's frame; the board's
- * mount-matrix maps it.
+ * Both take the unit's factory calibration first; the S8000's firmware sends
+ * no reports without it. The T8010's firmware reports in the device frame
+ * (x right, y up, z out of the screen; +1 g opposite to gravity), the S8000's
+ * in the sensor's frame; the board's mount-matrix maps it.
  */
 
 #include <linux/iio/buffer.h>
@@ -46,8 +46,6 @@
 #define AOP_ACCEL_SCALE_NANO		149637
 
 struct apple_aop_accel_hw {
-	const struct apple_aop_calibration *calibration;
-	unsigned int num_calibration;
 	/* No separate raw sample stream (raw interval 0) */
 	bool no_raw_stream;
 };
@@ -216,6 +214,14 @@ static const struct iio_info apple_aop_accel_info = {
 	.write_raw = apple_aop_accel_write_raw,
 };
 
+/* Offset at low temperature, sensitivity (either), interrupt calibration */
+static const struct apple_aop_calibration apple_aop_accel_calibration[] = {
+	{ "apple,low-temp-accel-offset", 0x1a, 1 },
+	{ "apple,accel-sensitivity-calibration", 0x0b, 2 },
+	{ "apple,accel-range-sensitivity-cal", 0x27, 2 },
+	{ "apple,accel-interrupt-calibration", 0x19, 3 },
+};
+
 static void apple_aop_accel_stop(void *data)
 {
 	struct apple_aop_accel *accel = data;
@@ -263,14 +269,14 @@ static int apple_aop_accel_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	if (accel->hw->num_calibration) {
-		ret = apple_aop_calibrate(service, dev, accel->hw->calibration,
-					  accel->hw->num_calibration);
-		if (ret) {
-			apple_aop_unlisten(service);
-			return dev_err_probe(dev, ret, "failed to calibrate\n");
-		}
-	}
+	/*
+	 * Without the calibration state the S8000's firmware stays silent; the
+	 * T8010's reports anyway, so carry on either way.
+	 */
+	ret = apple_aop_calibrate(service, dev, apple_aop_accel_calibration,
+				  ARRAY_SIZE(apple_aop_accel_calibration));
+	if (ret)
+		dev_warn(dev, "calibration state not set: %d\n", ret);
 
 	ret = apple_aop_accel_set_interval(accel, AOP_ACCEL_DEFAULT_US);
 	if (ret) {
@@ -285,17 +291,7 @@ static int apple_aop_accel_probe(struct platform_device *pdev)
 	return devm_iio_device_register(dev, indio_dev);
 }
 
-/* Offset at low temperature, sensitivity (either), interrupt calibration */
-static const struct apple_aop_calibration apple_aop_accel_s8000_calibration[] = {
-	{ "apple,low-temp-accel-offset", 0x1a, 1 },
-	{ "apple,accel-sensitivity-calibration", 0x0b, 2 },
-	{ "apple,accel-range-sensitivity-cal", 0x27, 2 },
-	{ "apple,accel-interrupt-calibration", 0x19, 3 },
-};
-
 static const struct apple_aop_accel_hw apple_aop_accel_s8000 = {
-	.calibration = apple_aop_accel_s8000_calibration,
-	.num_calibration = ARRAY_SIZE(apple_aop_accel_s8000_calibration),
 	.no_raw_stream = true,
 };
 
