@@ -30,8 +30,16 @@ properties:
       - const: fender
 
   interrupts:
-    minItems: 5
-    maxItems: 5
+    items:
+      - description: GPU interrupt 0
+      - description: GPU interrupt 1
+      - description: GPU interrupt 2
+      - description: GPU interrupt 3
+      - description:
+          The firmware's interrupt to the host, a software interrupt of the
+          interrupt controller. The firmware raises it through that
+          controller's registers, so the host tells it their address and
+          the interrupt's number.
 
   power-domains:
     maxItems: 1
