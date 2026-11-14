@@ -25,4 +25,14 @@ config SND_SOC_APPLE_S8000_MCA
 
 	  Say Y or M here if you have an Apple A9 device such as the iPad 5 or iPad 6.
 
+config SND_SOC_APPLE_T8010_PDM
+	tristate "Apple T8010 PDM microphone controller"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on COMMON_CLK
+	select SND_SOC_GENERIC_DMAENGINE_PCM
+	help
+	  This option enables an ASoC CPU DAI driver for the PDM microphone
+	  controller of the Apple A10, which records the built-in
+	  microphones of the iPad 6 and iPad 7.
+
 endmenu
