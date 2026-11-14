@@ -20,14 +20,16 @@ config DRM_POWERVR
 	  If "M" is selected, the module will be called powervr.
 
 config DRM_POWERVR_APPLE
-	bool "Apple A10 (T8010) GPU support"
+	bool "Apple A9 (S8003) and A10 (T8010) GPU support"
 	depends on DRM_POWERVR
 	depends on APPLE_RTKIT && (ARCH_APPLE || COMPILE_TEST)
 	depends on DRM_POWERVR=m || APPLE_RTKIT=y
 	help
 	  Support the Rogue-based GPU of the Apple A10 (T8010), which runs
 	  Apple's GFX firmware on an RTKit coprocessor instead of
-	  Imagination's firmware.
+	  Imagination's firmware, and start the firmware of the Apple A9
+	  (S8003), which runs on the GPU's own processor. The A9's GPU does
+	  not render yet.
 
 	  If in doubt, say "N".
 

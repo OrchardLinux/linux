@@ -33,6 +33,7 @@ powervr-$(CONFIG_DRM_POWERVR_APPLE) += \
 	pvr_apple.o \
 	pvr_apple_layout.o \
 	pvr_apple_queue.o \
+	pvr_apple_s8003.o \
 	pvr_apple_t8010.o
 
 powervr-$(CONFIG_DEBUG_FS) += \

@@ -1514,10 +1514,20 @@ static const struct pvr_device_data pvr_device_data_apple = {
 	.apple_fw = true,
 	.apple_chip = &pvr_apple_chip_t8010,
 };
+
+static const struct pvr_device_data pvr_device_data_apple_s8003 = {
+	.pwr_ops = &pvr_power_sequence_ops_apple,
+	.apple_fw = true,
+	.apple_chip = &pvr_apple_chip_s8003,
+};
 #endif
 
 static const struct of_device_id dt_match[] = {
 #if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
+	{
+		.compatible = "apple,s8003-gpu",
+		.data = &pvr_device_data_apple_s8003,
+	},
 	{
 		.compatible = "apple,t8010-gpu",
 		.data = &pvr_device_data_apple,

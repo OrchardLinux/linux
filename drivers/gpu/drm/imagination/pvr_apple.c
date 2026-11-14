@@ -8,7 +8,8 @@
  * and fragment jobs, the GPU's power and performance state (Fender), runtime
  * PM, sleep and recovery. The processor the firmware runs on, its memory
  * layout and its commands belong to the chip (struct pvr_apple_chip,
- * pvr_apple_chip.h): pvr_apple_t8010.c for the A10.
+ * pvr_apple_chip.h): pvr_apple_t8010.c for the A10, pvr_apple_s8003.c for the
+ * A9.
  */
 
 #include "pvr_apple.h"
