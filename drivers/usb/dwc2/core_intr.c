@@ -98,6 +98,10 @@ static void dwc2_handle_otg_intr(struct dwc2_hsotg *hsotg)
 		gotgctl = dwc2_readl(hsotg, GOTGCTL);
 
 		if (dwc2_is_device_mode(hsotg)) {
+			/* rare, and the cause of a gadget that stops answering mid-session */
+			dev_info_ratelimited(hsotg->dev,
+					     "VBUS session end in L%d (connected %u)\n",
+					     hsotg->lx_state, hsotg->connected);
 			if (hsotg->params.eusb2_disc) {
 				/* Clear the Gate hclk. */
 				pcgctl = dwc2_readl(hsotg, PCGCTL);
@@ -301,6 +305,10 @@ static void dwc2_handle_session_req_intr(struct dwc2_hsotg *hsotg)
 		hsotg->lx_state);
 
 	if (dwc2_is_device_mode(hsotg)) {
+		if (hsotg->connected)
+			dev_info_ratelimited(hsotg->dev,
+					     "VBUS session request while connected, in L%d: disconnecting\n",
+					     hsotg->lx_state);
 		if (hsotg->lx_state != DWC2_L0) {
 			if (hsotg->in_ppd) {
 				ret = dwc2_exit_partial_power_down(hsotg, 0,

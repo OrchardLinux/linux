@@ -3761,6 +3761,7 @@ irq_retry:
 	if (gintsts & (GINTSTS_USBRST | GINTSTS_RESETDET)) {
 		u32 usb_status = dwc2_readl(hsotg, GOTGCTL);
 		u32 connected = hsotg->connected;
+		enum dwc2_lx_state lx = hsotg->lx_state;
 
 		dev_dbg(hsotg->dev, "%s: USBRst\n", __func__);
 		dev_dbg(hsotg->dev, "GNPTXSTS=%08x\n",
@@ -3768,14 +3769,38 @@ irq_retry:
 
 		dwc2_writel(hsotg, GINTSTS_USBRST, GINTSTS);
 
+		/*
+		 * A reset of a suspended bus: no resume came first, so a core
+		 * that entered clock gating on the suspend is still gated.
+		 */
+		if (lx == DWC2_L2 && !hsotg->in_ppd &&
+		    hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE &&
+		    hsotg->bus_suspended && !hsotg->params.no_clock_gating)
+			dwc2_gadget_exit_clock_gating(hsotg, 0);
+
 		/* Report disconnection if it is not already done. */
 		dwc2_hsotg_disconnect(hsotg);
 
 		/* Reset device address to zero */
 		dwc2_clear_bit(hsotg, DCFG, DCFG_DEVADDR_MASK);
 
-		if (usb_status & GOTGCTL_BSESVLD && connected)
+		/*
+		 * The host resets an attached device.  A device that a session
+		 * event (VBUS session end or request) or a suspend took out of
+		 * L0 is no longer "connected", yet the host never saw it go:
+		 * without the re-initialisation the EP0 setup request that
+		 * enum-done queues is refused outside L0 (-EAGAIN) on this and
+		 * every later reset, until the UDC is rebound.  Re-arm it as
+		 * for a connected device, as Apple's device controller driver
+		 * does on every reset.
+		 */
+		if (usb_status & GOTGCTL_BSESVLD && (connected || lx != DWC2_L0))
 			dwc2_hsotg_core_init_disconnected(hsotg, true);
+		if (lx != DWC2_L0)
+			dev_info_ratelimited(hsotg->dev,
+					     "USB reset in L%d (connected %u, B-session %s): EP0 re-armed\n",
+					     lx, connected,
+					     usb_status & GOTGCTL_BSESVLD ? "valid" : "invalid");
 	}
 
 	if (gintsts & GINTSTS_ENUMDONE) {
