@@ -539,11 +539,8 @@ pvr_gpu_support_level(const struct pvr_gpu_id *gpu_id)
 	case PVR_PACKED_BVNC(36, 52, 104, 182):
 	case PVR_PACKED_BVNC(36, 53, 104, 796):
 	case PVR_PACKED_BVNC(13, 10, 6, 2):	/* Apple A10 (T8010) */
+	case PVR_PACKED_BVNC(9, 15, 6, 2):	/* Apple A9 (S8003) */
 		return PVR_GPU_SUPPORTED;
-
-	/* Apple A9 (S8003): its firmware is started, no job runs on it yet */
-	case PVR_PACKED_BVNC(9, 15, 6, 2):
-		return PVR_GPU_EXPERIMENTAL;
 
 	default:
 		return PVR_GPU_UNKNOWN;
