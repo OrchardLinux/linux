@@ -2607,7 +2607,7 @@ int pvr_mmu_map(struct pvr_mmu_op_context *op_ctx, u64 size, u64 flags,
 
 	memcpy(&ptr_copy, &op_ctx->curr_page, sizeof(ptr_copy));
 
-	flags_raw = pvr_page_flags_raw_create(false, false,
+	flags_raw = pvr_page_flags_raw_create(false, flags & PVR_BO_DEVICE_CACHE_COHERENT,
 					      flags & DRM_PVR_BO_BYPASS_DEVICE_CACHE,
 					      flags & DRM_PVR_BO_PM_FW_PROTECT);
 

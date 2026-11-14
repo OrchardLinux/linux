@@ -26,6 +26,7 @@
 #include <linux/lockdep.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
+#include <linux/scatterlist.h>
 #include <linux/stddef.h>
 
 /**
@@ -938,6 +939,85 @@ pvr_vm_unmap_obj(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
 	mutex_unlock(&vm_ctx->lock);
 
 	return err;
+}
+
+/**
+ * pvr_vm_map_io() - Map device registers into the kernel VM context
+ * @vm_ctx: The kernel VM context.
+ * @io_addr: Bus address of the registers.
+ * @device_addr: Virtual device address at the start of the mapping.
+ * @size: Size of the mapping.
+ *
+ * For a firmware that reaches registers outside the GPU through its own page
+ * tables. The pages are mapped for the firmware only and bypass the device
+ * cache. No memory object stands behind the mapping, so it is not tracked:
+ * the caller keeps the range free of other mappings and removes it with
+ * pvr_vm_unmap_io() before the context goes.
+ *
+ * Return:
+ *  * 0 on success,
+ *  * -%EINVAL for a userspace context or an address or size that is not
+ *    device page-aligned, or
+ *  * Any error encountered while building the page tables.
+ */
+int
+pvr_vm_map_io(struct pvr_vm_context *vm_ctx, phys_addr_t io_addr, u64 device_addr, u64 size)
+{
+	struct pvr_mmu_op_context *op_ctx;
+	struct sg_table sgt;
+	int err;
+
+	if (vm_ctx->is_userspace_context || !size ||
+	    ((io_addr | device_addr | size) & ~PVR_DEVICE_PAGE_MASK))
+		return -EINVAL;
+
+	err = sg_alloc_table(&sgt, 1, GFP_KERNEL);
+	if (err)
+		return err;
+
+	sg_dma_address(sgt.sgl) = io_addr;
+	sg_dma_len(sgt.sgl) = size;
+
+	op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, &sgt, 0, size);
+	if (IS_ERR(op_ctx)) {
+		err = PTR_ERR(op_ctx);
+		goto err_free_table;
+	}
+
+	mutex_lock(&vm_ctx->lock);
+	err = pvr_mmu_map(op_ctx, size,
+			  DRM_PVR_BO_BYPASS_DEVICE_CACHE | DRM_PVR_BO_PM_FW_PROTECT,
+			  device_addr);
+	mutex_unlock(&vm_ctx->lock);
+
+	pvr_mmu_op_context_destroy(op_ctx);
+
+err_free_table:
+	sg_free_table(&sgt);
+
+	return err;
+}
+
+/**
+ * pvr_vm_unmap_io() - Remove a mapping made with pvr_vm_map_io()
+ * @vm_ctx: The kernel VM context.
+ * @device_addr: Virtual device address at the start of the mapping.
+ * @size: Size of the mapping.
+ */
+void
+pvr_vm_unmap_io(struct pvr_vm_context *vm_ctx, u64 device_addr, u64 size)
+{
+	struct pvr_mmu_op_context *op_ctx;
+
+	op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, 0, 0);
+	if (WARN_ON(IS_ERR(op_ctx)))
+		return;
+
+	mutex_lock(&vm_ctx->lock);
+	WARN_ON(pvr_mmu_unmap(op_ctx, device_addr, size));
+	mutex_unlock(&vm_ctx->lock);
+
+	pvr_mmu_op_context_destroy(op_ctx);
 }
 
 /**

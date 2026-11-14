@@ -52,14 +52,21 @@ struct pvr_file;
  * Firmware options
  *    :PVR_BO_FW_NO_CLEAR_ON_RESET: By default, all FW objects are cleared and reinitialised on hard
  *       reset. Set this flag to override this behaviour and preserve buffer contents on reset.
+ *
+ * Device mapping options
+ *    :PVR_BO_DEVICE_CACHE_COHERENT: Map the object's pages as cache coherent on the device (the
+ *       CC bit of their page table entries). By default it is clear.
  */
 #define PVR_BO_CPU_CACHED BIT_ULL(63)
 
 #define PVR_BO_FW_NO_CLEAR_ON_RESET BIT_ULL(62)
 
-#define PVR_BO_KERNEL_FLAGS_MASK (PVR_BO_CPU_CACHED | PVR_BO_FW_NO_CLEAR_ON_RESET)
+#define PVR_BO_DEVICE_CACHE_COHERENT BIT_ULL(61)
 
-/* Bits 61..3 are undefined. */
+#define PVR_BO_KERNEL_FLAGS_MASK (PVR_BO_CPU_CACHED | PVR_BO_FW_NO_CLEAR_ON_RESET | \
+				  PVR_BO_DEVICE_CACHE_COHERENT)
+
+/* Bits 60..3 are undefined. */
 /* Bits 2..0 are defined in the UAPI. */
 
 /* Other utilities. */
