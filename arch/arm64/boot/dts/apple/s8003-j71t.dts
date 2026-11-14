@@ -24,3 +24,10 @@
 &wifi {
 	brcm,board-type = "apple,feara";
 };
+
+/*
+ * The GPU: the powervr driver starts its firmware. It does not render yet.
+ */
+&gpu {
+	status = "okay";
+};
