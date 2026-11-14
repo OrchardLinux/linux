@@ -66,6 +66,13 @@ config COMMON_CLK_APPLE_NCO
 	  found on Apple SoCs such as t8103 (M1). The blocks are typically
 	  generators of audio clocks.
 
+config COMMON_CLK_APPLE_AOP_AUDIO
+	tristate "Clock driver for the Apple AOP audio service"
+	depends on APPLE_AOP_T8010 || COMPILE_TEST
+	help
+	  This driver supports the clock of the PDM microphones on Apple A10
+	  devices, which the Always-On Processor's audio service generates.
+
 config COMMON_CLK_APPLE_T8010_TOUCH
 	bool "Clock driver for Apple T7000/T8010 touchscreens"
 	depends on ARCH_APPLE || COMPILE_TEST

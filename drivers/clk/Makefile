@@ -55,6 +55,7 @@ endif
 
 # hardware specific clock types
 # please keep this section sorted lexicographically by file path name
+obj-$(CONFIG_COMMON_CLK_APPLE_AOP_AUDIO) += clk-apple-aop-audio.o
 obj-$(CONFIG_COMMON_CLK_APPLE_NCO)  	+= clk-apple-nco.o
 obj-$(CONFIG_COMMON_CLK_APPLE_T8010_TOUCH) += clk-apple-t8010-touch.o
 obj-$(CONFIG_MACH_ASM9260)		+= clk-asm9260.o
