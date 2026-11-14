@@ -22,7 +22,10 @@
 #include <linux/errno.h>
 #include <linux/gfp_types.h>
 #include <linux/kref.h>
+#include <linux/list.h>
+#include <linux/lockdep.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
 #include <linux/stddef.h>
 
 /**
@@ -50,6 +53,12 @@ struct pvr_vm_context {
 
 	/** @lock: Global lock on this VM. */
 	struct mutex lock;
+
+	/**
+	 * @pins: Ranges that map and unmap requests must leave alone, as
+	 * &struct pvr_vm_pin. Protected by @lock.
+	 */
+	struct list_head pins;
 
 	/** @is_userspace_context: Mappings must lie within the userspace heaps. */
 	bool is_userspace_context;
@@ -598,6 +607,7 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 		       0, 1ULL << device_addr_bits, 0, 0, &pvr_vm_gpuva_ops);
 
 	mutex_init(&vm_ctx->lock);
+	INIT_LIST_HEAD(&vm_ctx->pins);
 	kref_init(&vm_ctx->ref_count);
 
 	if (is_userspace_context && pvr_device_is_apple(pvr_dev)) {
@@ -640,6 +650,7 @@ pvr_vm_context_release(struct kref *ref_count)
 		pvr_fw_object_destroy(vm_ctx->fw_mem_ctx_obj);
 
 	pvr_vm_unmap_all(vm_ctx);
+	WARN_ON(!list_empty(&vm_ctx->pins));
 
 	pvr_mmu_context_destroy(vm_ctx->mmu_ctx);
 	drm_gem_private_object_fini(&vm_ctx->dummy_gem);
@@ -709,6 +720,33 @@ void pvr_destroy_vm_contexts_for_file(struct pvr_file *pvr_file)
 	}
 }
 
+/**
+ * pvr_vm_range_is_pinned_locked() - Check whether a range overlaps a pin
+ * @vm_ctx: Target VM context.
+ * @device_addr: Start of the range.
+ * @size: Size of the range in bytes.
+ *
+ * The vm_ctx->lock must be held when calling this function.
+ *
+ * Return: %true if any part of the range is pinned.
+ */
+static bool
+pvr_vm_range_is_pinned_locked(struct pvr_vm_context *vm_ctx, u64 device_addr,
+			      u64 size)
+{
+	struct pvr_vm_pin *pin;
+
+	lockdep_assert_held(&vm_ctx->lock);
+
+	list_for_each_entry(pin, &vm_ctx->pins, node) {
+		if (device_addr < pin->start + pin->size &&
+		    pin->start < device_addr + size)
+			return true;
+	}
+
+	return false;
+}
+
 static int
 pvr_vm_lock_extra(struct drm_gpuvm_exec *vm_exec)
 {
@@ -737,6 +775,7 @@ pvr_vm_lock_extra(struct drm_gpuvm_exec *vm_exec)
  *    address; the region specified by @pvr_obj_offset and @size does not fall
  *    entirely within @pvr_obj, or any part of the specified region of @pvr_obj
  *    is not device-virtual page-aligned,
+ *  * -%EBUSY if the requested mapping overlaps a pinned range,
  *  * Any error encountered while performing internal operations required to
  *    destroy the mapping (returned from pvr_vm_gpuva_map or
  *    pvr_vm_gpuva_remap).
@@ -775,6 +814,12 @@ __pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
 		pvr_vm_bind_op_fini(&bind_op);
 		return err;
 	}
+
+	if (pvr_vm_range_is_pinned_locked(vm_ctx, device_addr, size)) {
+		err = -EBUSY;
+		goto err_cleanup;
+	}
+
 	err = drm_gpuvm_exec_lock(&vm_exec);
 	if (err)
 		goto err_cleanup;
@@ -903,6 +948,7 @@ pvr_vm_unmap_obj(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
  *
  * Return:
  *  * 0 on success,
+ *  * -%EBUSY if the mapping overlaps a pinned range,
  *  * Any error encountered by drm_gpuva_find,
  *  * Any error encountered by pvr_vm_unmap_obj_locked.
  */
@@ -916,7 +962,9 @@ pvr_vm_unmap(struct pvr_vm_context *vm_ctx, u64 device_addr, u64 size)
 	mutex_lock(&vm_ctx->lock);
 
 	va = drm_gpuva_find(&vm_ctx->gpuvm_mgr, device_addr, size);
-	if (va) {
+	if (va && pvr_vm_range_is_pinned_locked(vm_ctx, va->va.addr, va->va.range)) {
+		err = -EBUSY;
+	} else if (va) {
 		pvr_obj = gem_to_pvr_gem(va->gem.obj);
 		err = pvr_vm_unmap_obj_locked(vm_ctx, pvr_obj,
 					      va->va.addr, va->va.range);
@@ -1274,6 +1322,104 @@ err_unlock:
 	mutex_unlock(&vm_ctx->lock);
 
 	return NULL;
+}
+
+/**
+ * pvr_vm_range_is_pm_protected_locked() - Check that only the PM and firmware
+ *                                         can access a device-virtual range
+ * @vm_ctx: Target VM context.
+ * @device_addr: Start of the range.
+ * @size: Size of the range in bytes.
+ *
+ * The vm_ctx->lock must be held when calling this function.
+ *
+ * Return: %true if one mapping of a buffer object created with
+ * %DRM_PVR_BO_PM_FW_PROTECT, and without
+ * %DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS, covers the whole range.
+ */
+static bool
+pvr_vm_range_is_pm_protected_locked(struct pvr_vm_context *vm_ctx,
+				    u64 device_addr, u64 size)
+{
+	struct pvr_gem_object *pvr_obj;
+	struct drm_gpuva *va;
+	u64 end;
+
+	lockdep_assert_held(&vm_ctx->lock);
+
+	if (!size || check_add_overflow(device_addr, size, &end))
+		return false;
+
+	va = drm_gpuva_find_first(&vm_ctx->gpuvm_mgr, device_addr, 1);
+	if (!va || !va->gem.obj || end > va->va.addr + va->va.range)
+		return false;
+
+	pvr_obj = gem_to_pvr_gem(va->gem.obj);
+
+	return (pvr_obj->flags & DRM_PVR_BO_PM_FW_PROTECT) &&
+	       !(pvr_obj->flags & DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS);
+}
+
+/**
+ * pvr_vm_pin_pm_protected() - Pin device-virtual ranges that only the PM and
+ *                             firmware can access
+ * @vm_ctx: Target VM context.
+ * @pins: Ranges to pin, with &pvr_vm_pin.start and &pvr_vm_pin.size set.
+ * @count: Number of entries in @pins.
+ *
+ * Checks that each range lies within one mapping of a buffer object created
+ * with %DRM_PVR_BO_PM_FW_PROTECT and without
+ * %DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS, and then pins all of them: until
+ * pvr_vm_unpin(), pvr_vm_map() and pvr_vm_unmap() refuse to change any mapping
+ * that overlaps one. The check and the pin are atomic with respect to both.
+ *
+ * Return:
+ *  * 0 on success, or
+ *  * -%EINVAL if any range is not covered by such a mapping; nothing is
+ *    pinned then.
+ */
+int
+pvr_vm_pin_pm_protected(struct pvr_vm_context *vm_ctx, struct pvr_vm_pin *pins,
+			unsigned int count)
+{
+	unsigned int i;
+	int err = 0;
+
+	mutex_lock(&vm_ctx->lock);
+
+	for (i = 0; i < count; i++) {
+		if (!pvr_vm_range_is_pm_protected_locked(vm_ctx, pins[i].start,
+							 pins[i].size)) {
+			err = -EINVAL;
+			goto out_unlock;
+		}
+	}
+
+	for (i = 0; i < count; i++)
+		list_add_tail(&pins[i].node, &vm_ctx->pins);
+
+out_unlock:
+	mutex_unlock(&vm_ctx->lock);
+
+	return err;
+}
+
+/**
+ * pvr_vm_unpin() - Release ranges pinned by pvr_vm_pin_pm_protected()
+ * @vm_ctx: VM context the ranges were pinned in.
+ * @pins: The array passed to pvr_vm_pin_pm_protected().
+ * @count: Number of entries in @pins.
+ */
+void
+pvr_vm_unpin(struct pvr_vm_context *vm_ctx, struct pvr_vm_pin *pins,
+	     unsigned int count)
+{
+	mutex_lock(&vm_ctx->lock);
+
+	for (unsigned int i = 0; i < count; i++)
+		list_del(&pins[i].node);
+
+	mutex_unlock(&vm_ctx->lock);
 }
 
 /**

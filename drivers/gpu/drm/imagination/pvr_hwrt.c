@@ -10,7 +10,9 @@
 #include <drm/drm_gem.h>
 #include <linux/bitops.h>
 #include <linux/math.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/wait_bit.h>
 #include <linux/xarray.h>
 #include <uapi/drm/pvr_drm.h>
 
@@ -486,6 +488,86 @@ struct drm_gem_object *pvr_hwrt_data_resv_obj(struct pvr_hwrt_data *hwrt_data)
 	return gem_from_pvr_gem(hwrt_data->sync_obj);
 }
 
+/* PM page catalogue, directory and table entries per 4 KiB PM page */
+#define PVR_PM_PC_ENTRIES_PER_PAGE 0x400
+#define PVR_PM_PD_ENTRIES_PER_PAGE 0x200
+#define PVR_PM_PT_ENTRIES_PER_PAGE 0x200
+/* The PM keeps one set of tables for each of its TE and VCE address spaces. */
+#define PVR_PM_NUM_ADDRESS_SPACES 2
+#define PVR_PM_MLIST_ENTRY_STRIDE 4
+#define PVR_PM_FREE_LIST_ENTRY_SIZE sizeof(u32)
+
+/**
+ * pvr_hwrt_dataset_bind_vm() - Bind a HWRT data set to the VM context its jobs
+ *                              run in
+ * @hwrt: HWRT data set a geometry or fragment job runs on.
+ * @vm_ctx: VM context of that job.
+ *
+ * The parameter manager (PM) records in a render target's MList the physical
+ * pages it takes from the free list, and returns them to the free list from
+ * there; the free list itself holds physical page addresses too. Whoever can
+ * write either can make the PM hand any physical page to the tiler. Both must
+ * therefore live in buffer objects that only the PM and the firmware can
+ * access, and the device-virtual addresses the PM uses for them must keep
+ * pointing there for as long as a job may run on the data set.
+ *
+ * The first call checks, in @vm_ctx, that each MList and free list lies within
+ * one PM/FW-protected, non-CPU-mappable mapping of the size the PM uses, and
+ * pins those ranges until the data set is released. The MList size covers the
+ * page catalogue, directory and table entries for every page the free lists
+ * can hold, for both PM address spaces. Later calls only check that the job
+ * runs in the same VM context.
+ *
+ * Return:
+ *  * 0 on success, or
+ *  * -%EINVAL if a range is not protected, or the data set is bound to
+ *    another VM context.
+ */
+int pvr_hwrt_dataset_bind_vm(struct pvr_hwrt_dataset *hwrt,
+			     struct pvr_vm_context *vm_ctx)
+{
+	u64 pages = 0, pt_pages, pd_pages, pc_pages, mlist_size;
+	unsigned int n = 0;
+	int err = 0;
+
+	mutex_lock(&hwrt->pin_lock);
+
+	if (hwrt->vm_ctx) {
+		if (hwrt->vm_ctx != vm_ctx)
+			err = -EINVAL;
+		goto out_unlock;
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(hwrt->free_lists); i++) {
+		struct pvr_free_list *free_list = hwrt->free_lists[i];
+
+		pages += free_list->max_pages;
+		hwrt->pins[n].start = free_list->free_list_gpu_addr;
+		hwrt->pins[n++].size = (u64)free_list->max_pages *
+				       PVR_PM_FREE_LIST_ENTRY_SIZE;
+	}
+
+	pt_pages = DIV_ROUND_UP_ULL(pages, PVR_PM_PT_ENTRIES_PER_PAGE);
+	pd_pages = DIV_ROUND_UP_ULL(pt_pages, PVR_PM_PD_ENTRIES_PER_PAGE);
+	pc_pages = DIV_ROUND_UP_ULL(pd_pages, PVR_PM_PC_ENTRIES_PER_PAGE);
+	mlist_size = (pc_pages + pd_pages + pt_pages) *
+		     PVR_PM_NUM_ADDRESS_SPACES * PVR_PM_MLIST_ENTRY_STRIDE;
+
+	for (int i = 0; i < ARRAY_SIZE(hwrt->data); i++) {
+		hwrt->pins[n].start = hwrt->data[i].data.pm_mlist_dev_addr;
+		hwrt->pins[n++].size = mlist_size;
+	}
+
+	err = pvr_vm_pin_pm_protected(vm_ctx, hwrt->pins, n);
+	if (!err)
+		hwrt->vm_ctx = pvr_vm_context_get(vm_ctx);
+
+out_unlock:
+	mutex_unlock(&hwrt->pin_lock);
+
+	return err;
+}
+
 /**
  * pvr_hwrt_dataset_create() - Create a new HWRT dataset
  * @pvr_file: Pointer to pvr_file structure.
@@ -526,6 +608,7 @@ pvr_hwrt_dataset_create(struct pvr_file *pvr_file,
 		hwrt->data[i].hwrt_dataset = hwrt;
 	}
 
+	mutex_init(&hwrt->pin_lock);
 	kref_init(&hwrt->ref_count);
 	return hwrt;
 
@@ -555,6 +638,12 @@ pvr_hwrt_dataset_release(struct kref *ref_count)
 							 hwrt->data[i].fw_obj, 0));
 		hwrt_data_fini_fw_structure(hwrt, i);
 	}
+
+	if (hwrt->vm_ctx) {
+		pvr_vm_unpin(hwrt->vm_ctx, hwrt->pins, ARRAY_SIZE(hwrt->pins));
+		pvr_vm_context_put(hwrt->vm_ctx);
+	}
+	mutex_destroy(&hwrt->pin_lock);
 
 	hwrt_fini_common_fw_structure(hwrt);
 	hwrt_fini_kernel_structure(hwrt);
@@ -589,6 +678,23 @@ void pvr_destroy_hwrt_datasets_for_file(struct pvr_file *pvr_file)
 void
 pvr_hwrt_dataset_put(struct pvr_hwrt_dataset *hwrt)
 {
-	if (hwrt)
-		kref_put(&hwrt->ref_count, pvr_hwrt_dataset_release);
+	if (hwrt && !kref_put(&hwrt->ref_count, pvr_hwrt_dataset_release))
+		wake_up_var(&hwrt->ref_count);
+}
+
+/**
+ * pvr_hwrt_dataset_destroy() - Drop the handle reference on a HWRT dataset
+ * @hwrt: HWRT dataset whose handle userspace destroyed.
+ *
+ * Jobs hold references on the data set until they are freed, shortly after
+ * they complete. Waiting for them here releases the data set, and with it the
+ * ranges pvr_hwrt_dataset_bind_vm() pinned, before userspace sees the destroy
+ * complete, so that it can unmap the MList and free list buffers right away.
+ */
+void
+pvr_hwrt_dataset_destroy(struct pvr_hwrt_dataset *hwrt)
+{
+	wait_var_event_killable(&hwrt->ref_count,
+				kref_read(&hwrt->ref_count) == 1);
+	pvr_hwrt_dataset_put(hwrt);
 }

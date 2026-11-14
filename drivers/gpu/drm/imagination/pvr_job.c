@@ -455,6 +455,12 @@ create_job(struct pvr_device *pvr_dev,
 			err = -EINVAL;
 			goto err_put_job;
 		}
+
+		/* The PM uses the data set's MLists and free lists. */
+		err = pvr_hwrt_dataset_bind_vm(job->hwrt->hwrt_dataset,
+					       job->ctx->vm_ctx);
+		if (err)
+			goto err_put_job;
 	}
 
 	err = pvr_job_fw_cmd_init(job, args);

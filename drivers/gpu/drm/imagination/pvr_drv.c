@@ -895,7 +895,7 @@ pvr_ioctl_destroy_hwrt_dataset(struct drm_device *drm_dev, void *raw_args,
 	if (!hwrt)
 		return -EINVAL;
 
-	pvr_hwrt_dataset_put(hwrt);
+	pvr_hwrt_dataset_destroy(hwrt);
 	return 0;
 }
 
