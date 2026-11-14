@@ -25,9 +25,7 @@
 	brcm,board-type = "apple,feara";
 };
 
-/*
- * The GPU: the powervr driver starts its firmware. It does not render yet.
- */
+/* The GPU: its firmware file comes from this board's firmware recipe */
 &gpu {
 	status = "okay";
 };

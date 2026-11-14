@@ -24,3 +24,8 @@
 &wifi {
 	brcm,board-type = "apple,fearb";
 };
+
+/* The GPU: its firmware file comes from this board's firmware recipe */
+&gpu {
+	status = "okay";
+};
