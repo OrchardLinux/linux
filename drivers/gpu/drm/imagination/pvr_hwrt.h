@@ -84,6 +84,18 @@ struct pvr_hwrt_dataset {
 	/** @max_rts: Maximum render targets for this HWRT data set. */
 	u16 max_rts;
 
+	/**
+	 * @width: Width in pixels, as created; with @height and @samples for a
+	 * firmware that takes the target's geometry with each job (Apple A9).
+	 */
+	u32 width;
+
+	/** @height: Height in pixels. */
+	u32 height;
+
+	/** @samples: Samples per pixel. */
+	u32 samples;
+
 	/** @pin_lock: Protects @vm_ctx and @pins. */
 	struct mutex pin_lock;
 

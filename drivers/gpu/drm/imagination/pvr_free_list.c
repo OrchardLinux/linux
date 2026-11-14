@@ -456,9 +456,13 @@ pvr_free_list_create(struct pvr_file *pvr_file,
 			goto err_free_fw_id;
 	}
 
-	err = pvr_free_list_grow(free_list, args->initial_num_pages);
-	if (err < 0)
-		goto err_fw_struct_cleanup;
+	/* Not on a chip that allocates the parameter manager's pages itself */
+	if (!pvr_device_is_apple(pvr_file->pvr_dev) ||
+	    pvr_apple_free_list_has_pages(pvr_file->pvr_dev)) {
+		err = pvr_free_list_grow(free_list, args->initial_num_pages);
+		if (err < 0)
+			goto err_fw_struct_cleanup;
+	}
 
 	return free_list;
 

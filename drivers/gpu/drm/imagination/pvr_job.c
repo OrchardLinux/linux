@@ -235,7 +235,10 @@ pvr_compute_job_fw_cmd_init(struct pvr_job *job,
 		return -EINVAL;
 
 	job->fw_ccb_cmd_type = ROGUE_FWIF_CCB_CMD_TYPE_CDM;
-	err = pvr_fw_cmd_init(job->pvr_dev, job, &pvr_cmd_compute_stream,
+	err = pvr_fw_cmd_init(job->pvr_dev, job,
+			      pvr_device_is_apple(job->pvr_dev) ?
+				pvr_apple_cmd_stream(job->pvr_dev, DRM_PVR_JOB_TYPE_COMPUTE) :
+				&pvr_cmd_compute_stream,
 			      args->cmd_stream, args->cmd_stream_len);
 	if (err)
 		return err;

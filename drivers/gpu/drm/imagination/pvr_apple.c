@@ -26,6 +26,7 @@
 #include "pvr_power.h"
 #include "pvr_rogue_cr_defs.h"
 #include "pvr_rogue_heap_config.h"
+#include "pvr_stream_defs.h"
 #include "pvr_vm.h"
 
 #include <drm/drm_print.h>
@@ -372,7 +373,6 @@ static int pvr_apple_boot(struct pvr_apple *apple)
 
 static int pvr_apple_fw_restart(struct pvr_apple *apple);
 static void pvr_apple_fw_stop(struct pvr_apple *apple);
-static int pvr_apple_wait_idle(struct pvr_apple *apple, unsigned int timeout_us);
 
 /*
  * Runtime PM. Every job the firmware runs holds a runtime-PM reference from
@@ -411,8 +411,11 @@ static int pvr_apple_power_off(struct pvr_device *pvr_dev)
 	if (apple->devfreq)
 		devfreq_suspend_device(apple->devfreq);
 	mutex_lock(&apple->submit_lock);
-	/* Nothing holds a job reference, so this does not wait in practice. */
-	err = pvr_apple_wait_idle(apple, 1000000);
+	/*
+	 * Nothing holds a job reference, so this does not wait in practice.
+	 * A firmware that a reset stopped has nothing to wait for.
+	 */
+	err = apple->booted ? pvr_apple_wait_idle(apple, 1000000) : 0;
 	if (!err) {
 		pvr_apple_fw_stop(apple);
 		apple->chip->idle(apple);
@@ -571,7 +574,17 @@ static int pvr_apple_wait(struct pvr_apple *apple, u32 seq, unsigned int timeout
 
 static u32 pvr_apple_engine_done(struct pvr_apple *apple, enum pvr_apple_engine engine)
 {
+	if (apple->chip->engine_done)
+		return apple->chip->engine_done(apple, engine);
 	return heap_read32(apple, apple->layout.stamp[engine]);
+}
+
+/* For a wait: what the firmware posted meanwhile is read first */
+static u32 pvr_apple_engine_poll(struct pvr_apple *apple, enum pvr_apple_engine engine)
+{
+	if (apple->chip->events)
+		apple->chip->events(apple);
+	return pvr_apple_engine_done(apple, engine);
 }
 
 static u32 pvr_apple_engine_last(struct pvr_apple *apple, enum pvr_apple_engine engine)
@@ -596,12 +609,12 @@ static int pvr_apple_wait_engine(struct pvr_apple *apple, enum pvr_apple_engine 
 	 * switch of GPU VM, for every engine; 1 ms steps cost a scene-heavy
 	 * WebGL page several milliseconds per frame
 	 */
-	return read_poll_timeout(pvr_apple_engine_done, done, (s32)(done - seq) >= 0, 20,
+	return read_poll_timeout(pvr_apple_engine_poll, done, (s32)(done - seq) >= 0, 20,
 				 timeout_us, false, apple, engine);
 }
 
 /* Wait until every engine retired its submitted jobs; submit_lock held */
-static int pvr_apple_wait_idle(struct pvr_apple *apple, unsigned int timeout_us)
+int pvr_apple_wait_idle(struct pvr_apple *apple, unsigned int timeout_us)
 {
 	int engine, err = 0;
 
@@ -746,7 +759,10 @@ static void pvr_apple_poll_work(struct work_struct *work)
 	bool pending = false;
 	int engine;
 
-	pvr_apple_ack_events(apple);
+	if (apple->chip->events)
+		apple->chip->events(apple);
+	else
+		pvr_apple_ack_events(apple);
 	spin_lock_irq(&apple->fence_lock);
 	for (engine = 0; engine < APPLE_ENGINES; engine++) {
 		u32 done = pvr_apple_engine_done(apple, engine);
@@ -757,7 +773,7 @@ static void pvr_apple_poll_work(struct work_struct *work)
 		 * do not go through the GPU, such as the display. Its fence also
 		 * waits for the retirement stamp.
 		 */
-		if (engine == APPLE_ENGINE_FRAG) {
+		if (engine == APPLE_ENGINE_FRAG && !apple->chip->engine_done) {
 			u32 retired = pvr_apple_frag_retired_seq(apple);
 
 			if ((s32)(retired - done) < 0)
@@ -824,7 +840,19 @@ void pvr_apple_report_hang(struct pvr_device *pvr_dev, struct dma_fence *fence)
 		heap_read32(apple, apple->layout.producer[APPLE_ENGINE_FRAG]),
 		heap_read32(apple, apple->layout.event_producer),
 		heap_read32(apple, apple->layout.event_consumer));
-	apple->chip->report_hang(apple);
+	if (apple->chip->report_hang)
+		apple->chip->report_hang(apple);
+}
+
+/* No job is ordered after the scenes submitted so far any more */
+static void pvr_apple_forget_scenes(struct pvr_apple *apple)
+{
+	dma_fence_put(apple->last_frag);
+	apple->last_frag = NULL;
+	dma_fence_put(apple->prev_frag);
+	apple->prev_frag = NULL;
+	dma_fence_put(apple->last_geom);
+	apple->last_geom = NULL;
 }
 
 static unsigned int pvr_apple_cancel_fences(struct pvr_apple *apple, int error)
@@ -963,6 +991,11 @@ void pvr_apple_mmu_flush(struct pvr_device *pvr_dev)
 	struct pvr_apple *apple = to_apple(pvr_dev);
 	__le32 *gen = (__le32 *)(apple->heap + apple->layout.mmu_gen);
 
+	if (apple->chip->mmu_flush) {
+		apple->chip->mmu_flush(apple);
+		return;
+	}
+
 	/*
 	 * May run in atomic context, so no lock: only the host writes the
 	 * generation, and any change makes the firmware invalidate. A bump
@@ -1000,7 +1033,11 @@ void pvr_apple_vm_fini(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
 
-	if (vm_ctx == pvr_dev->kernel_vm_ctx || !apple->booted)
+	if (vm_ctx == pvr_dev->kernel_vm_ctx)
+		return;
+	if (apple->chip->vm_fini)
+		apple->chip->vm_fini(apple, vm_ctx);
+	if (!apple->booted)
 		return;
 	pvr_apple_switch_to_kernel_vm(apple, vm_ctx);
 }
@@ -1125,6 +1162,8 @@ struct dma_fence *pvr_apple_submit_render_job(struct pvr_job *job)
 	if (job->type == DRM_PVR_JOB_TYPE_FRAGMENT &&
 	    job->fw_ccb_cmd_type == ROGUE_FWIF_CCB_CMD_TYPE_FRAG_PR)
 		return ERR_PTR(-EOPNOTSUPP);	/* partial renders: not yet */
+	if (apple->chip->submit)
+		return pvr_apple_submit_job(job);
 
 	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
 	hw = kmalloc(apple->chip->render_job_size, GFP_KERNEL);
@@ -1148,6 +1187,26 @@ struct dma_fence *pvr_apple_submit_render_job(struct pvr_job *job)
 }
 
 /**
+ * pvr_apple_submit_job() - Queue a job on a chip that writes its jobs itself
+ * @job: The job, its command decoded with the chip's stream definitions.
+ *
+ * Return: a fence signalled when the job retires, or an ERR_PTR().
+ */
+struct dma_fence *pvr_apple_submit_job(struct pvr_job *job)
+{
+	struct pvr_apple *apple = to_apple(job->pvr_dev);
+	enum pvr_apple_engine engine = job->type == DRM_PVR_JOB_TYPE_GEOMETRY ? APPLE_ENGINE_GEOM :
+				       job->type == DRM_PVR_JOB_TYPE_FRAGMENT ? APPLE_ENGINE_FRAG :
+				       APPLE_ENGINE_COMPUTE;
+	struct pvr_apple_fence *fence;
+
+	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+	if (!fence)
+		return ERR_PTR(-ENOMEM);
+	return pvr_apple_job_fence(apple, fence, engine, apple->chip->submit(apple, job));
+}
+
+/**
  * pvr_apple_job_add_deps() - Order a job against the parameter manager's scene
  * @job: Job about to be armed.
  *
@@ -1157,6 +1216,12 @@ struct dma_fence *pvr_apple_submit_render_job(struct pvr_job *job)
  * geometry job. IMG's firmware orders a geometry/fragment pair itself; the
  * HWRT reservation does not, as a job's fence is added to it only after all
  * jobs of a submission collected their dependencies.
+ *
+ * A chip may hold two scenes of one VM (&pvr_apple_chip.scenes,
+ * &pvr_apple_chip.vm_scenes): a geometry job then waits for the fragment job
+ * before the last one if the last one is its own VM's, and a fragment job
+ * for its geometry job to be submitted rather than finished
+ * (pvr_apple_job_armed()).
  *
  * Return: 0 or a negative error.
  */
@@ -1168,8 +1233,14 @@ int pvr_apple_job_add_deps(struct pvr_job *job)
 	if (job->type != DRM_PVR_JOB_TYPE_GEOMETRY && job->type != DRM_PVR_JOB_TYPE_FRAGMENT)
 		return 0;
 	spin_lock_irq(&apple->fence_lock);
-	last = dma_fence_get(job->type == DRM_PVR_JOB_TYPE_GEOMETRY ? apple->last_frag :
-								     apple->last_geom);
+	if (job->type == DRM_PVR_JOB_TYPE_FRAGMENT)
+		last = apple->last_geom;
+	else if (apple->chip->scenes > 1 && apple->last_frag_vm == job->ctx->vm_ctx &&
+		 apple->chip->vm_scenes(apple, job->ctx->vm_ctx) > 1)
+		last = apple->prev_frag;
+	else
+		last = apple->last_frag;
+	last = dma_fence_get(last);
 	spin_unlock_irq(&apple->fence_lock);
 	return last ? drm_sched_job_add_dependency(&job->base, last) : 0;
 }
@@ -1182,6 +1253,7 @@ int pvr_apple_job_add_deps(struct pvr_job *job)
 void pvr_apple_job_armed(struct pvr_job *job, struct dma_fence *finished)
 {
 	struct pvr_apple *apple = to_apple(job->pvr_dev);
+	bool joint = apple->chip->scenes > 1;
 	struct dma_fence **last, *old;
 
 	if (job->type == DRM_PVR_JOB_TYPE_GEOMETRY)
@@ -1190,9 +1262,17 @@ void pvr_apple_job_armed(struct pvr_job *job, struct dma_fence *finished)
 		last = &apple->last_frag;
 	else
 		return;
+	/* The firmware orders a fragment job after its geometry job itself */
+	if (joint && job->type == DRM_PVR_JOB_TYPE_GEOMETRY)
+		finished = &job->base.s_fence->scheduled;
 	spin_lock_irq(&apple->fence_lock);
 	old = *last;
 	*last = dma_fence_get(finished);
+	if (job->type == DRM_PVR_JOB_TYPE_FRAGMENT) {
+		apple->last_frag_vm = job->ctx->vm_ctx;
+		if (joint)
+			swap(old, apple->prev_frag);
+	}
 	spin_unlock_irq(&apple->fence_lock);
 	dma_fence_put(old);
 }
@@ -1217,6 +1297,8 @@ int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
 				  PVR_DEVICE_PAGE_SIZE);
 	if (!err)
 		err = pvr_vm_map_reserved(vm_ctx, apple->zero_obj, 0, PVR_DEVICE_PAGE_SIZE);
+	if (!err && apple->chip->vm_init)
+		err = apple->chip->vm_init(apple, vm_ctx);
 	return err;
 }
 
@@ -1303,16 +1385,28 @@ int pvr_apple_reset(struct pvr_device *pvr_dev)
 	mutex_lock(&apple->submit_lock);
 	dev_warn(dev, "resetting the GPU\n");
 	pvr_apple_cancel_fences(apple, -ETIMEDOUT);
-	dma_fence_put(apple->last_frag);
-	apple->last_frag = NULL;
-	dma_fence_put(apple->last_geom);
-	apple->last_geom = NULL;
+	pvr_apple_forget_scenes(apple);
 	spin_lock_irq(&apple->fence_lock);
 	apple->busy_since = 0;
 	spin_unlock_irq(&apple->fence_lock);
 
 	pvr_apple_fw_stop(apple);
-	err = pvr_apple_fw_restart(apple);
+	/*
+	 * A chip whose core keeps state while its power domain is on: take
+	 * the domain off through runtime PM and leave it off for a while. The
+	 * next job starts the firmware (pvr_apple_power_on()). If another job
+	 * holds the GPU powered at this moment, the domain stays on and the
+	 * firmware is started here.
+	 */
+	if (apple->chip->gate_off_ms) {
+		mutex_unlock(&apple->submit_lock);
+		if (pm_runtime_suspend(dev) >= 0) {
+			msleep(apple->chip->gate_off_ms);
+			return 0;
+		}
+		mutex_lock(&apple->submit_lock);
+	}
+	err = apple->booted ? 0 : pvr_apple_fw_restart(apple);
 	mutex_unlock(&apple->submit_lock);
 	if (err)
 		dev_err(dev, "GPU reset failed: %d\n", err);
@@ -1364,10 +1458,7 @@ int pvr_apple_suspend(struct pvr_device *pvr_dev)
 	n = pvr_apple_cancel_fences(apple, -ETIMEDOUT);
 	if (n)
 		dev_warn(dev, "%u GPU jobs ended unfinished before sleep\n", n);
-	dma_fence_put(apple->last_frag);
-	apple->last_frag = NULL;
-	dma_fence_put(apple->last_geom);
-	apple->last_geom = NULL;
+	pvr_apple_forget_scenes(apple);
 	spin_lock_irq(&apple->fence_lock);
 	apple->busy_since = 0;
 	spin_unlock_irq(&apple->fence_lock);
@@ -1456,10 +1547,7 @@ void pvr_apple_fw_fini(struct pvr_device *pvr_dev)
 	struct pvr_apple *apple = to_apple(pvr_dev);
 
 	apple->fw_ready = false;
-	dma_fence_put(apple->last_frag);
-	apple->last_frag = NULL;
-	dma_fence_put(apple->last_geom);
-	apple->last_geom = NULL;
+	pvr_apple_forget_scenes(apple);
 	if (apple->booted)
 		pvr_apple_switch_to_kernel_vm(apple, NULL);
 	pvr_apple_cancel_fences(apple, -ENODEV);
@@ -1513,13 +1601,28 @@ void pvr_apple_device_info_init(struct pvr_device *pvr_dev)
  */
 bool pvr_apple_takes_jobs(struct pvr_device *pvr_dev)
 {
-	return pvr_dev->device_data->apple_chip->write_compute != NULL;
+	const struct pvr_apple_chip *chip = pvr_dev->device_data->apple_chip;
+
+	return chip->write_compute || chip->submit;
+}
+
+/**
+ * pvr_apple_free_list_has_pages() - Whether a free list holds parameter-manager pages
+ * @pvr_dev: Target device.
+ *
+ * Return: %false on a chip that allocates those pages itself, for each VM: a
+ * free list then only says how many a render may take.
+ */
+bool pvr_apple_free_list_has_pages(struct pvr_device *pvr_dev)
+{
+	return !pvr_dev->device_data->apple_chip->own_pm_pages;
 }
 
 /**
  * pvr_apple_cmd_stream() - How a render job's command stream is decoded
  * @pvr_dev: Target device.
- * @type: %DRM_PVR_JOB_TYPE_GEOMETRY or %DRM_PVR_JOB_TYPE_FRAGMENT.
+ * @type: %DRM_PVR_JOB_TYPE_GEOMETRY, %DRM_PVR_JOB_TYPE_FRAGMENT or
+ *	%DRM_PVR_JOB_TYPE_COMPUTE.
  *
  * Return: the chip's stream definition: the Rogue command plus the registers
  * its firmware takes beyond it.
@@ -1529,5 +1632,7 @@ const struct pvr_stream_cmd_defs *pvr_apple_cmd_stream(struct pvr_device *pvr_de
 {
 	const struct pvr_apple_chip *chip = pvr_dev->device_data->apple_chip;
 
+	if (type == DRM_PVR_JOB_TYPE_COMPUTE)
+		return chip->compute_stream ?: &pvr_cmd_compute_stream;
 	return type == DRM_PVR_JOB_TYPE_GEOMETRY ? chip->geom_stream : chip->frag_stream;
 }

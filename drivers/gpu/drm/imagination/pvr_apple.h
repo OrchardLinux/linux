@@ -95,6 +95,8 @@ int pvr_apple_suspend(struct pvr_device *pvr_dev);
 int pvr_apple_resume(struct pvr_device *pvr_dev);
 void pvr_apple_device_info_init(struct pvr_device *pvr_dev);
 bool pvr_apple_takes_jobs(struct pvr_device *pvr_dev);
+bool pvr_apple_free_list_has_pages(struct pvr_device *pvr_dev);
+struct dma_fence *pvr_apple_submit_job(struct pvr_job *job);
 struct dma_fence *pvr_apple_submit_compute_job(struct pvr_device *pvr_dev,
 					       struct pvr_vm_context *vm_ctx, u64 stream,
 					       u64 ctx_state);
@@ -126,6 +128,7 @@ static inline int pvr_apple_suspend(struct pvr_device *pvr_dev) { return 0; }
 static inline int pvr_apple_resume(struct pvr_device *pvr_dev) { return 0; }
 static inline void pvr_apple_device_info_init(struct pvr_device *pvr_dev) {}
 static inline bool pvr_apple_takes_jobs(struct pvr_device *pvr_dev) { return false; }
+static inline bool pvr_apple_free_list_has_pages(struct pvr_device *pvr_dev) { return true; }
 static inline int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
 {
 	return -ENODEV;

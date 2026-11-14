@@ -10,6 +10,7 @@
  */
 
 #include "pvr_apple.h"
+#include "pvr_apple_chip.h"
 #include "pvr_context.h"
 #include "pvr_device.h"
 #include "pvr_job.h"
@@ -27,6 +28,8 @@ static struct dma_fence *pvr_apple_submit(struct pvr_job *job)
 {
 	const struct rogue_fwif_cmd_compute *cmd = job->cmd;
 
+	if (job->type == DRM_PVR_JOB_TYPE_COMPUTE && !job->pvr_dev->device_data->apple_chip->write_compute)
+		return pvr_apple_submit_job(job);
 	if (job->type == DRM_PVR_JOB_TYPE_GEOMETRY || job->type == DRM_PVR_JOB_TYPE_FRAGMENT)
 		return pvr_apple_submit_render_job(job);
 	if (job->type != DRM_PVR_JOB_TYPE_COMPUTE)

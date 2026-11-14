@@ -116,6 +116,12 @@ struct pvr_apple {
 	struct dma_fence *last_frag;
 	/* The last geometry job pushed: the next fragment job consumes its scene */
 	struct dma_fence *last_geom;
+	/*
+	 * Chips with &pvr_apple_chip.scenes of 2: the fragment job before
+	 * @last_frag, and the VM @last_frag runs in.
+	 */
+	struct dma_fence *prev_frag;
+	const struct pvr_vm_context *last_frag_vm;
 
 	/*
 	 * Performance state (Fender power state) and its scaling: perf_lock
@@ -187,9 +193,38 @@ struct pvr_apple {
  * @write_frag: Write fragment job @seq and its work-ring entry.
  * @report_hang: Log what else the firmware recorded about a job that timed out.
  *
- * A chip without @write_compute takes no jobs: its firmware is started and
- * stopped, no context is created on it (pvr_apple_takes_jobs()), and @kick,
- * the job functions and the streams are not used.
+ * The functions from @kick to @write_frag are for a firmware that takes one
+ * command per engine at a time from a fixed place, named by the work ring's
+ * index (the A10's). A chip whose firmware takes jobs differently provides
+ * these instead, and pvr_apple.c keeps the fences, the order of the jobs and
+ * the power management:
+ *
+ * @compute_stream: How a compute job's command stream is decoded, if not as
+ *	the Rogue command alone.
+ * @scenes: Scenes (a geometry job and its fragment job) one VM may have in the
+ *	firmware at a time; 0 is 1. Above 1 a fragment job is submitted as soon
+ *	as its geometry job was, not when that finished: the firmware orders
+ *	the two. Scenes of different VMs never overlap.
+ * @own_pm_pages: The chip allocates the parameter manager's pages itself; a
+ *	free list has none (pvr_apple_free_list_has_pages()).
+ * @gate_off_ms: How long the GPU's power domain stays off before the firmware
+ *	is started again, and that a reset takes the domain off as well.
+ * @submit: Hand @job to the firmware. Takes &pvr_apple.submit_lock itself.
+ *	Return: the job's sequence number on its engine, which @engine_done
+ *	reaches when it is finished, or a negative error.
+ * @engine_done: The sequence number of the last finished job of @engine. No
+ *	lock held; may be called with interrupts off.
+ * @events: Read what the firmware posted. Before @engine_done wherever a job
+ *	is waited for; may sleep.
+ * @vm_init: A userspace VM was created: map what the firmware needs in it.
+ * @vm_fini: A VM is about to go, its jobs retired: take it from the firmware.
+ * @vm_scenes: How many scenes of this VM the firmware may hold now, at most
+ *	@scenes. Called in atomic context.
+ * @mmu_flush: Page tables of some VM changed. May be called in atomic context.
+ *
+ * A chip with neither @write_compute nor @submit takes no jobs: its firmware
+ * is started and stopped, no context is created on it
+ * (pvr_apple_takes_jobs()).
  *
  * pvr_apple.c calls @boot, @start, @stop, @restore_image, @kick and the
  * write functions with &pvr_apple.submit_lock held, except @boot and @start
@@ -203,6 +238,10 @@ struct pvr_apple_chip {
 	size_t render_job_size;
 	const struct pvr_stream_cmd_defs *geom_stream;
 	const struct pvr_stream_cmd_defs *frag_stream;
+	const struct pvr_stream_cmd_defs *compute_stream;
+	unsigned int scenes;
+	bool own_pm_pages;
+	unsigned int gate_off_ms;
 
 	int (*init)(struct pvr_apple *apple);
 	int (*boot)(struct pvr_apple *apple);
@@ -218,6 +257,14 @@ struct pvr_apple_chip {
 	void (*write_geom)(struct pvr_apple *apple, u32 seq, const void *hw);
 	void (*write_frag)(struct pvr_apple *apple, u32 seq, const void *hw);
 	void (*report_hang)(struct pvr_apple *apple);
+
+	int (*submit)(struct pvr_apple *apple, struct pvr_job *job);
+	u32 (*engine_done)(struct pvr_apple *apple, enum pvr_apple_engine engine);
+	void (*events)(struct pvr_apple *apple);
+	int (*vm_init)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
+	void (*vm_fini)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
+	unsigned int (*vm_scenes)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
+	void (*mmu_flush)(struct pvr_apple *apple);
 };
 
 /* The heap is coherent memory shared with the firmware, not MMIO. */
@@ -232,6 +279,7 @@ static inline struct device *apple_dev(struct pvr_apple *apple)
 }
 
 int pvr_apple_fw_load(struct pvr_apple *apple, size_t max_size);
+int pvr_apple_wait_idle(struct pvr_apple *apple, unsigned int timeout_us);
 int pvr_apple_request_power_state(struct pvr_apple *apple, u32 state);
 u32 pvr_apple_start_power_state(struct pvr_apple *apple);
 int pvr_apple_fender_power_on(struct pvr_apple *apple);
