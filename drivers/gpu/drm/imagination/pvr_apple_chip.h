@@ -172,6 +172,9 @@ struct pvr_apple {
  *	the processor ready for the next @boot regardless.
  * @idle: After @stop for runtime suspend: give up what would keep the GPU's
  *	power domain on.
+ * @fini: When the device goes, after @stop, with the kernel VM still there:
+ *	give up what @start made in it. Also after a first @start that failed.
+ *	Optional.
  * @restore_image: Before @boot, when the firmware ran before: put its memory
  *	back as @init left it.
  * @kick: Make the firmware look at its work rings.
@@ -183,6 +186,10 @@ struct pvr_apple {
  * @write_geom: Write geometry job @seq and its work-ring entry.
  * @write_frag: Write fragment job @seq and its work-ring entry.
  * @report_hang: Log what else the firmware recorded about a job that timed out.
+ *
+ * A chip without @write_compute takes no jobs: its firmware is started and
+ * stopped, no context is created on it (pvr_apple_takes_jobs()), and @kick,
+ * the job functions and the streams are not used.
  *
  * pvr_apple.c calls @boot, @start, @stop, @restore_image, @kick and the
  * write functions with &pvr_apple.submit_lock held, except @boot and @start
@@ -202,6 +209,7 @@ struct pvr_apple_chip {
 	int (*start)(struct pvr_apple *apple);
 	void (*stop)(struct pvr_apple *apple, bool recover);
 	void (*idle)(struct pvr_apple *apple);
+	void (*fini)(struct pvr_apple *apple);
 	void (*restore_image)(struct pvr_apple *apple);
 	int (*kick)(struct pvr_apple *apple);
 	void (*write_compute)(struct pvr_apple *apple, u32 seq, u64 stream, u64 ctx_state);
@@ -225,6 +233,7 @@ static inline struct device *apple_dev(struct pvr_apple *apple)
 
 int pvr_apple_fw_load(struct pvr_apple *apple, size_t max_size);
 int pvr_apple_request_power_state(struct pvr_apple *apple, u32 state);
+u32 pvr_apple_start_power_state(struct pvr_apple *apple);
 int pvr_apple_fender_power_on(struct pvr_apple *apple);
 
 #endif /* PVR_APPLE_CHIP_H */

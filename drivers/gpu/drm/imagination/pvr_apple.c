@@ -89,6 +89,19 @@ int pvr_apple_request_power_state(struct pvr_apple *apple, u32 state)
 }
 
 /**
+ * pvr_apple_start_power_state() - The power state the core starts in
+ * @apple: Apple firmware state.
+ *
+ * Return: the fixed state if one is set, else the fastest. Never state 0:
+ * that is off, and the firmware is about to start.
+ */
+u32 pvr_apple_start_power_state(struct pvr_apple *apple)
+{
+	return clamp(pvr_apple_perf_state ?: apple->perf_state_max, 1u,
+		     apple->perf_state_max ?: 1u);
+}
+
+/**
  * pvr_apple_fender_power_on() - Power the Rogue core up
  * @apple: Apple firmware state.
  *
@@ -114,9 +127,7 @@ int pvr_apple_fender_power_on(struct pvr_apple *apple)
 	 * from there.
 	 */
 	mutex_lock(&apple->perf_lock);
-	/* never state 0 here: that is off, and the firmware is about to start */
-	err = pvr_apple_request_power_state(apple, clamp(pvr_apple_perf_state ?: apple->perf_state_max,
-							 1u, apple->perf_state_max ?: 1u));
+	err = pvr_apple_request_power_state(apple, pvr_apple_start_power_state(apple));
 	mutex_unlock(&apple->perf_lock);
 	return err;
 }
@@ -1260,6 +1271,8 @@ int pvr_apple_fw_init(struct pvr_device *pvr_dev)
 		return err;
 	err = pvr_apple_fw_start(apple);
 	if (err) {
+		if (apple->chip->fini)
+			apple->chip->fini(apple);
 		pvr_apple_gpu_pages_fini(apple);
 		return err;
 	}
@@ -1455,13 +1468,15 @@ void pvr_apple_fw_fini(struct pvr_device *pvr_dev)
 		pvr_gem_object_put(apple->pm_pages);
 		apple->pm_pages = NULL;
 	}
-	if (!apple->booted)
-		return;
-	apple->chip->stop(apple, false);
-	/* the firmware's messages until its stop queued completion checks */
-	cancel_delayed_work_sync(&apple->poll_work);
-	hrtimer_cancel(&apple->poll_timer);
-	apple->booted = false;
+	if (apple->booted) {
+		apple->chip->stop(apple, false);
+		/* the firmware's messages until its stop queued completion checks */
+		cancel_delayed_work_sync(&apple->poll_work);
+		hrtimer_cancel(&apple->poll_timer);
+		apple->booted = false;
+	}
+	if (apple->chip->fini)
+		apple->chip->fini(apple);
 }
 
 /*
@@ -1486,6 +1501,18 @@ void pvr_apple_device_info_init(struct pvr_device *pvr_dev)
 	/* TE_AA as the iOS 10 kext sets it: 1, 5, 7 for 2, 4, 8 samples */
 	pvr_dev->features.has_isp_samples_per_pixel = true;
 	pvr_dev->features.isp_samples_per_pixel = 2;
+}
+
+/**
+ * pvr_apple_takes_jobs() - Whether the chip's firmware is given jobs
+ * @pvr_dev: Target device.
+ *
+ * Return: %false for a chip whose firmware is started and stopped, but whose
+ * commands are not written yet: it gets no contexts.
+ */
+bool pvr_apple_takes_jobs(struct pvr_device *pvr_dev)
+{
+	return pvr_dev->device_data->apple_chip->write_compute != NULL;
 }
 
 /**

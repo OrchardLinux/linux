@@ -296,6 +296,10 @@ int pvr_context_create(struct pvr_file *pvr_file, struct drm_pvr_ioctl_create_co
 	    args->type != DRM_PVR_CTX_TYPE_RENDER)
 		return -EOPNOTSUPP;
 
+	/* ... on the chips whose commands the driver writes. */
+	if (pvr_device_is_apple(pvr_dev) && !pvr_apple_takes_jobs(pvr_dev))
+		return -EOPNOTSUPP;
+
 	ctx_size = get_fw_obj_size(args->type);
 	if (ctx_size < 0)
 		return ctx_size;
