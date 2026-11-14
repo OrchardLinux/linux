@@ -105,15 +105,57 @@ add_boot_arg(u32 **boot_conf, u32 param, u32 data)
 	*(*boot_conf)++ = data;
 }
 
+/*
+ * The sections an IMG firmware image is loaded into, as the target of
+ * pvr_meta_ldr_process().
+ */
+struct pvr_meta_fw_sections {
+	struct pvr_device *pvr_dev;
+	u32 coremem_size;
+	u8 *fw_code_ptr;
+	u8 *fw_data_ptr;
+	u8 *fw_core_code_ptr;
+	u8 *fw_core_data_ptr;
+};
+
+static int
+pvr_meta_fw_sections_mem(void *data, u32 offset, u32 size, bool zero, void **write_addr)
+{
+	struct pvr_meta_fw_sections *sections = data;
+
+	if (zero) {
+		if (ROGUE_META_IS_COREMEM_DATA(offset, sections->coremem_size)) {
+			/* cannot zero coremem directly */
+			*write_addr = NULL;
+			return 0;
+		}
+
+		/* Global range is aliased to local range */
+		offset &= ~META_MEM_GLOBAL_RANGE_BIT;
+	} else if (!ROGUE_META_IS_COREMEM_CODE(offset, sections->coremem_size) &&
+		   !ROGUE_META_IS_COREMEM_DATA(offset, sections->coremem_size)) {
+		/* Global range is aliased to local range */
+		offset &= ~META_MEM_GLOBAL_RANGE_BIT;
+	}
+
+	return pvr_fw_find_mmu_segment(sections->pvr_dev, offset, size, sections->fw_code_ptr,
+				       sections->fw_data_ptr, sections->fw_core_code_ptr,
+				       sections->fw_core_data_ptr, write_addr);
+}
+
+static const struct pvr_meta_ldr_target pvr_meta_fw_sections_target = {
+	.mem = pvr_meta_fw_sections_mem,
+};
+
 static int
 meta_ldr_cmd_loadmem(struct drm_device *drm_dev, const u8 *fw,
-		     struct rogue_meta_ldr_l1_data_blk *l1_data, u32 coremem_size, u8 *fw_code_ptr,
-		     u8 *fw_data_ptr, u8 *fw_core_code_ptr, u8 *fw_core_data_ptr, const u32 fw_size)
+		     struct rogue_meta_ldr_l1_data_blk *l1_data,
+		     const struct pvr_meta_ldr_target *target, void *target_data,
+		     const u32 fw_size)
 {
 	struct rogue_meta_ldr_l2_data_blk *l2_block =
 		(struct rogue_meta_ldr_l2_data_blk *)(fw +
 						      l1_data->cmd_data[1]);
-	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
 	u32 offset = l1_data->cmd_data[0];
 	u32 data_size;
 	void *write_addr;
@@ -130,14 +172,7 @@ meta_ldr_cmd_loadmem(struct drm_device *drm_dev, const u8 *fw,
 	    ((((u8 *)l2_block->block_data) + data_size) - fw) >= fw_size)
 		return -EINVAL;
 
-	if (!ROGUE_META_IS_COREMEM_CODE(offset, coremem_size) &&
-	    !ROGUE_META_IS_COREMEM_DATA(offset, coremem_size)) {
-		/* Global range is aliased to local range */
-		offset &= ~META_MEM_GLOBAL_RANGE_BIT;
-	}
-
-	err = pvr_fw_find_mmu_segment(pvr_dev, offset, data_size, fw_code_ptr, fw_data_ptr,
-				      fw_core_code_ptr, fw_core_data_ptr, &write_addr);
+	err = target->mem(target_data, offset, data_size, false, &write_addr);
 	if (err) {
 		drm_err(drm_dev,
 			"Addr 0x%x (size: %d) not found in any firmware segment",
@@ -145,32 +180,23 @@ meta_ldr_cmd_loadmem(struct drm_device *drm_dev, const u8 *fw,
 		return err;
 	}
 
-	memcpy(write_addr, l2_block->block_data, data_size);
+	if (write_addr)
+		memcpy(write_addr, l2_block->block_data, data_size);
 
 	return 0;
 }
 
 static int
 meta_ldr_cmd_zeromem(struct drm_device *drm_dev,
-		     struct rogue_meta_ldr_l1_data_blk *l1_data, u32 coremem_size,
-		     u8 *fw_code_ptr, u8 *fw_data_ptr, u8 *fw_core_code_ptr, u8 *fw_core_data_ptr)
+		     struct rogue_meta_ldr_l1_data_blk *l1_data,
+		     const struct pvr_meta_ldr_target *target, void *target_data)
 {
-	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
 	u32 offset = l1_data->cmd_data[0];
 	u32 byte_count = l1_data->cmd_data[1];
 	void *write_addr;
 	int err;
 
-	if (ROGUE_META_IS_COREMEM_DATA(offset, coremem_size)) {
-		/* cannot zero coremem directly */
-		return 0;
-	}
-
-	/* Global range is aliased to local range */
-	offset &= ~META_MEM_GLOBAL_RANGE_BIT;
-
-	err = pvr_fw_find_mmu_segment(pvr_dev, offset, byte_count, fw_code_ptr, fw_data_ptr,
-				      fw_core_code_ptr, fw_core_data_ptr, &write_addr);
+	err = target->mem(target_data, offset, byte_count, true, &write_addr);
 	if (err) {
 		drm_err(drm_dev,
 			"Addr 0x%x (size: %d) not found in any firmware segment",
@@ -178,14 +204,44 @@ meta_ldr_cmd_zeromem(struct drm_device *drm_dev,
 		return err;
 	}
 
-	memset(write_addr, 0, byte_count);
+	if (write_addr)
+		memset(write_addr, 0, byte_count);
 
 	return 0;
 }
 
 static int
+meta_ldr_cmd_start_threads(const u8 *fw, struct rogue_meta_ldr_l1_data_blk *l1_data,
+			   const struct pvr_meta_ldr_target *target, void *target_data,
+			   const u32 fw_size)
+{
+	struct rogue_meta_ldr_l2_data_blk *l2_block =
+		(struct rogue_meta_ldr_l2_data_blk *)(fw +
+						      l1_data->cmd_data[0]);
+	u32 data_size;
+
+	/* Verify block header is within bounds. */
+	if (((u8 *)l2_block - fw) >= fw_size || ((u8 *)(l2_block + 1) - fw) >= fw_size)
+		return -EINVAL;
+
+	if (l2_block->length < 6)
+		return -EINVAL;
+
+	data_size = l2_block->length - 6 /* L2 Tag length and checksum */;
+
+	/* Verify data is within bounds. */
+	if (((u8 *)l2_block->block_data - fw) >= fw_size ||
+	    ((((u8 *)l2_block->block_data) + data_size) - fw) >= fw_size)
+		return -EINVAL;
+
+	return target->start_threads(target_data, l2_block->block_data,
+				     data_size / sizeof(u32));
+}
+
+static int
 meta_ldr_cmd_config(struct drm_device *drm_dev, const u8 *fw,
 		    struct rogue_meta_ldr_l1_data_blk *l1_data,
+		    const struct pvr_meta_ldr_target *target, void *target_data,
 		    const u32 fw_size, u32 **boot_conf_ptr)
 {
 	struct rogue_meta_ldr_l2_data_blk *l2_block =
@@ -210,6 +266,14 @@ meta_ldr_cmd_config(struct drm_device *drm_dev, const u8 *fw,
 	while (l2_block_size >= 12) {
 		if (config_command->type != ROGUE_META_LDR_CFG_WRITE)
 			return -EINVAL;
+
+		if (target->config) {
+			int err = target->config(target_data, config_command->block_data[0],
+						 config_command->block_data[1]);
+
+			if (err)
+				return err;
+		}
 
 		/*
 		 * Only write to bootloader if we got a valid pointer to the FW
@@ -238,43 +302,44 @@ meta_ldr_cmd_config(struct drm_device *drm_dev, const u8 *fw,
 }
 
 /**
- * process_ldr_command_stream() - Process LDR firmware image and populate
- *                                firmware sections
- * @pvr_dev: Device pointer.
+ * pvr_meta_ldr_process() - Process a META LDR firmware image
+ * @drm_dev: DRM device, for messages.
  * @fw: Pointer to firmware image.
- * @fw_code_ptr: Pointer to FW code section.
- * @fw_data_ptr: Pointer to FW data section.
- * @fw_core_code_ptr: Pointer to FW coremem code section.
- * @fw_core_data_ptr: Pointer to FW coremem data section.
- * @boot_conf_ptr: Pointer to boot config argument pointer.
+ * @fw_size: Size of the firmware image in bytes.
+ * @target: Where the image's memory goes.
+ * @target_data: Passed to the functions of @target.
+ * @boot_conf_ptr: Pointer to boot config argument pointer; each register write
+ *                 of the image's CONFIG commands is appended as a pair of
+ *                 words. May be %NULL.
  *
  * Returns :
  *  * 0 on success, or
- *  * -EINVAL on any error in LDR command stream.
+ *  * -EINVAL on any error in LDR command stream, or
+ *  * Any error returned by the functions of @target.
  */
-static int
-process_ldr_command_stream(struct pvr_device *pvr_dev, const u8 *fw, u8 *fw_code_ptr,
-			   u8 *fw_data_ptr, u8 *fw_core_code_ptr,
-			   u8 *fw_core_data_ptr, u32 **boot_conf_ptr)
+int
+pvr_meta_ldr_process(struct drm_device *drm_dev, const u8 *fw, u32 fw_size,
+		     const struct pvr_meta_ldr_target *target, void *target_data,
+		     u32 **boot_conf_ptr)
 {
-	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
 	struct rogue_meta_ldr_block_hdr *ldr_header =
 		(struct rogue_meta_ldr_block_hdr *)fw;
-	struct rogue_meta_ldr_l1_data_blk *l1_data =
-		(struct rogue_meta_ldr_l1_data_blk *)(fw + ldr_header->sl_data);
-	const u32 fw_size = pvr_dev->fw_dev.firmware->size;
+	struct rogue_meta_ldr_l1_data_blk *l1_data;
+	u32 blocks = 0;
 	int err;
 
 	u32 *boot_conf = boot_conf_ptr ? *boot_conf_ptr : NULL;
-	u32 coremem_size;
 
-	err = PVR_FEATURE_VALUE(pvr_dev, meta_coremem_size, &coremem_size);
-	if (err)
-		return err;
+	if (fw_size < sizeof(*ldr_header))
+		return -EINVAL;
 
-	coremem_size *= SZ_1K;
+	l1_data = (struct rogue_meta_ldr_l1_data_blk *)(fw + ldr_header->sl_data);
 
 	while (l1_data) {
+		/* More blocks than the image has room for: its chain is a loop. */
+		if (blocks++ > fw_size / sizeof(*l1_data))
+			return -EINVAL;
+
 		/* Verify block header is within bounds. */
 		if (((u8 *)l1_data - fw) >= fw_size || ((u8 *)(l1_data + 1) - fw) >= fw_size)
 			return -EINVAL;
@@ -286,32 +351,33 @@ process_ldr_command_stream(struct pvr_device *pvr_dev, const u8 *fw, u8 *fw_code
 
 		switch (l1_data->cmd & ROGUE_META_LDR_CMD_MASK)
 		case ROGUE_META_LDR_CMD_LOADMEM: {
-			err = meta_ldr_cmd_loadmem(drm_dev, fw, l1_data,
-						   coremem_size,
-						   fw_code_ptr, fw_data_ptr,
-						   fw_core_code_ptr,
-						   fw_core_data_ptr, fw_size);
+			err = meta_ldr_cmd_loadmem(drm_dev, fw, l1_data, target,
+						   target_data, fw_size);
 			if (err)
 				return err;
 			break;
 
 		case ROGUE_META_LDR_CMD_START_THREADS:
-			/* Don't process this block */
+			/* Only for a target that starts the threads itself */
+			if (!target->start_threads)
+				break;
+
+			err = meta_ldr_cmd_start_threads(fw, l1_data, target,
+							 target_data, fw_size);
+			if (err)
+				return err;
 			break;
 
 		case ROGUE_META_LDR_CMD_ZEROMEM:
-			err = meta_ldr_cmd_zeromem(drm_dev, l1_data,
-						   coremem_size,
-						   fw_code_ptr, fw_data_ptr,
-						   fw_core_code_ptr,
-						   fw_core_data_ptr);
+			err = meta_ldr_cmd_zeromem(drm_dev, l1_data, target,
+						   target_data);
 			if (err)
 				return err;
 			break;
 
 		case ROGUE_META_LDR_CMD_CONFIG:
-			err = meta_ldr_cmd_config(drm_dev, fw, l1_data, fw_size,
-						  &boot_conf);
+			err = meta_ldr_cmd_config(drm_dev, fw, l1_data, target,
+						  target_data, fw_size, &boot_conf);
 			if (err)
 				return err;
 			break;
@@ -459,6 +525,7 @@ pvr_meta_fw_process(struct pvr_device *pvr_dev, const u8 *fw,
 		    u32 core_code_alloc_size)
 {
 	struct pvr_fw_device *fw_dev = &pvr_dev->fw_dev;
+	struct pvr_meta_fw_sections sections;
 	u32 *boot_conf;
 	int err;
 
@@ -471,8 +538,20 @@ pvr_meta_fw_process(struct pvr_device *pvr_dev, const u8 *fw,
 	configure_seg_mmu(pvr_dev, &boot_conf);
 
 	/* Populate FW sections from LDR image. */
-	err = process_ldr_command_stream(pvr_dev, fw, fw_code_ptr, fw_data_ptr, fw_core_code_ptr,
-					 fw_core_data_ptr, &boot_conf);
+	sections.pvr_dev = pvr_dev;
+	sections.fw_code_ptr = fw_code_ptr;
+	sections.fw_data_ptr = fw_data_ptr;
+	sections.fw_core_code_ptr = fw_core_code_ptr;
+	sections.fw_core_data_ptr = fw_core_data_ptr;
+
+	err = PVR_FEATURE_VALUE(pvr_dev, meta_coremem_size, &sections.coremem_size);
+	if (err)
+		return err;
+
+	sections.coremem_size *= SZ_1K;
+
+	err = pvr_meta_ldr_process(from_pvr_device(pvr_dev), fw, pvr_dev->fw_dev.firmware->size,
+				   &pvr_meta_fw_sections_target, &sections, &boot_conf);
 	if (err)
 		return err;
 
