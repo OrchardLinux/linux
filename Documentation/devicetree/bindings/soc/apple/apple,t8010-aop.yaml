@@ -70,6 +70,24 @@ properties:
       The SoC's chip revision, filled in by the bootloader. The S8000
       firmware's boot arguments carry it.
 
+  aop-audio:
+    type: object
+    description:
+      The firmware's audio service. On the A10 it generates the clock of
+      the PDM microphones, which the application processor's PDM
+      controller records from.
+    properties:
+      compatible:
+        const: apple,t8010-aop-audio
+
+      "#clock-cells":
+        const: 0
+
+    required:
+      - compatible
+      - "#clock-cells"
+    additionalProperties: false
+
 patternProperties:
   "^(accel|gyro|compass|pressure)$":
     type: object
@@ -131,6 +149,11 @@ examples:
 
             accel {
                 compatible = "apple,t8010-aop-accel";
+            };
+
+            aop-audio {
+                compatible = "apple,t8010-aop-audio";
+                #clock-cells = <0>;
             };
         };
     };
