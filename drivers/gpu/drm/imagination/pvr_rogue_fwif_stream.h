@@ -68,6 +68,17 @@
 #define PVR_STREAM_EXTHDR_GEOM_APPLE_VALID PVR_STREAM_EXTHDR_GEOM_APPLE_REGS
 
 /*
+ * Stream extension header - Geometry, Apple A9 (G5P): what its firmware's
+ * geometry work record takes beyond the Rogue command
+ * (struct pvr_apple_g5p_geom_regs). Required on the A9; the A10's is refused.
+ */
+#define PVR_STREAM_EXTHDR_TYPE_GEOM_G5P 2U
+
+#define PVR_STREAM_EXTHDR_GEOM_G5P_REGS BIT(0U)
+
+#define PVR_STREAM_EXTHDR_GEOM_G5P_VALID PVR_STREAM_EXTHDR_GEOM_G5P_REGS
+
+/*
  * Stream extension header - Fragment 0
  */
 #define PVR_STREAM_EXTHDR_TYPE_FRAG0 0U
@@ -88,6 +99,16 @@
 #define PVR_STREAM_EXTHDR_FRAG_APPLE_VALID PVR_STREAM_EXTHDR_FRAG_APPLE_REGS
 
 /*
+ * Stream extension header - Fragment, Apple A9 (G5P)
+ * (struct pvr_apple_g5p_frag_regs). Required on the A9.
+ */
+#define PVR_STREAM_EXTHDR_TYPE_FRAG_G5P 2U
+
+#define PVR_STREAM_EXTHDR_FRAG_G5P_REGS BIT(0U)
+
+#define PVR_STREAM_EXTHDR_FRAG_G5P_VALID PVR_STREAM_EXTHDR_FRAG_G5P_REGS
+
+/*
  * Stream extension header - Compute 0
  */
 #define PVR_STREAM_EXTHDR_TYPE_COMPUTE0 0U
@@ -95,5 +116,15 @@
 #define PVR_STREAM_EXTHDR_COMPUTE0_BRN49927 BIT(0U)
 
 #define PVR_STREAM_EXTHDR_COMPUTE0_VALID PVR_STREAM_EXTHDR_COMPUTE0_BRN49927
+
+/*
+ * Stream extension header - Compute, Apple A9 (G5P)
+ * (struct pvr_apple_g5p_compute_regs). Required on the A9.
+ */
+#define PVR_STREAM_EXTHDR_TYPE_COMPUTE_G5P 1U
+
+#define PVR_STREAM_EXTHDR_COMPUTE_G5P_REGS BIT(0U)
+
+#define PVR_STREAM_EXTHDR_COMPUTE_G5P_VALID PVR_STREAM_EXTHDR_COMPUTE_G5P_REGS
 
 #endif /* PVR_ROGUE_FWIF_STREAM_H */

@@ -86,6 +86,77 @@ struct pvr_apple_cmd_frag {
 	struct pvr_apple_frag_regs apple;
 };
 
+/*
+ * Apple A9 (G5P). Its firmware takes a job as a work record: the kernel
+ * builds the record from the Rogue command, the HWRT dataset and these
+ * stream extensions, which carry the record's words that userspace owns.
+ * Addresses are GPU addresses in the job's VM; "PDS words" are the firmware's
+ * program descriptors as the A9 Vulkan driver builds them, code addresses in
+ * them relative to the PDS heap's base.
+ *
+ * Geometry (PVR_STREAM_EXTHDR_TYPE_GEOM_G5P). Of the Rogue command only
+ * regs.vdm_ctrl_stream_base is read.
+ */
+struct pvr_apple_g5p_geom_regs {
+	u64 scratch_base;		/* TA scratch block, 8-byte aligned */
+	u64 scratch_ptr[6];		/* TA scratch and marker pointers */
+	u64 ta_program;			/* TA state PDS program: byte offset from the PDS heap's base */
+	u64 sample_positions;		/* x | y << 4 per sample, 1/16 pixel; 0: the standard pattern */
+	u32 context_pds[2][6];		/* context store and load PDS words */
+	u32 resume_pds[2][4];		/* resume PDS words */
+	u32 ta_pds[4];			/* TA state PDS words; word 3 is zero */
+};
+
+struct pvr_apple_g5p_cmd_geom {
+	struct rogue_fwif_cmd_geom cmd;
+	struct pvr_apple_g5p_geom_regs g5p;
+};
+
+/*
+ * Fragment (PVR_STREAM_EXTHDR_TYPE_FRAG_G5P). Of the Rogue command
+ * regs.isp_scissor_base, isp_dbias_base, isp_oclqry_base, isp_bgobjdepth and
+ * isp_bgobjvals are read.
+ */
+#define PVR_APPLE_G5P_FRAG_MSAA_RESOLVE	BIT(0)	/* four samples only */
+
+struct pvr_apple_g5p_frag_regs {
+	u64 background_texture;		/* PDS_BGRND1_BASE: the background object's texture state */
+	u64 zls[6];			/* register images 0xf48, 0xf50, 0xf58, 0xf60, 0xf68, 0xfd0 */
+	u64 sample_positions;		/* as the geometry job's */
+	u32 background[8];		/* background (load or clear) object */
+	u32 eot[4];			/* end-of-tile object; word 3 is zero */
+	u32 eot_resume[4];		/* partial-render end of tile; word 3 is zero */
+	u32 restore[4];			/* partial-render restore words */
+	u32 pixel_output_width;		/* 2, 4 or 8 */
+	u32 flags;			/* PVR_APPLE_G5P_FRAG_* */
+};
+
+struct pvr_apple_g5p_cmd_frag {
+	struct rogue_fwif_cmd_frag cmd;
+	struct pvr_apple_g5p_frag_regs g5p;
+};
+
+/*
+ * Compute (PVR_STREAM_EXTHDR_TYPE_COMPUTE_G5P). Of the Rogue command only
+ * regs.cdm_ctrl_stream_base is read.
+ */
+struct pvr_apple_g5p_compute_regs {
+	u64 state[4];			/* context state buffers */
+	u64 tail;			/* 16-byte aligned */
+	u64 terminate;			/* address of the control stream's terminate word */
+	u64 pds_store;			/* PDS code | data << 32 */
+	u64 pds_resume;
+	u64 pds_terminate;
+	u32 config[2];
+	u32 pds_store1;
+	u32 pds_resume1;
+};
+
+struct pvr_apple_g5p_cmd_compute {
+	struct rogue_fwif_cmd_compute cmd;
+	struct pvr_apple_g5p_compute_regs g5p;
+};
+
 #if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
 int pvr_apple_fw_init(struct pvr_device *pvr_dev);
 void pvr_apple_fw_fini(struct pvr_device *pvr_dev);

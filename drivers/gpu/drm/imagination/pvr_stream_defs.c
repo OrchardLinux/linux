@@ -447,3 +447,140 @@ const struct pvr_stream_cmd_defs pvr_apple_cmd_frag_stream = {
 
 	.dest_size = sizeof(struct pvr_apple_cmd_frag),
 };
+
+/*
+ * Apple A9 (G5P): the Rogue commands, each followed by an extension carrying
+ * what the GFX firmware's work record takes beyond it.
+ */
+static const struct pvr_stream_def pvr_apple_g5p_geom_regs_stream[] = {
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_geom, g5p.scratch_base, 64),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_geom, g5p.scratch_ptr),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_geom, g5p.ta_program, 64),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_geom, g5p.sample_positions, 64),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_geom, g5p.context_pds),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_geom, g5p.resume_pds),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_geom, g5p.ta_pds),
+};
+
+static const struct pvr_stream_ext_def pvr_apple_g5p_geom_ext_streams[] = {
+	{
+		.stream = pvr_apple_g5p_geom_regs_stream,
+		.stream_len = ARRAY_SIZE(pvr_apple_g5p_geom_regs_stream),
+		.header_mask = PVR_STREAM_EXTHDR_GEOM_G5P_REGS,
+	},
+};
+
+static const struct pvr_stream_ext_header pvr_apple_g5p_geom_ext_headers[] = {
+	[PVR_STREAM_EXTHDR_TYPE_GEOM0] = {
+		.ext_streams = cmd_geom_ext_streams_0,
+		.ext_streams_num = ARRAY_SIZE(cmd_geom_ext_streams_0),
+		.valid_mask = PVR_STREAM_EXTHDR_GEOM0_VALID,
+	},
+	[PVR_STREAM_EXTHDR_TYPE_GEOM_G5P] = {
+		.ext_streams = pvr_apple_g5p_geom_ext_streams,
+		.ext_streams_num = ARRAY_SIZE(pvr_apple_g5p_geom_ext_streams),
+		.valid_mask = PVR_STREAM_EXTHDR_GEOM_G5P_VALID,
+	},
+};
+
+const struct pvr_stream_cmd_defs pvr_apple_g5p_cmd_geom_stream = {
+	.type = PVR_STREAM_TYPE_GEOM,
+
+	.main_stream = rogue_fwif_cmd_geom_stream,
+	.main_stream_len = ARRAY_SIZE(rogue_fwif_cmd_geom_stream),
+
+	.ext_nr_headers = ARRAY_SIZE(pvr_apple_g5p_geom_ext_headers),
+	.ext_headers = pvr_apple_g5p_geom_ext_headers,
+
+	.dest_size = sizeof(struct pvr_apple_g5p_cmd_geom),
+};
+
+static const struct pvr_stream_def pvr_apple_g5p_frag_regs_stream[] = {
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_frag, g5p.background_texture, 64),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_frag, g5p.zls),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_frag, g5p.sample_positions, 64),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_frag, g5p.background),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_frag, g5p.eot),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_frag, g5p.eot_resume),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_frag, g5p.restore),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_frag, g5p.pixel_output_width, 32),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_frag, g5p.flags, 32),
+};
+
+static const struct pvr_stream_ext_def pvr_apple_g5p_frag_ext_streams[] = {
+	{
+		.stream = pvr_apple_g5p_frag_regs_stream,
+		.stream_len = ARRAY_SIZE(pvr_apple_g5p_frag_regs_stream),
+		.header_mask = PVR_STREAM_EXTHDR_FRAG_G5P_REGS,
+	},
+};
+
+static const struct pvr_stream_ext_header pvr_apple_g5p_frag_ext_headers[] = {
+	[PVR_STREAM_EXTHDR_TYPE_FRAG0] = {
+		.ext_streams = cmd_frag_ext_streams_0,
+		.ext_streams_num = ARRAY_SIZE(cmd_frag_ext_streams_0),
+		.valid_mask = PVR_STREAM_EXTHDR_FRAG0_VALID,
+	},
+	[PVR_STREAM_EXTHDR_TYPE_FRAG_G5P] = {
+		.ext_streams = pvr_apple_g5p_frag_ext_streams,
+		.ext_streams_num = ARRAY_SIZE(pvr_apple_g5p_frag_ext_streams),
+		.valid_mask = PVR_STREAM_EXTHDR_FRAG_G5P_VALID,
+	},
+};
+
+const struct pvr_stream_cmd_defs pvr_apple_g5p_cmd_frag_stream = {
+	.type = PVR_STREAM_TYPE_FRAG,
+
+	.main_stream = rogue_fwif_cmd_frag_stream,
+	.main_stream_len = ARRAY_SIZE(rogue_fwif_cmd_frag_stream),
+
+	.ext_nr_headers = ARRAY_SIZE(pvr_apple_g5p_frag_ext_headers),
+	.ext_headers = pvr_apple_g5p_frag_ext_headers,
+
+	.dest_size = sizeof(struct pvr_apple_g5p_cmd_frag),
+};
+
+static const struct pvr_stream_def pvr_apple_g5p_compute_regs_stream[] = {
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_compute, g5p.state),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_compute, g5p.tail, 64),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_compute, g5p.terminate, 64),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_compute, g5p.pds_store, 64),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_compute, g5p.pds_resume, 64),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_compute, g5p.pds_terminate, 64),
+	PVR_STREAM_DEF_ARRAY(pvr_apple_g5p_cmd_compute, g5p.config),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_compute, g5p.pds_store1, 32),
+	PVR_STREAM_DEF(pvr_apple_g5p_cmd_compute, g5p.pds_resume1, 32),
+};
+
+static const struct pvr_stream_ext_def pvr_apple_g5p_compute_ext_streams[] = {
+	{
+		.stream = pvr_apple_g5p_compute_regs_stream,
+		.stream_len = ARRAY_SIZE(pvr_apple_g5p_compute_regs_stream),
+		.header_mask = PVR_STREAM_EXTHDR_COMPUTE_G5P_REGS,
+	},
+};
+
+static const struct pvr_stream_ext_header pvr_apple_g5p_compute_ext_headers[] = {
+	[PVR_STREAM_EXTHDR_TYPE_COMPUTE0] = {
+		.ext_streams = cmd_compute_ext_streams_0,
+		.ext_streams_num = ARRAY_SIZE(cmd_compute_ext_streams_0),
+		.valid_mask = PVR_STREAM_EXTHDR_COMPUTE0_VALID,
+	},
+	[PVR_STREAM_EXTHDR_TYPE_COMPUTE_G5P] = {
+		.ext_streams = pvr_apple_g5p_compute_ext_streams,
+		.ext_streams_num = ARRAY_SIZE(pvr_apple_g5p_compute_ext_streams),
+		.valid_mask = PVR_STREAM_EXTHDR_COMPUTE_G5P_VALID,
+	},
+};
+
+const struct pvr_stream_cmd_defs pvr_apple_g5p_cmd_compute_stream = {
+	.type = PVR_STREAM_TYPE_COMPUTE,
+
+	.main_stream = rogue_fwif_cmd_compute_stream,
+	.main_stream_len = ARRAY_SIZE(rogue_fwif_cmd_compute_stream),
+
+	.ext_nr_headers = ARRAY_SIZE(pvr_apple_g5p_compute_ext_headers),
+	.ext_headers = pvr_apple_g5p_compute_ext_headers,
+
+	.dest_size = sizeof(struct pvr_apple_g5p_cmd_compute),
+};
