@@ -158,8 +158,9 @@ pvr_geom_job_fw_cmd_init(struct pvr_job *job,
 
 	job->fw_ccb_cmd_type = ROGUE_FWIF_CCB_CMD_TYPE_GEOM;
 	err = pvr_fw_cmd_init(job->pvr_dev, job,
-			      pvr_device_is_apple(job->pvr_dev) ? &pvr_apple_cmd_geom_stream :
-								  &pvr_cmd_geom_stream,
+			      pvr_device_is_apple(job->pvr_dev) ?
+				pvr_apple_cmd_stream(job->pvr_dev, DRM_PVR_JOB_TYPE_GEOMETRY) :
+				&pvr_cmd_geom_stream,
 			      args->cmd_stream, args->cmd_stream_len);
 	if (err)
 		return err;
@@ -192,8 +193,9 @@ pvr_frag_job_fw_cmd_init(struct pvr_job *job,
 			       ROGUE_FWIF_CCB_CMD_TYPE_FRAG_PR :
 			       ROGUE_FWIF_CCB_CMD_TYPE_FRAG;
 	err = pvr_fw_cmd_init(job->pvr_dev, job,
-			      pvr_device_is_apple(job->pvr_dev) ? &pvr_apple_cmd_frag_stream :
-								  &pvr_cmd_frag_stream,
+			      pvr_device_is_apple(job->pvr_dev) ?
+				pvr_apple_cmd_stream(job->pvr_dev, DRM_PVR_JOB_TYPE_FRAGMENT) :
+				&pvr_cmd_frag_stream,
 			      args->cmd_stream, args->cmd_stream_len);
 	if (err)
 		return err;

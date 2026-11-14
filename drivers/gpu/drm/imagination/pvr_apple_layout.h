@@ -54,7 +54,6 @@ u32 pvr_apple_layout_mmu_root_offset(unsigned int ctx);
 u32 pvr_apple_layout_mmu_gen_offset(unsigned int ctx);
 u32 pvr_apple_layout_init_offset(void);
 u32 pvr_apple_layout_compute_producer(void);
-u32 pvr_apple_layout_ring_index(u32 seq);
 u32 pvr_apple_layout_stamp_offset(void);
 u32 pvr_apple_layout_debug_flags_offset(void);
 u32 pvr_apple_layout_sku_index(void);

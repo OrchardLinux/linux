@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
-/* Apple A10 (T8010): Rogue hardware behind Apple's GFX firmware. */
+/* Apple chips: Rogue hardware behind Apple's GFX firmware. */
 
 #ifndef PVR_APPLE_H
 #define PVR_APPLE_H
@@ -12,14 +12,17 @@
 #include "pvr_rogue_fwif_client.h"
 
 struct dma_fence;
+struct pvr_apple_chip;
 struct pvr_context;
 struct pvr_device;
 struct pvr_job;
 struct pvr_queue;
 struct pvr_power_sequence_ops;
+struct pvr_stream_cmd_defs;
 struct pvr_vm_context;
 
 extern const struct pvr_power_sequence_ops pvr_power_sequence_ops_apple;
+extern const struct pvr_apple_chip pvr_apple_chip_t8010;
 
 /*
  * The A10's GPU resolves 38-bit data addresses (a triangle renders with its
@@ -102,6 +105,8 @@ int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
 void pvr_apple_mmu_flush(struct pvr_device *pvr_dev);
 void pvr_apple_vm_fini(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx);
 void pvr_apple_quiesce(struct pvr_device *pvr_dev);
+const struct pvr_stream_cmd_defs *pvr_apple_cmd_stream(struct pvr_device *pvr_dev,
+						       enum drm_pvr_job_type type);
 
 struct pvr_queue *pvr_apple_queue_create(struct pvr_context *ctx, enum drm_pvr_job_type type);
 void pvr_apple_queue_destroy(struct pvr_queue *queue, bool cleanup_queue_entity);
@@ -141,6 +146,11 @@ static inline void pvr_apple_wait_file_jobs(struct pvr_device *pvr_dev) {}
 static inline void pvr_apple_report_hang(struct pvr_device *pvr_dev, struct dma_fence *fence) {}
 static inline void pvr_apple_vm_fini(struct pvr_device *pvr_dev,
 				     struct pvr_vm_context *vm_ctx) {}
+static inline const struct pvr_stream_cmd_defs *
+pvr_apple_cmd_stream(struct pvr_device *pvr_dev, enum drm_pvr_job_type type)
+{
+	return NULL;
+}
 #endif
 
 #endif /* PVR_APPLE_H */

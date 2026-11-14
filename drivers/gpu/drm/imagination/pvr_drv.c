@@ -1512,6 +1512,7 @@ static const struct pvr_device_data pvr_device_data_pwrseq = {
 static const struct pvr_device_data pvr_device_data_apple = {
 	.pwr_ops = &pvr_power_sequence_ops_apple,
 	.apple_fw = true,
+	.apple_chip = &pvr_apple_chip_t8010,
 };
 #endif
 

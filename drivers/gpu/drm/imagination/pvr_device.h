@@ -62,6 +62,8 @@ struct pvr_fw_version {
 	u16 major, minor;
 };
 
+struct pvr_apple_chip;
+
 /**
  * struct pvr_device_data - Platform specific data associated with a compatible string.
  * @pwr_ops: Pointer to a structure with platform-specific power functions.
@@ -71,6 +73,9 @@ struct pvr_device_data {
 
 	/** @apple_fw: GPU driven by Apple's GFX firmware (see pvr_apple.c). */
 	bool apple_fw;
+
+	/** @apple_chip: With @apple_fw, the chip's side of it (pvr_apple_chip.h). */
+	const struct pvr_apple_chip *apple_chip;
 };
 
 struct pvr_apple;

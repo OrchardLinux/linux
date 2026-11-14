@@ -718,15 +718,6 @@ void pvr_apple_layout_write_3d_job(u8 *heap, u32 seq, const struct pvr_apple_3d_
 	heap[work + 0x12] = F_SLOT;
 }
 
-/*
- * The producer index of a work ring after job @seq: ring indices wrap at the
- * ring size (the firmware's own indices do), sequence numbers do not.
- */
-u32 pvr_apple_layout_ring_index(u32 seq)
-{
-	return seq % RING_ENTRIES;
-}
-
 /* Work ring @ring's index words: two the firmware advances, then the producer */
 u32 pvr_apple_layout_ring_indices_offset(unsigned int ring)
 {
