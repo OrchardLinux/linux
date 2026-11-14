@@ -1097,10 +1097,14 @@ static const struct apple_sio_hw apple_sio_s8000_hw = {
 	.num_dma_ranges = ARRAY_SIZE(apple_sio_s8000_dma_ranges),
 };
 
-/* SPI3 touch TX and MCA2 speaker TX, independently described by the J71b ADT. */
+/*
+ * SPI3 touch TX, MCA2 speaker TX and PDM microphone RX, each described by
+ * the J71b ADT.
+ */
 static const struct apple_sio_dma_range apple_sio_t8010_dma_ranges[] = {
 	{ 0x1a, 0x1a },
 	{ 0x2c, 0x2c },
+	{ 0x5b, 0x5b },
 };
 
 static const struct apple_sio_hw apple_sio_t8010_hw = {
