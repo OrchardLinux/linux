@@ -23,6 +23,13 @@
 	 * The speaker amplifiers: one logical codec models the MAX98357A bank's
 	 * shared SD_MODE line.
 	 */
+	/* The two built-in PDM microphones */
+	dmics: audio-codec {
+		compatible = "dmic-codec";
+		#sound-dai-cells = <0>;
+		num-channels = <2>;
+	};
+
 	speaker_amps: amplifier {
 		compatible = "maxim,max98357a";
 		#sound-dai-cells = <0>;
@@ -121,6 +128,19 @@
 
 		simple-audio-card,codec {
 			sound-dai = <&speaker_amps>;
+		};
+	};
+
+	/* The microphones, recorded by the PDM controller. Each board names it. */
+	microphones: sound-microphones {
+		compatible = "simple-audio-card";
+
+		simple-audio-card,cpu {
+			sound-dai = <&pdm>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&dmics>;
 		};
 	};
 };
@@ -271,6 +291,10 @@
 
 &mca2 {
 	apple,i2s-switch = <&i2s_switch 2 2>;
+	status = "okay";
+};
+
+&pdm {
 	status = "okay";
 };
 

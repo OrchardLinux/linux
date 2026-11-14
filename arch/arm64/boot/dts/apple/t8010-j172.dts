@@ -16,3 +16,7 @@
 &speakers {
 	simple-audio-card,name = "J172 Speakers";
 };
+
+&microphones {
+	simple-audio-card,name = "J172 Microphones";
+};

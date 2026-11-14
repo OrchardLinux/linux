@@ -17,6 +17,10 @@
 	simple-audio-card,name = "J72b Speakers";
 };
 
+&microphones {
+	simple-audio-card,name = "J72b Microphones";
+};
+
 &wifi {
 	brcm,board-type = "apple,j72b";
 };
