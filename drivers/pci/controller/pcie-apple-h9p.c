@@ -1554,6 +1554,68 @@ static irqreturn_t apple_h9p_nvmmu_irq(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Program the NVMMU from the tables allocated by apple_h9p_setup_nvmmu(). The
+ * storage port has to be powered; the tables have to be zeroed.
+ */
+static int apple_h9p_program_nvmmu(struct apple_h9p_pcie *pcie)
+{
+	struct apple_h9p_nvmmu *nvmmu = &pcie->nvmmu;
+	u32 val;
+	int ret;
+
+	if (pcie->hw->nvmmu_inv_fifo) {
+		/*
+		 * iOS's S8003 order: the invalidate FIFO drained, the old SART
+		 * aperture off before its address changes, the zeroed scratch
+		 * page and TCBs visible, then scratch page, TCB base, init, SART.
+		 */
+		ret = readl_poll_timeout(pcie->base_port[0] +
+					 S8003_PORT_NVMMU_INV_FIFO, val,
+					 val & S8003_PORT_NVMMU_INV_FIFO_EMPTY,
+					 10, S8003_NVMMU_INV_FIFO_TIMEOUT_US);
+		if (ret)
+			return ret;
+		h9p_writel_flush(0, nvmmu->base + H9P_NVMMU_SART_CTRL);
+		dma_wmb();
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
+	} else {
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
+		h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
+		h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
+				 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
+	}
+	h9p_writel_flush(H9P_NVMMU_TCB_CTRL_INIT,
+			 nvmmu->base + H9P_NVMMU_TCB_CTRL);
+
+	ret = apple_h9p_wait(nvmmu->base + H9P_NVMMU_TCB_CTRL,
+			     pcie->hw->nvmmu_init_busy, 0, 0, 250000);
+	if (ret)
+		return ret;
+
+	h9p_writel_flush(nvmmu->va_base - 0x80000000U,
+			 nvmmu->base + H9P_NVMMU_SART_VA_BASE);
+	h9p_writel_flush(round_up(nvmmu->va_base + nvmmu->size,
+				  H9P_NVMMU_SART_ALIGNMENT) - 0x80100000U,
+			 nvmmu->base + H9P_NVMMU_SART_VA_END);
+	h9p_writel_flush(nvmmu->pa_base >> 20,
+			 nvmmu->base + H9P_NVMMU_SART_PA_BASE);
+	h9p_writel_flush(1, nvmmu->base + H9P_NVMMU_SART_CTRL);
+
+	return 0;
+}
+
 static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
 {
 	struct apple_h9p_nvmmu *nvmmu = &pcie->nvmmu;
@@ -1561,7 +1623,7 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
 	struct device_node *mem_np;
 	struct resource res;
 	resource_size_t size;
-	u32 iova, val;
+	u32 iova;
 	int irq;
 	int ret;
 
@@ -1630,54 +1692,9 @@ static int apple_h9p_setup_nvmmu(struct apple_h9p_pcie *pcie)
 	}
 
 	spin_lock_init(&nvmmu->inv_lock);
-	if (pcie->hw->nvmmu_inv_fifo) {
-		/*
-		 * iOS's S8003 order: the invalidate FIFO drained, the old SART
-		 * aperture off before its address changes, the zeroed scratch
-		 * page and TCBs visible, then scratch page, TCB base, init, SART.
-		 */
-		ret = readl_poll_timeout(pcie->base_port[0] +
-					 S8003_PORT_NVMMU_INV_FIFO, val,
-					 val & S8003_PORT_NVMMU_INV_FIFO_EMPTY,
-					 10, S8003_NVMMU_INV_FIFO_TIMEOUT_US);
-		if (ret)
-			goto out_put_node;
-		h9p_writel_flush(0, nvmmu->base + H9P_NVMMU_SART_CTRL);
-		dma_wmb();
-		h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
-				 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
-		h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
-				 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
-		h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
-				 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
-		h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
-				 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
-	} else {
-		h9p_writel_flush(lower_32_bits(nvmmu->tcb_dma),
-				 nvmmu->base + H9P_NVMMU_TCB_BASE_LO);
-		h9p_writel_flush(upper_32_bits(nvmmu->tcb_dma),
-				 nvmmu->base + H9P_NVMMU_TCB_BASE_HI);
-		h9p_writel_flush(lower_32_bits(nvmmu->tcb_table_dma),
-				 nvmmu->base + H9P_NVMMU_TCB_TABLE_LO);
-		h9p_writel_flush(upper_32_bits(nvmmu->tcb_table_dma),
-				 nvmmu->base + H9P_NVMMU_TCB_TABLE_HI);
-	}
-	h9p_writel_flush(H9P_NVMMU_TCB_CTRL_INIT,
-			 nvmmu->base + H9P_NVMMU_TCB_CTRL);
-
-	ret = apple_h9p_wait(nvmmu->base + H9P_NVMMU_TCB_CTRL,
-			     pcie->hw->nvmmu_init_busy, 0, 0, 250000);
+	ret = apple_h9p_program_nvmmu(pcie);
 	if (ret)
 		goto out_put_node;
-
-	h9p_writel_flush(nvmmu->va_base - 0x80000000U,
-			 nvmmu->base + H9P_NVMMU_SART_VA_BASE);
-	h9p_writel_flush(round_up(nvmmu->va_base + nvmmu->size,
-				  H9P_NVMMU_SART_ALIGNMENT) - 0x80100000U,
-			 nvmmu->base + H9P_NVMMU_SART_VA_END);
-	h9p_writel_flush(nvmmu->pa_base >> 20,
-			 nvmmu->base + H9P_NVMMU_SART_PA_BASE);
-	h9p_writel_flush(1, nvmmu->base + H9P_NVMMU_SART_CTRL);
 
 	irq = platform_get_irq_byname_optional(pcie->pdev, "nvmmu");
 	if (irq > 0) {
