@@ -2710,6 +2710,13 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 		return -ENODEV;
 	}
 
+	/*
+	 * The BAR0 window register is not part of the configuration space the
+	 * PCI core restores. After a sleep that reset the chip it selects
+	 * another core, and the test below would read that core's register.
+	 */
+	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
+
 	/* Check if device is still up and running, if so we are ready */
 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
 		brcmf_dbg(PCIE, "Try to wakeup device....\n");
