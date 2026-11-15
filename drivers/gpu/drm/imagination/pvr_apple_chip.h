@@ -313,6 +313,7 @@ struct pvr_apple_chip {
 	void (*write_frag)(struct pvr_apple *apple, u32 seq, const void *hw);
 	void (*report_hang)(struct pvr_apple *apple);
 
+	int (*prepare_job)(struct pvr_apple *apple, struct pvr_job *job);
 	int (*submit)(struct pvr_apple *apple, struct pvr_job *job);
 	u32 (*engine_done)(struct pvr_apple *apple, enum pvr_apple_engine engine);
 	bool (*fault)(struct pvr_apple *apple);

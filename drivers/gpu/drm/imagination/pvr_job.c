@@ -776,6 +776,13 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 		goto out_free;
 
 	jobs_alloced = args->jobs.count;
+	if (pvr_device_is_apple(pvr_dev)) {
+		for (u32 i = 0; i < jobs_alloced; i++) {
+			err = pvr_apple_job_prepare_resources(job_data[i].job);
+			if (err)
+				goto out_job_data_cleanup;
+		}
+	}
 
 	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT | DRM_EXEC_IGNORE_DUPLICATES, 0);
 

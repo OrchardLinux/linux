@@ -56,6 +56,7 @@
 #include <linux/bitmap.h>
 #include <linux/cleanup.h>
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/of.h>
@@ -250,6 +251,11 @@ struct s8003_pm {
 	u32 rec_seq;			/* last geometry job carrying its PM record */
 	struct pvr_gem_object *pool;
 	struct pvr_gem_object *aux;	/* the PM's tables, mapped in the VM */
+	void *pool_map, *aux_map;
+	struct pvr_gem_object *next_pool;
+	void *next_pool_map;
+	u32 next_blocks;
+	bool ready;			/* published under submit_lock and set_lock */
 	const struct pvr_hwrt_data *hwrt;	/* the scene's target */
 	u32 scene;			/* the firmware start the scene belongs to; 0: none */
 	u32 ta_seq;			/* its geometry job */
@@ -259,6 +265,8 @@ struct s8003_pm {
 
 struct s8003_vm {
 	struct pvr_vm_context *vm_ctx;
+	/* Only ioctl preparers take this lock; the job worker never waits on it. */
+	struct mutex prepare_lock;
 	u32 slot[2];			/* geometry and compute, fragment; 0: none */
 	u32 attached;			/* the firmware start the slots were loaded for */
 	struct s8003_pm pm[2];
@@ -1577,6 +1585,7 @@ static int pvr_apple_s8003_vm_init(struct pvr_apple *apple, struct pvr_vm_contex
 	if (!vm)
 		return -ENOMEM;
 	vm->vm_ctx = vm_ctx;
+	mutex_init(&vm->prepare_lock);
 	vm->pm[0].set = -1;
 	vm->pm[1].set = -1;
 	/* The PM reaches its sets through the job's slot, at the firmware's addresses */
@@ -1590,10 +1599,10 @@ static int pvr_apple_s8003_vm_init(struct pvr_apple *apple, struct pvr_vm_contex
 
 /*
  * How many scenes of a VM the firmware may hold: as many as the VM has PM
- * sets. It takes its first here, and its second while the firmware has more
- * than half of them left. Called when a job is ordered, in atomic context.
+ * sets. Reserve the first here, and the second while more than half remain.
+ * IOCTL context: arming counts only sets whose resources are fully ready.
  */
-static unsigned int pvr_apple_s8003_vm_scenes(struct pvr_apple *apple,
+static unsigned int s8003_vm_reserve_sets(struct pvr_apple *apple,
 					      struct pvr_vm_context *vm_ctx)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
@@ -1628,6 +1637,24 @@ static unsigned int pvr_apple_s8003_vm_scenes(struct pvr_apple *apple,
 	return max(n, 1u);
 }
 
+static unsigned int pvr_apple_s8003_vm_scenes(struct pvr_apple *apple,
+					      struct pvr_vm_context *vm_ctx)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	struct s8003_vm *vm = xa_load(&s->vms, (unsigned long)vm_ctx);
+	unsigned long flags;
+	unsigned int n = 0, i;
+
+	if (!vm)
+		return 1;
+	spin_lock_irqsave(&s->set_lock, flags);
+	for (i = 0; i < ARRAY_SIZE(vm->pm); i++)
+		if (vm->pm[i].set >= 0 && vm->pm[i].ready)
+			n++;
+	spin_unlock_irqrestore(&s->set_lock, flags);
+	return max(n, 1U);
+}
+
 static void s8003_pm_put(struct pvr_apple_s8003 *s, struct s8003_pm *pm)
 {
 	unsigned long flags;
@@ -1636,10 +1663,18 @@ static void s8003_pm_put(struct pvr_apple_s8003 *s, struct s8003_pm *pm)
 	if (pm->set >= 0)
 		__clear_bit(pm->set, s->sets);
 	spin_unlock_irqrestore(&s->set_lock, flags);
-	if (pm->pool)
+	if (pm->pool) {
+		pvr_gem_object_vunmap(pm->pool);
 		pvr_gem_object_put(pm->pool);
-	if (pm->aux)
+	}
+	if (pm->next_pool) {
+		pvr_gem_object_vunmap(pm->next_pool);
+		pvr_gem_object_put(pm->next_pool);
+	}
+	if (pm->aux) {
+		pvr_gem_object_vunmap(pm->aux);
 		pvr_gem_object_put(pm->aux);
+	}
 }
 
 /*
@@ -1680,17 +1715,6 @@ static void pvr_apple_s8003_vm_fini(struct pvr_apple *apple, struct pvr_vm_conte
 	kfree(vm);
 }
 
-static int s8003_obj_zero(struct pvr_gem_object *obj)
-{
-	void *map = pvr_gem_object_vmap(obj);
-
-	if (IS_ERR(map))
-		return PTR_ERR(map);
-	memset(map, 0, pvr_gem_object_size(obj));
-	pvr_gem_object_vunmap(obj);
-	return 0;
-}
-
 static u64 s8003_pm_set_va(const struct s8003_pm *pm, u32 page)
 {
 	return S8003_PM_SETS_VA + pm->set * S8003_PM_SET_SIZE + page * PVR_DEVICE_PAGE_SIZE;
@@ -1719,41 +1743,31 @@ static int s8003_pm_build(struct pvr_apple *apple, struct s8003_vm *vm, struct s
 	u64 list_va, aux_va;
 	int err;
 
-	if (!pm->aux) {
-		struct pvr_gem_object *aux;
-
-		aux = pvr_gem_object_create(apple->pvr_dev, S8003_PM_AUX_SIZE,
-					    DRM_PVR_BO_PM_FW_PROTECT);
-		if (IS_ERR(aux))
-			return PTR_ERR(aux);
-		err = pvr_vm_map_reserved(vm->vm_ctx, aux, s8003_pm_aux_va(pm), S8003_PM_AUX_SIZE);
-		if (err) {
-			pvr_gem_object_put(aux);
-			return err;
-		}
-		pm->aux = aux;
-	}
+	if (!pm->aux || !pm->aux_map)
+		return -ENOMEM;
 	if (pm->built == s->gen && pm->blocks >= blocks)
 		return 0;
 	if (pm->blocks < blocks) {
-		struct pvr_gem_object *pool;
-
-		pool = pvr_gem_object_create(apple->pvr_dev, (size_t)blocks * S8003_PM_BLOCK_SIZE,
-					     PVR_BO_FW_FLAGS_DEVICE_CACHED);
-		if (IS_ERR(pool))
-			return PTR_ERR(pool);
-		if (pm->pool)
+		if (!pm->next_pool || pm->next_blocks < blocks)
+			return -ENOMEM;
+		/* This set is idle. Its previous pool can now be retired. */
+		if (pm->pool) {
+			pvr_gem_object_vunmap(pm->pool);
 			pvr_gem_object_put(pm->pool);
-		pm->pool = pool;
-		pm->blocks = blocks;
+		}
+		pm->pool = pm->next_pool;
+		pm->pool_map = pm->next_pool_map;
+		pm->blocks = pm->next_blocks;
+		pm->next_pool = NULL;
+		pm->next_pool_map = NULL;
+		pm->next_blocks = 0;
 	}
 	pm->built = 0;
 	pm->rec_seq = 0;
-	err = s8003_obj_zero(pm->pool);
-	if (!err)
-		err = s8003_obj_zero(pm->aux);
-	if (err)
-		return err;
+	memset(pm->pool_map, 0, pvr_gem_object_size(pm->pool));
+	memset(pm->aux_map, 0, S8003_PM_AUX_SIZE);
+	dma_sync_sgtable_for_device(apple_dev(apple), pm->pool->base.sgt, DMA_BIDIRECTIONAL);
+	dma_sync_sgtable_for_device(apple_dev(apple), pm->aux->base.sgt, DMA_BIDIRECTIONAL);
 
 	control = s->pmsets.map + pm->set * S8003_PM_SET_SIZE;
 	list = control + PVR_DEVICE_PAGE_SIZE;
@@ -2356,6 +2370,115 @@ static bool pvr_apple_s8003_vm_evictable(struct pvr_apple *apple,
 	return true;
 }
 
+/* Publish capacity only once its pages, CPU maps and aux VA are ready.
+ * Worker readers hold submit_lock; the atomic arming callback holds set_lock.
+ */
+static void s8003_pm_mark_ready(struct pvr_apple_s8003 *s, struct s8003_pm *pm)
+{
+	unsigned long flags;
+
+	lockdep_assert_held(&s->apple->submit_lock);
+	spin_lock_irqsave(&s->set_lock, flags);
+	pm->ready = true;
+	spin_unlock_irqrestore(&s->set_lock, flags);
+}
+
+static int s8003_prepare_job(struct pvr_apple *apple, struct pvr_job *job)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	struct s8003_vm *vm = xa_load(&s->vms, (unsigned long)job->ctx->vm_ctx);
+	struct s8003_rt rt;
+	u32 blocks;
+	unsigned int i;
+	int err;
+
+	if (job->type != DRM_PVR_JOB_TYPE_GEOMETRY)
+		return 0;
+	if (!vm)
+		return -EINVAL;
+	err = s8003_rt_derive(job->hwrt->hwrt_dataset, &rt);
+	if (err)
+		return err;
+	blocks = min_t(u32, max(DIV_ROUND_UP(job->hwrt->hwrt_dataset->free_lists[0]->initial_num_pages, 32),
+			       DIV_ROUND_UP(50 + rt.tiles, 32)), S8003_PM_BLOCKS_MAX);
+	mutex_lock(&vm->prepare_lock);
+	mutex_lock(&apple->submit_lock);
+	s8003_vm_reserve_sets(apple, vm->vm_ctx);
+	/* The firmware's feedback (s8003_pm_feedback()) is a floor for the next pool. */
+	blocks = max(blocks, min(vm->fb_blocks, S8003_PM_BLOCKS_MAX));
+	mutex_unlock(&apple->submit_lock);
+	if (vm->pm[0].set < 0) {
+		err = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(vm->pm); i++) {
+		struct s8003_pm *pm = &vm->pm[i];
+		struct pvr_gem_object *obj;
+		void *map;
+		bool need_pool;
+
+		if (pm->set < 0)
+			continue;
+		if (!pm->aux) {
+			obj = pvr_gem_object_create(apple->pvr_dev, S8003_PM_AUX_SIZE,
+						   DRM_PVR_BO_PM_FW_PROTECT);
+			if (IS_ERR(obj)) {
+				err = PTR_ERR(obj);
+				goto out;
+			}
+			map = pvr_gem_object_vmap(obj);
+			if (IS_ERR(map)) {
+				err = PTR_ERR(map);
+				pvr_gem_object_put(obj);
+				goto out;
+			}
+			err = pvr_vm_map_reserved(vm->vm_ctx, obj, s8003_pm_aux_va(pm), S8003_PM_AUX_SIZE);
+			if (err) {
+				pvr_gem_object_vunmap(obj);
+				pvr_gem_object_put(obj);
+				goto out;
+			}
+			mutex_lock(&apple->submit_lock);
+			pm->aux = obj;
+			pm->aux_map = map;
+			mutex_unlock(&apple->submit_lock);
+		}
+		mutex_lock(&apple->submit_lock);
+		need_pool = max(pm->blocks, pm->next_blocks) < blocks;
+		if (!need_pool)
+			s8003_pm_mark_ready(s, pm);
+		mutex_unlock(&apple->submit_lock);
+		if (!need_pool)
+			continue;
+		obj = pvr_gem_object_create(apple->pvr_dev, (size_t)blocks * S8003_PM_BLOCK_SIZE,
+					   PVR_BO_FW_FLAGS_DEVICE_CACHED);
+		if (IS_ERR(obj)) {
+			err = PTR_ERR(obj);
+			goto out;
+		}
+		map = pvr_gem_object_vmap(obj);
+		if (IS_ERR(map)) {
+			err = PTR_ERR(map);
+			pvr_gem_object_put(obj);
+			goto out;
+		}
+		mutex_lock(&apple->submit_lock);
+		if (pm->next_pool) {
+			pvr_gem_object_vunmap(pm->next_pool);
+			pvr_gem_object_put(pm->next_pool);
+		}
+		pm->next_pool = obj;
+		pm->next_pool_map = map;
+		pm->next_blocks = blocks;
+		s8003_pm_mark_ready(s, pm);
+		mutex_unlock(&apple->submit_lock);
+	}
+	err = 0;
+out:
+	mutex_unlock(&vm->prepare_lock);
+	return err;
+}
+
 static int s8003_submit_error(struct pvr_apple *apple, struct s8003_vm *vm,
 			      const char *engine, int err, const char *reason)
 {
@@ -2382,26 +2505,30 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		return s8003_submit_error(apple, vm, "geometry", err, "rt derive");
 	/* The VM's sets were taken when the job was ordered (pvr_apple_s8003_vm_scenes()) */
 	for (i = 0; i < 2 && !pm; i++)
-		if (vm->pm[i].set >= 0 && s8003_pm_idle(apple, &vm->pm[i]))
+		if (vm->pm[i].set >= 0 && vm->pm[i].ready &&
+		    s8003_pm_idle(apple, &vm->pm[i]))
 			pm = &vm->pm[i];
 	/*
 	 * Each holds a scene still: one whose fragment job never came (a
 	 * geometry job alone) is given up once its geometry job is done.
 	 */
 	for (i = 0; i < 2 && !pm; i++)
-		if (vm->pm[i].set >= 0 && !vm->pm[i].td_seq &&
+		if (vm->pm[i].set >= 0 && vm->pm[i].ready && !vm->pm[i].td_seq &&
 		    !s8003_wait_done(apple, APPLE_ENGINE_GEOM, vm->pm[i].ta_seq))
 			pm = &vm->pm[i];
 	if (!pm)
 		return s8003_submit_error(apple, vm, "geometry", -EBUSY, "no PM set");
 
-	/* Process context, submit_lock held: grow through the existing pool allocator. */
+	/*
+	 * Take the firmware's feedback. The worker does not allocate: a larger
+	 * pool is prepared for a later job (s8003_prepare_job()) and switched to
+	 * here, between scenes, once it is ready.
+	 */
 	s8003_pm_feedback(apple, vm);
 	/* As many 128 KiB blocks as the free list has 4 KiB pages, and enough for the target */
 	blocks = max(DIV_ROUND_UP(hwrt->free_lists[0]->initial_num_pages, 32),
 		     DIV_ROUND_UP(50 + rt.tiles, 32));
-	/* The existing build path allocates a larger pool while this set is idle. */
-	blocks = max(blocks, vm->fb_blocks);
+	blocks = max(blocks, min(vm->fb_blocks, max(pm->blocks, pm->next_blocks)));
 	/* Before the build, which may make the set anew */
 	pm_record = !s8003_pm_clean(apple, pm, min(blocks, S8003_PM_BLOCKS_MAX));
 	pm->clean = false;
@@ -2952,6 +3079,7 @@ const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.fini = pvr_apple_s8003_fini,
 	.restore_image = pvr_apple_s8003_restore_image,
 	.report_hang = pvr_apple_s8003_report_hang,
+	.prepare_job = s8003_prepare_job,
 	.submit = pvr_apple_s8003_submit,
 	.engine_done = pvr_apple_s8003_engine_done,
 	.fault = pvr_apple_s8003_fault,

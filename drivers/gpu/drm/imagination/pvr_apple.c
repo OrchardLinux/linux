@@ -1441,7 +1441,7 @@ struct dma_fence *pvr_apple_submit_compute_job(struct pvr_device *pvr_dev,
 	struct pvr_apple *apple = to_apple(pvr_dev);
 	struct pvr_apple_fence *fence;
 
-	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+	fence = kzalloc(sizeof(*fence), GFP_NOWAIT);
 	if (!fence)
 		return ERR_PTR(-ENOMEM);
 	return pvr_apple_job_fence(apple, fence, APPLE_ENGINE_COMPUTE,
@@ -1689,8 +1689,8 @@ struct dma_fence *pvr_apple_submit_render_job(struct pvr_job *job)
 	if (apple->chip->submit)
 		return pvr_apple_submit_job(job);
 
-	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
-	hw = kmalloc(apple->chip->render_job_size, GFP_KERNEL);
+	fence = kzalloc(sizeof(*fence), GFP_NOWAIT);
+	hw = kmalloc(apple->chip->render_job_size, GFP_NOWAIT);
 	if (!fence || !hw) {
 		kfree(fence);
 		kfree(hw);
@@ -1724,7 +1724,7 @@ struct dma_fence *pvr_apple_submit_job(struct pvr_job *job)
 				       APPLE_ENGINE_COMPUTE;
 	struct pvr_apple_fence *fence;
 
-	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+	fence = kzalloc(sizeof(*fence), GFP_NOWAIT);
 	if (!fence)
 		return ERR_PTR(-ENOMEM);
 	return pvr_apple_job_fence(apple, fence, engine, apple->chip->submit(apple, job));
@@ -2256,4 +2256,12 @@ bool pvr_apple_vm_evictable(struct pvr_device *pvr_dev, struct pvr_vm_context *v
 	allowed = apple->chip->vm_evictable && apple->chip->vm_evictable(apple, vm_ctx);
 	mutex_unlock(&apple->submit_lock);
 	return allowed;
+}
+
+/* IOCTL context, before VM locks, reservation locking or scheduler arming. */
+int pvr_apple_job_prepare_resources(struct pvr_job *job)
+{
+	struct pvr_apple *apple = to_apple(job->pvr_dev);
+
+	return apple->chip->prepare_job ? apple->chip->prepare_job(apple, job) : 0;
 }
