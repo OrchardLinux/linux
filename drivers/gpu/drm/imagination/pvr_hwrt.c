@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_free_list.h"
 #include "pvr_hwrt.h"
 #include "pvr_gem.h"
@@ -45,6 +46,7 @@ hwrt_init_kernel_structure(struct pvr_file *pvr_file,
 			   struct pvr_hwrt_dataset *hwrt)
 {
 	struct pvr_device *pvr_dev = pvr_file->pvr_dev;
+	u32 local_pages;
 	int err;
 
 	hwrt->pvr_dev = pvr_dev;
@@ -62,8 +64,16 @@ hwrt_init_kernel_structure(struct pvr_file *pvr_file,
 		}
 	}
 
-	if (hwrt->free_lists[ROGUE_FW_LOCAL_FREELIST]->current_pages <
-	    pvr_get_free_list_min_pages(pvr_dev)) {
+	/*
+	 * On a chip that allocates the parameter manager's pages itself, a
+	 * free list never holds pages (pvr_apple_free_list_has_pages()); its
+	 * initial size is how many a render may take.
+	 */
+	local_pages = hwrt->free_lists[ROGUE_FW_LOCAL_FREELIST]->current_pages;
+	if (pvr_device_is_apple(pvr_dev) && !pvr_apple_free_list_has_pages(pvr_dev))
+		local_pages = hwrt->free_lists[ROGUE_FW_LOCAL_FREELIST]->initial_num_pages;
+
+	if (local_pages < pvr_get_free_list_min_pages(pvr_dev)) {
 		err = -EINVAL;
 		goto err_put_free_lists;
 	}
