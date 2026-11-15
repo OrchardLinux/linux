@@ -2685,6 +2685,28 @@ static int apple_t7000_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
 	return 0;
 }
 
+/*
+ * System sleep on T7000. iOS's take-down wasn't decoded for this SoC; this
+ * takes back what apple_t7000_enable_rc_port() enabled, in the order iOS uses
+ * on S8003: PERST#, the link, then the port's reference clock. The delay is
+ * the perst-to-refclk-delay-us of the S8003 and T8010 device trees; the
+ * T7000 one wasn't read. The bring-up starts from this state: it clears the
+ * link enable and asserts the port's reset itself.
+ */
+static void apple_t7000_port_down(struct apple_h9p_pcie *pcie,
+				  unsigned int port)
+{
+	void __iomem *pb = pcie->base_port[port];
+	void __iomem *rc = pcie->base_rc;
+
+	gpiod_direction_output(pcie->perst[port], 1);
+	h9p_rmw(pb + H9P_PORT_LTSSMCTL, H9P_PORT_LTSSM_ENABLE, 0);
+	readl(pb + H9P_PORT_LTSSMCTL);
+	fsleep(H9P_PERST_TO_REFCLK_US);
+	h9p_rmw(rc + T7000_RC_PORT_LINK_EN(port), T7000_RC_PORT_LINK_EN_BIT, 0);
+	h9p_rmw(rc + T7000_RC_PORT_REFCLK(port), T7000_RC_PORT_REFCLK_EN, 0);
+}
+
 /* lane configuration 1: x2 x1 x1 x1; 3: x2 x1 x2, port 3 unusable */
 static const u8 apple_s8003_lane_start[H9P_NUM_PORTS] = { 0, 2, 3, 4 };
 
@@ -3968,6 +3990,8 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 
 static const struct apple_h9p_hw apple_h9p_hw_t7000 = {
 	.setup_port = apple_t7000_setup_port,
+	.port_down = apple_t7000_port_down,
+	.resume_port = apple_h9p_resume_port,
 	/* The only speed validated on T7001; J81's port 1 is Gen1-limited. */
 	.default_link_speed = H9P_LINK_SPEED_2_5GT,
 	.no_port_irqs = true,
