@@ -7,6 +7,7 @@
 #include "pvr_stream.h"
 
 #include <linux/align.h>
+#include <linux/dev_printk.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <uapi/drm/pvr_drm.h>
@@ -49,6 +50,8 @@ pvr_stream_get_data(u8 *stream, u32 *stream_offset, u32 stream_size, u32 data_si
 /**
  * pvr_stream_process_1() - Process a single stream and fill destination structure
  * @pvr_dev: Device pointer.
+ * @type: Command stream type.
+ * @ext_type: Extension header type, or -1 for the main stream.
  * @stream_def: Stream definition.
  * @nr_entries: Number of entries in &stream_def.
  * @stream: Pointer to stream.
@@ -63,14 +66,20 @@ pvr_stream_get_data(u8 *stream, u32 *stream_offset, u32 stream_size, u32 data_si
  *  * -%EINVAL on malformed stream.
  */
 static int
-pvr_stream_process_1(struct pvr_device *pvr_dev, const struct pvr_stream_def *stream_def,
-		     u32 nr_entries, u8 *stream, u32 stream_offset, u32 stream_size,
+pvr_stream_process_1(struct pvr_device *pvr_dev, enum pvr_stream_type type, int ext_type,
+		     const struct pvr_stream_def *stream_def, u32 nr_entries, u8 *stream,
+		     u32 stream_offset, u32 stream_size,
 		     u8 *dest, u32 dest_size, u32 *stream_offset_out)
 {
 	int err = 0;
 
 	for (u32 i = 0; i < nr_entries; i++) {
+		u32 data_size = 0;
+
 		if (stream_def[i].offset >= dest_size) {
+			dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+					     "stream rejected: destination type=%u ext_type=%d entry=%u offset=%u dest_size=%u\n",
+					     type, ext_type, i, stream_def[i].offset, dest_size);
 			err = -EINVAL;
 			break;
 		}
@@ -80,40 +89,41 @@ pvr_stream_process_1(struct pvr_device *pvr_dev, const struct pvr_stream_def *st
 
 		switch (stream_def[i].size) {
 		case PVR_STREAM_SIZE_8:
+			data_size = sizeof(u8);
 			err = pvr_stream_get_data(stream, &stream_offset, stream_size, sizeof(u8),
 						  sizeof(u8), dest + stream_def[i].offset);
-			if (err)
-				return err;
 			break;
 
 		case PVR_STREAM_SIZE_16:
+			data_size = sizeof(u16);
 			err = pvr_stream_get_data(stream, &stream_offset, stream_size, sizeof(u16),
 						  sizeof(u16), dest + stream_def[i].offset);
-			if (err)
-				return err;
 			break;
 
 		case PVR_STREAM_SIZE_32:
+			data_size = sizeof(u32);
 			err = pvr_stream_get_data(stream, &stream_offset, stream_size, sizeof(u32),
 						  sizeof(u32), dest + stream_def[i].offset);
-			if (err)
-				return err;
 			break;
 
 		case PVR_STREAM_SIZE_64:
+			data_size = sizeof(u64);
 			err = pvr_stream_get_data(stream, &stream_offset, stream_size, sizeof(u64),
 						  sizeof(u64), dest + stream_def[i].offset);
-			if (err)
-				return err;
 			break;
 
 		case PVR_STREAM_SIZE_ARRAY:
+			data_size = stream_def[i].array_size;
 			err = pvr_stream_get_data(stream, &stream_offset, stream_size,
 						  stream_def[i].array_size, sizeof(u64),
 						  dest + stream_def[i].offset);
-			if (err)
-				return err;
 			break;
+		}
+		if (err) {
+			dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+					     "stream rejected: short data type=%u ext_type=%d entry=%u offset=%u size=%u stream_size=%u\n",
+					     type, ext_type, i, stream_offset, data_size, stream_size);
+			return err;
 		}
 	}
 
@@ -143,18 +153,30 @@ pvr_stream_process_ext_stream(struct pvr_device *pvr_dev,
 
 		err = pvr_stream_get_data(ext_stream, &stream_offset, ext_stream_size, sizeof(u32),
 					  sizeof(ext_header), &ext_header);
-		if (err)
+		if (err) {
+			dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+					     "stream rejected: short extension header type=%u ext_type=-1 entry=-1 offset=%u size=%zu stream_size=%u\n",
+					     cmd_defs->type, stream_offset, sizeof(ext_header), ext_stream_size);
 			return err;
+		}
 
 		type = (ext_header & PVR_STREAM_EXTHDR_TYPE_MASK) >> PVR_STREAM_EXTHDR_TYPE_SHIFT;
 		data = ext_header & PVR_STREAM_EXTHDR_DATA_MASK;
 
-		if (type >= cmd_defs->ext_nr_headers)
+		if (type >= cmd_defs->ext_nr_headers) {
+			dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+					     "stream rejected: extension type=%u ext_type=%u ext_nr_headers=%u\n",
+					     cmd_defs->type, type, cmd_defs->ext_nr_headers);
 			return -EINVAL;
+		}
 
 		header = &cmd_defs->ext_headers[type];
-		if (data & ~header->valid_mask)
+		if (data & ~header->valid_mask) {
+			dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+					     "stream rejected: extension bits type=%u ext_type=%u data=0x%08x valid_mask=0x%08x\n",
+					     cmd_defs->type, type, data, header->valid_mask);
 			return -EINVAL;
+		}
 
 		musthave_masks[type] &= ~data;
 
@@ -165,10 +187,15 @@ pvr_stream_process_ext_stream(struct pvr_device *pvr_dev,
 				continue;
 
 			/* Quirk 0: the extension is not tied to a hardware quirk. */
-			if (ext_def->quirk && !pvr_device_has_uapi_quirk(pvr_dev, ext_def->quirk))
+			if (ext_def->quirk && !pvr_device_has_uapi_quirk(pvr_dev, ext_def->quirk)) {
+				dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+						     "stream rejected: unsupported quirk type=%u ext_type=%u entry=%u quirk=%u data=0x%08x mask=0x%08x\n",
+						     cmd_defs->type, type, i, ext_def->quirk, data, ext_def->header_mask);
 				return -EINVAL;
+			}
 
-			err = pvr_stream_process_1(pvr_dev, ext_def->stream, ext_def->stream_len,
+			err = pvr_stream_process_1(pvr_dev, cmd_defs->type, type,
+						   ext_def->stream, ext_def->stream_len,
 						   ext_stream, stream_offset,
 						   ext_stream_size, dest,
 						   cmd_defs->dest_size, &stream_offset);
@@ -182,8 +209,12 @@ pvr_stream_process_ext_stream(struct pvr_device *pvr_dev,
 	 * for this command was not present.
 	 */
 	for (u32 i = 0; i < cmd_defs->ext_nr_headers; i++) {
-		if (musthave_masks[i])
+		if (musthave_masks[i]) {
+			dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+					     "stream rejected: missing must-have type=%u ext_type=%u leftover_mask=0x%08x\n",
+					     cmd_defs->type, i, musthave_masks[i]);
 			return -EINVAL;
+		}
 	}
 
 	return 0;
@@ -213,13 +244,21 @@ pvr_stream_process(struct pvr_device *pvr_dev, const struct pvr_stream_cmd_defs 
 	u32 padding;
 	int err;
 
-	if (!stream || !stream_size)
+	if (!stream || !stream_size) {
+		dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+				     "stream rejected: empty input type=%u stream_present=%u stream_size=%u\n",
+				     cmd_defs->type, !!stream, stream_size);
 		return -EINVAL;
+	}
 
 	err = pvr_stream_get_data(stream, &stream_offset, stream_size, sizeof(u32),
 				  sizeof(u32), &main_stream_len);
-	if (err)
+	if (err) {
+		dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+				     "stream rejected: short main_stream_len type=%u ext_type=-1 entry=-1 offset=%u size=%zu stream_size=%u\n",
+				     cmd_defs->type, stream_offset, sizeof(u32), stream_size);
 		return err;
+	}
 
 	/*
 	 * u32 after stream length is padding to ensure u64 alignment, but may be used for expansion
@@ -227,13 +266,22 @@ pvr_stream_process(struct pvr_device *pvr_dev, const struct pvr_stream_cmd_defs 
 	 */
 	err = pvr_stream_get_data(stream, &stream_offset, stream_size, sizeof(u32),
 				  sizeof(u32), &padding);
-	if (err)
+	if (err) {
+		dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+				     "stream rejected: short padding type=%u ext_type=-1 entry=-1 offset=%u size=%zu stream_size=%u\n",
+				     cmd_defs->type, stream_offset, sizeof(u32), stream_size);
 		return err;
+	}
 
-	if (main_stream_len < stream_offset || main_stream_len > stream_size || padding)
+	if (main_stream_len < stream_offset || main_stream_len > stream_size || padding) {
+		dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+				     "stream rejected: main header type=%u main_stream_len=%u stream_size=%u padding=0x%08x\n",
+				     cmd_defs->type, main_stream_len, stream_size, padding);
 		return -EINVAL;
+	}
 
-	err = pvr_stream_process_1(pvr_dev, cmd_defs->main_stream, cmd_defs->main_stream_len,
+	err = pvr_stream_process_1(pvr_dev, cmd_defs->type, -1,
+				   cmd_defs->main_stream, cmd_defs->main_stream_len,
 				   stream, stream_offset, main_stream_len, dest_out,
 				   cmd_defs->dest_size, &stream_offset);
 	if (err)
@@ -250,8 +298,13 @@ pvr_stream_process(struct pvr_device *pvr_dev, const struct pvr_stream_cmd_defs 
 		 * quirks for this command.
 		 */
 		for (u32 i = 0; i < cmd_defs->ext_nr_headers; i++) {
-			if (pvr_dev->stream_musthave_quirks[cmd_defs->type][i])
+			if (pvr_dev->stream_musthave_quirks[cmd_defs->type][i]) {
+				dev_warn_ratelimited(from_pvr_device(pvr_dev)->dev,
+						     "stream rejected: no extension must-have type=%u ext_type=%u leftover_mask=0x%08x\n",
+						     cmd_defs->type, i,
+						     pvr_dev->stream_musthave_quirks[cmd_defs->type][i]);
 				return -EINVAL;
+			}
 		}
 	}
 
