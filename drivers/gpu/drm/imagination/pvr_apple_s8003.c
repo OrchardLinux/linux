@@ -2101,6 +2101,15 @@ static bool s8003_pm_idle(struct pvr_apple *apple, const struct s8003_pm *pm)
 	return false;
 }
 
+static int s8003_submit_error(struct pvr_apple *apple, struct s8003_vm *vm,
+			      const char *engine, int err, const char *reason)
+{
+	dev_warn_ratelimited(apple_dev(apple),
+			     "%s job not submitted: error=%d VM=%p: %s\n",
+			     engine, err, vm->vm_ctx, reason);
+	return err;
+}
+
 static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job)
 {
 	const struct pvr_hwrt_dataset *hwrt = job->hwrt->hwrt_dataset;
@@ -2114,7 +2123,7 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 
 	err = s8003_rt_derive(hwrt, &rt);
 	if (err)
-		return err;
+		return s8003_submit_error(apple, vm, "geometry", err, "rt derive");
 	/* The VM's sets were taken when the job was ordered (pvr_apple_s8003_vm_scenes()) */
 	for (i = 0; i < 2 && !pm; i++)
 		if (vm->pm[i].set >= 0 && s8003_pm_idle(apple, &vm->pm[i]))
@@ -2128,17 +2137,19 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		    !s8003_wait_done(apple, APPLE_ENGINE_GEOM, vm->pm[i].ta_seq))
 			pm = &vm->pm[i];
 	if (!pm)
-		return -EBUSY;
+		return s8003_submit_error(apple, vm, "geometry", -EBUSY, "no PM set");
 
 	/* As many 128 KiB blocks as the free list has 4 KiB pages, and enough for the target */
 	blocks = max(DIV_ROUND_UP(hwrt->free_lists[0]->initial_num_pages, 32),
 		     DIV_ROUND_UP(50 + rt.tiles, 32));
 	err = s8003_pm_build(apple, vm, pm, min(blocks, S8003_PM_BLOCKS_MAX));
+	if (err)
+		return s8003_submit_error(apple, vm, "geometry", err, "PM pool build failed");
 	/* The record slot of the job before the last one is free again */
-	if (!err && apple->ta_seq)
+	if (apple->ta_seq)
 		err = s8003_wait_done(apple, APPLE_ENGINE_GEOM, apple->ta_seq - 1);
 	if (err)
-		return err;
+		return s8003_submit_error(apple, vm, "geometry", err, "record slot wait");
 
 	seq = apple->ta_seq + 1;
 	s8003_fill_ta(p + s8003_slot_of(seq, false).w, job->cmd, job->hwrt, &rt);
@@ -2152,7 +2163,9 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	pm->td_seq = 0;
 	apple->ta_seq = seq;
 	err = s8003_publish(apple, APPLE_ENGINE_GEOM, seq, (2 * seq) % S8003_CH_ENTRIES);
-	return err ?: seq;
+	if (err)
+		return s8003_submit_error(apple, vm, "geometry", err, "publish");
+	return seq;
 }
 
 static int s8003_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job)
@@ -2169,21 +2182,21 @@ static int s8003_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	for (i = 0; i < 2; i++)
 		if (vm->pm[i].scene == s->gen && vm->pm[i].hwrt == job->hwrt && !vm->pm[i].td_seq)
 			pm = &vm->pm[i];
-	if (!pm) {
-		dev_warn_ratelimited(apple_dev(apple),
-				     "fragment job without a geometry job: not run\n");
-		return -ECANCELED;
-	}
+	if (!pm)
+		return s8003_submit_error(apple, vm, "fragment", -ECANCELED,
+					   "its geometry job failed or was not submitted");
 	err = s8003_rt_derive(job->hwrt->hwrt_dataset, &rt);
-	if (!err && apple->frag_seq)
+	if (err)
+		return s8003_submit_error(apple, vm, "fragment", err, "rt derive");
+	if (apple->frag_seq)
 		err = s8003_wait_done(apple, APPLE_ENGINE_FRAG, apple->frag_seq - 1);
 	if (err)
-		return err;
+		return s8003_submit_error(apple, vm, "fragment", err, "record slot wait");
 
 	seq = apple->frag_seq + 1;
 	err = s8003_fill_3d(p + s8003_slot_of(seq, true).w, job->cmd, job->hwrt, &rt);
 	if (err)
-		return err;
+		return s8003_submit_error(apple, vm, "fragment", err, "3D record fill");
 	s8003_job_write(p, s8003_channel_addr(APPLE_ENGINE_FRAG),
 			s8003_object_addr(&s->layout, S8003_CHANNEL + 1),
 			s8003_meta_addr(s8003_pm_set_va(pm, 0)), pm->set + 1, vm->slot[1], true, seq,
@@ -2191,7 +2204,9 @@ static int s8003_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	pm->td_seq = seq;
 	apple->frag_seq = seq;
 	err = s8003_publish(apple, APPLE_ENGINE_FRAG, seq, (2 * seq) % S8003_CH_ENTRIES);
-	return err ?: seq;
+	if (err)
+		return s8003_submit_error(apple, vm, "fragment", err, "publish");
+	return seq;
 }
 
 /*
@@ -2214,7 +2229,7 @@ static int s8003_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, st
 
 	err = s8003_wait_done(apple, APPLE_ENGINE_COMPUTE, apple->last_seq);
 	if (err)
-		return err;
+		return s8003_submit_error(apple, vm, "compute", err, "record slot wait");
 	seq = apple->last_seq + 1;
 	{
 		const u32 useq[] = {
@@ -2260,7 +2275,9 @@ static int s8003_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, st
 	put32(p + S8003_CH_RING + ((seq - 1) % S8003_CH_ENTRIES) * 4, w);
 	apple->last_seq = seq;
 	err = s8003_publish(apple, APPLE_ENGINE_COMPUTE, seq, seq % S8003_CH_ENTRIES);
-	return err ?: seq;
+	if (err)
+		return s8003_submit_error(apple, vm, "compute", err, "publish");
+	return seq;
 }
 
 static int pvr_apple_s8003_submit(struct pvr_apple *apple, struct pvr_job *job)
