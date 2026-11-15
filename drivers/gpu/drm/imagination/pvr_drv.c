@@ -115,7 +115,7 @@ pvr_ioctl_create_bo(struct drm_device *drm_dev, void *raw_args,
 	 * Create a buffer object and transfer ownership to a userspace-
 	 * accessible handle.
 	 */
-	pvr_obj = pvr_gem_object_create(pvr_dev, sanitized_size, args->flags);
+	pvr_obj = pvr_gem_object_create_user(pvr_dev, sanitized_size, args->flags);
 	if (IS_ERR(pvr_obj)) {
 		err = PTR_ERR(pvr_obj);
 		goto err_drm_dev_exit;

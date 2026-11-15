@@ -63,10 +63,12 @@ struct pvr_file;
 
 #define PVR_BO_DEVICE_CACHE_COHERENT BIT_ULL(61)
 
-#define PVR_BO_KERNEL_FLAGS_MASK (PVR_BO_CPU_CACHED | PVR_BO_FW_NO_CLEAR_ON_RESET | \
-				  PVR_BO_DEVICE_CACHE_COHERENT)
+#define PVR_BO_KERNEL_PINNED BIT_ULL(60)
 
-/* Bits 60..3 are undefined. */
+#define PVR_BO_KERNEL_FLAGS_MASK (PVR_BO_CPU_CACHED | PVR_BO_FW_NO_CLEAR_ON_RESET | \
+				  PVR_BO_DEVICE_CACHE_COHERENT | PVR_BO_KERNEL_PINNED)
+
+/* Bits 59..3 are undefined. */
 /* Bits 2..0 are defined in the UAPI. */
 
 /* Other utilities. */
@@ -129,16 +131,16 @@ struct drm_gem_object *pvr_gem_create_object(struct drm_device *drm_dev, size_t 
 struct pvr_gem_object *pvr_gem_object_create(struct pvr_device *pvr_dev,
 					     size_t size, u64 flags);
 
+struct pvr_gem_object *pvr_gem_object_create_user(struct pvr_device *pvr_dev,
+						 size_t size, u64 flags);
+struct sg_table *pvr_gem_get_pages_sgt_locked(struct pvr_gem_object *pvr_obj);
+
 int pvr_gem_object_into_handle(struct pvr_gem_object *pvr_obj,
 			       struct pvr_file *pvr_file, u32 *handle);
 struct pvr_gem_object *pvr_gem_object_from_handle(struct pvr_file *pvr_file,
 						  u32 handle);
 
-static __always_inline struct sg_table *
-pvr_gem_object_get_pages_sgt(struct pvr_gem_object *pvr_obj)
-{
-	return drm_gem_shmem_get_pages_sgt(shmem_gem_from_pvr_gem(pvr_obj));
-}
+struct sg_table *pvr_gem_object_get_pages_sgt(struct pvr_gem_object *pvr_obj);
 
 void *pvr_gem_object_vmap(struct pvr_gem_object *pvr_obj);
 void pvr_gem_object_vunmap(struct pvr_gem_object *pvr_obj);

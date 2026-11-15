@@ -227,6 +227,10 @@ pvr_gem_object_vmap(struct pvr_gem_object *pvr_obj)
 
 	dma_resv_lock(obj->resv, NULL);
 
+	err = PTR_ERR_OR_ZERO(pvr_gem_get_pages_sgt_locked(pvr_obj));
+	if (err)
+		goto err_unlock;
+
 	err = drm_gem_shmem_vmap_locked(shmem_obj, &map);
 	if (err)
 		goto err_unlock;
@@ -357,8 +361,8 @@ struct drm_gem_object *pvr_gem_create_object(struct drm_device *drm_dev, size_t 
  *  * -%ENOMEM if sufficient physical memory cannot be allocated, or
  *  * Any other error returned by drm_gem_create_mmap_offset().
  */
-struct pvr_gem_object *
-pvr_gem_object_create(struct pvr_device *pvr_dev, size_t size, u64 flags)
+static struct pvr_gem_object *
+pvr_gem_object_create_common(struct pvr_device *pvr_dev, size_t size, u64 flags)
 {
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
 	struct drm_gem_shmem_object *shmem_obj;
@@ -381,7 +385,10 @@ pvr_gem_object_create(struct pvr_device *pvr_dev, size_t size, u64 flags)
 	pvr_obj = shmem_gem_to_pvr_gem(shmem_obj);
 	pvr_obj->flags = flags;
 
-	sgt = drm_gem_shmem_get_pages_sgt(shmem_obj);
+	if (!(flags & PVR_BO_KERNEL_PINNED))
+		return pvr_obj;
+
+	sgt = pvr_gem_object_get_pages_sgt(pvr_obj);
 	if (IS_ERR(sgt)) {
 		err = PTR_ERR(sgt);
 		goto err_shmem_object_free;
@@ -423,7 +430,8 @@ pvr_gem_get_dma_addr(struct pvr_gem_object *pvr_obj, u32 offset,
 	struct scatterlist *sgl;
 	unsigned int sgt_idx;
 
-	WARN_ON(!shmem_obj->sgt);
+	if (!shmem_obj->sgt || offset >= pvr_gem_object_size(pvr_obj))
+		return -EINVAL;
 	for_each_sgtable_dma_sg(shmem_obj->sgt, sgl, sgt_idx) {
 		u32 new_offset = accumulated_offset + sg_dma_len(sgl);
 
@@ -437,4 +445,67 @@ pvr_gem_get_dma_addr(struct pvr_gem_object *pvr_obj, u32 offset,
 	}
 
 	return -EINVAL;
+}
+
+struct pvr_gem_object *pvr_gem_object_create(struct pvr_device *pvr_dev,
+					  size_t size, u64 flags)
+{
+	return pvr_gem_object_create_common(pvr_dev, size, flags | PVR_BO_KERNEL_PINNED);
+}
+
+struct pvr_gem_object *pvr_gem_object_create_user(struct pvr_device *pvr_dev,
+					       size_t size, u64 flags)
+{
+	return pvr_gem_object_create_common(pvr_dev, size, flags);
+}
+
+/* The shmem helper's locked page-in entry points are private to that helper. */
+struct sg_table *pvr_gem_get_pages_sgt_locked(struct pvr_gem_object *pvr_obj)
+{
+	struct drm_gem_shmem_object *shmem = &pvr_obj->base;
+	struct drm_gem_object *obj = &shmem->base;
+	struct sg_table *sgt;
+	int err;
+
+	dma_resv_assert_held(obj->resv);
+	if (shmem->sgt)
+		return shmem->sgt;
+	if (drm_gem_is_imported(obj))
+		return ERR_PTR(-EINVAL);
+
+	/* pin_locked gets pages without recursively acquiring the reservation. */
+	err = drm_gem_shmem_pin_locked(shmem);
+	if (err)
+		return ERR_PTR(err);
+	sgt = drm_gem_shmem_get_sg_table(shmem);
+	if (IS_ERR(sgt)) {
+		err = PTR_ERR(sgt);
+		goto unpin;
+	}
+	err = dma_map_sgtable(obj->dev->dev, sgt, DMA_BIDIRECTIONAL, 0);
+	if (err) {
+		sg_free_table(sgt);
+		kfree(sgt);
+		goto unpin;
+	}
+	/* Transfer the temporary pin's page reference to the sgt. */
+	refcount_inc(&shmem->pages_use_count);
+	shmem->sgt = sgt;
+unpin:
+	drm_gem_shmem_unpin_locked(shmem);
+	return err ? ERR_PTR(err) : sgt;
+}
+
+struct sg_table *pvr_gem_object_get_pages_sgt(struct pvr_gem_object *pvr_obj)
+{
+	struct drm_gem_object *obj = gem_from_pvr_gem(pvr_obj);
+	struct sg_table *sgt;
+	int err;
+
+	err = dma_resv_lock_interruptible(obj->resv, NULL);
+	if (err)
+		return ERR_PTR(err);
+	sgt = pvr_gem_get_pages_sgt_locked(pvr_obj);
+	dma_resv_unlock(obj->resv);
+	return sgt;
 }
