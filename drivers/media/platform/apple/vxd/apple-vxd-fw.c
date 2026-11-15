@@ -20,6 +20,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/iopoll.h>
+#include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 
@@ -292,7 +293,7 @@ static void vxd_post_boot_init(struct apple_vxd_dev *vxd)
 
 int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
 {
-	const struct firmware *fw;
+	const struct firmware *fw = vxd->fw;
 	u32 fw_words;
 	int ret;
 
@@ -312,23 +313,10 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
 
 	/*
 	 * AllocateFirmwareBuffer [E]: a 4-byte-aligned coherent buffer of
-	 * blob_size, GART-mapped (the MTX fetches through its own MMU), and
-	 * the firmware must fit under 0x10000 MTX words.
+	 * blob_size, GART-mapped (the MTX fetches through its own MMU).  The
+	 * image was loaded and checked before the video node was registered
+	 * (apple_vxd_fw_request()).
 	 */
-	ret = request_firmware(&fw, APPLE_VXD_FW_NAME, vxd->dev);
-	if (ret) {
-		dev_err(vxd->dev, "firmware %s not available: %d\n",
-			APPLE_VXD_FW_NAME, ret);
-		goto out_put;
-	}
-
-	if (!fw->size || (fw->size & 3) ||
-	    fw->size / sizeof(u32) >= APPLE_VXD_FW_MAX_WORDS) {
-		dev_err(vxd->dev, "firmware size %zu is not usable (< 0x10000 words)\n",
-			fw->size);
-		ret = -EINVAL;
-		goto out_release;
-	}
 	fw_words = fw->size / sizeof(u32);
 	vxd->fw_blob_size = fw->size;
 
@@ -337,7 +325,7 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
 					   &vxd->fw_dma, GFP_KERNEL);
 	if (!vxd->fw_vaddr) {
 		ret = -ENOMEM;
-		goto out_release;
+		goto out_put;
 	}
 
 	/* Device VA = low 32 bits of the DMA address (identity GART). */
@@ -352,9 +340,6 @@ int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd)
 	}
 
 	memcpy(vxd->fw_vaddr, fw->data, fw->size);
-	release_firmware(fw);
-	/* Every later failure unwinds through out_release: no double free. */
-	fw = NULL;
 
 	/*
 	 * The eight command buffers are mapped now, before the MTX and its
@@ -427,8 +412,6 @@ out_unmap:
 out_fwbuf:
 	dma_free_coherent(vxd->dev, vxd->fw_size, vxd->fw_vaddr, vxd->fw_dma);
 	vxd->fw_vaddr = NULL;
-out_release:
-	release_firmware(fw);
 out_put:
 	pm_runtime_put_autosuspend(vxd->dev);
 	mutex_unlock(&vxd->power_lock);
@@ -456,4 +439,69 @@ void apple_vxd_fw_cleanup(struct apple_vxd_dev *vxd)
 
 	if (was_loaded)
 		pm_runtime_put_autosuspend(vxd->dev);
+}
+
+/*
+ * The firmware file is in (or is not there): the decoder becomes visible to
+ * userspace only now and only with a usable image, so that a registered
+ * video node can always be opened.  The image is kept until the driver is
+ * unbound; the MTX still boots from it on the first open.
+ */
+static void apple_vxd_fw_ready(const struct firmware *fw, void *context)
+{
+	struct apple_vxd_dev *vxd = context;
+
+	if (!fw) {
+		dev_warn(vxd->dev,
+			 "firmware %s not found, not registering the video decoder\n",
+			 APPLE_VXD_FW_NAME);
+		return;
+	}
+
+	/* The image must fit under 0x10000 MTX words [E]. */
+	if (!fw->size || (fw->size & 3) ||
+	    fw->size / sizeof(u32) >= APPLE_VXD_FW_MAX_WORDS) {
+		dev_err(vxd->dev,
+			"firmware %s: size %zu is not usable (< 0x10000 words), not registering the video decoder\n",
+			APPLE_VXD_FW_NAME, fw->size);
+		goto err_release;
+	}
+
+	vxd->fw = fw;
+	if (apple_vxd_v4l2_init(vxd))
+		goto err_clear;
+
+	return;
+
+err_clear:
+	vxd->fw = NULL;
+err_release:
+	release_firmware(fw);
+}
+
+/*
+ * Ask for the firmware file without holding up probe.  The video node is
+ * registered from the callback, when the file is there.
+ */
+int apple_vxd_fw_request(struct apple_vxd_dev *vxd)
+{
+	return firmware_request_nowait_nowarn(THIS_MODULE, APPLE_VXD_FW_NAME,
+					      vxd->dev, GFP_KERNEL, vxd,
+					      apple_vxd_fw_ready);
+}
+
+/*
+ * End a request that has not been answered yet, or wait for its callback;
+ * afterwards vxd->fw and the V4L2 registration no longer change.
+ */
+void apple_vxd_fw_request_cancel(struct apple_vxd_dev *vxd)
+{
+	request_firmware_nowait_cancel(vxd->dev, vxd, apple_vxd_fw_ready);
+}
+
+/* After apple_vxd_fw_cleanup(): nothing boots from the image any more. */
+void apple_vxd_fw_release(struct apple_vxd_dev *vxd)
+{
+	release_firmware(vxd->fw);
+	vxd->fw = NULL;
 }

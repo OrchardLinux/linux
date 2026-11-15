@@ -46,6 +46,8 @@
 #define APPLE_VXD_FW_NAME		"apple/vxd-deva.bin"
 #define APPLE_VXD_FW_MAX_WORDS		0x10000
 
+struct firmware;
+
 /*
  * DT advertises h264-playback-level = 42: H.264 level 4.2, 1920x1088 [E].
  * Tile decode exists (H264DecoderSupportsTileDecode = true) and could lift
@@ -306,7 +308,8 @@ struct apple_vxd_dev {
 	u32 pipe_status_2_max;		/* max per-pipe 0x40c4 & 3 */
 	u32 cfg_flags;			/* InitializeCoreConfig core[0x54] */
 
-	/* Firmware buffer and boot results. */
+	/* Firmware image, buffer and boot results. */
+	const struct firmware *fw;	/* set before the video node exists */
 	bool fw_loaded;			/* MTX up: ready magic seen */
 	void *fw_vaddr;
 	dma_addr_t fw_dma;
@@ -458,6 +461,9 @@ void apple_vxd_dev_buf_free(struct apple_vxd_dev *vxd,
 			    struct apple_vxd_dev_buf *buf);
 
 /* fw.c */
+int apple_vxd_fw_request(struct apple_vxd_dev *vxd);
+void apple_vxd_fw_request_cancel(struct apple_vxd_dev *vxd);
+void apple_vxd_fw_release(struct apple_vxd_dev *vxd);
 int apple_vxd_boot_firmware(struct apple_vxd_dev *vxd);
 void apple_vxd_fw_cleanup(struct apple_vxd_dev *vxd);
 

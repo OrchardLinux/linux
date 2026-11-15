@@ -893,9 +893,9 @@ static int apple_vxd_open(struct file *filp)
 	int ret;
 
 	/*
-	 * The DEVA firmware boots on the first open, when the firmware file
-	 * can be read, and keeps running (and the block powered) until the
-	 * driver is unbound. Later opens find it running.
+	 * The DEVA firmware boots on the first open, from the image loaded
+	 * before this node was registered, and keeps running (and the block
+	 * powered) until the driver is unbound. Later opens find it running.
 	 */
 	ret = apple_vxd_boot_firmware(vxd);
 	if (ret)
@@ -1034,6 +1034,10 @@ err_unregister_v4l2:
 
 void apple_vxd_v4l2_cleanup(struct apple_vxd_dev *vxd)
 {
+	/* Never registered: the firmware file was missing or unusable. */
+	if (!vxd->m2m_dev)
+		return;
+
 	media_device_unregister(&vxd->mdev);
 	v4l2_m2m_unregister_media_controller(vxd->m2m_dev);
 	video_unregister_device(&vxd->vdev);

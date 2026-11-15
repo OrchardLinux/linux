@@ -5,8 +5,9 @@
  * Copyright (c) 2026 Berkay Kösebay <brkosebay@users.noreply.github.com>
  *
  * Probe powers the vdec domain, maps the 1 MiB register window, reads the
- * core identity and registers the V4L2 decoder. The DEVA firmware boots
- * on the first open of the video node (apple-vxd-fw.c).
+ * core identity and asks for the DEVA firmware file. The V4L2 decoder is
+ * registered once that file is loaded, and the firmware boots on the first
+ * open of the video node (apple-vxd-fw.c).
  */
 
 #include <linux/delay.h>
@@ -373,7 +374,7 @@ static int apple_vxd_probe(struct platform_device *pdev)
 	if (!ret)
 		ret = apple_vxd_hevc_register(vxd);
 	if (!ret)
-		ret = apple_vxd_v4l2_init(vxd);
+		ret = apple_vxd_fw_request(vxd);
 	if (ret)
 		goto err_gart_fini;
 
@@ -391,9 +392,12 @@ static void apple_vxd_remove(struct platform_device *pdev)
 {
 	struct apple_vxd_dev *vxd = platform_get_drvdata(pdev);
 
+	/* No video node appears from here on. */
+	apple_vxd_fw_request_cancel(vxd);
 	cancel_delayed_work_sync(&vxd->watchdog_work);
 	apple_vxd_v4l2_cleanup(vxd);
 	apple_vxd_fw_cleanup(vxd);
+	apple_vxd_fw_release(vxd);
 	/* fw_cleanup failed every fence: let a pending job finish first. */
 	flush_work(&vxd->job_done_work);
 	cancel_delayed_work_sync(&vxd->watchdog_work);

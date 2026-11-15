@@ -14,7 +14,8 @@ config VIDEO_APPLE_VXD
 	  firmware. It is exposed as a V4L2 stateless H.264 decoder, and as
 	  an HEVC (H.265 Main) decoder on the SoCs whose decoder has it.
 
-	  The driver needs the DEVA firmware as apple/vxd-deva.bin.
+	  The driver needs the DEVA firmware as apple/vxd-deva.bin. Without
+	  that file it registers no video device.
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called apple-vxd.
