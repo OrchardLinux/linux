@@ -2663,6 +2663,10 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 
+	/* Lost over an earlier sleep, see brcmf_pcie_pm_leave_D3() */
+	if (!pci_device_is_present(devinfo->pdev))
+		return 0;
+
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
@@ -2695,6 +2699,16 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
+
+	/*
+	 * The host bridge could not bring the link back. Any BAR access now
+	 * could stall the CPU, so stay down; with the bus down, firmware
+	 * commands and transmits are refused early.
+	 */
+	if (!pci_device_is_present(devinfo->pdev)) {
+		brcmf_err(bus, "device lost over suspend, staying down\n");
+		return -ENODEV;
+	}
 
 	/* Check if device is still up and running, if so we are ready */
 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
