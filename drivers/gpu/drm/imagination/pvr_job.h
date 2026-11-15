@@ -31,6 +31,7 @@ struct pvr_job {
 	/** @base: drm_sched_job object. */
 	struct drm_sched_job base;
 
+
 	/** @ref_count: Refcount for job. */
 	struct kref ref_count;
 

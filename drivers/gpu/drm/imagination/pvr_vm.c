@@ -55,6 +55,9 @@ struct pvr_vm_context {
 	/** @lock: Global lock on this VM. */
 	struct mutex lock;
 
+	/* Latest published job retirement, updated under lock when checking idle. */
+	ktime_t last_retired;
+
 	/**
 	 * @pins: Ranges that map and unmap requests must leave alone, as
 	 * &struct pvr_vm_pin. Protected by @lock.
@@ -608,6 +611,7 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 		       0, 1ULL << device_addr_bits, 0, 0, &pvr_vm_gpuva_ops);
 
 	mutex_init(&vm_ctx->lock);
+	vm_ctx->last_retired = ktime_get();
 	INIT_LIST_HEAD(&vm_ctx->pins);
 	kref_init(&vm_ctx->ref_count);
 
@@ -1514,4 +1518,9 @@ struct pvr_fw_object *
 pvr_vm_get_fw_mem_context(struct pvr_vm_context *vm_ctx)
 {
 	return vm_ctx->fw_mem_ctx_obj;
+}
+
+struct drm_gem_object *pvr_vm_resv_obj(struct pvr_vm_context *vm_ctx)
+{
+	return drm_gpuvm_resv_obj(&vm_ctx->gpuvm_mgr);
 }

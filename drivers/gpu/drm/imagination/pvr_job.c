@@ -16,6 +16,7 @@
 #include "pvr_stream_defs.h"
 #include "pvr_sync.h"
 #include "pvr_trace.h"
+#include "pvr_vm.h"
 
 #include <drm/drm_exec.h>
 #include <drm/drm_gem.h>
@@ -577,6 +578,10 @@ jobs_lock_all_objs(struct drm_exec *exec, struct pvr_job_data *job_data,
 				return err;
 		}
 
+		err = drm_exec_prepare_obj(exec, pvr_vm_resv_obj(job->ctx->vm_ctx), job_count);
+		if (err)
+			return err;
+
 		if (job->hwrt) {
 			err = drm_exec_prepare_obj(exec, pvr_hwrt_data_resv_obj(job->hwrt), 1);
 			if (err)
@@ -605,6 +610,11 @@ prepare_job_resvs_for_each(struct drm_exec *exec, struct pvr_job_data *job_data,
 static void
 update_job_resvs(struct pvr_job *job)
 {
+	struct dma_fence *fence = &job->base.s_fence->finished;
+
+	dma_resv_add_fence(pvr_vm_get_dma_resv(job->ctx->vm_ctx), fence,
+			   DMA_RESV_USAGE_BOOKKEEP);
+
 	if (job->hwrt) {
 		enum dma_resv_usage usage = job->type == DRM_PVR_JOB_TYPE_GEOMETRY ?
 					    DMA_RESV_USAGE_WRITE : DMA_RESV_USAGE_READ;
