@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_device.h"
 #include "pvr_rogue_fwif_stream.h"
 #include "pvr_stream.h"
@@ -272,10 +273,12 @@ pvr_stream_create_musthave_masks(struct pvr_device *pvr_dev)
 			PVR_STREAM_EXTHDR_FRAG0_BRN47217;
 
 	if (pvr_device_is_apple(pvr_dev)) {
-		pvr_dev->stream_musthave_quirks[PVR_STREAM_TYPE_GEOM][PVR_STREAM_EXTHDR_TYPE_GEOM_APPLE] |=
-			PVR_STREAM_EXTHDR_GEOM_APPLE_REGS;
-		pvr_dev->stream_musthave_quirks[PVR_STREAM_TYPE_FRAG][PVR_STREAM_EXTHDR_TYPE_FRAG_APPLE] |=
-			PVR_STREAM_EXTHDR_FRAG_APPLE_REGS;
+		u32 ext_type, mask;
+
+		mask = pvr_apple_stream_musthave(pvr_dev, PVR_STREAM_TYPE_GEOM, &ext_type);
+		pvr_dev->stream_musthave_quirks[PVR_STREAM_TYPE_GEOM][ext_type] |= mask;
+		mask = pvr_apple_stream_musthave(pvr_dev, PVR_STREAM_TYPE_FRAG, &ext_type);
+		pvr_dev->stream_musthave_quirks[PVR_STREAM_TYPE_FRAG][ext_type] |= mask;
 	}
 
 	if (pvr_device_has_uapi_quirk(pvr_dev, 49927)) {

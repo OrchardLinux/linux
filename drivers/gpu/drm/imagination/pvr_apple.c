@@ -1636,3 +1636,29 @@ const struct pvr_stream_cmd_defs *pvr_apple_cmd_stream(struct pvr_device *pvr_de
 		return chip->compute_stream ?: &pvr_cmd_compute_stream;
 	return type == DRM_PVR_JOB_TYPE_GEOMETRY ? chip->geom_stream : chip->frag_stream;
 }
+
+/**
+ * pvr_apple_stream_musthave() - Required register extension for a chip's stream
+ * @pvr_dev: Target device.
+ * @type: Geometry or fragment stream type.
+ * @ext_type: Extension header type to which the returned mask applies.
+ *
+ * Return: the chip's required register bits, or zero for other stream types.
+ */
+u32 pvr_apple_stream_musthave(struct pvr_device *pvr_dev, enum pvr_stream_type type,
+			      u32 *ext_type)
+{
+	const struct pvr_apple_chip *chip = pvr_dev->device_data->apple_chip;
+
+	if (type == PVR_STREAM_TYPE_GEOM) {
+		*ext_type = chip->geom_ext_type;
+		return chip->geom_ext_mask;
+	}
+	if (type == PVR_STREAM_TYPE_FRAG) {
+		*ext_type = chip->frag_ext_type;
+		return chip->frag_ext_mask;
+	}
+
+	*ext_type = 0;
+	return 0;
+}

@@ -10,6 +10,7 @@
 #include <uapi/drm/pvr_drm.h>
 
 #include "pvr_rogue_fwif_client.h"
+#include "pvr_stream.h"
 
 struct dma_fence;
 struct pvr_apple_chip;
@@ -167,6 +168,8 @@ int pvr_apple_resume(struct pvr_device *pvr_dev);
 void pvr_apple_device_info_init(struct pvr_device *pvr_dev);
 bool pvr_apple_takes_jobs(struct pvr_device *pvr_dev);
 bool pvr_apple_free_list_has_pages(struct pvr_device *pvr_dev);
+u32 pvr_apple_stream_musthave(struct pvr_device *pvr_dev, enum pvr_stream_type type,
+			      u32 *ext_type);
 struct dma_fence *pvr_apple_submit_job(struct pvr_job *job);
 struct dma_fence *pvr_apple_submit_compute_job(struct pvr_device *pvr_dev,
 					       struct pvr_vm_context *vm_ctx, u64 stream,
@@ -200,6 +203,12 @@ static inline int pvr_apple_resume(struct pvr_device *pvr_dev) { return 0; }
 static inline void pvr_apple_device_info_init(struct pvr_device *pvr_dev) {}
 static inline bool pvr_apple_takes_jobs(struct pvr_device *pvr_dev) { return false; }
 static inline bool pvr_apple_free_list_has_pages(struct pvr_device *pvr_dev) { return true; }
+static inline u32 pvr_apple_stream_musthave(struct pvr_device *pvr_dev,
+					 enum pvr_stream_type type, u32 *ext_type)
+{
+	*ext_type = 0;
+	return 0;
+}
 static inline int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
 {
 	return -ENODEV;

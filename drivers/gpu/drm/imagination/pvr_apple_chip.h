@@ -164,6 +164,10 @@ struct pvr_apple {
  * @render_job_size: Bytes @prepare_geom and @prepare_frag fill.
  * @geom_stream: How a geometry job's command stream from userspace is decoded.
  * @frag_stream: The same for a fragment job.
+ * @geom_ext_type: Required geometry register extension header type.
+ * @geom_ext_mask: Required bits within that geometry extension header.
+ * @frag_ext_type: Required fragment register extension header type.
+ * @frag_ext_mask: Required bits within that fragment extension header.
  * @init: At probe, with Fender mapped: map and allocate what the chip needs,
  *	load the firmware (pvr_apple_fw_load()), set &pvr_apple.heap,
  *	&pvr_apple.layout and &pvr_apple.chip_data. Device-managed.
@@ -238,6 +242,10 @@ struct pvr_apple_chip {
 	size_t render_job_size;
 	const struct pvr_stream_cmd_defs *geom_stream;
 	const struct pvr_stream_cmd_defs *frag_stream;
+	u32 geom_ext_type;
+	u32 geom_ext_mask;
+	u32 frag_ext_type;
+	u32 frag_ext_mask;
 	const struct pvr_stream_cmd_defs *compute_stream;
 	unsigned int scenes;
 	bool own_pm_pages;
