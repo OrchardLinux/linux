@@ -1229,14 +1229,18 @@ int pvr_apple_job_add_deps(struct pvr_job *job)
 {
 	struct pvr_apple *apple = to_apple(job->pvr_dev);
 	struct dma_fence *last;
+	unsigned int scenes = 1;
 
 	if (job->type != DRM_PVR_JOB_TYPE_GEOMETRY && job->type != DRM_PVR_JOB_TYPE_FRAGMENT)
 		return 0;
 	spin_lock_irq(&apple->fence_lock);
+	/* Take this VM's first scene even when another VM rendered last. */
+	if (job->type == DRM_PVR_JOB_TYPE_GEOMETRY && apple->chip->vm_scenes)
+		scenes = apple->chip->vm_scenes(apple, job->ctx->vm_ctx);
 	if (job->type == DRM_PVR_JOB_TYPE_FRAGMENT)
 		last = apple->last_geom;
 	else if (apple->chip->scenes > 1 && apple->last_frag_vm == job->ctx->vm_ctx &&
-		 apple->chip->vm_scenes(apple, job->ctx->vm_ctx) > 1)
+		 scenes > 1)
 		last = apple->prev_frag;
 	else
 		last = apple->last_frag;
