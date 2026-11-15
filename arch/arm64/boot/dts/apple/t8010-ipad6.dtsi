@@ -192,6 +192,9 @@
 			reg = <0x500 0x10>;
 			nvmem-cells = <&rtc_offset>;
 			nvmem-cell-names = "rtc_offset";
+			interrupt-parent = <&pmu_gpio>;
+			interrupts = <16 IRQ_TYPE_EDGE_RISING>;
+			wakeup-source;
 		};
 
 		tristar_charger: charger@180 {
@@ -201,11 +204,11 @@
 			interrupt-parent = <&pmu_gpio>;
 			/*
 			 * The PMU line, ADC done, then the events the iPadOS
-			 * charger subscribes to.
+			 * charger subscribes to, except RTC event 16, which
+			 * belongs to the RTC alarm.
 			 */
 			interrupts = <240 IRQ_TYPE_EDGE_RISING>,
 				     <176 IRQ_TYPE_EDGE_RISING>,
-				     <16 IRQ_TYPE_EDGE_RISING>,
 				     <40 IRQ_TYPE_EDGE_RISING>,
 				     <41 IRQ_TYPE_EDGE_RISING>,
 				     <42 IRQ_TYPE_EDGE_RISING>,
