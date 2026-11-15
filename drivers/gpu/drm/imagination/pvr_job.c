@@ -79,8 +79,11 @@ pvr_job_process_stream(struct pvr_device *pvr_dev, const struct pvr_stream_cmd_d
 	job->cmd_len = cmd_defs->dest_size;
 
 	err = pvr_stream_process(pvr_dev, cmd_defs, stream, stream_size, job->cmd);
-	if (err)
+	if (err) {
 		kfree(job->cmd);
+		job->cmd = NULL;
+		job->cmd_len = 0;
+	}
 
 	return err;
 }
