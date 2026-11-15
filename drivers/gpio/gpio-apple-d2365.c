@@ -664,54 +664,74 @@ EXPORT_SYMBOL_GPL(apple_d2365_gpio_quiesce);
  * with the event thread stopped. Consumer events in that read are run as
  * the thread would have run them; a wake source among them ends this
  * transition, as it would once the line is armed.
+ *
+ * Some wake-only events are level events: a Smart Cover hall sensor latches
+ * its event again at once for as long as it reads "open". Armed, such an
+ * event would end the suspend immediately, and it has nothing to wake for
+ * (the cover is already open). Read the block a second time and leave out
+ * every wake-only event that latched again; @quiet gets the rest.
  */
-static void apple_pmic_wake_only_drop(struct apple_pmic_gpio *gpio)
+static void apple_pmic_wake_only_drop(struct apple_pmic_gpio *gpio,
+				      unsigned long *quiet)
 {
 	struct device *dev = gpio->chip.parent;
 	DECLARE_BITMAP(latched, APPLE_PMIC_EVENTS_MAX);
 	DECLARE_BITMAP(pending, APPLE_PMIC_EVENTS_MAX);
-	int ret;
+	DECLARE_BITMAP(again, APPLE_PMIC_EVENTS_MAX);
+	int pass, ret;
 
-	mutex_lock(&gpio->irq_lock);
-	ret = apple_pmic_event_read(gpio, latched, pending);
-	mutex_unlock(&gpio->irq_lock);
-	if (ret) {
-		/* Unknown: as the thread does, every consumer may have an event. */
-		dev_warn(dev, "cannot drop the latched events: %d\n", ret);
-		bitmap_copy(pending, gpio->enabled, gpio->nevents);
+	bitmap_copy(quiet, gpio->wake_only, gpio->nevents);
+	for (pass = 0; pass < 2; pass++) {
+		mutex_lock(&gpio->irq_lock);
+		ret = apple_pmic_event_read(gpio, latched, pending);
+		mutex_unlock(&gpio->irq_lock);
+		if (ret) {
+			/* Unknown: as the thread does, every consumer may have an event. */
+			dev_warn(dev, "cannot drop the latched events: %d\n", ret);
+			bitmap_copy(pending, gpio->enabled, gpio->nevents);
+			bitmap_zero(latched, APPLE_PMIC_EVENTS_MAX);
+		}
+		if (bitmap_intersects(pending, gpio->wake, gpio->nevents))
+			pm_system_wakeup();
+		apple_pmic_dispatch_events(gpio, pending);
+		if (pass && bitmap_and(again, latched, gpio->wake_only, gpio->nevents)) {
+			bitmap_andnot(quiet, quiet, again, gpio->nevents);
+			dev_dbg(dev, "%*pb: wake-only events active now, not armed\n",
+				gpio->nevents, again);
+		}
 	}
-	if (bitmap_intersects(pending, gpio->wake, gpio->nevents))
-		pm_system_wakeup();
-	apple_pmic_dispatch_events(gpio, pending);
 }
 
 static int apple_pmic_gpio_suspend(struct device *dev)
 {
 	struct apple_pmic_gpio *gpio = dev_get_drvdata(dev);
 	DECLARE_BITMAP(armed, APPLE_PMIC_EVENTS_MAX);
-	bool wake_only = false;
+	DECLARE_BITMAP(quiet, APPLE_PMIC_EVENTS_MAX);
+	bool wake_only = false, gated = false;
 	int ret;
 
 	if (!gpio->domain)
 		return 0;
 
 	cancel_delayed_work_sync(&gpio->irq_retry);
+	bitmap_zero(quiet, APPLE_PMIC_EVENTS_MAX);
 	if (!bitmap_empty(gpio->wake_only, gpio->nevents)) {
-		wake_only = true;
+		gated = true;
 		disable_irq(gpio->parent_irq);
-		apple_pmic_wake_only_drop(gpio);
+		apple_pmic_wake_only_drop(gpio, quiet);
+		wake_only = !bitmap_empty(quiet, gpio->nevents);
 	}
 
 	mutex_lock(&gpio->irq_lock);
 	/* Only wake-enabled events may pull the line while asleep. */
-	bitmap_or(armed, gpio->wake, gpio->wake_only, gpio->nevents);
+	bitmap_or(armed, gpio->wake, quiet, gpio->nevents);
 	ret = apple_pmic_event_sync(gpio, armed);
 	if (ret)
 		goto unwind;
 	gpio->suspended = true;
 	gpio->wake_only_armed = wake_only;
 	mutex_unlock(&gpio->irq_lock);
-	if (wake_only)
+	if (gated)
 		enable_irq(gpio->parent_irq);
 	/* A thread that passed the gate before it closed has finished now. */
 	synchronize_irq(gpio->parent_irq);
@@ -733,7 +753,7 @@ static int apple_pmic_gpio_suspend(struct device *dev)
 
 unwind:
 	/* resume() will not run for this device: mask the halls again here. */
-	if (wake_only)
+	if (gated)
 		enable_irq(gpio->parent_irq);
 unwind_enabled:
 	if (apple_pmic_event_sync(gpio, gpio->enabled))
