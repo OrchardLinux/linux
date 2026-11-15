@@ -243,10 +243,12 @@
 #define S8003_PORT_LINKSTS_UP		BIT(0)
 /* PME_Turn_Off request (0x31 sends it, AppleS800xPCIePort::disableGated) */
 #define S8003_PORT_PMETO		0x008c
+#define S8003_PORT_PMETO_SEND		0x31
 #define S8003_PORT_LINKPMGRSTS		0x0210
 #define S8003_PORT_LINKCDMSTS		0x0804
 #define S8003_PORT_LINKCDMSTS_LTSSM	GENMASK(14, 9)
 #define S8003_LTSSM_L0			0x11
+#define S8003_LTSSM_L2_IDLE		0x15
 
 /* ADT perst-to-refclk-delay-us and pci-bridge t-refclk-to-perst (j71t) */
 #define S8003_PERST_TO_REFCLK_US	60
@@ -627,6 +629,12 @@ enum apple_h9p_port_result {
  * @setup_port: power up one root port and train its link
  * @setup_ports: bring up all root ports, replacing the generic loop around
  *               @setup_port (optional)
+ * @port_down: take one root port down for system sleep: its link, PERST#, its
+ *             reference clock and its power. Without it the controller is
+ *             left as it is over a sleep.
+ * @resume_port: bring one root port up again after @port_down (required with
+ *               @port_down). It runs with device interrupts off, so it can't
+ *               use the endpoint's power control.
  * @default_link_speed: target link speed of a root port without
  *	max-link-speed (used by T7000)
  * @has_clocks: the controller takes "aux" and "ref" clocks
@@ -656,6 +664,8 @@ struct apple_h9p_hw {
 	int (*setup_port)(struct apple_h9p_pcie *pcie, unsigned int port,
 			  enum apple_h9p_port_result *result);
 	int (*setup_ports)(struct apple_h9p_pcie *pcie);
+	void (*port_down)(struct apple_h9p_pcie *pcie, unsigned int port);
+	int (*resume_port)(struct apple_h9p_pcie *pcie, unsigned int port);
 	u8 default_link_speed;
 	bool has_clocks;
 	bool has_phy;
@@ -713,6 +723,9 @@ struct apple_h9p_pcie {
 	u32 late_ports;
 	unsigned int late_tries;
 	struct delayed_work late_work;
+	/* System sleep: the ports are down; the ports that were up before */
+	bool asleep;
+	u32 sleep_ports;
 
 	struct apple_h9p_nvmmu nvmmu;
 
@@ -2765,6 +2778,16 @@ static void apple_s8003_port_off(struct apple_h9p_pcie *pcie,
 	h9p_rmw(rc + S8003_RC_PORT_CTL(port), S8003_RC_PORT_CTL_ENABLE, 0);
 }
 
+/* The port block may only be touched while the port is enabled and powered */
+static bool apple_s8003_port_is_on(struct apple_h9p_pcie *pcie,
+				   unsigned int port)
+{
+	void __iomem *rc = pcie->base_rc;
+
+	return (readl(rc + S8003_RC_PORT_CTL(port)) & S8003_RC_PORT_CTL_ENABLE) &&
+	       (readl(rc + S8003_RC_PORT_PWR(port)) & S8003_RC_PORT_PWR_ON);
+}
+
 /* Stop a link training state machine left running by the boot loader */
 static int apple_s8003_port_stop(struct apple_h9p_pcie *pcie,
 				 unsigned int port)
@@ -2793,8 +2816,7 @@ static int apple_s8003_power_cycle_port(struct apple_h9p_pcie *pcie,
 	void __iomem *rc = pcie->base_rc;
 	int ret;
 
-	if ((readl(rc + S8003_RC_PORT_CTL(port)) & S8003_RC_PORT_CTL_ENABLE) &&
-	    (readl(rc + S8003_RC_PORT_PWR(port)) & S8003_RC_PORT_PWR_ON)) {
+	if (apple_s8003_port_is_on(pcie, port)) {
 		ret = apple_s8003_port_stop(pcie, port);
 		if (ret)
 			return ret;
@@ -3042,8 +3064,7 @@ static int apple_s8003_setup_storage_port(struct apple_h9p_pcie *pcie,
 
 	dev_warn(pcie->dev, "port %u: no link (%d), power cycling the port\n",
 		 port, ret);
-	if ((readl(rc + S8003_RC_PORT_CTL(port)) & S8003_RC_PORT_CTL_ENABLE) &&
-	    (readl(rc + S8003_RC_PORT_PWR(port)) & S8003_RC_PORT_PWR_ON)) {
+	if (apple_s8003_port_is_on(pcie, port)) {
 		ret = apple_s8003_port_stop(pcie, port);
 		if (ret)
 			return ret;
@@ -3056,6 +3077,53 @@ static int apple_s8003_setup_storage_port(struct apple_h9p_pcie *pcie,
 	msleep(S8003_PORT_OFF_HOLD_MS);
 
 	return apple_s8003_setup_port_once(pcie, port);
+}
+
+/*
+ * System sleep, as AppleS800xPCIePort::disableGated takes a port down:
+ * PME_Turn_Off with a bounded wait for L2, neither of which iOS insists on,
+ * PERST#, then the port's reference clock and power. The endpoint's driver
+ * has put its device to rest before; for the storage controller that means
+ * disabled (CC.EN clear), which is what makes powering its port off safe.
+ */
+static void apple_s8003_port_down(struct apple_h9p_pcie *pcie,
+				  unsigned int port)
+{
+	void __iomem *pb = pcie->base_port[port];
+	bool on = apple_s8003_port_is_on(pcie, port);
+	u32 val;
+
+	if (on && (readl(pb + S8003_PORT_LINKSTS) & S8003_PORT_LINKSTS_UP)) {
+		writel(S8003_PORT_PMETO_SEND, pb + S8003_PORT_PMETO);
+		if (readl_poll_timeout(pb + S8003_PORT_LINKCDMSTS, val,
+				       FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM,
+						 val) == S8003_LTSSM_L2_IDLE,
+				       100, PCIE_PME_TO_L2_TIMEOUT_US))
+			dev_info(pcie->dev,
+				 "port %u: no L2 after PME_Turn_Off (LTSSM %#lx)\n",
+				 port,
+				 FIELD_GET(S8003_PORT_LINKCDMSTS_LTSSM, val));
+	}
+
+	gpiod_direction_output(pcie->perst[port], 1);
+	if (on)
+		apple_s8003_port_stop(pcie, port);
+	fsleep(S8003_PERST_TO_REFCLK_US);
+	apple_s8003_port_off(pcie, port);
+}
+
+/*
+ * Resume: the storage port exactly as at probe. An endpoint port without the
+ * power cycle of its endpoint, which was held in reset over the sleep: the
+ * power control hangs off the PMIC, out of reach with interrupts off.
+ */
+static int apple_s8003_resume_port(struct apple_h9p_pcie *pcie,
+				   unsigned int port)
+{
+	if (pcie->hw->nvme_mode_ports & BIT(port))
+		return apple_s8003_setup_storage_port(pcie, port);
+
+	return apple_s8003_setup_port_tries(pcie, port);
 }
 
 /*
@@ -3268,6 +3336,159 @@ static int apple_h9p_setup_ports(struct apple_h9p_pcie *pcie)
 
 	return 0;
 }
+
+/*
+ * A port that did not come back from sleep: power it off again and cut its
+ * devices off, so that nothing reaches for them.
+ */
+static void apple_h9p_port_lost(struct apple_h9p_pcie *pcie, unsigned int port,
+				int err)
+{
+	struct pci_dev *rp;
+
+	dev_err(pcie->dev,
+		"port %u did not come back after sleep (%d), its devices are cut off\n",
+		port, err);
+	WRITE_ONCE(pcie->enabled_ports, pcie->enabled_ports & ~BIT(port));
+	pcie->hw->port_down(pcie, port);
+
+	rp = pci_get_slot(pcie->bridge->bus, PCI_DEVFN(port, 0));
+	if (!rp)
+		return;
+	if (rp->subordinate)
+		pci_walk_bus(rp->subordinate, pci_dev_set_disconnected, NULL);
+	pci_dev_set_disconnected(rp, NULL);
+	pci_dev_put(rp);
+}
+
+/*
+ * System sleep, the way iOS's platform quiesce and active actions do it
+ * (AppleS8003PCIe, AppleT8010PCIe): every port is taken down before the
+ * controller's power domains go off, and resume runs the bring-up of the
+ * probe again: common block and tunables, the ports, link training, NVMMU.
+ * Nothing is kept powered and nothing is expected to survive.
+ *
+ * Ordering. The endpoints are children: their drivers suspend before and
+ * resume after these callbacks, and the PCI core restores their configuration
+ * space after resume_noirq found the links again. A port's DART sits inside
+ * the port; the DART driver saves it in the suspend phase, with the port
+ * still up, and rebuilds it in the resume phase, after the noirq phase has
+ * brought the port back and before the endpoint's driver resumes (the
+ * endpoint is the DART's consumer).
+ */
+static int apple_h9p_pcie_prepare(struct device *dev)
+{
+	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(dev);
+
+	if (!pcie || !pcie->hw->port_down)
+		return 0;
+
+	/* Ports still waiting for their endpoint's power wait for the wake */
+	cancel_delayed_work_sync(&pcie->late_work);
+	WRITE_ONCE(pcie->nvmmu.ans_stopped, false);
+
+	return 0;
+}
+
+static void apple_h9p_pcie_complete(struct device *dev)
+{
+	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(dev);
+
+	if (pcie && pcie->late_ports)
+		schedule_delayed_work(&pcie->late_work,
+				      msecs_to_jiffies(S8003_LATE_PORT_RETRY_MS));
+}
+
+static int apple_h9p_pcie_suspend_noirq(struct device *dev)
+{
+	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(dev);
+	unsigned int port;
+
+	if (!pcie || !pcie->hw->port_down)
+		return 0;
+
+	/*
+	 * A storage controller that its driver did not stop (none is bound)
+	 * may still be enabled, and power cycling the port of an enabled
+	 * controller hangs the SoC. Leave everything as it is then.
+	 */
+	if (pcie->hw->has_nvmmu && (pcie->enabled_ports & BIT(0)) &&
+	    !READ_ONCE(pcie->nvmmu.ans_stopped)) {
+		dev_warn(dev,
+			 "storage controller not stopped, ports stay up over sleep\n");
+		return 0;
+	}
+
+	pcie->sleep_ports = pcie->enabled_ports;
+	WRITE_ONCE(pcie->enabled_ports, 0);
+	pcie->nvmmu.ready = false;
+
+	/* The reverse of the bring-up: the storage port goes last */
+	for (port = H9P_NUM_PORTS; port-- > 0;)
+		if (pcie->sleep_ports & BIT(port))
+			pcie->hw->port_down(pcie, port);
+
+	pcie->asleep = true;
+	return 0;
+}
+
+static int apple_h9p_pcie_resume_noirq(struct device *dev)
+{
+	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(dev);
+	struct apple_h9p_nvmmu *nvmmu;
+	unsigned long ports;
+	unsigned int port;
+	int ret = 0;
+
+	if (!pcie || !pcie->asleep)
+		return 0;
+
+	pcie->asleep = false;
+	nvmmu = &pcie->nvmmu;
+	ports = pcie->sleep_ports;
+
+	if (pcie->hw->setup_common)
+		ret = pcie->hw->setup_common(pcie);
+	if (!ret)
+		ret = apple_h9p_prepare_phy_ports(pcie);
+
+	for_each_set_bit(port, &ports, H9P_NUM_PORTS) {
+		int err = ret ?: pcie->hw->resume_port(pcie, port);
+
+		if (err) {
+			apple_h9p_port_lost(pcie, port, err);
+			continue;
+		}
+		WRITE_ONCE(pcie->enabled_ports,
+			   pcie->enabled_ports | BIT(port));
+	}
+
+	/* PCIe r6.0 sec 6.6.1: 100 ms after link-up before configuration */
+	if (pcie->hw->link_settle_ms && pcie->enabled_ports)
+		msleep(pcie->hw->link_settle_ms);
+
+	/* Storage needs its NVMMU as the probe set it up, on zeroed tables */
+	if (nvmmu->tcb_sgl && (pcie->enabled_ports & BIT(0))) {
+		memset(nvmmu->tcb, 0, nvmmu->tcb_size);
+		memset(nvmmu->tcb_table, 0, nvmmu->tcb_table_size);
+		memset(nvmmu->tcb_sgl, 0, nvmmu->tcb_sgl_size);
+		bitmap_zero(nvmmu->mapped, APPLE_ANS_NVMMU_MAX_REQS);
+		ret = apple_h9p_program_nvmmu(pcie);
+		if (ret)
+			apple_h9p_port_lost(pcie, 0, ret);
+		else
+			nvmmu->ready = true;
+	}
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_h9p_pcie_pm_ops = {
+	.prepare = pm_sleep_ptr(apple_h9p_pcie_prepare),
+	.complete = pm_sleep_ptr(apple_h9p_pcie_complete),
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_h9p_pcie_suspend_noirq,
+				  apple_h9p_pcie_resume_noirq)
+};
 
 static int apple_h9p_pcie_init(struct pci_config_window *cfg)
 {
@@ -3728,6 +3949,8 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
 	.parse = apple_s8003_parse,
 	.setup_common = apple_s8003_setup_common,
 	.setup_ports = apple_s8003_setup_ports,
+	.port_down = apple_s8003_port_down,
+	.resume_port = apple_s8003_resume_port,
 	.nvme_mode_ports = BIT(0),
 	.link_settle_ms = 100,
 	.has_phy = true,
@@ -3759,6 +3982,7 @@ static struct platform_driver apple_h9p_pcie_driver = {
 		.name = "pcie-apple-h9p",
 		.of_match_table = apple_h9p_pcie_of_match,
 		.suppress_bind_attrs = true,
+		.pm = pm_sleep_ptr(&apple_h9p_pcie_pm_ops),
 	},
 };
 module_platform_driver(apple_h9p_pcie_driver);
