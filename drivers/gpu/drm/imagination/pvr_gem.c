@@ -49,7 +49,16 @@ static int pvr_gem_mmap(struct drm_gem_object *gem_obj, struct vm_area_struct *v
 	if (!(pvr_obj->flags & DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS))
 		return -EINVAL;
 
-	return drm_gem_shmem_mmap(shmem_obj, vma);
+	if (drm_gem_is_imported(gem_obj))
+		return drm_gem_shmem_mmap(shmem_obj, vma);
+	if (vma_is_cow_mapping(vma))
+		return -EINVAL;
+
+	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_page_prot = vma_get_page_prot(vma);
+	if (shmem_obj->map_wc)
+		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	return 0;
 }
 
 static enum drm_gem_object_status pvr_gem_object_status(struct drm_gem_object *obj)
@@ -62,6 +71,35 @@ static enum drm_gem_object_status pvr_gem_object_status(struct drm_gem_object *o
 	return 0;
 }
 
+static vm_fault_t pvr_gem_fault(struct vm_fault *vmf)
+{
+	struct drm_gem_object *obj = vmf->vma->vm_private_data;
+	struct pvr_gem_object *bo = gem_to_pvr_gem(obj);
+	pgoff_t offset = vmf->pgoff - vmf->vma->vm_pgoff;
+	vm_fault_t ret;
+	struct sg_table *sgt;
+
+	if (offset >= obj->size >> PAGE_SHIFT)
+		return VM_FAULT_SIGBUS;
+	dma_resv_lock(obj->resv, NULL);
+	sgt = pvr_gem_get_pages_sgt_locked(bo);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt) == -ENOMEM ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+	} else {
+		bo->base.pages_mark_dirty_on_put = true;
+		ret = vmf_insert_pfn(vmf->vma, vmf->address,
+				     page_to_pfn(bo->base.pages[offset]));
+	}
+	dma_resv_unlock(obj->resv);
+	return ret;
+}
+
+static const struct vm_operations_struct pvr_gem_vm_ops = {
+	.fault = pvr_gem_fault,
+	.open = drm_gem_vm_open,
+	.close = drm_gem_vm_close,
+};
+
 static const struct drm_gem_object_funcs pvr_gem_object_funcs = {
 	.free = pvr_gem_object_free,
 	.status = pvr_gem_object_status,
@@ -73,7 +111,7 @@ static const struct drm_gem_object_funcs pvr_gem_object_funcs = {
 	.vmap = drm_gem_shmem_object_vmap,
 	.vunmap = drm_gem_shmem_object_vunmap,
 	.mmap = pvr_gem_mmap,
-	.vm_ops = &drm_gem_shmem_vm_ops,
+	.vm_ops = &pvr_gem_vm_ops,
 };
 
 /**
