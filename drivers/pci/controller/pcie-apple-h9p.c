@@ -584,6 +584,8 @@ struct apple_h9p_nvmmu {
 	void __iomem *base;
 	/* Programmed: the ANS glue may map through it */
 	bool ready;
+	/* The ANS glue stopped the controller and retired its translations */
+	bool ans_stopped;
 	/* Serializes the invalidate FIFO wait and the invalidate write */
 	spinlock_t inv_lock;
 	/* With the invalidate FIFO: tags mapped since their last invalidate */
@@ -1833,6 +1835,56 @@ int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_ans_nvmmu_map);
+
+/* The host of the ANS endpoint @dev on the storage port, or NULL */
+static struct apple_h9p_pcie *apple_ans_endpoint_host(struct device *dev)
+{
+	struct device *host = dev;
+	struct apple_h9p_pcie *pcie;
+
+	while (host && host->bus == dev->bus)
+		host = host->parent;
+	if (!host || !host->parent)
+		return NULL;
+	pcie = apple_h9p_pcie_lookup(host->parent);
+	if (!pcie || apple_h9p_pcie_device_port(pcie, dev) != 0)
+		return NULL;
+	return pcie;
+}
+
+int apple_ans_nvmmu_drain(struct device *dev)
+{
+	struct apple_h9p_pcie *pcie = apple_ans_endpoint_host(dev);
+	u32 fifo;
+
+	if (!pcie || !pcie->nvmmu.ready)
+		return -ENODEV;
+	if (!pcie->hw->nvmmu_inv_fifo)
+		return 0;
+	if (!bitmap_empty(pcie->nvmmu.mapped, APPLE_ANS_NVMMU_MAX_REQS))
+		return -EBUSY;
+
+	return readl_poll_timeout(pcie->base_port[0] +
+				  S8003_PORT_NVMMU_INV_FIFO, fifo,
+				  fifo & S8003_PORT_NVMMU_INV_FIFO_EMPTY, 10,
+				  S8003_NVMMU_INV_FIFO_TIMEOUT_US);
+}
+EXPORT_SYMBOL_GPL(apple_ans_nvmmu_drain);
+
+int apple_ans_stopped(struct device *dev)
+{
+	struct apple_h9p_pcie *pcie = apple_ans_endpoint_host(dev);
+	int ret;
+
+	/* The last invalidate has to leave the FIFO as well */
+	ret = apple_ans_nvmmu_drain(dev);
+	if (ret)
+		return ret;
+
+	WRITE_ONCE(pcie->nvmmu.ans_stopped, true);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_ans_stopped);
 
 static bool apple_h9p_ltssm_link_up(u32 ltssm)
 {

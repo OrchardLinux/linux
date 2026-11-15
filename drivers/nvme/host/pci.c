@@ -13,6 +13,7 @@
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/kstrtox.h>
 #include <linux/memremap.h>
 #include <linux/mm.h>
@@ -3283,11 +3284,58 @@ static bool nvme_pci_ctrl_is_dead(struct nvme_dev *dev)
 	return (csts & NVME_CSTS_CFS) || !(csts & NVME_CSTS_RDY);
 }
 
-static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
+/*
+ * A controller that loses power in sleep: after the shutdown notification
+ * completed, clear CC.EN, wait for RDY to drop and take the controller off
+ * the bus, as iOS does before it powers the port off. A controller that was
+ * shut down but is still enabled must not have its port power cycled.
+ */
+static int nvme_dev_stop_after_shutdown(struct nvme_dev *dev, int shutdown_ret)
+{
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	struct nvme_ctrl *ctrl = &dev->ctrl;
+	u32 csts = ~0U, cc;
+	int ret, err;
+
+	ret = ctrl->ops->reg_read32(ctrl, NVME_REG_CSTS, &csts);
+	if (shutdown_ret || ret || (csts & NVME_CSTS_CFS) ||
+	    (csts & NVME_CSTS_SHST_MASK) != NVME_CSTS_SHST_CMPLT) {
+		pci_clear_master(pdev);
+		return -EBUSY;
+	}
+	ctrl->ctrl_config &= ~(NVME_CC_ENABLE | NVME_CC_SHN_MASK);
+	ret = ctrl->ops->reg_write32(ctrl, NVME_REG_CC, ctrl->ctrl_config);
+	if (!ret) {
+		ret = read_poll_timeout(ctrl->ops->reg_read32, err,
+					err || !(csts & NVME_CSTS_RDY),
+					1000, 2000000, false, ctrl,
+					NVME_REG_CSTS, &csts);
+		if (!ret)
+			ret = err;
+	}
+	if (ret)
+		goto block_dma;
+	cc = readl(dev->bar + NVME_REG_CC);
+	if ((csts & NVME_CSTS_CFS) ||
+	    (cc & (NVME_CC_ENABLE | NVME_CC_SHN_MASK)))
+		ret = -EBUSY;
+block_dma:
+	pci_clear_master(pdev);
+	return ret;
+}
+
+/*
+ * @stop: stop the controller for a sleep in which it loses power (implies
+ * @shutdown). Returns an error if the controller could not be stopped; it
+ * is disabled as far as possible and the caller has to reset it. If the I/O
+ * queues don't drain, nothing is stopped.
+ */
+static int __nvme_dev_disable(struct nvme_dev *dev, bool shutdown, bool stop)
 {
 	enum nvme_ctrl_state state = nvme_ctrl_state(&dev->ctrl);
 	struct pci_dev *pdev = to_pci_dev(dev->dev);
 	bool dead;
+	int ret = 0;
 
 	mutex_lock(&dev->shutdown_lock);
 	dead = nvme_pci_ctrl_is_dead(dev);
@@ -3298,15 +3346,30 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 		 * Give the controller a chance to complete all entered requests
 		 * if doing a safe shutdown.
 		 */
-		if (!dead && shutdown)
-			nvme_wait_freeze_timeout(&dev->ctrl);
+		if (!dead && shutdown &&
+		    nvme_wait_freeze_timeout(&dev->ctrl) <= 0 && stop) {
+			nvme_unfreeze(&dev->ctrl);
+			mutex_unlock(&dev->shutdown_lock);
+			return -EBUSY;
+		}
 	}
 
 	nvme_quiesce_io_queues(&dev->ctrl);
 
+	if (stop && (dead || !dev->ctrl.queue_count))
+		ret = -EBUSY;
 	if (!dead && dev->ctrl.queue_count > 0) {
+		int shutdown_ret;
+
+		if (stop) {
+			nvme_sync_io_queues(&dev->ctrl);
+			if (dev->dma_ops && dev->dma_ops->drain)
+				ret = dev->dma_ops->drain(dev);
+		}
 		nvme_delete_io_queues(dev);
-		nvme_disable_ctrl(&dev->ctrl, shutdown);
+		shutdown_ret = nvme_disable_ctrl(&dev->ctrl, shutdown);
+		if (stop && !ret)
+			ret = nvme_dev_stop_after_shutdown(dev, shutdown_ret);
 		nvme_poll_irqdisable(&dev->queues[0]);
 	}
 	nvme_suspend_io_queues(dev);
@@ -3329,7 +3392,16 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 		if (dev->ctrl.admin_q && !blk_queue_dying(dev->ctrl.admin_q))
 			nvme_unquiesce_admin_queue(&dev->ctrl);
 	}
+	if (stop && !ret && dev->dma_ops && dev->dma_ops->stopped)
+		ret = dev->dma_ops->stopped(dev);
 	mutex_unlock(&dev->shutdown_lock);
+
+	return ret;
+}
+
+static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
+{
+	__nvme_dev_disable(dev, shutdown, false);
 }
 
 static int nvme_disable_prepare_reset(struct nvme_dev *dev, bool shutdown)
@@ -3989,6 +4061,23 @@ static int nvme_suspend(struct device *dev)
 	int ret = -EBUSY;
 
 	ndev->last_ps = U32_MAX;
+
+	/*
+	 * The controller loses power: stop it completely. If that fails, bring
+	 * it back with a reset and refuse the sleep.
+	 */
+	if (ndev->sleep_stop) {
+		if (!nvme_wait_reset(ctrl))
+			return -EBUSY;
+		ret = __nvme_dev_disable(ndev, true, true);
+		if (ret) {
+			dev_err(dev, "controller not stopped for sleep: %d\n",
+				ret);
+			nvme_try_sched_reset(ctrl);
+			return -EBUSY;
+		}
+		return 0;
+	}
 
 	/*
 	 * The platform does not remove power for a kernel managed suspend so

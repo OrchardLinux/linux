@@ -55,12 +55,16 @@ struct apple_ans_nvme_req {
  *                  than after CAP.TO (0: CAP.TO only)
  * @late_bus_master: let the controller master the bus only after the
  *                   preinit has stopped it and reset the NVMMU slots
+ * @sleep_stop: the controller's port loses power in system sleep: stop the
+ *              controller first, as iOS (AppleEmbeddedNVMeController) does,
+ *              and bring it up from reset on resume
  */
 struct apple_ans_host {
 	u32 l1ss_ctl1;
 	unsigned int enable_settle_ms;
 	unsigned int rdy_timeout_ms;
 	bool late_bus_master;
+	bool sleep_stop;
 };
 
 static const struct apple_ans_host apple_ans_host_s8003 = {
@@ -72,10 +76,12 @@ static const struct apple_ans_host apple_ans_host_s8003 = {
 	.enable_settle_ms = 100,
 	.rdy_timeout_ms = 5000,
 	.late_bus_master = true,
+	.sleep_stop = true,
 };
 
 static const struct apple_ans_host apple_ans_host_t8010 = {
 	.l1ss_ctl1 = APPLE_ANS_L1SS_CTL1_T8010,
+	.sleep_stop = true,
 };
 
 struct apple_ans_nvme {
@@ -148,6 +154,7 @@ static int nvme_pci_apple_ans_init(struct nvme_dev *dev, int node)
 
 	ans->host = match->data;
 	dev->late_bus_master = ans->host->late_bus_master;
+	dev->sleep_stop = ans->host->sleep_stop;
 	spin_lock_init(&ans->req_lock);
 	dev->dma_data = ans;
 	return 0;
@@ -593,6 +600,23 @@ out_unmap:
 	return status;
 }
 
+static int nvme_pci_apple_ans_drain(struct nvme_dev *dev)
+{
+	return apple_ans_nvmmu_drain(dev->dev);
+}
+
+/* Retire every translation, then let the host power the port off */
+static int nvme_pci_apple_ans_stopped(struct nvme_dev *dev)
+{
+	int ret;
+
+	ret = nvme_pci_apple_ans_reset_dma(dev);
+	if (ret)
+		return ret;
+
+	return apple_ans_stopped(dev->dev);
+}
+
 static u32 nvme_pci_apple_ans_queue_depth(struct nvme_dev *dev, u32 depth)
 {
 	return min_t(u32, depth, APPLE_ANS_NVMMU_MAX_REQS);
@@ -611,6 +635,8 @@ const struct nvme_pci_dma_ops nvme_pci_apple_ans_ops = {
 	.prepare_enable = nvme_pci_apple_ans_prepare_enable,
 	.write_cc	= nvme_pci_apple_ans_write_cc,
 	.read_csts	= nvme_pci_apple_ans_read_csts,
+	.drain		= nvme_pci_apple_ans_drain,
+	.stopped	= nvme_pci_apple_ans_stopped,
 	.map_data	= nvme_pci_apple_ans_map_data,
 	.unmap_data	= nvme_pci_apple_ans_unmap_data,
 	.queue_depth	= nvme_pci_apple_ans_queue_depth,

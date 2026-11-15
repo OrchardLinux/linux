@@ -40,6 +40,13 @@ struct nvme_pci_dma_ops {
 	/* Controller register hooks for CC writes and CSTS reads (optional) */
 	int (*write_cc)(struct nvme_dev *dev, u32 cc);
 	int (*read_csts)(struct nvme_dev *dev, u32 *csts);
+	/*
+	 * Stop for sleep (optional, see nvme_dev.sleep_stop): @drain before
+	 * the shutdown, with the I/O queues idle; @stopped once the
+	 * controller is disabled and off the bus.
+	 */
+	int (*drain)(struct nvme_dev *dev);
+	int (*stopped)(struct nvme_dev *dev);
 	blk_status_t (*map_data)(struct request *req);
 	bool (*unmap_data)(struct request *req);
 	u32 (*queue_depth)(struct nvme_dev *dev, u32 depth);
@@ -80,6 +87,8 @@ struct nvme_dev {
 	void *dma_data;
 	/* Enable bus mastering only once the glue's preinit has run */
 	bool late_bus_master;
+	/* The controller loses power in system sleep: stop it completely */
+	bool sleep_stop;
 
 	/* shadow doorbell buffer support: */
 	__le32 *dbbuf_dbs;

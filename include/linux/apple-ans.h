@@ -21,7 +21,26 @@ struct device;
 int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
 			const u64 *pages, unsigned int npages,
 			bool to_memory, dma_addr_t *iova);
+/*
+ * System sleep, in which the storage port loses power.
+ * apple_ans_nvmmu_drain(): no request is mapped and the NVMMU has no
+ * invalidation left to do. apple_ans_stopped(): the controller is disabled
+ * and off the bus and its translations are retired, so the host may power
+ * the port off.
+ */
+int apple_ans_nvmmu_drain(struct device *dev);
+int apple_ans_stopped(struct device *dev);
 #else
+static inline int apple_ans_nvmmu_drain(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline int apple_ans_stopped(struct device *dev)
+{
+	return -ENODEV;
+}
+
 static inline int apple_ans_nvmmu_map(struct device *dev, unsigned int tag,
 				      const u64 *pages, unsigned int npages,
 				      bool to_memory, dma_addr_t *iova)
