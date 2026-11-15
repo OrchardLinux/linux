@@ -26,6 +26,7 @@ struct drm_pvr_ioctl_get_heap_info_args;
 
 /* Forward declaration from <drm/drm_exec.h> */
 struct drm_exec;
+struct mutex;
 
 /**
  * struct pvr_vm_pin - Device-virtual range whose mappings must not change
@@ -66,6 +67,10 @@ void pvr_vm_unmap_all(struct pvr_vm_context *vm_ctx);
 dma_addr_t pvr_vm_get_page_table_root_addr(struct pvr_vm_context *vm_ctx);
 struct dma_resv *pvr_vm_get_dma_resv(struct pvr_vm_context *vm_ctx);
 struct drm_gem_object *pvr_vm_resv_obj(struct pvr_vm_context *vm_ctx);
+int pvr_vm_submit_lock(struct pvr_vm_context *vm_ctx, struct mutex *nest);
+void pvr_vm_submit_unlock(struct pvr_vm_context *vm_ctx);
+int pvr_vm_prepare_objects(struct pvr_vm_context *vm_ctx, struct drm_exec *exec);
+int pvr_vm_validate(struct pvr_vm_context *vm_ctx, struct drm_exec *exec);
 bool pvr_vm_evict_bo(struct drm_gem_object *obj, unsigned int idle_ms,
 		     unsigned int *reason);
 

@@ -234,7 +234,16 @@ static int pvr_vm_bind_op_exec(struct pvr_vm_bind_op *bind_op)
 
 static void pvr_vm_bind_op_fini(struct pvr_vm_bind_op *bind_op)
 {
-	drm_gpuvm_bo_put(bind_op->gpuvm_bo);
+	if (bind_op->gpuvm_bo) {
+		struct drm_gem_object *obj = bind_op->gpuvm_bo->obj;
+
+		/* Last put removes vm_bo from the BO's GPUVA list. */
+		drm_gem_object_get(obj);
+		dma_resv_lock(obj->resv, NULL);
+		drm_gpuvm_bo_put(bind_op->gpuvm_bo);
+		dma_resv_unlock(obj->resv);
+		drm_gem_object_put(obj);
+	}
 
 	kfree(bind_op->new_va);
 	kfree(bind_op->prev_va);
@@ -256,7 +265,6 @@ pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
 	struct drm_gem_object *obj = gem_from_pvr_gem(pvr_obj);
 	const bool is_user = vm_ctx->is_userspace_context;
 	const u64 pvr_obj_size = pvr_gem_object_size(pvr_obj);
-	struct sg_table *sgt;
 	u64 offset_plus_size;
 	int err;
 
@@ -286,20 +294,6 @@ pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
 	bind_op->next_va = kzalloc_obj(*bind_op->next_va);
 	if (!bind_op->new_va || !bind_op->prev_va || !bind_op->next_va) {
 		err = -ENOMEM;
-		goto err_bind_op_fini;
-	}
-
-	/* Pin pages so they're ready for use. */
-	sgt = pvr_gem_object_get_pages_sgt(pvr_obj);
-	err = PTR_ERR_OR_ZERO(sgt);
-	if (err)
-		goto err_bind_op_fini;
-
-	bind_op->mmu_op_ctx =
-		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, sgt, device_addr, offset, size);
-	err = PTR_ERR_OR_ZERO(bind_op->mmu_op_ctx);
-	if (err) {
-		bind_op->mmu_op_ctx = NULL;
 		goto err_bind_op_fini;
 	}
 
@@ -358,6 +352,16 @@ err_bind_op_fini:
 	return err;
 }
 
+static void pvr_vm_gpuva_unlink(struct drm_gpuva *va)
+{
+	struct drm_gpuvm_bo *vm_bo = va->vm_bo;
+
+	/* prepare_range() only locks objects with a live VA. */
+	if (vm_bo->evicted && list_is_singular(&vm_bo->list.gpuva))
+		drm_gpuvm_bo_evict(vm_bo, false);
+	drm_gpuva_unlink(va);
+}
+
 /**
  * pvr_vm_gpuva_map() - Insert a mapping into a memory context.
  * @op: gpuva op containing the remap details.
@@ -409,14 +413,17 @@ pvr_vm_gpuva_unmap(struct drm_gpuva_op *op, void *op_ctx)
 {
 	struct pvr_vm_bind_op *ctx = op_ctx;
 
-	int err = pvr_mmu_unmap(ctx->mmu_op_ctx, op->unmap.va->va.addr,
-				op->unmap.va->va.range);
+	int err = 0;
+
+	if (!to_pvr_vm_gpuva(op->unmap.va)->evicted)
+		err = pvr_mmu_unmap(ctx->mmu_op_ctx, op->unmap.va->va.addr,
+				    op->unmap.va->va.range);
 
 	if (err)
 		return err;
 
 	drm_gpuva_unmap(&op->unmap);
-	drm_gpuva_unlink(op->unmap.va);
+	pvr_vm_gpuva_unlink(op->unmap.va);
 	kfree(to_pvr_vm_gpuva(op->unmap.va));
 
 	return 0;
@@ -443,9 +450,13 @@ pvr_vm_gpuva_remap(struct drm_gpuva_op *op, void *op_ctx)
 	int err;
 
 	drm_gpuva_op_remap_to_unmap_range(&op->remap, &va_start, &va_range);
-	err = pvr_mmu_unmap(ctx->mmu_op_ctx, va_start, va_range);
-	if (err)
-		return err;
+	if (!to_pvr_vm_gpuva(op->remap.unmap->va)->evicted) {
+		err = pvr_mmu_unmap(ctx->mmu_op_ctx, va_start, va_range);
+		if (err)
+			return err;
+	}
+	ctx->prev_va->evicted = to_pvr_vm_gpuva(op->remap.unmap->va)->evicted;
+	ctx->next_va->evicted = ctx->prev_va->evicted;
 
 	/* No actual remap required: the page table tree depth is fixed to 3,
 	 * and we use 4k page table entries only for now.
@@ -464,7 +475,7 @@ pvr_vm_gpuva_remap(struct drm_gpuva_op *op, void *op_ctx)
 		ctx->next_va = NULL;
 	}
 
-	drm_gpuva_unlink(op->remap.unmap->va);
+	pvr_vm_gpuva_unlink(op->remap.unmap->va);
 	kfree(to_pvr_vm_gpuva(op->remap.unmap->va));
 
 	return 0;
@@ -529,7 +540,10 @@ static void pvr_gpuvm_free(struct drm_gpuvm *gpuvm)
 	kfree(to_pvr_vm_context(gpuvm));
 }
 
+static int pvr_vm_bo_validate(struct drm_gpuvm_bo *vm_bo, struct drm_exec *exec);
+
 static const struct drm_gpuvm_ops pvr_vm_gpuva_ops = {
+	.vm_bo_validate = pvr_vm_bo_validate,
 	.vm_free = pvr_gpuvm_free,
 	.sm_step_map = pvr_vm_gpuva_map,
 	.sm_step_remap = pvr_vm_gpuva_remap,
@@ -832,8 +846,27 @@ __pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
 	if (err)
 		goto err_cleanup;
 
-	err = pvr_vm_bind_op_exec(&bind_op);
+	{
+		struct sg_table *sgt = pvr_gem_get_pages_sgt_locked(pvr_obj);
 
+		err = PTR_ERR_OR_ZERO(sgt);
+		if (!err) {
+			bind_op.mmu_op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, sgt,
+								   device_addr, pvr_obj_offset,
+								   size);
+			err = PTR_ERR_OR_ZERO(bind_op.mmu_op_ctx);
+			if (err)
+				bind_op.mmu_op_ctx = NULL;
+		}
+		if (!err)
+			err = pvr_vm_bind_op_exec(&bind_op);
+	}
+
+	/* Publish table edits while both VM and BO reservations still exclude reclaim. */
+	if (bind_op.mmu_op_ctx) {
+		pvr_mmu_op_context_destroy(bind_op.mmu_op_ctx);
+		bind_op.mmu_op_ctx = NULL;
+	}
 	drm_gpuvm_exec_unlock(&vm_exec);
 
 err_cleanup:
@@ -915,6 +948,11 @@ pvr_vm_unmap_obj_locked(struct pvr_vm_context *vm_ctx,
 
 	err = pvr_vm_bind_op_exec(&bind_op);
 
+	/* Publish table edits while both VM and BO reservations still exclude reclaim. */
+	if (bind_op.mmu_op_ctx) {
+		pvr_mmu_op_context_destroy(bind_op.mmu_op_ctx);
+		bind_op.mmu_op_ctx = NULL;
+	}
 	drm_gpuvm_exec_unlock(&vm_exec);
 
 err_cleanup:
@@ -1588,13 +1626,16 @@ bool pvr_vm_evict_bo(struct drm_gem_object *obj, unsigned int idle_ms,
 		struct drm_gpuva *va;
 		int err = 0, flush_err;
 
+		if (list_empty(&vm_bo->list.gpuva))
+			continue;
 		op = pvr_mmu_unmap_context_create(vm->mmu_ctx);
 		if (IS_ERR(op)) {
 			*reason = 10;
 			goto unlock;
 		}
 		/* On any partial failure keep pages and validate all cleared VAs. */
-		drm_gpuvm_bo_evict(vm_bo, true);
+		if (!vm_bo->evicted)
+			drm_gpuvm_bo_evict(vm_bo, true);
 		drm_gpuvm_bo_for_each_va(va, vm_bo) {
 			struct pvr_vm_gpuva *pva = to_pvr_vm_gpuva(va);
 
@@ -1623,4 +1664,86 @@ unlock:
 		}
 	}
 	return success;
+}
+
+int pvr_vm_submit_lock(struct pvr_vm_context *vm, struct mutex *nest)
+{
+	mutex_lock_nest_lock(&vm->lock, nest);
+	return 0;
+}
+
+void pvr_vm_submit_unlock(struct pvr_vm_context *vm)
+{
+	/* Fence reservation may prune completed fences even on a failed submit.
+	 * Keep a conservative quiet-period floor before releasing the VM lock.
+	 */
+	vm->last_retired = max(vm->last_retired, ktime_get());
+	mutex_unlock(&vm->lock);
+}
+
+int pvr_vm_prepare_objects(struct pvr_vm_context *vm, struct drm_exec *exec)
+{
+	lockdep_assert_held(&vm->lock);
+	/* PowerVR does not register extobjs. Prepare its actual VA tree instead. */
+	return drm_gpuvm_prepare_range(&vm->gpuvm_mgr, exec, 0,
+				      vm->gpuvm_mgr.mm_range, 0);
+}
+
+static int pvr_vm_bo_validate(struct drm_gpuvm_bo *vm_bo, struct drm_exec *exec)
+{
+	struct pvr_vm_context *vm = to_pvr_vm_context(vm_bo->vm);
+	struct pvr_gem_object *bo = gem_to_pvr_gem(vm_bo->obj);
+	struct drm_gpuva *va;
+	struct sg_table *sgt;
+
+	lockdep_assert_held(&vm->lock);
+	dma_resv_assert_held(vm_bo->obj->resv);
+	sgt = pvr_gem_get_pages_sgt_locked(bo);
+	if (IS_ERR(sgt))
+		return -ENOMEM;
+	drm_gpuvm_bo_for_each_va(va, vm_bo) {
+		struct pvr_vm_gpuva *pva = to_pvr_vm_gpuva(va);
+		struct pvr_mmu_op_context *op;
+		int err;
+
+		if (!pva->evicted)
+			continue;
+		op = pvr_mmu_op_context_create(vm->mmu_ctx, sgt, va->va.addr,
+					       va->gem.offset, va->va.range);
+		if (IS_ERR(op))
+			return -ENOMEM;
+		/* Also repair an eviction that stopped after clearing only a prefix. */
+		err = pvr_mmu_unmap(op, va->va.addr, va->va.range);
+		if (!err)
+			err = pvr_mmu_map(op, va->va.range, bo->flags, va->va.addr);
+		pvr_mmu_op_context_destroy(op);
+		if (err)
+			return -ENOMEM;
+		pva->evicted = false;
+	}
+	/* A failed flush leaves vm_bo evicted, so a retry must flush again. */
+	pvr_mmu_flush_request_all(vm->pvr_dev);
+	if (pvr_mmu_flush_exec(vm->pvr_dev, false))
+		return -ENOMEM;
+	drm_gpuvm_bo_evict(vm_bo, false);
+	pvr_gem_lru_update_locked(bo);
+	atomic64_inc(&vm->pvr_dev->gem_reclaim.restores);
+	return 0;
+}
+
+int pvr_vm_validate(struct pvr_vm_context *vm, struct drm_exec *exec)
+{
+	struct drm_gpuva *va;
+	int err;
+
+	lockdep_assert_held(&vm->lock);
+	err = drm_gpuvm_validate(&vm->gpuvm_mgr, exec);
+	if (err) {
+		atomic64_inc(&vm->pvr_dev->gem_reclaim.restore_fail);
+		return -ENOMEM;
+	}
+	drm_gpuvm_for_each_va(va, &vm->gpuvm_mgr)
+		if (va->gem.obj)
+			pvr_gem_lru_update_locked(gem_to_pvr_gem(va->gem.obj));
+	return 0;
 }
