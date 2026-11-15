@@ -142,6 +142,9 @@
 #define H9P_J172_QUIRK_PREFIX_SETTLE_MIN_US	6400
 #define H9P_J172_QUIRK_PREFIX_SETTLE_MAX_US	7000
 
+/* perst-to-refclk-delay-us of the Apple device trees (J71t, J71b) */
+#define H9P_PERST_TO_REFCLK_US		60
+
 #define H9P_LINK_SPEED_2_5GT		1
 #define H9P_LINK_SPEED_5GT		2
 #define H9P_LINK_SPEED_8GT		3
@@ -2099,6 +2102,13 @@ static int apple_t8010_setup_port(struct apple_h9p_pcie *pcie, unsigned int port
 	if (pcie->manual_dart[port]) {
 		ret = apple_dart_reload_configuration(pcie->manual_dart[port],
 						      pcie->manual_dart_sid[port]);
+		/*
+		 * -EBUSY: a device is attached to the stream, so this isn't
+		 * the probe. Its translation is rebuilt by the DART driver's
+		 * resume, or by the next attach.
+		 */
+		if (ret == -EBUSY)
+			ret = 0;
 		if (ret)
 			return dev_err_probe(dev, ret,
 					     "failed to reload port %u DART\n", port);
@@ -2224,6 +2234,53 @@ disable_port:
 		 port, ret, linksts);
 	*result = APPLE_H9P_PORT_DISABLED;
 	return 0;
+}
+
+/*
+ * System sleep on T8010. iOS's port take-down was decoded on S8003 only: it
+ * asserts PERST#, waits perst-to-refclk-delay-us and clears the port's
+ * reference clock and enable bits in the root complex. The per-port root
+ * complex registers have the same layout here, and these are the bits
+ * apple_h9p_enable_rc_port() sets, so the same is done. PME_Turn_Off is left
+ * out: the request register of this SoC's port block isn't known, and iOS
+ * goes on without the acknowledge anyway.
+ */
+static void apple_t8010_port_down(struct apple_h9p_pcie *pcie,
+				  unsigned int port)
+{
+	void __iomem *pb = pcie->base_port[port];
+	void __iomem *rc = pcie->base_rc;
+
+	/* A port that only has its PHY lane prepared has no port block here */
+	if (pb) {
+		if (pcie->hw->port3_link_events && port == 3)
+			apple_h9p_disable_port_irq(pcie, port);
+		writel(H9P_PORT_IRQMASK_ALL, pb + H9P_PORT_IRQMASK);
+		gpiod_direction_output(pcie->perst[port], 1);
+		h9p_rmw(pb + H9P_PORT_LTSSMCTL, H9P_PORT_LTSSM_ENABLE, 0);
+		readl(pb + H9P_PORT_LTSSMCTL);
+		fsleep(H9P_PERST_TO_REFCLK_US);
+	}
+
+	h9p_rmw(rc + H9P_RC_PORT_CTL1(port), 1, 0);
+	h9p_rmw(rc + H9P_RC_PORT_CTL0(port), 1, 0);
+}
+
+/*
+ * Resume with the SoC's port bring-up of the probe, once. The probe's retry
+ * power cycles the endpoint, which can't be done with interrupts off.
+ */
+static int apple_h9p_resume_port(struct apple_h9p_pcie *pcie,
+				 unsigned int port)
+{
+	enum apple_h9p_port_result result;
+	int ret;
+
+	ret = pcie->hw->setup_port(pcie, port, &result);
+	if (ret)
+		return ret;
+
+	return result == APPLE_H9P_PORT_READY ? 0 : -ENOLINK;
 }
 
 static int apple_t8010_setup_common(struct apple_h9p_pcie *pcie)
@@ -3425,8 +3482,11 @@ static int apple_h9p_pcie_suspend_noirq(struct device *dev)
 
 	/* The reverse of the bring-up: the storage port goes last */
 	for (port = H9P_NUM_PORTS; port-- > 0;)
-		if (pcie->sleep_ports & BIT(port))
+		if ((pcie->sleep_ports | pcie->preinit_phy_ports) & BIT(port))
 			pcie->hw->port_down(pcie, port);
+
+	if (pcie->hw->has_clocks)
+		clk_bulk_disable_unprepare(ARRAY_SIZE(pcie->clks), pcie->clks);
 
 	pcie->asleep = true;
 	return 0;
@@ -3447,7 +3507,13 @@ static int apple_h9p_pcie_resume_noirq(struct device *dev)
 	nvmmu = &pcie->nvmmu;
 	ports = pcie->sleep_ports;
 
-	if (pcie->hw->setup_common)
+	if (pcie->hw->has_clocks) {
+		ret = clk_bulk_prepare_enable(ARRAY_SIZE(pcie->clks),
+					      pcie->clks);
+		if (ret)
+			pcie->clks_enabled = 0;
+	}
+	if (!ret && pcie->hw->setup_common)
 		ret = pcie->hw->setup_common(pcie);
 	if (!ret)
 		ret = apple_h9p_prepare_phy_ports(pcie);
@@ -3910,6 +3976,8 @@ static const struct apple_h9p_hw apple_h9p_hw_t7000 = {
 static const struct apple_h9p_hw apple_h9p_hw_t8010 = {
 	.setup_common = apple_t8010_setup_common,
 	.setup_port = apple_t8010_setup_port,
+	.port_down = apple_t8010_port_down,
+	.resume_port = apple_h9p_resume_port,
 	.nvmmu_init_busy = T8010_NVMMU_TCB_CTRL_INIT_BUSY,
 	.has_clocks = true,
 	.has_phy = true,
@@ -3920,6 +3988,8 @@ static const struct apple_h9p_hw apple_h9p_hw_t8010 = {
 static const struct apple_h9p_hw apple_h9p_hw_j172 = {
 	.setup_common = apple_t8010_setup_common,
 	.setup_port = apple_t8010_setup_port,
+	.port_down = apple_t8010_port_down,
+	.resume_port = apple_h9p_resume_port,
 	.nvmmu_init_busy = T8010_NVMMU_TCB_CTRL_INIT_BUSY,
 	.has_clocks = true,
 	.has_phy = true,
