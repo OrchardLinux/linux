@@ -2244,3 +2244,16 @@ u32 pvr_apple_stream_musthave(struct pvr_device *pvr_dev, enum pvr_stream_type t
 	*ext_type = 0;
 	return 0;
 }
+
+/* Reclaim cannot wait behind a chip submission or firmware restart. */
+bool pvr_apple_vm_evictable(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
+{
+	struct pvr_apple *apple = to_apple(pvr_dev);
+	bool allowed;
+
+	if (!mutex_trylock(&apple->submit_lock))
+		return false;
+	allowed = apple->chip->vm_evictable && apple->chip->vm_evictable(apple, vm_ctx);
+	mutex_unlock(&apple->submit_lock);
+	return allowed;
+}

@@ -131,6 +131,9 @@ struct dma_resv *pvr_vm_get_dma_resv(struct pvr_vm_context *vm_ctx)
 struct pvr_vm_gpuva {
 	/** @base: The wrapped drm_gpuva object. */
 	struct drm_gpuva base;
+
+	/** @evicted: PTEs absent, even if another VA of this BO is resident. */
+	bool evicted;
 };
 
 #define to_pvr_vm_gpuva(va) container_of_const(va, struct pvr_vm_gpuva, base)
@@ -1523,4 +1526,101 @@ pvr_vm_get_fw_mem_context(struct pvr_vm_context *vm_ctx)
 struct drm_gem_object *pvr_vm_resv_obj(struct pvr_vm_context *vm_ctx)
 {
 	return drm_gpuvm_resv_obj(&vm_ctx->gpuvm_mgr);
+}
+
+static bool pvr_vm_quiet(struct pvr_vm_context *vm, unsigned int idle_ms)
+{
+	struct dma_resv_iter cursor;
+	struct dma_fence *fence;
+	bool idle = true;
+
+	lockdep_assert_held(&vm->lock);
+	dma_resv_iter_begin(&cursor, pvr_vm_get_dma_resv(vm), DMA_RESV_USAGE_BOOKKEEP);
+	dma_resv_for_each_fence_unlocked(&cursor, fence) {
+		/* The signalled bit can be set before the timestamp is published.
+		 * Do not spin or touch a job's lifetime from reclaim.
+		 */
+		if (!dma_fence_is_signaled(fence) ||
+		    !test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &fence->flags)) {
+			idle = false;
+			break;
+		}
+		vm->last_retired = max(vm->last_retired, dma_fence_timestamp(fence));
+	}
+	dma_resv_iter_end(&cursor);
+	return idle && ktime_ms_delta(ktime_get(), vm->last_retired) >= idle_ms;
+}
+
+/* BO resv stabilizes its vm_bo list; all VM locks are trylocked before edits. */
+bool pvr_vm_evict_bo(struct drm_gem_object *obj, unsigned int idle_ms,
+		     unsigned int *reason)
+{
+	struct drm_gpuvm_bo *vm_bo, *last = NULL;
+	bool success = false;
+
+	drm_gem_for_each_gpuvm_bo(vm_bo, obj) {
+		struct pvr_vm_context *vm = to_pvr_vm_context(vm_bo->vm);
+
+		if (!mutex_trylock(&vm->lock)) {
+			*reason = 6;
+			goto unlock;
+		}
+		last = vm_bo;
+		if (!vm->is_userspace_context ||
+		    !dma_resv_test_signaled(pvr_vm_get_dma_resv(vm), DMA_RESV_USAGE_BOOKKEEP)) {
+			*reason = 7;
+			goto unlock;
+		}
+		if (!pvr_vm_quiet(vm, idle_ms)) {
+			*reason = 8;
+			goto unlock;
+		}
+		if (pvr_device_is_apple(vm->pvr_dev) &&
+		    !pvr_apple_vm_evictable(vm->pvr_dev, vm)) {
+			*reason = 9;
+			goto unlock;
+		}
+	}
+
+	drm_gem_for_each_gpuvm_bo(vm_bo, obj) {
+		struct pvr_vm_context *vm = to_pvr_vm_context(vm_bo->vm);
+		struct pvr_mmu_op_context *op;
+		struct drm_gpuva *va;
+		int err = 0, flush_err;
+
+		op = pvr_mmu_unmap_context_create(vm->mmu_ctx);
+		if (IS_ERR(op)) {
+			*reason = 10;
+			goto unlock;
+		}
+		/* On any partial failure keep pages and validate all cleared VAs. */
+		drm_gpuvm_bo_evict(vm_bo, true);
+		drm_gpuvm_bo_for_each_va(va, vm_bo) {
+			struct pvr_vm_gpuva *pva = to_pvr_vm_gpuva(va);
+
+			if (pva->evicted)
+				continue;
+			/* Failed unmaps may have cleared a prefix. Restore the full VA. */
+			pva->evicted = true;
+			err = pvr_mmu_unmap(op, va->va.addr, va->va.range);
+			if (err)
+				break;
+		}
+		flush_err = pvr_mmu_unmap_flush(op);
+		pvr_mmu_op_context_destroy(op);
+		if (err || flush_err) {
+			*reason = 11;
+			goto unlock;
+		}
+	}
+	success = true;
+unlock:
+	if (last) {
+		drm_gem_for_each_gpuvm_bo(vm_bo, obj) {
+			mutex_unlock(&to_pvr_vm_context(vm_bo->vm)->lock);
+			if (vm_bo == last)
+				break;
+		}
+	}
+	return success;
 }

@@ -11,6 +11,8 @@
 #include "pvr_stream.h"
 
 #include <drm/drm_device.h>
+#include <drm/drm_gem.h>
+#include <linux/shrinker.h>
 #include <drm/drm_file.h>
 #include <drm/drm_mm.h>
 
@@ -91,6 +93,21 @@ struct pvr_device {
 	 * from_pvr_device().
 	 */
 	struct drm_device base;
+
+	/** @gem_reclaim: GEM residency, using base.gem_lru_mutex for all LRUs. */
+	struct {
+		struct drm_gem_lru evictable;
+		struct drm_gem_lru dontneed;
+		struct drm_gem_lru pinned;
+		struct mutex scan_lock;
+		struct shrinker *shrinker;
+		bool stopped;
+		struct work_struct work;
+		atomic_long_t requested;
+		atomic64_t evicted_bytes;
+		atomic64_t scans, evicts, purges, restores, restore_fail;
+		atomic64_t skip[12];
+	} gem_reclaim;
 
 	/** @gpu_id: GPU ID detected at runtime. */
 	struct pvr_gpu_id gpu_id;

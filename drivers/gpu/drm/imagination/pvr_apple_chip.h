@@ -320,6 +320,7 @@ struct pvr_apple_chip {
 	void (*events)(struct pvr_apple *apple);
 	int (*vm_init)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
 	void (*vm_fini)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
+	bool (*vm_evictable)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
 	unsigned int (*vm_scenes)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
 	void (*mmu_flush)(struct pvr_apple *apple);
 	/* Acknowledge the firmware's interrupt at its source; hard IRQ context */

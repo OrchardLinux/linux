@@ -2336,6 +2336,26 @@ static void s8003_pm_feedback(struct pvr_apple *apple, struct s8003_vm *vm)
 	}
 }
 
+static bool pvr_apple_s8003_vm_evictable(struct pvr_apple *apple,
+					      struct pvr_vm_context *vm_ctx)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	struct s8003_vm *vm = xa_load(&s->vms, (unsigned long)vm_ctx);
+	unsigned int i;
+
+	lockdep_assert_held(&apple->submit_lock);
+	if (!vm || READ_ONCE(s->fault))
+		return false;
+	if (vm->attached != s->gen)
+		return true;
+	if (!apple->booted || s->pm_last == vm || s->pm_prev == vm)
+		return false;
+	for (i = 0; i < ARRAY_SIZE(vm->pm); i++)
+		if (!s8003_pm_idle(apple, &vm->pm[i]))
+			return false;
+	return true;
+}
+
 static int s8003_submit_error(struct pvr_apple *apple, struct s8003_vm *vm,
 			      const char *engine, int err, const char *reason)
 {
@@ -2940,6 +2960,7 @@ const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.vm_init = pvr_apple_s8003_vm_init,
 	.vm_fini = pvr_apple_s8003_vm_fini,
 	.vm_scenes = pvr_apple_s8003_vm_scenes,
+	.vm_evictable = pvr_apple_s8003_vm_evictable,
 	.mmu_flush = pvr_apple_s8003_mmu_flush,
 	.irq_ack = pvr_apple_s8003_irq_ack,
 	.debugfs_show = pvr_apple_s8003_debugfs_show,

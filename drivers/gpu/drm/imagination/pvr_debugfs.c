@@ -5,6 +5,7 @@
 
 #include "pvr_apple.h"
 #include "pvr_device.h"
+#include "pvr_gem.h"
 #include "pvr_fw_trace.h"
 
 #include <linux/dcache.h>
@@ -29,6 +30,7 @@ pvr_debugfs_init(struct drm_minor *minor)
 	struct dentry *root = minor->debugfs_root;
 
 	pvr_apple_debugfs_init(pvr_dev, root);
+	pvr_gem_shrinker_debugfs_init(pvr_dev, root);
 
 	for (size_t i = 0; i < ARRAY_SIZE(pvr_debugfs_entries); ++i) {
 		const struct pvr_debugfs_entry *entry = &pvr_debugfs_entries[i];

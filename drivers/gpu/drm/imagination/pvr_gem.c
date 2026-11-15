@@ -18,6 +18,7 @@
 #include <linux/iosys-map.h>
 #include <linux/log2.h>
 #include <linux/mutex.h>
+#include <linux/mm.h>
 #include <linux/pagemap.h>
 #include <linux/property.h>
 #include <linux/refcount.h>
@@ -27,6 +28,11 @@ static void pvr_gem_object_free(struct drm_gem_object *obj)
 {
 	struct drm_gem_shmem_object *shmem_obj = to_drm_gem_shmem_obj(obj);
 
+	struct pvr_gem_object *bo = gem_to_pvr_gem(obj);
+
+	drm_gem_lru_remove(obj);
+	if (bo->pages_evicted)
+		atomic64_sub(obj->size, &to_pvr_device(obj->dev)->gem_reclaim.evicted_bytes);
 	shmem_obj->pages_mark_dirty_on_put = true;
 	drm_gem_shmem_free(shmem_obj);
 }
@@ -38,6 +44,11 @@ static struct dma_buf *pvr_gem_export(struct drm_gem_object *obj, int flags)
 	if (pvr_obj->flags & DRM_PVR_BO_PM_FW_PROTECT)
 		return ERR_PTR(-EPERM);
 
+	/* Serialize the transition, including the gap before core sets dma_buf. */
+	dma_resv_lock(obj->resv, NULL);
+	pvr_obj->exported = true;
+	pvr_gem_lru_update_locked(pvr_obj);
+	dma_resv_unlock(obj->resv);
 	return drm_gem_prime_export(obj, flags);
 }
 
@@ -100,16 +111,54 @@ static const struct vm_operations_struct pvr_gem_vm_ops = {
 	.close = drm_gem_vm_close,
 };
 
+static int pvr_gem_pin(struct drm_gem_object *obj)
+{
+	struct pvr_gem_object *bo = gem_to_pvr_gem(obj);
+	int err = PTR_ERR_OR_ZERO(pvr_gem_get_pages_sgt_locked(bo));
+
+	if (!err)
+		err = drm_gem_shmem_pin_locked(&bo->base);
+	pvr_gem_lru_update_locked(bo);
+	return err;
+}
+
+static void pvr_gem_unpin(struct drm_gem_object *obj)
+{
+	struct pvr_gem_object *bo = gem_to_pvr_gem(obj);
+
+	drm_gem_shmem_unpin_locked(&bo->base);
+	pvr_gem_lru_update_locked(bo);
+}
+
+static int pvr_gem_vmap(struct drm_gem_object *obj, struct iosys_map *map)
+{
+	struct pvr_gem_object *bo = gem_to_pvr_gem(obj);
+	int err = PTR_ERR_OR_ZERO(pvr_gem_get_pages_sgt_locked(bo));
+
+	if (!err)
+		err = drm_gem_shmem_vmap_locked(&bo->base, map);
+	pvr_gem_lru_update_locked(bo);
+	return err;
+}
+
+static void pvr_gem_vunmap(struct drm_gem_object *obj, struct iosys_map *map)
+{
+	struct pvr_gem_object *bo = gem_to_pvr_gem(obj);
+
+	drm_gem_shmem_vunmap_locked(&bo->base, map);
+	pvr_gem_lru_update_locked(bo);
+}
+
 static const struct drm_gem_object_funcs pvr_gem_object_funcs = {
 	.free = pvr_gem_object_free,
 	.status = pvr_gem_object_status,
 	.print_info = drm_gem_shmem_object_print_info,
 	.export = pvr_gem_export,
-	.pin = drm_gem_shmem_object_pin,
-	.unpin = drm_gem_shmem_object_unpin,
+	.pin = pvr_gem_pin,
+	.unpin = pvr_gem_unpin,
 	.get_sg_table = drm_gem_shmem_object_get_sg_table,
-	.vmap = drm_gem_shmem_object_vmap,
-	.vunmap = drm_gem_shmem_object_vunmap,
+	.vmap = pvr_gem_vmap,
+	.vunmap = pvr_gem_vunmap,
 	.mmap = pvr_gem_mmap,
 	.vm_ops = &pvr_gem_vm_ops,
 };
@@ -269,7 +318,7 @@ pvr_gem_object_vmap(struct pvr_gem_object *pvr_obj)
 	if (err)
 		goto err_unlock;
 
-	err = drm_gem_shmem_vmap_locked(shmem_obj, &map);
+	err = pvr_gem_vmap(obj, &map);
 	if (err)
 		goto err_unlock;
 
@@ -323,7 +372,7 @@ pvr_gem_object_vunmap(struct pvr_gem_object *pvr_obj)
 			dma_sync_sgtable_for_device(dev, shmem_obj->sgt, DMA_BIDIRECTIONAL);
 	}
 
-	drm_gem_shmem_vunmap_locked(shmem_obj, &map);
+	pvr_gem_vunmap(obj, &map);
 
 	dma_resv_unlock(obj->resv);
 }
@@ -529,8 +578,14 @@ struct sg_table *pvr_gem_get_pages_sgt_locked(struct pvr_gem_object *pvr_obj)
 	/* Transfer the temporary pin's page reference to the sgt. */
 	refcount_inc(&shmem->pages_use_count);
 	shmem->sgt = sgt;
+	if (pvr_obj->pages_evicted) {
+		pvr_obj->pages_evicted = false;
+		atomic64_sub(obj->size, &to_pvr_device(obj->dev)->gem_reclaim.evicted_bytes);
+	}
 unpin:
 	drm_gem_shmem_unpin_locked(shmem);
+	if (!err)
+		pvr_gem_lru_update_locked(pvr_obj);
 	return err ? ERR_PTR(err) : sgt;
 }
 
@@ -546,4 +601,18 @@ struct sg_table *pvr_gem_object_get_pages_sgt(struct pvr_gem_object *pvr_obj)
 	sgt = pvr_gem_get_pages_sgt_locked(pvr_obj);
 	dma_resv_unlock(obj->resv);
 	return sgt;
+}
+
+void pvr_gem_release_pages_locked(struct pvr_gem_object *bo)
+{
+	struct drm_gem_object *obj = gem_from_pvr_gem(bo);
+
+	dma_resv_assert_held(obj->resv);
+	drm_vma_node_unmap(&obj->vma_node, obj->dev->anon_inode->i_mapping);
+	bo->base.pages_mark_dirty_on_put = true;
+	__drm_gem_shmem_free_sgt_locked(&bo->base);
+	drm_gem_shmem_put_pages_locked(&bo->base);
+	bo->pages_evicted = true;
+	atomic64_add(obj->size, &to_pvr_device(obj->dev)->gem_reclaim.evicted_bytes);
+	drm_gem_lru_remove(obj);
 }

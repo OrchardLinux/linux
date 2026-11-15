@@ -111,6 +111,11 @@ struct pvr_gem_object {
 	 */
 	u64 flags;
 
+	/** @exported: Latched before publishing a dma-buf, under the reservation. */
+	bool exported;
+	/** @pages_evicted: Backing pages released; protected by the reservation. */
+	bool pages_evicted;
+
 };
 
 static_assert(offsetof(struct pvr_gem_object, base) == 0,
@@ -133,6 +138,12 @@ struct pvr_gem_object *pvr_gem_object_create(struct pvr_device *pvr_dev,
 
 struct pvr_gem_object *pvr_gem_object_create_user(struct pvr_device *pvr_dev,
 						 size_t size, u64 flags);
+void pvr_gem_lru_update_locked(struct pvr_gem_object *bo);
+void pvr_gem_shrinker_debugfs_init(struct pvr_device *pvr_dev, struct dentry *root);
+int pvr_gem_shrinker_init(struct pvr_device *pvr_dev);
+void pvr_gem_shrinker_fini(struct pvr_device *pvr_dev);
+void pvr_gem_release_pages_locked(struct pvr_gem_object *bo);
+
 struct sg_table *pvr_gem_get_pages_sgt_locked(struct pvr_gem_object *pvr_obj);
 
 int pvr_gem_object_into_handle(struct pvr_gem_object *pvr_obj,

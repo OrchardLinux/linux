@@ -3,6 +3,7 @@
 
 #include "pvr_apple.h"
 #include "pvr_device.h"
+#include "pvr_gem.h"
 #include "pvr_device_info.h"
 
 #include "pvr_fw.h"
@@ -807,6 +808,10 @@ pvr_device_init(struct pvr_device *pvr_dev)
 	/* Get the platform-specific data based on the compatible string. */
 	pvr_dev->device_data = of_device_get_match_data(dev);
 
+	err = pvr_gem_shrinker_init(pvr_dev);
+	if (err)
+		return err;
+
 	/* Enable and initialize clocks required for the device to operate. */
 	err = pvr_device_clk_init(pvr_dev);
 	if (err)
@@ -858,6 +863,8 @@ err_pm_runtime_put:
 void
 pvr_device_fini(struct pvr_device *pvr_dev)
 {
+	pvr_gem_shrinker_fini(pvr_dev);
+
 	/*
 	 * Deinitialization stages are performed in reverse order compared to
 	 * the initialization stages in pvr_device_init().

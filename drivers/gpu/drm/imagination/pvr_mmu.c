@@ -2656,3 +2656,21 @@ int pvr_mmu_map(struct pvr_mmu_op_context *op_ctx, u64 size, u64 flags,
 
 	return err;
 }
+
+/* Reclaim only needs an unmap cursor, never preallocated page tables. */
+struct pvr_mmu_op_context *pvr_mmu_unmap_context_create(struct pvr_mmu_context *ctx)
+{
+	struct pvr_mmu_op_context *op_ctx = kzalloc(sizeof(*op_ctx), GFP_NOWAIT);
+
+	if (!op_ctx)
+		return ERR_PTR(-ENOMEM);
+	op_ctx->mmu_ctx = ctx;
+	return op_ctx;
+}
+
+int pvr_mmu_unmap_flush(struct pvr_mmu_op_context *op_ctx)
+{
+	pvr_mmu_op_context_sync(op_ctx);
+	pvr_mmu_flush_request_all(op_ctx->mmu_ctx->pvr_dev);
+	return pvr_mmu_flush_exec(op_ctx->mmu_ctx->pvr_dev, true);
+}

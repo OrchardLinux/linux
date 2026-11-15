@@ -181,6 +181,7 @@ void pvr_apple_report_hang(struct pvr_device *pvr_dev, struct dma_fence *fence);
 void pvr_apple_wait_file_jobs(struct pvr_device *pvr_dev);
 int pvr_apple_job_add_deps(struct pvr_job *job);
 void pvr_apple_job_armed(struct pvr_job *job, struct dma_fence *finished);
+bool pvr_apple_vm_evictable(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx);
 int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx);
 void pvr_apple_mmu_flush(struct pvr_device *pvr_dev);
 void pvr_apple_vm_fini(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx);
@@ -214,6 +215,12 @@ static inline u32 pvr_apple_stream_musthave(struct pvr_device *pvr_dev,
 	*ext_type = 0;
 	return 0;
 }
+static inline bool pvr_apple_vm_evictable(struct pvr_device *pvr_dev,
+					struct pvr_vm_context *vm_ctx)
+{
+	return true;
+}
+
 static inline int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
 {
 	return -ENODEV;
