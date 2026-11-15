@@ -638,6 +638,8 @@ enum apple_h9p_port_result {
  * @resume_port: bring one root port up again after @port_down (required with
  *               @port_down). It runs with device interrupts off, so it can't
  *               use the endpoint's power control.
+ * @recover_port: bring up an endpoint port that @resume_port could not, with
+ *                a power cycle of its endpoint (optional)
  * @default_link_speed: target link speed of a root port without
  *	max-link-speed (used by T7000)
  * @has_clocks: the controller takes "aux" and "ref" clocks
@@ -669,6 +671,7 @@ struct apple_h9p_hw {
 	int (*setup_ports)(struct apple_h9p_pcie *pcie);
 	void (*port_down)(struct apple_h9p_pcie *pcie, unsigned int port);
 	int (*resume_port)(struct apple_h9p_pcie *pcie, unsigned int port);
+	int (*recover_port)(struct apple_h9p_pcie *pcie, unsigned int port);
 	u8 default_link_speed;
 	bool has_clocks;
 	bool has_phy;
@@ -729,6 +732,9 @@ struct apple_h9p_pcie {
 	/* System sleep: the ports are down; the ports that were up before */
 	bool asleep;
 	u32 sleep_ports;
+	/* Endpoint ports that need their endpoint power cycled after resume */
+	u32 lost_ports;
+	struct work_struct recover_work;
 
 	struct apple_h9p_nvmmu nvmmu;
 
@@ -2283,6 +2289,33 @@ static int apple_h9p_resume_port(struct apple_h9p_pcie *pcie,
 	return result == APPLE_H9P_PORT_READY ? 0 : -ENOLINK;
 }
 
+/*
+ * A port that didn't come up on resume: power cycle its endpoint and bring
+ * the port up again, as the probe retries a port whose link failed.
+ */
+static int apple_h9p_recover_port(struct apple_h9p_pcie *pcie,
+				  unsigned int port)
+{
+	int ret;
+
+	ret = gpiod_direction_output(pcie->perst[port], 1);
+	if (ret)
+		return ret;
+
+	if (pcie->pwrctrl_powered) {
+		pci_pwrctrl_power_off_devices(pcie->dev);
+		pcie->pwrctrl_powered = false;
+		msleep(100);
+	}
+
+	ret = pci_pwrctrl_power_on_devices(pcie->dev);
+	if (ret)
+		return ret;
+	pcie->pwrctrl_powered = true;
+
+	return apple_h9p_resume_port(pcie, port);
+}
+
 static int apple_t8010_setup_common(struct apple_h9p_pcie *pcie)
 {
 	int ret;
@@ -3343,6 +3376,7 @@ static void apple_h9p_pcie_cancel_late_ports(void *data)
 	struct apple_h9p_pcie *pcie = data;
 
 	cancel_delayed_work_sync(&pcie->late_work);
+	cancel_work_sync(&pcie->recover_work);
 }
 
 static int apple_h9p_prepare_phy_ports(struct apple_h9p_pcie *pcie)
@@ -3416,20 +3450,11 @@ static int apple_h9p_setup_ports(struct apple_h9p_pcie *pcie)
 	return 0;
 }
 
-/*
- * A port that did not come back from sleep: power it off again and cut its
- * devices off, so that nothing reaches for them.
- */
-static void apple_h9p_port_lost(struct apple_h9p_pcie *pcie, unsigned int port,
-				int err)
+/* Cut the devices of a port off for good, so that nothing reaches for them */
+static void apple_h9p_disconnect_port(struct apple_h9p_pcie *pcie,
+				      unsigned int port)
 {
 	struct pci_dev *rp;
-
-	dev_err(pcie->dev,
-		"port %u did not come back after sleep (%d), its devices are cut off\n",
-		port, err);
-	WRITE_ONCE(pcie->enabled_ports, pcie->enabled_ports & ~BIT(port));
-	pcie->hw->port_down(pcie, port);
 
 	rp = pci_get_slot(pcie->bridge->bus, PCI_DEVFN(port, 0));
 	if (!rp)
@@ -3438,6 +3463,91 @@ static void apple_h9p_port_lost(struct apple_h9p_pcie *pcie, unsigned int port,
 		pci_walk_bus(rp->subordinate, pci_dev_set_disconnected, NULL);
 	pci_dev_set_disconnected(rp, NULL);
 	pci_dev_put(rp);
+}
+
+/*
+ * A port that did not come back from sleep is powered off again, and
+ * configuration access to its devices is refused. An endpoint port gets a
+ * second chance once the system is up, with a power cycle of its endpoint;
+ * the devices of any other port are cut off.
+ */
+static void apple_h9p_port_lost(struct apple_h9p_pcie *pcie, unsigned int port,
+				int err)
+{
+	bool storage = pcie->hw->has_nvmmu && port == 0;
+
+	WRITE_ONCE(pcie->enabled_ports, pcie->enabled_ports & ~BIT(port));
+	pcie->hw->port_down(pcie, port);
+
+	if (pcie->hw->recover_port && !storage) {
+		dev_warn(pcie->dev,
+			 "port %u: no link after sleep (%d), power cycling its endpoint\n",
+			 port, err);
+		pcie->lost_ports |= BIT(port);
+		return;
+	}
+
+	dev_err(pcie->dev,
+		"port %u did not come back after sleep (%d), its devices are cut off\n",
+		port, err);
+	apple_h9p_disconnect_port(pcie, port);
+}
+
+/*
+ * Runs when the system is up again, so the endpoint's power control works.
+ * The devices of the port resumed without their hardware: their drivers have
+ * to stay away from a device that isn't present. Once the link is back, the
+ * devices get their configuration space again, so that their drivers can let
+ * go of them, and the port is enumerated afresh as at boot.
+ */
+static void apple_h9p_recover_ports_work(struct work_struct *work)
+{
+	struct apple_h9p_pcie *pcie = container_of(work, struct apple_h9p_pcie,
+						   recover_work);
+	unsigned long ports = pcie->lost_ports;
+	unsigned int port;
+
+	pcie->lost_ports = 0;
+	for_each_set_bit(port, &ports, H9P_NUM_PORTS) {
+		struct pci_dev *rp, *child;
+		int ret;
+
+		ret = pcie->hw->recover_port(pcie, port);
+		if (ret) {
+			dev_err(pcie->dev,
+				"port %u did not come back after sleep (%d), its devices are cut off\n",
+				port, ret);
+			pcie->hw->port_down(pcie, port);
+			apple_h9p_disconnect_port(pcie, port);
+			continue;
+		}
+
+		/* PCIe r6.0 sec 6.6.1: 100 ms after link-up before configuration */
+		msleep(PCIE_RESET_CONFIG_WAIT_MS);
+		WRITE_ONCE(pcie->enabled_ports,
+			   pcie->enabled_ports | BIT(port));
+
+		pci_lock_rescan_remove();
+		rp = pci_get_slot(pcie->bridge->bus, PCI_DEVFN(port, 0));
+		if (rp) {
+			pci_set_power_state(rp, PCI_D0);
+			pci_restore_state(rp);
+			if (rp->subordinate) {
+				list_for_each_entry(child,
+						    &rp->subordinate->devices,
+						    bus_list) {
+					pci_set_power_state(child, PCI_D0);
+					pci_restore_state(child);
+				}
+			}
+			pci_stop_and_remove_bus_device(rp);
+			pci_dev_put(rp);
+		}
+		pci_rescan_bus(pcie->bridge->bus);
+		pci_unlock_rescan_remove();
+		dev_info(pcie->dev, "port %u back after an endpoint power cycle\n",
+			 port);
+	}
 }
 
 /*
@@ -3462,7 +3572,11 @@ static int apple_h9p_pcie_prepare(struct device *dev)
 	if (!pcie || !pcie->hw->port_down)
 		return 0;
 
-	/* Ports still waiting for their endpoint's power wait for the wake */
+	/*
+	 * Let a port recovery finish. Ports still waiting for their endpoint's
+	 * power wait for the wake.
+	 */
+	flush_work(&pcie->recover_work);
 	cancel_delayed_work_sync(&pcie->late_work);
 	WRITE_ONCE(pcie->nvmmu.ans_stopped, false);
 
@@ -3473,7 +3587,12 @@ static void apple_h9p_pcie_complete(struct device *dev)
 {
 	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(dev);
 
-	if (pcie && pcie->late_ports)
+	if (!pcie)
+		return;
+
+	if (pcie->lost_ports)
+		schedule_work(&pcie->recover_work);
+	if (pcie->late_ports)
 		schedule_delayed_work(&pcie->late_work,
 				      msecs_to_jiffies(S8003_LATE_PORT_RETRY_MS));
 }
@@ -3973,6 +4092,7 @@ static int apple_h9p_pcie_probe(struct platform_device *pdev)
 		return ret;
 
 	INIT_DELAYED_WORK(&pcie->late_work, apple_s8003_late_ports_work);
+	INIT_WORK(&pcie->recover_work, apple_h9p_recover_ports_work);
 	ret = devm_add_action_or_reset(dev, apple_h9p_pcie_cancel_late_ports,
 				       pcie);
 	if (ret)
@@ -3992,6 +4112,7 @@ static const struct apple_h9p_hw apple_h9p_hw_t7000 = {
 	.setup_port = apple_t7000_setup_port,
 	.port_down = apple_t7000_port_down,
 	.resume_port = apple_h9p_resume_port,
+	.recover_port = apple_h9p_recover_port,
 	/* The only speed validated on T7001; J81's port 1 is Gen1-limited. */
 	.default_link_speed = H9P_LINK_SPEED_2_5GT,
 	.no_port_irqs = true,
@@ -4002,6 +4123,7 @@ static const struct apple_h9p_hw apple_h9p_hw_t8010 = {
 	.setup_port = apple_t8010_setup_port,
 	.port_down = apple_t8010_port_down,
 	.resume_port = apple_h9p_resume_port,
+	.recover_port = apple_h9p_recover_port,
 	.nvmmu_init_busy = T8010_NVMMU_TCB_CTRL_INIT_BUSY,
 	.has_clocks = true,
 	.has_phy = true,
@@ -4014,6 +4136,7 @@ static const struct apple_h9p_hw apple_h9p_hw_j172 = {
 	.setup_port = apple_t8010_setup_port,
 	.port_down = apple_t8010_port_down,
 	.resume_port = apple_h9p_resume_port,
+	.recover_port = apple_h9p_recover_port,
 	.nvmmu_init_busy = T8010_NVMMU_TCB_CTRL_INIT_BUSY,
 	.has_clocks = true,
 	.has_phy = true,
@@ -4045,6 +4168,7 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
 	.setup_ports = apple_s8003_setup_ports,
 	.port_down = apple_s8003_port_down,
 	.resume_port = apple_s8003_resume_port,
+	.recover_port = apple_s8003_setup_endpoint_port,
 	.nvme_mode_ports = BIT(0),
 	.link_settle_ms = 100,
 	.has_phy = true,
