@@ -3460,6 +3460,16 @@ static void nvme_reset_work(struct work_struct *work)
 	}
 
 	/*
+	 * The host bridge cut the device off, for instance because its link
+	 * did not come back after a sleep. Fail without touching it: its BAR
+	 * leads nowhere.
+	 */
+	if (pci_dev_is_disconnected(to_pci_dev(dev->dev))) {
+		result = -ENODEV;
+		goto out;
+	}
+
+	/*
 	 * If we're called to reset a live controller first shut it down before
 	 * moving on.
 	 */
