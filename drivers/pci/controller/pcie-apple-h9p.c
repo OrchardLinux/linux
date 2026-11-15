@@ -1233,6 +1233,24 @@ static void apple_h9p_limit_config_field(u32 *val, int where, int size,
 	*val = (*val & ~mask) | (value & mask);
 }
 
+/*
+ * Devices below a root port that is down must not be reached: with the port
+ * unpowered a configuration request has nowhere to go.
+ */
+static bool apple_h9p_config_blocked(struct pci_bus *bus)
+{
+	struct pci_config_window *cfg = bus->sysdata;
+	struct apple_h9p_pcie *pcie = apple_h9p_pcie_lookup(cfg->parent);
+	struct pci_bus *root = bus;
+
+	if (!pcie || bus->number == cfg->busr.start)
+		return false;
+	while (root->parent && root->parent->parent)
+		root = root->parent;
+	return root->self && !(READ_ONCE(pcie->enabled_ports) &
+			      BIT(PCI_SLOT(root->self->devfn)));
+}
+
 static int apple_h9p_pcie_config_read(struct pci_bus *bus, unsigned int devfn,
 				      int where, int size, u32 *val)
 {
@@ -1250,6 +1268,11 @@ static int apple_h9p_pcie_config_read(struct pci_bus *bus, unsigned int devfn,
 			return PCIBIOS_DEVICE_NOT_FOUND;
 	} else {
 		pcie = NULL;
+	}
+
+	if (apple_h9p_config_blocked(bus)) {
+		PCI_SET_ERROR_RESPONSE(val);
+		return PCIBIOS_DEVICE_NOT_FOUND;
 	}
 
 	ret = pci_generic_config_read(bus, devfn, where, size, val);
@@ -1288,6 +1311,9 @@ static int apple_h9p_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
 		    !(pcie->enabled_ports & BIT(PCI_SLOT(devfn))))
 			return PCIBIOS_DEVICE_NOT_FOUND;
 	}
+
+	if (apple_h9p_config_blocked(bus))
+		return PCIBIOS_DEVICE_NOT_FOUND;
 
 	if (where <= PCI_INTERRUPT_LINE && where + size > PCI_INTERRUPT_LINE)
 		val |= 0xffu << ((PCI_INTERRUPT_LINE - where) << 3);
