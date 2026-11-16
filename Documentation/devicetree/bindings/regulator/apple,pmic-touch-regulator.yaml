@@ -10,7 +10,7 @@ maintainers:
   - Paul Praschl <praschlpaul@g-p.at>
 
 description:
-  Fixed touchscreen supply switches provided by the D2186, D2207, Adelyn,
+  Fixed touchscreen supply switches provided by the D2089, D2186, D2207, Adelyn,
   Angel, Chestnut and Acorn PMICs. The compatible identifies both the PMIC and the physical supply;
   register layout is an implementation detail of the regulator driver.
 
@@ -24,6 +24,8 @@ properties:
       - apple,adelyn-touch-core-regulator
       - apple,angel-touch-analog-regulator
       - apple,chestnut-touch-hv-regulator
+      - apple,d2089-touch-analog-regulator
+      - apple,d2089-touch-core-regulator
       - apple,d2186-touch-core-regulator
       - apple,d2207-touch-analog-regulator
 
