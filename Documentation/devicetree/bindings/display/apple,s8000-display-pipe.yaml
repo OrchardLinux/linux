@@ -18,9 +18,11 @@ description: |
   bootloader leaves the pipe, the eDP link and the panel running; the pipe
   reads memory through the display DART (dart-disp0), which the bootloader
   leaves in bypass (on the A10, the scanout's streams have no page tables).
-  The DART has no node of its own: it must not be reset under the running
-  scanout, so its two register windows are listed here and only read, to
-  check that the scanout bypasses translation.
+  The pipe's two dart-disp0 register windows, the DART and the SMMU in
+  front of it, are listed here and only read, to check that the scanout
+  bypasses translation. For translated scanout the DART may also be
+  described as a disabled iommu node that the display driver enables on
+  request, referenced from a "scanout" child node.
 
 properties:
   compatible:
@@ -61,6 +63,29 @@ properties:
   power-domains:
     minItems: 2
     maxItems: 3
+
+  scanout:
+    type: object
+    additionalProperties: false
+    description:
+      The pipe's memory reads as a DMA master behind the display DART, for
+      translated scanout. Every stream of the DART is listed. The
+      bootloader leaves the DART in bypass under a live scanout, so the
+      attach is deferred until the driver has mapped that scanout.
+
+    properties:
+      iommus:
+        minItems: 1
+        maxItems: 4
+
+      apple,dart-deferred-attach:
+        type: boolean
+        description:
+          Keep the DART in bypass for this master until its driver attaches
+          the default domain itself.
+
+    required:
+      - iommus
 
 allOf:
   - if:

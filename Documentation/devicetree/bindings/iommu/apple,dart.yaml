@@ -41,10 +41,27 @@ properties:
           - const: apple,s5l8960x-dart
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: dart
+      - const: smmu
+    description:
+      The SMMU window of display DARTs; translation must be enabled per
+      stream in both units. Only S5L8960X display DARTs have this window.
 
   interrupts:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+
+  interrupt-names:
+    minItems: 1
+    items:
+      - const: dart
+      - const: smmu
 
   clocks:
     description:
@@ -99,6 +116,37 @@ allOf:
         apple,error-reflector: false
         apple,fetch-config: false
         apple,diag-config: false
+        reg:
+          maxItems: 1
+        reg-names: false
+        interrupts:
+          maxItems: 1
+        interrupt-names: false
+
+  - if:
+      properties:
+        reg:
+          minItems: 2
+    then:
+      required:
+        - reg-names
+        - interrupt-names
+      properties:
+        reg-names:
+          minItems: 2
+        interrupts:
+          minItems: 2
+        interrupt-names:
+          minItems: 2
+
+  - if:
+      properties:
+        interrupts:
+          minItems: 2
+    then:
+      properties:
+        reg:
+          minItems: 2
 
 additionalProperties: false
 
