@@ -972,7 +972,12 @@ EXPORT_SYMBOL_GPL(apple_rtkit_poweroff);
 
 u8 apple_rtkit_app_ep_to_ep(struct apple_rtkit *rtk, u8 app_ep)
 {
-	if (!apple_rtkit_is_running(rtk))
+	/*
+	 * The app endpoints are known once the protocol is negotiated, which
+	 * a driver with an epmap_done callback needs before power-on.
+	 */
+	if (!apple_rtkit_is_running(rtk) &&
+	    !(rtk->ops->epmap_done && rtk->version))
 		return 0;
 
 	return rtk->app_ep_start + app_ep;

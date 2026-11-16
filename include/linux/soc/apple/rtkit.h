@@ -195,7 +195,9 @@ int apple_rtkit_poll(struct apple_rtkit *rtk);
  * Convert an endpoint number relative to start of app endpoint to an absolute
  * endpoint number.
  *
- * Returns the endpoint number on success, 0 on failure.
+ * Returns the endpoint number on success, 0 on failure. A driver with an
+ * epmap_done callback may call it from that callback; others only once the
+ * co-processor runs.
  *
  * @rtk:            RTKit reference
  */
