@@ -475,6 +475,29 @@ static int w1_uart_serdev_tx_rx(struct w1_uart_device *w1dev,
 	return ret;
 }
 
+/*
+ * The command echo must arrive as eight contiguous symbols. After a
+ * mismatch, keep the longest tail of what was received (the echo matched
+ * so far, then @c) that is still a prefix of the command, so a stray
+ * symbol neither leaves an old partial match valid nor drops a real echo
+ * that started inside it.
+ */
+static u8 w1_uart_hdq_echo_restart(const struct w1_uart_device *w1dev,
+				   u8 matched, u8 c)
+{
+	const u8 *cmd = w1dev->hdq_command;
+	u8 len;
+
+	for (len = matched; len > 0; len--) {
+		/* received tail: cmd[matched - len + 1 .. matched - 1], c */
+		if (cmd[len - 1] == c &&
+		    !memcmp(cmd, cmd + matched - len + 1, len - 1))
+			return len;
+	}
+
+	return 0;
+}
+
 static size_t w1_uart_serdev_receive_buf(struct serdev_device *serdev,
 					  const u8 *buf, size_t count)
 {
@@ -486,8 +509,13 @@ static size_t w1_uart_serdev_receive_buf(struct serdev_device *serdev,
 		spin_lock_irqsave(&w1dev->hdq_rx_lock, flags);
 		for (i = 0; i < count && w1dev->hdq_receiving; i++) {
 			if (w1dev->hdq_rx_bit < W1_UART_HDQ_BITS_PER_BYTE &&
-			    buf[i] != w1dev->hdq_command[w1dev->hdq_rx_bit])
+			    buf[i] != w1dev->hdq_command[w1dev->hdq_rx_bit]) {
+				w1dev->hdq_rx_bit =
+					w1_uart_hdq_echo_restart(w1dev,
+								 w1dev->hdq_rx_bit,
+								 buf[i]);
 				continue;
+			}
 
 			if (w1dev->hdq_rx_bit >= W1_UART_HDQ_BITS_PER_BYTE &&
 			    buf[i] >= W1_UART_HDQ_RX_ONE_MIN)
