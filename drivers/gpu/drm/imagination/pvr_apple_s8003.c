@@ -247,6 +247,7 @@ struct s8003_pm {
 	int set;			/* of the firmware's sets; -1: none */
 	u32 blocks;			/* of the pool */
 	u32 built;			/* the firmware start it was built for */
+	u32 rec_seq;			/* last geometry job carrying its PM record */
 	struct pvr_gem_object *pool;
 	struct pvr_gem_object *aux;	/* the PM's tables, mapped in the VM */
 	const struct pvr_hwrt_data *hwrt;	/* the scene's target */
@@ -308,7 +309,7 @@ struct pvr_apple_s8003 {
 	atomic64_t touches, touch_ns, touch_lines;
 	atomic64_t done_polls, ring_polls;
 	/* Under submit_lock: PM record or none per geometry job, pool feedback */
-	u64 pm_full, pm_clean, pm_clean_busy;
+	u64 pm_full, pm_clean, pm_clean_queued, pm_rec_unreached;
 	u64 fb_reads, fb_grows;
 	u32 fb_max_blocks;
 	struct pvr_vm_context *park_vm;	/* maps what every VM maps, nothing else */
@@ -1747,6 +1748,7 @@ static int s8003_pm_build(struct pvr_apple *apple, struct s8003_vm *vm, struct s
 		pm->blocks = blocks;
 	}
 	pm->built = 0;
+	pm->rec_seq = 0;
 	err = s8003_obj_zero(pm->pool);
 	if (!err)
 		err = s8003_obj_zero(pm->aux);
@@ -2101,11 +2103,12 @@ static u8 *useq_put(u8 *out, const u32 *words, unsigned int n)
  * image at the job's slot of the channel page @p: the record's links (slot,
  * dependency object, PM set and its scene record, microsequence, stamps), the
  * microsequence, the command and both pointer-ring entries. @pm is the PM
- * set's META address, @pm_id its number. A geometry job's command hands over
- * the PM set, unless @pm_record is false: then it only names the previous
- * geometry job's stamp, which that job already reached, as the G5P driver
- * did for a clean set. A fragment job's waits for the stamp at @wait_stamp to
- * reach @wait_seq, its geometry job's.
+ * set's META address, @pm_id its number. Without @pm_record a geometry job
+ * waits for its set's last record-carrying TA, already complete. This is
+ * AGXTACommandDescriptor_preparePMAndWork (0xfffffff006cb9afc): a steady TA
+ * takes the PM stamp set at +0x40; a rebuild takes the full set. Backing is
+ * rebuilt only on a generation change (0xfffffff006cb1940). A fragment job
+ * waits at @wait_stamp for @wait_seq, its geometry job's stamp.
  */
 static void s8003_job_write(u8 *p, u32 addr, u32 global, u32 pm, u32 pm_id, u32 slot, bool frag,
 			    u32 seq, u32 wait_stamp, u32 wait_seq, bool pm_record)
@@ -2192,9 +2195,9 @@ static void s8003_job_write(u8 *p, u32 addr, u32 global, u32 pm, u32 pm_id, u32 
 		put32(cmd + 12, pm);
 	} else {
 		put32(cmd, S8003_CMD_WAIT);
-		put32(cmd + 4, addr + S8003_CH_STAMP + 4);
-		put32(cmd + 8, seq - 1);
-		put32(cmd + 12, (seq - 1) & 0x7fffffff);
+		put32(cmd + 4, wait_stamp);
+		put32(cmd + 8, wait_seq);
+		put32(cmd + 12, wait_seq & 0x7fffffff);
 	}
 	put32(p + S8003_CH_RING + ring * 4, addr + at.cmd);
 	put32(p + S8003_CH_RING + ((ring + 1) % S8003_CH_ENTRIES) * 4, w);
@@ -2268,7 +2271,7 @@ static bool s8003_pm_clean(struct pvr_apple *apple, const struct s8003_pm *pm, u
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
 
-	return pm->clean && pm->built == s->gen && pm->blocks >= blocks &&
+	return pm->rec_seq && pm->clean && pm->built == s->gen && pm->blocks >= blocks &&
 	       pm->scene == s->gen && pm->td_seq && !READ_ONCE(s->fault) &&
 	       (s32)(pvr_apple_s8003_engine_done(apple, APPLE_ENGINE_FRAG) - pm->td_seq) >= 0;
 }
@@ -2399,15 +2402,16 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		return s8003_submit_error(apple, vm, "geometry", err, "record slot wait");
 
 	seq = apple->ta_seq + 1;
-	/*
-	 * Without the record the job waits for the previous geometry job's
-	 * stamp; only if it is there already, so that the firmware never
-	 * waits on its own stamp for it.
-	 */
-	if (!pm_record &&
-	    (s32)(pvr_apple_s8003_engine_done(apple, APPLE_ENGINE_GEOM) - apple->ta_seq) < 0) {
-		pm_record = true;
-		s->pm_clean_busy++;
+	if (!pm_record) {
+		u32 done = pvr_apple_s8003_engine_done(apple, APPLE_ENGINE_GEOM);
+
+		/* The last rebuild must be visible; a newer ordinary TA need not be. */
+		if ((s32)(done - pm->rec_seq) < 0) {
+			pm_record = true;
+			s->pm_rec_unreached++;
+		} else if ((s32)(done - apple->ta_seq) < 0) {
+			s->pm_clean_queued++;
+		}
 	}
 	if (pm_record)
 		s->pm_full++;
@@ -2417,7 +2421,10 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	s8003_job_write(p, s8003_channel_addr(APPLE_ENGINE_GEOM),
 			s8003_object_addr(&s->layout, S8003_CHANNEL),
 			s8003_meta_addr(s8003_pm_set_va(pm, 0)), pm->set + 1, vm->slot[0], false,
-			seq, 0, 0, pm_record);
+			seq, s8003_channel_addr(APPLE_ENGINE_GEOM) + S8003_CH_STAMP + 4,
+			pm_record ? 0 : pm->rec_seq, pm_record);
+	if (pm_record)
+		pm->rec_seq = seq;
 	pm->hwrt = job->hwrt;
 	if (s->pm_last != vm) {
 		s->pm_prev = s->pm_last;
@@ -2624,7 +2631,9 @@ static int s8003_first_command(struct pvr_apple *apple)
 /* A start of the firmware: it knows no VM, and its channels are empty */
 static void s8003_jobs_reset(struct pvr_apple_s8003 *s)
 {
-	unsigned long flags;
+	struct s8003_vm *vm;
+	unsigned long index, flags;
+	unsigned int i;
 
 	spin_lock_irqsave(&s->tag_lock, flags);
 	memset(s->tag, 0, sizeof(s->tag));
@@ -2632,6 +2641,9 @@ static void s8003_jobs_reset(struct pvr_apple_s8003 *s)
 	bitmap_zero(s->parked, S8003_SLOTS);
 	if (!++s->gen)
 		s->gen = 1;
+	xa_for_each(&s->vms, index, vm)
+		for (i = 0; i < ARRAY_SIZE(vm->pm); i++)
+			vm->pm[i].rec_seq = 0;
 	WRITE_ONCE(s->failed, false);
 	WRITE_ONCE(s->fault, false);
 	memset(s->set_geom, 0, sizeof(s->set_geom));
@@ -2888,8 +2900,9 @@ static void pvr_apple_s8003_debugfs_show(struct pvr_apple *apple, struct seq_fil
 
 	seq_printf(m, "touch count %lld ns %lld lines %lld\n", atomic64_read(&s->touches),
 		   atomic64_read(&s->touch_ns), atomic64_read(&s->touch_lines));
-	seq_printf(m, "pm_record full %llu clean %llu clean_busy %llu\n", READ_ONCE(s->pm_full),
-		   READ_ONCE(s->pm_clean), READ_ONCE(s->pm_clean_busy));
+	seq_printf(m, "pm_record full %llu clean %llu clean_queued %llu rec_unreached %llu\n",
+		   READ_ONCE(s->pm_full), READ_ONCE(s->pm_clean),
+		   READ_ONCE(s->pm_clean_queued), READ_ONCE(s->pm_rec_unreached));
 	seq_printf(m, "pm_pool feedback %llu grows %llu max_blocks %u\n", READ_ONCE(s->fb_reads),
 		   READ_ONCE(s->fb_grows), READ_ONCE(s->fb_max_blocks));
 	seq_printf(m, "s8003_wait_polls done %lld ring %lld\n", atomic64_read(&s->done_polls),
