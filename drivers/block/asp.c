@@ -29,7 +29,6 @@
 #include <linux/dmapool.h>
 
 #define DEVICE_NAME	"asp"
-#define ASP_RTKIT_ENDPOINT	0x20
 #define DISK_NAME	"asp%dn%d"
 
 #define AKF_V1_REMAP_AP_LO	0x8
@@ -1177,11 +1176,15 @@ static void apple_asp_rtkit_epmap_done(void *cookie)
 	int ret;
 
 	/*
-	 * The storage endpoint is the first app endpoint: 0x20 on RTKit 11 and
-	 * later (the iPad Air 2's ANS speaks 12.0). Older ANS firmware with
-	 * RTKit 10 is not supported; starting the endpoint fails there.
+	 * The storage endpoint is the first app endpoint: 0x20 on RTKit 11
+	 * and later (the iPad Air 2's ANS speaks 12.0), 0x6 on RTKit 10.2
+	 * (the iPad Air's ANS on iOS 12).
 	 */
-	asp->ep = ASP_RTKIT_ENDPOINT;
+	asp->ep = apple_rtkit_app_ep_to_ep(asp->rtk, 0);
+	if (!asp->ep) {
+		dev_err(asp->dev, "Could not determine the ASP endpoint");
+		return;
+	}
 
 	dev_dbg(asp->dev, "ASP endpoint is %d", asp->ep);
 
