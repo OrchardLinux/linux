@@ -290,7 +290,7 @@ pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
 		goto err_bind_op_fini;
 
 	bind_op->mmu_op_ctx =
-		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, sgt, offset, size);
+		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, sgt, device_addr, offset, size);
 	err = PTR_ERR_OR_ZERO(bind_op->mmu_op_ctx);
 	if (err) {
 		bind_op->mmu_op_ctx = NULL;
@@ -332,7 +332,7 @@ pvr_vm_bind_op_unmap_init(struct pvr_vm_bind_op *bind_op,
 	}
 
 	bind_op->mmu_op_ctx =
-		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, 0, 0);
+		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, device_addr, 0, 0);
 	err = PTR_ERR_OR_ZERO(bind_op->mmu_op_ctx);
 	if (err) {
 		bind_op->mmu_op_ctx = NULL;
@@ -978,7 +978,7 @@ pvr_vm_map_io(struct pvr_vm_context *vm_ctx, phys_addr_t io_addr, u64 device_add
 	sg_dma_address(sgt.sgl) = io_addr;
 	sg_dma_len(sgt.sgl) = size;
 
-	op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, &sgt, 0, size);
+	op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, &sgt, device_addr, 0, size);
 	if (IS_ERR(op_ctx)) {
 		err = PTR_ERR(op_ctx);
 		goto err_free_table;
@@ -1009,7 +1009,7 @@ pvr_vm_unmap_io(struct pvr_vm_context *vm_ctx, u64 device_addr, u64 size)
 {
 	struct pvr_mmu_op_context *op_ctx;
 
-	op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, 0, 0);
+	op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, device_addr, 0, 0);
 	if (WARN_ON(IS_ERR(op_ctx)))
 		return;
 
