@@ -77,6 +77,15 @@ struct pvr_apple_layout {
 	u32 event_size;
 };
 
+struct seq_file;
+
+/* A duration in microseconds, for debugfs: the last, the longest, the sum */
+struct pvr_apple_stat {
+	u64 last;
+	u64 max;
+	u64 total;
+};
+
 struct pvr_apple {
 	struct pvr_device *pvr_dev;
 	const struct pvr_apple_chip *chip;
@@ -153,6 +162,21 @@ struct pvr_apple {
 	bool devfreq_suspended;
 	ktime_t busy_since;
 	u64 busy_ns;
+	u64 retired_total; /* retired or cancelled jobs, fence_lock */
+
+	/*
+	 * For debugfs (apple_jobs): runtime PM cycles and how often the
+	 * backend looked for finished jobs; under fence_lock unless atomic.
+	 * A resume runs from power-on to the firmware taking commands; the
+	 * first job after it retires @first_job_from later.
+	 */
+	struct pvr_apple_stat rpm_gate_wait, rpm_boot, rpm_resume, rpm_first_job, rpm_suspend;
+	u64 rpm_resumes, rpm_resume_failed, rpm_suspends;
+	ktime_t power_on_at;		/* the last runtime power-on not yet booted from */
+	ktime_t first_job_from;		/* 0: no start waits for its first job */
+	u64 poll_runs;
+	atomic64_t fw_irqs;
+	atomic64_t wait_polls;
 	ktime_t stat_since;
 
 	/* Backs GPU VA 0 in userspace VMs: the end-of-render writes there */
@@ -238,6 +262,7 @@ struct pvr_apple {
  * @engine_done: The sequence number of the last finished job of @engine. No
  *	lock held; may be called with interrupts off.
  * @max_power_state: Highest state licensed for fault capture; optional.
+ * @fault: Read the chip firmware fault flag without waking the GPU.
  * @events: Read what the firmware posted. Before @engine_done wherever a job
  *	is waited for; may sleep.
  * @vm_init: A userspace VM was created: map what the firmware needs in it.
@@ -290,6 +315,7 @@ struct pvr_apple_chip {
 
 	int (*submit)(struct pvr_apple *apple, struct pvr_job *job);
 	u32 (*engine_done)(struct pvr_apple *apple, enum pvr_apple_engine engine);
+	bool (*fault)(struct pvr_apple *apple);
 	u32 (*max_power_state)(struct pvr_apple *apple);
 	void (*events)(struct pvr_apple *apple);
 	int (*vm_init)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
@@ -298,6 +324,8 @@ struct pvr_apple_chip {
 	void (*mmu_flush)(struct pvr_apple *apple);
 	/* Acknowledge the firmware's interrupt at its source; hard IRQ context */
 	void (*irq_ack)(struct pvr_apple *apple);
+	/* The chip's own lines of debugfs apple_jobs */
+	void (*debugfs_show)(struct pvr_apple *apple, struct seq_file *m);
 };
 
 /* A new host tag must be nonzero and differ from the firmware's cached tag. */

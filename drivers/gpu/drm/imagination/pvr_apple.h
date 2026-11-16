@@ -12,6 +12,7 @@
 #include "pvr_rogue_fwif_client.h"
 #include "pvr_stream.h"
 
+struct dentry;
 struct dma_fence;
 struct pvr_apple_chip;
 struct pvr_context;
@@ -159,6 +160,7 @@ struct pvr_apple_g5p_cmd_compute {
 };
 
 #if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
+void pvr_apple_debugfs_init(struct pvr_device *pvr_dev, struct dentry *root);
 int pvr_apple_fw_init(struct pvr_device *pvr_dev);
 void pvr_apple_fw_fini(struct pvr_device *pvr_dev);
 struct pvr_gem_object *pvr_apple_pm_pages(struct pvr_device *pvr_dev, size_t size);
@@ -193,6 +195,7 @@ void pvr_apple_queue_destroy(struct pvr_queue *queue, bool cleanup_queue_entity)
 int pvr_apple_queue_job_init(struct pvr_job *job, u64 drm_client_id);
 void pvr_apple_queue_job_cleanup(struct pvr_job *job);
 #else
+static inline void pvr_apple_debugfs_init(struct pvr_device *pvr_dev, struct dentry *root) {}
 static inline int pvr_apple_fw_init(struct pvr_device *pvr_dev) { return -ENODEV; }
 static inline void pvr_apple_fw_fini(struct pvr_device *pvr_dev) {}
 static inline struct pvr_gem_object *pvr_apple_pm_pages(struct pvr_device *pvr_dev, size_t size)

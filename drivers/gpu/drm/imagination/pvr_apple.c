@@ -31,6 +31,7 @@
 
 #include <drm/drm_print.h>
 #include <drm/gpu_scheduler.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/devfreq.h>
 #include <linux/dma-fence.h>
@@ -45,6 +46,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_opp.h>
 #include <linux/pm_runtime.h>
+#include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 
@@ -420,16 +422,30 @@ static void pvr_apple_fw_stop(struct pvr_apple *apple);
  * after a reset. At probe, before the init data exists, power on only boots
  * the firmware: pvr_apple_fw_init() follows.
  */
+static void pvr_apple_stat_add(struct pvr_apple_stat *stat, s64 us)
+{
+	stat->last = max(us, 0LL);
+	stat->max = max(stat->max, stat->last);
+	stat->total += stat->last;
+}
+
 static int pvr_apple_power_on(struct pvr_device *pvr_dev)
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
+	ktime_t start = ktime_get();
+	unsigned long flags;
 
+	WRITE_ONCE(apple->power_on_at, start);
 	if (apple->chip->gate_off_ms && apple->gate_off) {
 		s64 remaining = (s64)apple->chip->gate_off_ms * USEC_PER_MSEC -
-				ktime_us_delta(ktime_get(), apple->gate_off);
+				ktime_us_delta(start, apple->gate_off);
 
-		if (remaining > 0)
+		if (remaining > 0) {
 			msleep(DIV_ROUND_UP(remaining, USEC_PER_MSEC));
+			spin_lock_irqsave(&apple->fence_lock, flags);
+			pvr_apple_stat_add(&apple->rpm_gate_wait, ktime_us_delta(ktime_get(), start));
+			spin_unlock_irqrestore(&apple->fence_lock, flags);
+		}
 	}
 	/* The driver core resumes a device before .remove(). Powering the
 	 * domain must not boot an idle firmware just to tear it down again.
@@ -443,12 +459,31 @@ static int pvr_apple_power_on(struct pvr_device *pvr_dev)
 int pvr_apple_prepare_job(struct pvr_device *pvr_dev)
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
+	ktime_t start = ktime_get(), on;
+	unsigned long flags;
+	bool resumed;
 	int err;
 
 	mutex_lock(&apple->submit_lock);
+	resumed = !apple->booted;
 	err = READ_ONCE(apple->stopping) ? -ENODEV :
 		apple->booted ? 0 : pvr_apple_fw_restart(apple);
 	mutex_unlock(&apple->submit_lock);
+	if (resumed) {
+		/* A start after a reset has no power-on of its own */
+		on = xchg(&apple->power_on_at, 0);
+		spin_lock_irqsave(&apple->fence_lock, flags);
+		apple->rpm_resumes++;
+		if (err) {
+			apple->rpm_resume_failed++;
+		} else {
+			pvr_apple_stat_add(&apple->rpm_boot, ktime_us_delta(ktime_get(), start));
+			if (on)
+				pvr_apple_stat_add(&apple->rpm_resume, ktime_us_delta(ktime_get(), on));
+			apple->first_job_from = on ?: start;
+		}
+		spin_unlock_irqrestore(&apple->fence_lock, flags);
+	}
 	if (err)
 		dev_err(apple_dev(apple), "GPU did not start: %d\n", err);
 	else if (READ_ONCE(apple->devfreq_suspended))
@@ -459,6 +494,8 @@ int pvr_apple_prepare_job(struct pvr_device *pvr_dev)
 static int pvr_apple_power_off(struct pvr_device *pvr_dev)
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
+	ktime_t start = ktime_get();
+	unsigned long flags;
 	int err;
 
 	/* Terminal shutdown already stopped firmware; never wait on submitters. */
@@ -488,6 +525,10 @@ static int pvr_apple_power_off(struct pvr_device *pvr_dev)
 	cancel_delayed_work_sync(&apple->poll_work);
 	if (apple->chip->gate_off_ms)
 		apple->gate_off = ktime_get();
+	spin_lock_irqsave(&apple->fence_lock, flags);
+	apple->rpm_suspends++;
+	pvr_apple_stat_add(&apple->rpm_suspend, ktime_us_delta(ktime_get(), start));
+	spin_unlock_irqrestore(&apple->fence_lock, flags);
 	return 0;
 }
 
@@ -641,6 +682,7 @@ static u32 pvr_apple_engine_done(struct pvr_apple *apple, enum pvr_apple_engine 
 /* For a wait: what the firmware posted meanwhile is read first */
 static u32 pvr_apple_engine_poll(struct pvr_apple *apple, enum pvr_apple_engine engine)
 {
+	atomic64_inc(&apple->wait_polls);
 	if (!READ_ONCE(apple->stopping) && apple->chip->events)
 		apple->chip->events(apple);
 	return pvr_apple_engine_done(apple, engine);
@@ -656,6 +698,108 @@ static u32 pvr_apple_engine_last(struct pvr_apple *apple, enum pvr_apple_engine 
 	default:
 		return apple->last_seq;
 	}
+}
+
+static void pvr_apple_stat_show(struct seq_file *s, const char *name,
+				const struct pvr_apple_stat *stat)
+{
+	seq_printf(s, "%s last %llu max %llu total %llu\n", name, stat->last, stat->max,
+		   stat->total);
+}
+
+static int pvr_apple_jobs_show(struct seq_file *s, void *unused)
+{
+	struct pvr_apple *apple = s->private;
+	struct device *dev = apple_dev(apple);
+	static const char *const names[APPLE_ENGINES] = {
+		[APPLE_ENGINE_GEOM] = "geometry",
+		[APPLE_ENGINE_FRAG] = "fragment",
+		[APPLE_ENGINE_COMPUTE] = "compute",
+	};
+	struct pvr_apple_stat gate_wait, boot, resume, first_job, suspend;
+	u32 submitted[APPLE_ENGINES], done[APPLE_ENGINES];
+	unsigned int pending[APPLE_ENGINES] = {};
+	u64 resumes, resume_failed, suspends, poll_runs;
+	struct pvr_apple_fence *fence;
+	u64 retired_total, busy_ns;
+	bool irq_on;
+	unsigned long flags;
+	bool booted, fault = false;
+	const char *runtime_status;
+	int engine;
+
+	mutex_lock(&apple->submit_lock);
+	booted = apple->booted;
+	for (engine = 0; engine < APPLE_ENGINES; engine++) {
+		submitted[engine] = pvr_apple_engine_last(apple, engine);
+		done[engine] = pvr_apple_engine_done(apple, engine);
+	}
+	if (apple->chip->fault)
+		fault = apple->chip->fault(apple);
+	spin_lock_irqsave(&apple->fence_lock, flags);
+	for (engine = 0; engine < APPLE_ENGINES; engine++)
+		list_for_each_entry(fence, &apple->pending[engine], node)
+			pending[engine]++;
+	retired_total = apple->retired_total;
+	busy_ns = apple->busy_ns;
+	gate_wait = apple->rpm_gate_wait;
+	boot = apple->rpm_boot;
+	resume = apple->rpm_resume;
+	first_job = apple->rpm_first_job;
+	suspend = apple->rpm_suspend;
+	resumes = apple->rpm_resumes;
+	resume_failed = apple->rpm_resume_failed;
+	suspends = apple->rpm_suspends;
+	poll_runs = apple->poll_runs;
+	irq_on = apple->fw_irq_on;
+	spin_unlock_irqrestore(&apple->fence_lock, flags);
+	mutex_unlock(&apple->submit_lock);
+
+	switch (READ_ONCE(dev->power.runtime_status)) {
+	case RPM_ACTIVE:
+		runtime_status = "active";
+		break;
+	case RPM_RESUMING:
+		runtime_status = "resuming";
+		break;
+	case RPM_SUSPENDED:
+		runtime_status = "suspended";
+		break;
+	default:
+		runtime_status = "suspending";
+		break;
+	}
+	seq_printf(s, "booted %u\n", booted);
+	for (engine = 0; engine < APPLE_ENGINES; engine++)
+		seq_printf(s, "%s submitted %u done %u pending %u\n", names[engine],
+			   submitted[engine], done[engine], pending[engine]);
+	seq_printf(s, "retired_total %llu\nbusy_ns %llu\n", retired_total, busy_ns);
+	if (apple->chip->fault)
+		seq_printf(s, "fault %u\n", fault);
+	seq_printf(s, "runtime_pm_status %s\n", runtime_status);
+	seq_printf(s, "fw_irq %s irqs %lld\n", !apple->fw_irq ? "none" : irq_on ? "on" : "off",
+		   atomic64_read(&apple->fw_irqs));
+	seq_printf(s, "poll_runs %llu wait_polls %lld\n", poll_runs,
+		   atomic64_read(&apple->wait_polls));
+	seq_printf(s, "rpm_resumes %llu failed %llu\n", resumes, resume_failed);
+	pvr_apple_stat_show(s, "rpm_gate_wait_us", &gate_wait);
+	pvr_apple_stat_show(s, "rpm_boot_us", &boot);
+	pvr_apple_stat_show(s, "rpm_resume_us", &resume);
+	pvr_apple_stat_show(s, "rpm_first_job_us", &first_job);
+	seq_printf(s, "rpm_suspends %llu\n", suspends);
+	pvr_apple_stat_show(s, "rpm_suspend_us", &suspend);
+	if (apple->chip->debugfs_show)
+		apple->chip->debugfs_show(apple, s);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(pvr_apple_jobs);
+
+void pvr_apple_debugfs_init(struct pvr_device *pvr_dev, struct dentry *root)
+{
+	if (pvr_dev->apple)
+		debugfs_create_file("apple_jobs", 0400, root, pvr_dev->apple,
+				    &pvr_apple_jobs_fops);
 }
 
 static int pvr_apple_wait_engine(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 seq,
@@ -1016,9 +1160,13 @@ static u32 pvr_apple_frag_events(struct pvr_apple *apple)
 static void pvr_apple_jobs_retired(struct pvr_apple *apple, unsigned int n)
 {
 	struct device *dev = apple_dev(apple);
+	unsigned long flags;
 
 	if (!n)
 		return;
+	spin_lock_irqsave(&apple->fence_lock, flags);
+	apple->retired_total += n;
+	spin_unlock_irqrestore(&apple->fence_lock, flags);
 	pm_runtime_mark_last_busy(dev);
 	while (n--)
 		pm_runtime_put_autosuspend(dev);
@@ -1052,6 +1200,7 @@ static irqreturn_t pvr_apple_firmware_irq(int irq, void *data)
 {
 	struct pvr_apple *apple = data;
 
+	atomic64_inc(&apple->fw_irqs);
 	/* At its source first, as Apple's kext does before it reads the rings */
 	apple->chip->irq_ack(apple);
 	pvr_apple_firmware_event(apple);
@@ -1138,6 +1287,12 @@ static void pvr_apple_poll_work(struct work_struct *work)
 			retired++;
 		}
 		pending |= !list_empty(&apple->pending[engine]);
+	}
+	apple->poll_runs++;
+	if (retired && apple->first_job_from) {
+		pvr_apple_stat_add(&apple->rpm_first_job,
+				   ktime_us_delta(ktime_get(), apple->first_job_from));
+		apple->first_job_from = 0;
 	}
 	if (!pending && apple->busy_since) {
 		apple->busy_ns += ktime_to_ns(ktime_sub(ktime_get(), apple->busy_since));
