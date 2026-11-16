@@ -7,10 +7,16 @@
 #include <linux/types.h>
 
 struct device_node;
+struct device;
 
 #if IS_REACHABLE(CONFIG_APPLE_DART)
+int apple_dart_fault_count(struct device *dart_dev);
 int apple_dart_reload_configuration(struct device_node *np, u32 sid);
 #else
+static inline int apple_dart_fault_count(struct device *dart_dev)
+{
+	return -ENODEV;
+}
 static inline int apple_dart_reload_configuration(struct device_node *np,
 						  u32 sid)
 {

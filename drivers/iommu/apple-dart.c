@@ -84,6 +84,15 @@
 #define DART_S5L8960X_REMAP		0x2c
 #define DART_S5L8960X_FETCH_CONFIG	0x30
 
+/* The display SMMU shares DART's walker, but has its own stream enable. */
+#define DART_S5L8960X_SMMU_TCR        0x0c
+#define DART_S5L8960X_SMMU_ERROR      0x10
+#define DART_S5L8960X_SMMU_ERROR_ADDR 0x1c
+#define DART_S5L8960X_SMMU_DIAG       0x20
+#define DART_S5L8960X_SMMU_REFLECTOR  0x24
+#define DART_S5L8960X_SMMU_BYPASS     0x2c
+#define DART_S5L8960X_FAULT_LIMIT    16
+
 #define DART_S5L8960X_TTBR	0x40
 
 /* T8020/T6000 registers */
@@ -220,6 +229,13 @@ struct apple_dart {
 	const struct apple_dart_hw *hw;
 
 	void __iomem *regs;
+	void __iomem *smmu;
+	int smmu_irq;
+	bool smmu_irq_requested;
+	atomic_t fault_count;
+	spinlock_t fault_lock;
+	u32 fault_base;
+	unsigned long fault_irq_masked; /* bit 0 DART, bit 1 SMMU */
 
 	int irq;
 	struct clk_bulk_data *clks;
@@ -252,6 +268,75 @@ struct apple_dart {
 };
 
 static DEFINE_MUTEX(apple_dart_groups_lock);
+static struct platform_driver apple_dart_driver;
+
+/* Only a display DART with a second window uses the new IRQ storm policy. */
+static void apple_dart_s5l8960x_rearm_faults(struct apple_dart *dart)
+{
+	unsigned long flags, masked;
+
+	if (!dart->smmu)
+		return;
+	spin_lock_irqsave(&dart->fault_lock, flags);
+	dart->fault_base = atomic_read(&dart->fault_count);
+	masked = dart->fault_irq_masked;
+	dart->fault_irq_masked = 0;
+	spin_unlock_irqrestore(&dart->fault_lock, flags);
+	if (masked & BIT(0))
+		enable_irq(dart->irq);
+	if (masked & BIT(1))
+		enable_irq(dart->smmu_irq);
+}
+
+static void apple_dart_s5l8960x_note_fault(struct apple_dart *dart, int irq,
+					void __iomem *reg, u32 status)
+{
+	unsigned long flags;
+	unsigned int bit = irq == dart->irq ? 0 : 1;
+	u32 count;
+
+	if (!dart->smmu) {
+		writel(status, reg);
+		atomic_inc(&dart->fault_count);
+		return;
+	}
+	/* Keep the W1C and count indivisible to a verdict's status snapshot. */
+	spin_lock_irqsave(&dart->fault_lock, flags);
+	writel(status, reg);
+	count = atomic_inc_return(&dart->fault_count);
+	if (count - dart->fault_base >= DART_S5L8960X_FAULT_LIMIT &&
+	    !test_and_set_bit(bit, &dart->fault_irq_masked)) {
+		dev_err(dart->dev, "%s fault storm, masking IRQ %d after %u faults\n",
+			bit ? "SMMU" : "DART", irq, count - dart->fault_base);
+		disable_irq_nosync(irq);
+	}
+	spin_unlock_irqrestore(&dart->fault_lock, flags);
+}
+
+int apple_dart_fault_count(struct device *dev)
+{
+	struct apple_dart *dart;
+	unsigned long flags;
+	u32 pending;
+	int count;
+
+	if (!dev || dev->driver != &apple_dart_driver.driver ||
+	    !of_device_is_compatible(dev->of_node, "apple,s5l8960x-dart"))
+		return -ENODEV;
+	dart = dev_get_drvdata(dev);
+	if (!dart)
+		return -ENODEV;
+	spin_lock_irqsave(&dart->fault_lock, flags);
+	pending = readl(dart->regs + DART_S5L8960X_ERROR);
+	if (dart->smmu)
+		pending |= readl(dart->smmu + DART_S5L8960X_SMMU_ERROR);
+	count = atomic_read(&dart->fault_count) + !!(pending & DART_S5L8960X_ERROR_FLAG);
+	spin_unlock_irqrestore(&dart->fault_lock, flags);
+	return count;
+}
+
+EXPORT_SYMBOL_GPL(apple_dart_fault_count);
+
 
 struct apple_dart_hw {
 	enum dart_type type;
@@ -405,6 +490,16 @@ static u32 apple_dart_s5l8960x_read_tcr(struct apple_dart *dart, u32 sid)
 	return (tcr >> (sid * 8)) & 0xff;
 }
 
+static bool apple_dart_s5l8960x_smmu_tcr_matches(struct apple_dart *dart, u32 sid)
+{
+	u32 smmu;
+
+	if (!dart->smmu)
+		return true;
+	smmu = readl(dart->smmu + DART_S5L8960X_SMMU_TCR) >> (sid * 8);
+	return !((smmu ^ apple_dart_s5l8960x_read_tcr(dart, sid)) & BIT(7));
+}
+
 static void apple_dart_s5l8960x_write_tcr(struct apple_dart *dart, u32 sid, u32 val)
 {
 	u32 shift = sid * DART_S5L8960X_TCR_BITS_PER_STREAM;
@@ -424,6 +519,14 @@ static void apple_dart_s5l8960x_write_tcr(struct apple_dart *dart, u32 sid, u32 
 	tcr &= ~(0xff << shift);
 	tcr |= (val & 0xff) << shift;
 	writel(tcr, dart->regs + dart->hw->tcr);
+	if (dart->smmu) {
+		/* iOS enableStream: DART first, SMMU second, under the same lock. */
+		readl(dart->regs + dart->hw->tcr);
+		tcr = readl(dart->smmu + DART_S5L8960X_SMMU_TCR);
+		tcr &= ~(0x80U << shift);
+		tcr |= (val & 0x80U) << shift;
+		writel(tcr, dart->smmu + DART_S5L8960X_SMMU_TCR);
+	}
 	spin_unlock_irqrestore(&dart->tcr_lock, flags);
 }
 
@@ -628,6 +731,9 @@ static void apple_dart_s5l8960x_set_reflector(struct apple_dart *dart)
 	if (dart->has_error_reflector)
 		writel(dart->error_reflector,
 		       dart->regs + DART_S5L8960X_ERROR_REFLECTOR);
+	if (dart->smmu && dart->has_error_reflector)
+		writel(dart->error_reflector,
+		       dart->smmu + DART_S5L8960X_SMMU_REFLECTOR);
 }
 
 /* The configuration iOS writes after the TCR: fetch, then diag */
@@ -639,6 +745,8 @@ static void apple_dart_s5l8960x_set_configs(struct apple_dart *dart)
 	if (dart->has_diag_config)
 		writel(dart->diag_config,
 		       dart->regs + DART_S5L8960X_DIAG_CONFIG);
+	if (dart->smmu)
+		writel(0, dart->smmu + DART_S5L8960X_SMMU_DIAG);
 }
 
 static int apple_dart_hw_reset(struct apple_dart *dart)
@@ -670,6 +778,9 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 
 	/* clear any pending errors before the interrupt is unmasked */
 	writel(readl(dart->regs + dart->hw->error), dart->regs + dart->hw->error);
+	if (dart->smmu)
+		writel(readl(dart->smmu + DART_S5L8960X_SMMU_ERROR),
+		       dart->smmu + DART_S5L8960X_SMMU_ERROR);
 
 	if (dart->hw->type == DART_T8110)
 		writel(0,  dart->regs + DART_T8110_ERROR_MASK);
@@ -701,7 +812,7 @@ apple_dart_s5l8960x_reload_configuration(struct apple_dart *dart, u32 sid)
 	u32 fetch_config;
 	u32 command = DART_S5L8960X_STREAM_COMMAND_INVALIDATE;
 	u32 remap;
-	u32 tcr;
+	u32 tcr, smmu_tcr = 0;
 	int ret;
 
 	spin_lock_irqsave(&dart->lock, flags);
@@ -709,6 +820,8 @@ apple_dart_s5l8960x_reload_configuration(struct apple_dart *dart, u32 sid)
 	fetch_config = readl(dart->regs + DART_S5L8960X_FETCH_CONFIG);
 	remap = readl(dart->regs + DART_S5L8960X_REMAP);
 	tcr = readl(dart->regs + DART_S5L8960X_TCR);
+	if (dart->smmu)
+		smmu_tcr = readl(dart->smmu + DART_S5L8960X_SMMU_TCR);
 
 	for (stream = 0; stream < dart->num_streams; stream++)
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
@@ -731,6 +844,8 @@ apple_dart_s5l8960x_reload_configuration(struct apple_dart *dart, u32 sid)
 	 */
 	tcr &= ~(0xff << shift);
 	tcr |= (dart->hw->tcr_enabled & 0xff) << shift;
+	smmu_tcr = (smmu_tcr & ~(0x80U << shift)) |
+		   ((dart->hw->tcr_enabled & 0x80U) << shift);
 	apple_dart_s5l8960x_set_reflector(dart);
 	apple_dart_s5l8960x_write_tcr(dart, sid, dart->hw->tcr_enabled);
 	writel(remap, dart->regs + DART_S5L8960X_REMAP);
@@ -743,6 +858,8 @@ apple_dart_s5l8960x_reload_configuration(struct apple_dart *dart, u32 sid)
 	ret = apple_dart_s5l8960x_command_locked(&stream_map, command);
 
 	writel(tcr, dart->regs + DART_S5L8960X_TCR);
+	if (dart->smmu)
+		writel(smmu_tcr, dart->smmu + DART_S5L8960X_SMMU_TCR);
 	writel(fetch_config, dart->regs + DART_S5L8960X_FETCH_CONFIG);
 	writel(diag_config, dart->regs + DART_S5L8960X_DIAG_CONFIG);
 	spin_unlock_irqrestore(&dart->lock, flags);
@@ -901,7 +1018,8 @@ static bool apple_dart_streams_tcr_is(struct apple_dart_stream_map *stream_map,
 
 	/* Only the streams of this map: other bytes belong to other masters */
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams)
-		if (dart->hw->read_tcr(dart, sid) != tcr)
+		if (dart->hw->read_tcr(dart, sid) != tcr ||
+		    !apple_dart_s5l8960x_smmu_tcr_matches(dart, sid))
 			return false;
 
 	return true;
@@ -944,6 +1062,7 @@ apple_dart_s5l8960x_setup_translation(struct apple_dart_domain *domain,
 	struct apple_dart *dart = stream_map->dart;
 	int i, ret;
 
+	apple_dart_s5l8960x_rearm_faults(dart);
 	apple_dart_hw_disable_dma(stream_map);
 	if (!apple_dart_streams_tcr_is(stream_map, dart->hw->tcr_disabled)) {
 		ret = -EIO;
@@ -1177,8 +1296,10 @@ static int apple_dart_attach_dev_blocked(struct iommu_domain *domain,
 	struct apple_dart_stream_map *stream_map;
 	int i;
 
-	for_each_stream_map(i, cfg, stream_map)
+	for_each_stream_map(i, cfg, stream_map) {
 		apple_dart_hw_disable_dma(stream_map);
+		apple_dart_s5l8960x_rearm_faults(stream_map->dart);
+	}
 	return 0;
 }
 
@@ -1531,6 +1652,24 @@ static const struct iommu_ops apple_dart_iommu_ops = {
 	}
 };
 
+static irqreturn_t apple_dart_s5l8960x_smmu_irq(int irq, void *dev)
+{
+	struct apple_dart *dart = dev;
+	u32 status, addr;
+
+	if (!dart->smmu)
+		return IRQ_NONE;
+	status = readl(dart->smmu + DART_S5L8960X_SMMU_ERROR);
+	if (!(status & DART_S5L8960X_ERROR_FLAG))
+		return IRQ_NONE;
+	addr = readl(dart->smmu + DART_S5L8960X_SMMU_ERROR_ADDR);
+	dev_err_ratelimited(dart->dev, "SMMU fault: status %#x stream %u at %#x\n",
+		status, (u32)FIELD_GET(DART_S5L8960X_ERROR_STREAM, status), addr);
+	apple_dart_s5l8960x_note_fault(dart, irq,
+				      dart->smmu + DART_S5L8960X_SMMU_ERROR, status);
+	return IRQ_HANDLED;
+}
+
 static irqreturn_t apple_dart_s5l8960x_irq(int irq, void *dev)
 {
 	struct apple_dart *dart = dev;
@@ -1541,7 +1680,7 @@ static irqreturn_t apple_dart_s5l8960x_irq(int irq, void *dev)
 	u8 stream_idx = FIELD_GET(DART_S5L8960X_ERROR_STREAM, error);
 
 	if (!(error & DART_S5L8960X_ERROR_FLAG))
-		return IRQ_NONE;
+		return apple_dart_s5l8960x_smmu_irq(irq, dev);
 
 	/* there should only be a single bit set but let's use == to be sure */
 	if (error_code == DART_T8020_ERROR_READ_FAULT)
@@ -1562,7 +1701,8 @@ static irqreturn_t apple_dart_s5l8960x_irq(int irq, void *dev)
 		"translation fault: status:0x%x stream:%d code:0x%x (%s) at 0x%x",
 		error, stream_idx, error_code, fault_name, addr);
 
-	writel(error, dart->regs + DART_S5L8960X_ERROR);
+	apple_dart_s5l8960x_note_fault(dart, irq,
+				      dart->regs + DART_S5L8960X_ERROR, error);
 	return IRQ_HANDLED;
 }
 
@@ -1684,7 +1824,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret;
 	u32 dart_params[4];
-	struct resource *res;
+	struct resource *res, *smmu_res = NULL;
 	struct apple_dart *dart;
 	struct device *dev = &pdev->dev;
 
@@ -1696,6 +1836,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->hw = of_device_get_match_data(dev);
 	spin_lock_init(&dart->lock);
 	spin_lock_init(&dart->tcr_lock);
+	spin_lock_init(&dart->fault_lock);
+	atomic_set(&dart->fault_count, 0);
+	dart->smmu_irq = -1;
 
 	dart->regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(dart->regs))
@@ -1704,6 +1847,22 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (resource_size(res) < 0x2000) {
 		dev_err(dev, "MMIO region too small (%pr)\n", res);
 		return -EINVAL;
+	}
+
+	if (dart->hw->type == DART_S5L8960X) {
+		smmu_res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "smmu");
+		if (smmu_res) {
+			dart->smmu = devm_ioremap_resource(dev, smmu_res);
+			if (IS_ERR(dart->smmu))
+				return PTR_ERR(dart->smmu);
+			dart->smmu_irq = platform_get_irq_byname_optional(pdev, "smmu");
+			if (dart->smmu_irq == -EPROBE_DEFER)
+				return -EPROBE_DEFER;
+			if (dart->smmu_irq < 0 && platform_irq_count(pdev) > 1)
+				dart->smmu_irq = platform_get_irq(pdev, 1);
+			if (dart->smmu_irq < 0)
+				return dart->smmu_irq;
+		}
 	}
 
 	dart->irq = platform_get_irq(pdev, 0);
@@ -1720,6 +1879,12 @@ static int apple_dart_probe(struct platform_device *pdev)
 		return ret;
 
 	if (dart->hw->type == DART_S5L8960X) {
+		if (dart->smmu)
+			dev_info(dev, "SMMU at %pR: tcr %08x error %08x reflector %08x bypass %08x\n",
+				 smmu_res, readl(dart->smmu + DART_S5L8960X_SMMU_TCR),
+				 readl(dart->smmu + DART_S5L8960X_SMMU_ERROR),
+				 readl(dart->smmu + DART_S5L8960X_SMMU_REFLECTOR),
+				 readl(dart->smmu + DART_S5L8960X_SMMU_BYPASS));
 		dart->pgsize = SZ_4K;
 		/*
 		 * These DARTs only support bypass with offset due to address
@@ -1776,6 +1941,14 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_clk_disable;
 
+	if (dart->smmu) {
+		ret = request_irq(dart->smmu_irq, apple_dart_s5l8960x_smmu_irq,
+				  IRQF_SHARED, "apple-dart SMMU fault handler", dart);
+		if (ret)
+			goto err_free_irq;
+		dart->smmu_irq_requested = true;
+	}
+
 	platform_set_drvdata(pdev, dart);
 
 	ret = iommu_device_sysfs_add(&dart->iommu, dev, NULL, "apple-dart.%s",
@@ -1797,6 +1970,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 err_sysfs_remove:
 	iommu_device_sysfs_remove(&dart->iommu);
 err_free_irq:
+	apple_dart_s5l8960x_rearm_faults(dart);
+	if (dart->smmu_irq_requested)
+		free_irq(dart->smmu_irq, dart);
 	free_irq(dart->irq, dart);
 err_clk_disable:
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
@@ -1809,6 +1985,9 @@ static void apple_dart_remove(struct platform_device *pdev)
 	struct apple_dart *dart = platform_get_drvdata(pdev);
 
 	apple_dart_hw_reset(dart);
+	apple_dart_s5l8960x_rearm_faults(dart);
+	if (dart->smmu_irq_requested)
+		free_irq(dart->smmu_irq, dart);
 	free_irq(dart->irq, dart);
 
 	iommu_device_unregister(&dart->iommu);
