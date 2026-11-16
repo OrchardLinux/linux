@@ -275,6 +275,7 @@ struct pvr_apple_s8003 {
 	u32 gen;
 	spinlock_t tag_lock;		/* @tag and the host's tags in the shared memory */
 	u32 tag[S8003_SLOTS];		/* 0: slot not loaded */
+	u64 tag_steps_past;		/* cached or zero tags skipped, under tag_lock */
 	DECLARE_BITMAP(loading, S8003_SLOTS);	/* tag held until DC_SLOT completes */
 	DECLARE_BITMAP(bump_pending, S8003_SLOTS); /* flush deferred while loading */
 	DECLARE_BITMAP(slots, S8003_SLOTS);
@@ -1326,18 +1327,18 @@ static int s8003_device_control(struct pvr_apple *apple, const u32 (*cmd)[2], un
 }
 
 /* Bump a loaded slot's tag with tag_lock held; leave empty slots at zero. */
-static void s8003_slot_tag_bump(struct pvr_apple_s8003 *s, u32 slot)
+static u64 s8003_slot_tag_bump(struct pvr_apple_s8003 *s, u32 slot)
 {
-	u32 tag = s->tag[slot];
+	u32 tag = s->tag[slot], cached, next;
 
 	lockdep_assert_held(&s->tag_lock);
 	if (!tag)
-		return;
-	tag += S8003_TAG_CATALOGUE;
-	if (!tag)
-		tag = S8003_TAG_CATALOGUE;
-	s->tag[slot] = tag;
-	put32(s8003_object(s, S8003_TAG_HOST) + 4 * slot, tag);
+		return 0;
+	cached = get32(s8003_object(s, S8003_TAG_SEEN) + 4 * slot);
+	next = pvr_apple_tag_bump(tag, S8003_TAG_CATALOGUE, cached);
+	s->tag[slot] = next;
+	put32(s8003_object(s, S8003_TAG_HOST) + 4 * slot, next);
+	return (u32)(next - (tag + S8003_TAG_CATALOGUE)) / S8003_TAG_CATALOGUE;
 }
 
 /* Point a pair of slots at a page-table root (0: at none) under @tag */
@@ -1346,6 +1347,7 @@ static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, 
 	const u32 cmd[2][2] = { { S8003_DC_SLOT, slot[1] }, { S8003_DC_SLOT, slot[0] } };
 	struct pvr_apple_s8003 *s = apple->chip_data;
 	unsigned long flags;
+	u64 steps = 0, total;
 	unsigned int e;
 	int err;
 
@@ -1377,12 +1379,17 @@ static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, 
 	for (e = 0; e < 2; e++) {
 		__clear_bit(slot[e], s->loading);
 		if (test_bit(slot[e], s->bump_pending)) {
-			s8003_slot_tag_bump(s, slot[e]);
+			steps += s8003_slot_tag_bump(s, slot[e]);
 			__clear_bit(slot[e], s->bump_pending);
 		}
 	}
+	s->tag_steps_past += steps;
+	total = s->tag_steps_past;
 	spin_unlock_irqrestore(&s->tag_lock, flags);
 	wmb();
+	if (steps)
+		dev_dbg_ratelimited(apple_dev(apple),
+				    "MMU tag steps-past=%llu total=%llu\n", steps, total);
 	return err;
 }
 
@@ -1440,6 +1447,7 @@ static void pvr_apple_s8003_mmu_flush(struct pvr_apple *apple)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
 	unsigned long flags;
+	u64 steps = 0, total;
 	u32 slot;
 
 	if (!s->shared.map)
@@ -1449,10 +1457,15 @@ static void pvr_apple_s8003_mmu_flush(struct pvr_apple *apple)
 		if (test_bit(slot, s->loading))
 			__set_bit(slot, s->bump_pending);
 		else
-			s8003_slot_tag_bump(s, slot);
+			steps += s8003_slot_tag_bump(s, slot);
 	}
+	s->tag_steps_past += steps;
+	total = s->tag_steps_past;
 	spin_unlock_irqrestore(&s->tag_lock, flags);
 	wmb();
+	if (steps)
+		dev_dbg_ratelimited(apple_dev(apple),
+				    "MMU tag steps-past=%llu total=%llu\n", steps, total);
 }
 
 static int pvr_apple_s8003_vm_init(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx)

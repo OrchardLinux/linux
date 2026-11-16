@@ -280,6 +280,15 @@ struct pvr_apple_chip {
 	void (*mmu_flush)(struct pvr_apple *apple);
 };
 
+/* A new host tag must be nonzero and differ from the firmware's cached tag. */
+static inline u32 pvr_apple_tag_bump(u32 tag, u32 step, u32 cached)
+{
+	tag += step;
+	while (!tag || tag == cached)
+		tag += step;
+	return tag;
+}
+
 /* The heap is coherent memory shared with the firmware, not MMIO. */
 static inline u32 heap_read32(struct pvr_apple *apple, u32 offset)
 {
