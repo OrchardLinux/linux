@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/apple,s5l8960x-touch-clock.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S5L8960X touchscreen reference clock
+
+maintainers:
+  - thisiscamk <100883750+thisiscamk@users.noreply.github.com>
+
+description:
+  PWM0 channel 2 generates the touchscreen reference clock. Its count and
+  control register layout differs from the later Apple FPWM block. The
+  clock is nominally 32768 Hz, rounded to an even number of reference-clock
+  cycles for a symmetric waveform. Other PWM channels are not described.
+
+properties:
+  compatible:
+    const: apple,s5l8960x-touch-clock
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  '#clock-cells':
+    const: 0
+
+  clock-frequency:
+    const: 32768
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - power-domains
+  - '#clock-cells'
+  - clock-frequency
+
+additionalProperties: false
+
+examples:
+  - |
+    clock-controller@a118000 {
+        compatible = "apple,s5l8960x-touch-clock";
+        reg = <0x0a118000 0x4000>;
+        clocks = <&clkref>;
+        power-domains = <&ps_pwm0>;
+        #clock-cells = <0>;
+        clock-frequency = <32768>;
+    };
