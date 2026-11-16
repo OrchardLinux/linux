@@ -289,6 +289,16 @@ struct pvr_apple_s8003 {
 	spinlock_t set_lock;		/* @sets, @next_set, &s8003_pm.set */
 	DECLARE_BITMAP(sets, S8003_PM_SETS);
 	u32 next_set;
+	/*
+	 * Which sets the firmware may be writing, for s8003_touch(): per set
+	 * the last geometry and fragment job on it (0: none this start), and
+	 * the sets of the VMs that submitted the last two scenes. Written
+	 * under submit_lock, read without it.
+	 */
+	u32 set_geom[S8003_PM_SETS];
+	u32 set_frag[S8003_PM_SETS];
+	unsigned long wb_sets;
+	struct s8003_vm *pm_last, *pm_prev; /* last two scenes for cache-line reads */
 	struct pvr_vm_context *park_vm;	/* maps what every VM maps, nothing else */
 
 	/* Bus addresses the firmware is told: its registers' and ours */
@@ -1180,25 +1190,71 @@ static void s8003_channels_init(struct pvr_apple_s8003 *s)
 			   s8003_channel_addr(APPLE_ENGINE_COMPUTE), S8003_CU_TQ, S8003_CU_DEP);
 }
 
+/* How often s8003_touch() runs while the firmware works for the host */
+#define S8003_TOUCH_US			1000
+
+static u32 pvr_apple_s8003_engine_done(struct pvr_apple *apple, enum pvr_apple_engine engine);
+
+/*
+ * The PM sets the firmware may be writing: those with a geometry or fragment
+ * job not done yet, and those of the VMs whose scenes it handled last and
+ * the one before, whose free lists the PM writes back when a later job runs.
+ */
+static unsigned long s8003_live_sets(struct pvr_apple_s8003 *s)
+{
+	u32 geom = pvr_apple_s8003_engine_done(s->apple, APPLE_ENGINE_GEOM);
+	u32 frag = pvr_apple_s8003_engine_done(s->apple, APPLE_ENGINE_FRAG);
+	unsigned long live = READ_ONCE(s->wb_sets);
+	unsigned int set;
+
+	BUILD_BUG_ON(S8003_PM_SETS > BITS_PER_LONG);
+	for (set = 0; set < S8003_PM_SETS; set++) {
+		u32 g = READ_ONCE(s->set_geom[set]), f = READ_ONCE(s->set_frag[set]);
+
+		if ((g && (s32)(geom - g) < 0) || (f && (s32)(frag - f) < 0))
+			live |= BIT(set);
+	}
+	return live & READ_ONCE(s->sets[0]);
+}
+
 /*
  * While a job runs the firmware does not see its own progress in the root and
  * shared memory until the host read those cache lines: without the reads a
  * phase waited for the firmware's next tick, seconds in all (measured on the
  * iPad 5: 7.9 s from input to frame, 0.27 s with them every 1 to 2 ms). One
- * load per 64-byte line, the PM sets in use included.
+ * load per 64-byte line, the PM sets the firmware may be writing included;
+ * reading only those cut the time of the reads by a quarter to a third on
+ * the G5P driver, with no slower phase.
  */
 static void s8003_touch(struct pvr_apple_s8003 *s)
 {
-	unsigned long set;
+	unsigned long set, live = s8003_live_sets(s);
 	u32 at;
 
 	for (at = 0; at < S8003_ROOT_SIZE; at += 64)
 		(void)READ_ONCE(*(const u32 *)(s->root.map + at));
 	for (at = 0; at < S8003_SHARED_SIZE; at += 64)
 		(void)READ_ONCE(*(const u32 *)(s->shared.map + at));
-	for_each_set_bit(set, s->sets, S8003_PM_SETS)
+	for_each_set_bit(set, &live, S8003_PM_SETS)
 		for (at = 0; at < S8003_PM_SET_SIZE; at += 64)
 			(void)READ_ONCE(*(const u32 *)(s->pmsets.map + set * S8003_PM_SET_SIZE + at));
+}
+
+static unsigned long s8003_vm_sets(const struct s8003_vm *vm)
+{
+	unsigned long mask = 0;
+	unsigned int i;
+
+	for (i = 0; vm && i < ARRAY_SIZE(vm->pm); i++)
+		if (vm->pm[i].set >= 0)
+			mask |= BIT(vm->pm[i].set);
+	return mask;
+}
+
+/* After @pm_last or @pm_prev changed; submit_lock held */
+static void s8003_wb_sets_update(struct pvr_apple_s8003 *s)
+{
+	WRITE_ONCE(s->wb_sets, s8003_vm_sets(s->pm_last) | s8003_vm_sets(s->pm_prev));
 }
 
 /* What the firmware posted since the last look; wherever a job is waited for */
@@ -1210,7 +1266,8 @@ static void pvr_apple_s8003_events(struct pvr_apple *apple)
 
 	if (!READ_ONCE(apple->booted) || !s->shared.map)
 		return;
-	if (ktime_us_delta(now, READ_ONCE(s->touched)) >= USEC_PER_MSEC) {
+	/* An eighth early, so that a check every S8003_TOUCH_US always touches */
+	if (ktime_us_delta(now, READ_ONCE(s->touched)) + S8003_TOUCH_US / 8 >= S8003_TOUCH_US) {
 		WRITE_ONCE(s->touched, now);
 		s8003_touch(s);
 	}
@@ -1587,6 +1644,11 @@ static void pvr_apple_s8003_vm_fini(struct pvr_apple *apple, struct pvr_vm_conte
 		__set_bit(vm->slot[0], s->parked);
 		__set_bit(vm->slot[1], s->parked);
 	}
+	if (s->pm_last == vm)
+		s->pm_last = NULL;
+	if (s->pm_prev == vm)
+		s->pm_prev = NULL;
+	s8003_wb_sets_update(s);
 	for (e = 0; e < 2; e++) {
 		if (vm->slot[e])
 			__clear_bit(vm->slot[e], s->slots);
@@ -2231,9 +2293,16 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 			s8003_meta_addr(s8003_pm_set_va(pm, 0)), pm->set + 1, vm->slot[0], false,
 			seq, 0, 0);
 	pm->hwrt = job->hwrt;
+	if (s->pm_last != vm) {
+		s->pm_prev = s->pm_last;
+		s->pm_last = vm;
+	}
+	s8003_wb_sets_update(s);
 	pm->scene = s->gen;
 	pm->ta_seq = seq;
 	pm->td_seq = 0;
+	WRITE_ONCE(s->set_frag[pm->set], 0);
+	WRITE_ONCE(s->set_geom[pm->set], seq);
 	apple->ta_seq = seq;
 	err = s8003_publish(apple, APPLE_ENGINE_GEOM, seq, (2 * seq) % S8003_CH_ENTRIES);
 	if (err)
@@ -2275,6 +2344,7 @@ static int s8003_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 			s8003_meta_addr(s8003_pm_set_va(pm, 0)), pm->set + 1, vm->slot[1], true, seq,
 			s8003_channel_addr(APPLE_ENGINE_GEOM) + S8003_CH_STAMP + 4, pm->ta_seq);
 	pm->td_seq = seq;
+	WRITE_ONCE(s->set_frag[pm->set], seq);
 	apple->frag_seq = seq;
 	err = s8003_publish(apple, APPLE_ENGINE_FRAG, seq, (2 * seq) % S8003_CH_ENTRIES);
 	if (err)
@@ -2437,6 +2507,8 @@ static void s8003_jobs_reset(struct pvr_apple_s8003 *s)
 		s->gen = 1;
 	WRITE_ONCE(s->failed, false);
 	WRITE_ONCE(s->fault, false);
+	memset(s->set_geom, 0, sizeof(s->set_geom));
+	memset(s->set_frag, 0, sizeof(s->set_frag));
 	memset(s->pmsets.map, 0, s->pmsets.size);
 	s8003_channels_init(s);
 }
