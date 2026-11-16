@@ -106,19 +106,30 @@ static bool dwc2_drd_soft_role(struct dwc2_hsotg *hsotg)
 static int dwc2_drd_set_soft_role(struct dwc2_hsotg *hsotg, enum usb_role role)
 {
 	unsigned long flags;
+	bool was_held;
 
 	if (role == USB_ROLE_HOST)
 		return -EINVAL;
 
 	spin_lock_irqsave(&hsotg->lock, flags);
+	was_held = hsotg->role_sw_hold;
 	hsotg->role_sw_hold = role != USB_ROLE_DEVICE;
 	if (dwc2_is_device_enabled(hsotg)) {
-		if (hsotg->role_sw_hold) {
-			dwc2_hsotg_core_disconnect(hsotg);
-			/* End the old gadget session and its current allowance. */
+		if (dwc2_gadget_ungate_clock(hsotg))
+			hsotg->bus_suspended = false;
+		if (hsotg->role_sw_hold && !was_held) {
+			/* Stop the old session with its clock and pull-up still on. */
 			dwc2_hsotg_disconnect(hsotg);
-		} else
+			dwc2_hsotg_core_disconnect(hsotg);
+			dev_info_ratelimited(hsotg->dev, "USB data held off (charger/role)\n");
+		} else if (!hsotg->role_sw_hold && was_held) {
+			dwc2_hsotg_core_init_disconnected(hsotg, false);
+			dwc2_enable_acg(hsotg);
 			dwc2_hsotg_core_connect(hsotg);
+			dev_info_ratelimited(hsotg->dev, "USB data released: core reset, reconnect\n");
+		} else if (!hsotg->role_sw_hold) {
+			dwc2_hsotg_core_connect(hsotg);
+		}
 	}
 	spin_unlock_irqrestore(&hsotg->lock, flags);
 
