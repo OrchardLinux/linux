@@ -122,6 +122,16 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 	int max_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MAXVER, msg);
 	int want_ver = min(APPLE_RTKIT_MAX_SUPPORTED_VERSION, max_ver);
 
+	/*
+	 * Protocol 10 firmware carries its minor version in the HELLO's
+	 * minimum-version field (10.0 to 10.2), not a lower major version.
+	 */
+	rtk->minor_version = 0;
+	if (max_ver == 10) {
+		rtk->minor_version = min_ver;
+		min_ver = max_ver;
+	}
+
 	dev_dbg(rtk->dev, "RTKit: Min ver %d, max ver %d\n", min_ver, max_ver);
 
 	if (min_ver > APPLE_RTKIT_MAX_SUPPORTED_VERSION) {
@@ -140,12 +150,16 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 		 want_ver);
 	rtk->version = want_ver;
 
-	if (rtk->version < 11)
-		rtk->app_ep_start = APPLE_RTKIT_APP_ENDPOINT_START_V10;
+	if (rtk->version == 10 && rtk->minor_version < 2)
+		rtk->app_ep_start = APPLE_RTKIT_APP_ENDPOINT_START_V10_0;
+	else if (rtk->version == 10)
+		rtk->app_ep_start = APPLE_RTKIT_APP_ENDPOINT_START_V10_2;
 	else
 		rtk->app_ep_start = APPLE_RTKIT_APP_ENDPOINT_START_V11;
 
-	reply = FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER, want_ver);
+	/* Protocol 10 echoes the minor version the firmware offered. */
+	reply = FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER,
+			   rtk->version == 10 ? rtk->minor_version : want_ver);
 	reply |= FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MAXVER, want_ver);
 	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY, reply);
 
@@ -814,9 +828,22 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 	if (ret)
 		return ret;
 
+	/* Protocol 10.0 and 10.1 do not acknowledge the AP power-on. */
+	if (rtk->version == 10 && rtk->minor_version < 2 &&
+	    state == APPLE_RTKIT_PWR_STATE_ON) {
+		rtk->ap_power_state = state;
+		return 0;
+	}
+
 	ret = apple_rtkit_wait_for_completion(&rtk->ap_pwr_ack_completion);
 	if (ret)
 		return ret;
+
+	/* ... and report quiesce as off. */
+	if (rtk->version == 10 && rtk->minor_version < 2 &&
+	    state == APPLE_RTKIT_PWR_STATE_QUIESCED &&
+	    rtk->ap_power_state == APPLE_RTKIT_PWR_STATE_OFF)
+		rtk->ap_power_state = state;
 
 	if (rtk->ap_power_state != state)
 		return -EINVAL;
