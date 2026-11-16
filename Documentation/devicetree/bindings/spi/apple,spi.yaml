@@ -12,7 +12,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,s8000-spi
+            enum:
+              - apple,s5l8960x-spi
+              - apple,s8000-spi
     then:
       properties:
         dmas: false
@@ -34,6 +36,7 @@ properties:
           - const: apple,t8103-spi
       - items:
           - enum:
+              - apple,s5l8960x-spi
               - apple,s8000-spi
               - apple,t7000-spi
               - apple,t8010-spi
