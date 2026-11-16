@@ -613,8 +613,8 @@
 
 		/*
 		 * iBoot leaves the eDP link, the panel and the pipe running; the
-		 * driver adopts that mode. The display DART (dart-disp0) is only
-		 * read, to check that the scanout bypasses translation.
+		 * driver adopts that mode. The display DART (dart-disp0) stays
+		 * in bypass until the driver maps and verifies translated scanout.
 		 */
 		disp0: display-controller@206200000 {
 			compatible = "apple,t8010-display-pipe", "apple,s8000-display-pipe";
@@ -630,6 +630,32 @@
 				     <AIC_IRQ 161 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 155 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_disp0_fe>, <&ps_disp0_be>, <&ps_dp>;
+			status = "disabled";
+
+			/* Map the live boot framebuffer before enabling translation. */
+			scanout {
+				iommus = <&disp0_dart 0>, <&disp0_dart 1>,
+					 <&disp0_dart 2>, <&disp0_dart 3>;
+				apple,dart-deferred-attach;
+			};
+		};
+
+		/* Disabled until the display driver maps and verifies scanout. */
+		disp0_dart: iommu@206304000 {
+			compatible = "apple,t8010-dart", "apple,s5l8960x-dart";
+			reg = <0x2 0x06304000 0x0 0x4000>,
+			      <0x2 0x06300000 0x0 0x4000>;
+			reg-names = "dart", "smmu";
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 156 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 157 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "dart", "smmu";
+			/* No separate DISP0_DART domain; BE keeps FE powered too. */
+			power-domains = <&ps_disp0_be>;
+			apple,error-reflector = /bits/ 64 <0x20fffc000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x00000100>;
 			status = "disabled";
 		};
 
