@@ -283,6 +283,17 @@ void apple_mbox_stop(struct apple_mbox *mbox)
 }
 EXPORT_SYMBOL(apple_mbox_stop);
 
+/* Terminal shutdown retains all callback storage until the CPUs stop. */
+void apple_mbox_stop_nowait(struct apple_mbox *mbox)
+{
+	if (!mbox->active)
+		return;
+	mbox->active = false;
+	disable_irq_nosync(mbox->irq_recv_not_empty);
+	pm_runtime_put_noidle(mbox->dev);
+}
+EXPORT_SYMBOL_GPL(apple_mbox_stop_nowait);
+
 struct apple_mbox *apple_mbox_get(struct device *dev, int index)
 {
 	struct of_phandle_args args;

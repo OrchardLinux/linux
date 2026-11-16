@@ -303,6 +303,30 @@ int pvr_apple_fw_load(struct pvr_apple *apple, size_t max_size)
 	return 0;
 }
 
+/* Track our one suspend reference, including jobless resumes and failed starts.
+ * devfreq changes its suspend count even when its governor callback fails.
+ * Do not take submit_lock here: devfreq callbacks have their own lock order.
+ */
+static void pvr_apple_devfreq_suspend(struct pvr_apple *apple)
+{
+	mutex_lock(&apple->devfreq_lock);
+	if (apple->devfreq && !apple->devfreq_suspended) {
+		devfreq_suspend_device(apple->devfreq);
+		WRITE_ONCE(apple->devfreq_suspended, true);
+	}
+	mutex_unlock(&apple->devfreq_lock);
+}
+
+static void pvr_apple_devfreq_resume(struct pvr_apple *apple)
+{
+	mutex_lock(&apple->devfreq_lock);
+	if (apple->devfreq && apple->devfreq_suspended) {
+		devfreq_resume_device(apple->devfreq);
+		WRITE_ONCE(apple->devfreq_suspended, false);
+	}
+	mutex_unlock(&apple->devfreq_lock);
+}
+
 static int pvr_apple_power_init(struct pvr_device *pvr_dev)
 {
 	struct device *dev = from_pvr_device(pvr_dev)->dev;
@@ -320,6 +344,8 @@ static int pvr_apple_power_init(struct pvr_device *pvr_dev)
 	err = devm_mutex_init(dev, &apple->submit_lock);
 	if (!err)
 		err = devm_mutex_init(dev, &apple->perf_lock);
+	if (!err)
+		err = devm_mutex_init(dev, &apple->devfreq_lock);
 	if (!err)
 		err = devm_mutex_init(dev, &apple->pm_lock);
 	if (err)
@@ -389,7 +415,6 @@ static void pvr_apple_fw_stop(struct pvr_apple *apple);
 static int pvr_apple_power_on(struct pvr_device *pvr_dev)
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
-	int err;
 
 	if (apple->chip->gate_off_ms && apple->gate_off) {
 		s64 remaining = (s64)apple->chip->gate_off_ms * USEC_PER_MSEC -
@@ -398,16 +423,28 @@ static int pvr_apple_power_on(struct pvr_device *pvr_dev)
 		if (remaining > 0)
 			msleep(DIV_ROUND_UP(remaining, USEC_PER_MSEC));
 	}
-	if (!apple->fw_ready)
-		return pvr_apple_boot(apple);
+	/* The driver core resumes a device before .remove(). Powering the
+	 * domain must not boot an idle firmware just to tear it down again.
+	 * The first job after resume starts it in pvr_apple_prepare_job().
+	 */
+	if (READ_ONCE(apple->stopping))
+		return -ENODEV;
+	return apple->fw_ready ? 0 : pvr_apple_boot(apple);
+}
+
+int pvr_apple_prepare_job(struct pvr_device *pvr_dev)
+{
+	struct pvr_apple *apple = to_apple(pvr_dev);
+	int err;
 
 	mutex_lock(&apple->submit_lock);
-	err = apple->booted ? 0 : pvr_apple_fw_restart(apple);
+	err = READ_ONCE(apple->stopping) ? -ENODEV :
+		apple->booted ? 0 : pvr_apple_fw_restart(apple);
 	mutex_unlock(&apple->submit_lock);
 	if (err)
 		dev_err(apple_dev(apple), "GPU did not start: %d\n", err);
-	else if (apple->devfreq)
-		devfreq_resume_device(apple->devfreq);
+	else if (READ_ONCE(apple->devfreq_suspended))
+		pvr_apple_devfreq_resume(apple);
 	return err;
 }
 
@@ -416,11 +453,13 @@ static int pvr_apple_power_off(struct pvr_device *pvr_dev)
 	struct pvr_apple *apple = to_apple(pvr_dev);
 	int err;
 
+	/* Terminal shutdown already stopped firmware; never wait on submitters. */
+	if (READ_ONCE(apple->stopping))
+		return 0;
 	if (!apple->fw_ready)
 		return 0;
 
-	if (apple->devfreq)
-		devfreq_suspend_device(apple->devfreq);
+	pvr_apple_devfreq_suspend(apple);
 	mutex_lock(&apple->submit_lock);
 	/*
 	 * Nothing holds a job reference, so this does not wait in practice.
@@ -433,8 +472,7 @@ static int pvr_apple_power_off(struct pvr_device *pvr_dev)
 	}
 	mutex_unlock(&apple->submit_lock);
 	if (err) {
-		if (apple->devfreq)
-			devfreq_resume_device(apple->devfreq);
+		pvr_apple_devfreq_resume(apple);
 		return -EBUSY;
 	}
 	/* the pollers run only while fences are pending; none are */
@@ -595,7 +633,7 @@ static u32 pvr_apple_engine_done(struct pvr_apple *apple, enum pvr_apple_engine 
 /* For a wait: what the firmware posted meanwhile is read first */
 static u32 pvr_apple_engine_poll(struct pvr_apple *apple, enum pvr_apple_engine engine)
 {
-	if (apple->chip->events)
+	if (!READ_ONCE(apple->stopping) && apple->chip->events)
 		apple->chip->events(apple);
 	return pvr_apple_engine_done(apple, engine);
 }
@@ -987,6 +1025,8 @@ static void pvr_apple_poll_work(struct work_struct *work)
 	bool pending = false;
 	int engine;
 
+	if (READ_ONCE(apple->stopping))
+		return;
 	if (apple->chip->events)
 		apple->chip->events(apple);
 	else
@@ -1027,7 +1067,7 @@ static void pvr_apple_poll_work(struct work_struct *work)
 	pvr_apple_jobs_retired(apple, retired);
 
 	/* The firmware sends no completion message in this setup: poll. */
-	if (pending)
+	if (pending && !READ_ONCE(apple->stopping))
 		hrtimer_start(&apple->poll_timer, us_to_ktime(max(pvr_apple_poll_us, 10U)),
 			      HRTIMER_MODE_REL);
 }
@@ -1036,7 +1076,8 @@ static enum hrtimer_restart pvr_apple_poll_timer(struct hrtimer *timer)
 {
 	struct pvr_apple *apple = container_of(timer, struct pvr_apple, poll_timer);
 
-	mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
+	if (!READ_ONCE(apple->stopping))
+		mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
 	return HRTIMER_NORESTART;
 }
 
@@ -1091,10 +1132,16 @@ static unsigned int pvr_apple_cancel_fences(struct pvr_apple *apple, int error)
 	unsigned int cancelled = 0;
 	int engine;
 
-	/* each rearms the other: the timer, the work, then a timer it started */
-	hrtimer_cancel(&apple->poll_timer);
-	cancel_delayed_work_sync(&apple->poll_work);
-	hrtimer_cancel(&apple->poll_timer);
+	if (READ_ONCE(apple->stopping)) {
+		/* Terminal: retain storage and never wait for blocked worker activity. */
+		hrtimer_try_to_cancel(&apple->poll_timer);
+		cancel_delayed_work(&apple->poll_work);
+	} else {
+		/* Each rearms the other. Normal teardown joins both pollers. */
+		hrtimer_cancel(&apple->poll_timer);
+		cancel_delayed_work_sync(&apple->poll_work);
+		hrtimer_cancel(&apple->poll_timer);
+	}
 	spin_lock_irq(&apple->fence_lock);
 	for (engine = 0; engine < APPLE_ENGINES; engine++) {
 		list_for_each_entry_safe(fence, tmp, &apple->pending[engine], node) {
@@ -1192,13 +1239,13 @@ void pvr_apple_quiesce(struct pvr_device *pvr_dev)
 	int err;
 
 	mutex_lock(&apple->submit_lock);
-	err = pvr_apple_wait_idle(apple, 5000000);
+	err = apple->booted ? pvr_apple_wait_idle(apple, 5000000) : 0;
 	mutex_unlock(&apple->submit_lock);
 
 	if (err) {
 		dev_err(apple_dev(apple), "GPU did not retire its jobs before removal\n");
 		pvr_apple_cancel_fences(apple, -ETIMEDOUT);
-	} else {
+	} else if (apple->booted) {
 		mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
 		flush_delayed_work(&apple->poll_work);
 	}
@@ -1572,6 +1619,8 @@ static int pvr_apple_fw_restart(struct pvr_apple *apple)
 	int err;
 
 	lockdep_assert_held(&apple->submit_lock);
+	if (READ_ONCE(apple->stopping))
+		return -ENODEV;
 	apple->chip->restore_image(apple);
 	err = pvr_apple_boot(apple);
 	if (!err)
@@ -1641,7 +1690,8 @@ int pvr_apple_reset(struct pvr_device *pvr_dev)
 		}
 		mutex_lock(&apple->submit_lock);
 	}
-	err = apple->booted ? 0 : pvr_apple_fw_restart(apple);
+	err = READ_ONCE(apple->stopping) ? -ENODEV :
+		apple->booted ? 0 : pvr_apple_fw_restart(apple);
 	mutex_unlock(&apple->submit_lock);
 	if (err)
 		dev_err(dev, "GPU reset failed: %d\n", err);
@@ -1677,8 +1727,7 @@ int pvr_apple_suspend(struct pvr_device *pvr_dev)
 	if (pm_runtime_status_suspended(dev))
 		return 0;
 
-	if (apple->devfreq)
-		devfreq_suspend_device(apple->devfreq);
+	pvr_apple_devfreq_suspend(apple);
 
 	mutex_lock(&apple->submit_lock);
 	err = pvr_apple_wait_idle(apple, 5000000);
@@ -1730,8 +1779,8 @@ int pvr_apple_resume(struct pvr_device *pvr_dev)
 	mutex_unlock(&apple->submit_lock);
 	if (err)
 		dev_err(apple_dev(apple), "GPU did not start after sleep: %d\n", err);
-	else if (apple->devfreq)
-		devfreq_resume_device(apple->devfreq);
+	else
+		pvr_apple_devfreq_resume(apple);
 	return err;
 }
 
@@ -1777,27 +1826,78 @@ struct pvr_gem_object *pvr_apple_pm_pages(struct pvr_device *pvr_dev, size_t siz
 	return obj;
 }
 
+/*
+ * Shutdown is terminal: wait at most one second for a submitter and at most
+ * one second total for all engines. Chip stop has bounded hardware/RTKit
+ * polls (A9: 200 ms; A10: 100 ms plus two 1 s ACKs). Never flush the job
+ * scheduler here: it may be waiting on a job that the GPU cannot finish.
+ */
+void pvr_apple_shutdown(struct pvr_device *pvr_dev)
+{
+	struct pvr_apple *apple = to_apple(pvr_dev);
+	struct device *dev = apple_dev(apple);
+	unsigned long deadline = jiffies + msecs_to_jiffies(1000);
+	int engine, err = 0;
+
+	WRITE_ONCE(apple->stopping, true);
+	while (!mutex_trylock(&apple->submit_lock)) {
+		if (time_after_eq(jiffies, deadline)) {
+			dev_err(dev, "shutdown: submitter did not stop within 1 s; continuing\n");
+			pvr_apple_cancel_fences(apple, -ESHUTDOWN);
+			return;
+		}
+		usleep_range(1000, 2000);
+	}
+	deadline = jiffies + msecs_to_jiffies(1000);
+	if (apple->booted) {
+		for (engine = 0; engine < APPLE_ENGINES && !err; engine++) {
+			unsigned int remaining;
+
+			if (time_after_eq(jiffies, deadline)) {
+				err = -ETIMEDOUT;
+				break;
+			}
+			remaining = jiffies_to_usecs(deadline - jiffies);
+			err = pvr_apple_wait_engine(apple, engine,
+						   pvr_apple_engine_last(apple, engine), remaining);
+		}
+		apple->chip->stop(apple, false);
+		apple->booted = false;
+		apple->chip->idle(apple);
+	}
+	mutex_unlock(&apple->submit_lock);
+	pvr_apple_cancel_fences(apple, -ESHUTDOWN);
+	if (err)
+		dev_warn(dev, "shutdown: GPU jobs timed out; firmware forced off\n");
+	/* No resume, including for a firmware that has never run. */
+	/* device_shutdown() pins runtime PM before invoking this callback. */
+	pm_runtime_put_noidle(dev);
+	err = __pm_runtime_suspend(dev, RPM_ASYNC | RPM_NOWAIT);
+	pm_runtime_get_noresume(dev);
+	if (err < 0)
+		dev_warn(dev, "shutdown: runtime suspend returned %d; continuing\n", err);
+	else
+		dev_info(dev, "shutdown: Apple GPU firmware stopped, runtime suspend requested\n");
+}
+
 void pvr_apple_fw_fini(struct pvr_device *pvr_dev)
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
 
+	/* Stop the DMA writer while every firmware page is still owned. */
+	mutex_lock(&apple->submit_lock);
+	pvr_apple_fw_stop(apple);
 	apple->fw_ready = false;
+	mutex_unlock(&apple->submit_lock);
+	hrtimer_cancel(&apple->poll_timer);
+	cancel_delayed_work_sync(&apple->poll_work);
 	pvr_apple_forget_scenes(apple);
-	if (apple->booted)
-		pvr_apple_switch_to_kernel_vm(apple, NULL);
 	pvr_apple_cancel_fences(apple, -ENODEV);
 	pvr_apple_gpu_pages_fini(apple);
 	if (apple->pm_pages) {
 		/* free lists still holding the pages keep their own references */
 		pvr_gem_object_put(apple->pm_pages);
 		apple->pm_pages = NULL;
-	}
-	if (apple->booted) {
-		apple->chip->stop(apple, false);
-		/* the firmware's messages until its stop queued completion checks */
-		cancel_delayed_work_sync(&apple->poll_work);
-		hrtimer_cancel(&apple->poll_timer);
-		apple->booted = false;
 	}
 	if (apple->chip->fini)
 		apple->chip->fini(apple);

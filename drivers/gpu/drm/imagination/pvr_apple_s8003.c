@@ -1003,12 +1003,15 @@ static void s8003_drain_work(struct work_struct *work)
 	bool alive = false;
 	int err;
 
+	if (READ_ONCE(s->apple->stopping))
+		return;
 	err = s8003_drain(s->apple, &alive);
 	if (err) {
 		dev_err(apple_dev(s->apple), "GFX firmware's rings are no longer read: %d\n", err);
 		return;
 	}
-	schedule_delayed_work(&s->drain_work, msecs_to_jiffies(S8003_DRAIN_MS));
+	if (!READ_ONCE(s->apple->stopping))
+		schedule_delayed_work(&s->drain_work, msecs_to_jiffies(S8003_DRAIN_MS));
 }
 
 static int s8003_wait_alive(struct pvr_apple *apple)
@@ -2606,7 +2609,10 @@ static void pvr_apple_s8003_stop(struct pvr_apple *apple, bool recover)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
 
-	cancel_delayed_work_sync(&s->drain_work);
+	if (READ_ONCE(apple->stopping))
+		cancel_delayed_work(&s->drain_work);
+	else
+		cancel_delayed_work_sync(&s->drain_work);
 	if (pm_runtime_status_suspended(apple_dev(apple)))
 		return;
 	s8003_core_off(apple);

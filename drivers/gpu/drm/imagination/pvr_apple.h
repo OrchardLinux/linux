@@ -182,7 +182,9 @@ void pvr_apple_job_armed(struct pvr_job *job, struct dma_fence *finished);
 int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx);
 void pvr_apple_mmu_flush(struct pvr_device *pvr_dev);
 void pvr_apple_vm_fini(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx);
+int pvr_apple_prepare_job(struct pvr_device *pvr_dev);
 void pvr_apple_quiesce(struct pvr_device *pvr_dev);
+void pvr_apple_shutdown(struct pvr_device *pvr_dev);
 const struct pvr_stream_cmd_defs *pvr_apple_cmd_stream(struct pvr_device *pvr_dev,
 						       enum drm_pvr_job_type type);
 
@@ -228,6 +230,7 @@ static inline int pvr_apple_job_add_deps(struct pvr_job *job) { return 0; }
 static inline void pvr_apple_job_armed(struct pvr_job *job, struct dma_fence *finished) {}
 static inline void pvr_apple_mmu_flush(struct pvr_device *pvr_dev) {}
 static inline void pvr_apple_quiesce(struct pvr_device *pvr_dev) {}
+static inline void pvr_apple_shutdown(struct pvr_device *pvr_dev) {}
 static inline void pvr_apple_wait_file_jobs(struct pvr_device *pvr_dev) {}
 static inline void pvr_apple_report_hang(struct pvr_device *pvr_dev, struct dma_fence *fence) {}
 static inline void pvr_apple_vm_fini(struct pvr_device *pvr_dev,

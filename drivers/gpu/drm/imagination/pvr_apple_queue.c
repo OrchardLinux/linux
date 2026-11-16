@@ -54,7 +54,8 @@ static struct dma_fence *pvr_apple_run_job(struct drm_sched_job *sched_job)
 	err = pvr_power_get(job->pvr_dev);
 	if (err)
 		return ERR_PTR(err);
-	fence = pvr_apple_submit(job);
+	err = pvr_apple_prepare_job(job->pvr_dev);
+	fence = err ? ERR_PTR(err) : pvr_apple_submit(job);
 	if (IS_ERR(fence))
 		pvr_power_put(job->pvr_dev);
 	else

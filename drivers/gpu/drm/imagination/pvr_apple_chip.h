@@ -87,6 +87,7 @@ struct pvr_apple {
 	size_t fw_size;
 	void *heap;		/* memory shared with the firmware: rings, stamps, commands */
 	struct pvr_apple_layout layout;
+	bool stopping;		/* terminal shutdown forbids firmware restart */
 	bool booted;
 	bool fault_reported;		/* once per firmware boot */
 	bool fw_ready;		/* init data handed over once: runtime PM restarts it */
@@ -138,6 +139,8 @@ struct pvr_apple {
 	u32 perf_state;
 	u32 perf_state_max;
 	struct devfreq *devfreq;
+	struct mutex devfreq_lock;	/* serializes our devfreq suspend reference */
+	bool devfreq_suspended;
 	ktime_t busy_since;
 	u64 busy_ns;
 	ktime_t stat_since;

@@ -292,7 +292,9 @@ static void pvr_apple_t8010_stop(struct pvr_apple *apple, bool recover)
 	struct pvr_apple_t8010 *t = apple->chip_data;
 
 	pvr_apple_request_power_state(apple, 0);
-	if (apple_rtkit_shutdown(t->rtk) && recover)
+	if (READ_ONCE(apple->stopping))
+		apple_rtkit_shutdown_terminal(t->rtk);
+	else if (apple_rtkit_shutdown(t->rtk) && recover)
 		apple_rtkit_reinit(t->rtk);
 	writel(readl(apple->fender + FENDER_RUN) & ~FENDER_RUN_ENABLE,
 	       apple->fender + FENDER_RUN);
@@ -303,7 +305,10 @@ static void pvr_apple_t8010_idle(struct pvr_apple *apple)
 	struct pvr_apple_t8010 *t = apple->chip_data;
 
 	/* its mailbox would keep the GPU's power domain on */
-	t->rtk_idle = !apple_rtkit_mbox_stop(t->rtk);
+	if (READ_ONCE(apple->stopping))
+		t->rtk_idle = true;
+	else
+		t->rtk_idle = !apple_rtkit_mbox_stop(t->rtk);
 }
 
 static void pvr_apple_t8010_restore_image(struct pvr_apple *apple)

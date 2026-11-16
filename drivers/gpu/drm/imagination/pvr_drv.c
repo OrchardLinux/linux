@@ -1500,6 +1500,17 @@ static void pvr_remove(struct platform_device *plat_dev)
 	pvr_power_domains_fini(pvr_dev);
 }
 
+static void pvr_shutdown(struct platform_device *plat_dev)
+{
+	struct drm_device *drm_dev = platform_get_drvdata(plat_dev);
+	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
+
+	if (!pvr_device_is_apple(pvr_dev))
+		return;
+	/* Unplug waits for ioctl SRCU readers, including wedged submitters. */
+	pvr_apple_shutdown(pvr_dev);
+}
+
 static const struct pvr_device_data pvr_device_data_manual = {
 	.pwr_ops = &pvr_power_sequence_ops_manual,
 };
@@ -1588,6 +1599,7 @@ static const struct dev_pm_ops pvr_pm_ops = {
 static struct platform_driver pvr_driver = {
 	.probe = pvr_probe,
 	.remove = pvr_remove,
+	.shutdown = pvr_shutdown,
 	.driver = {
 		.name = PVR_DRIVER_NAME,
 		.pm = &pvr_pm_ops,
