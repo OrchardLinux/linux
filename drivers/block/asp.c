@@ -446,6 +446,7 @@ static blk_status_t asp_setup_rw(struct asp_queue *qd, struct request *req,
 
 out_free_sg:
 	mempool_free(iod->sg, asp->iod_mempool);
+	iod->sg = NULL;
 	return BLK_STS_RESOURCE;
 }
 
@@ -471,6 +472,17 @@ static blk_status_t asp_setup_cmd(struct asp_queue *qd, struct request *req)
 	struct asp_iod *iod = blk_mq_rq_to_pdu(req);
 	struct asp_cmd_hdr *cmd = &iod->cmd;
 
+	/*
+	 * The request PDU is reused across requests of the same tag: only an
+	 * admin request (REQ_OP_DRV_IN) arrives with its command and buffer
+	 * set up, nothing else may see a previous request's buffer or
+	 * scatterlist.
+	 */
+	iod->sg = NULL;
+	if (req_op(req) != REQ_OP_DRV_IN) {
+		iod->buffer = NULL;
+		iod->buf_len = 0;
+	}
 	cmd->tag = req->tag;
 
 	/*
@@ -652,6 +664,7 @@ static blk_status_t asp_submit_sync_admin_cmd(struct request_queue *q,
 
 	iod = blk_mq_rq_to_pdu(req);
 
+	memset(iod, 0, sizeof(*iod));
 	memcpy(&iod->cmd, cmd, ASP_CMD_HDR_SIZE);
 	iod->buffer = buffer;
 	iod->buf_len = buf_len;
@@ -713,6 +726,7 @@ static void apple_asp_complete_rq(struct request *rq)
 	if (iod->sg) {
 		dma_unmap_sg(asp->dev, iod->sg, iod->nents, rq_dma_dir(rq));
 		mempool_free(iod->sg, asp->iod_mempool);
+		iod->sg = NULL;
 	}
 
 	switch (iod->status) {
@@ -767,7 +781,7 @@ static const struct block_device_operations asp_fops = {
 static int apple_asp_start_disk(struct apple_asp *asp)
 {
 	int ret;
-	int disk_added;
+	int disk_added = ASP_QUEUE_TYPE_USERAREA - 1;
 	blk_status_t status;
 	struct asp_cmd_hdr *cmd;
 	struct asp_identify *identify;
@@ -788,7 +802,7 @@ static int apple_asp_start_disk(struct apple_asp *asp)
 	asp->tagset.ops = &apple_asp_queue_ops;
 	asp->tagset.nr_hw_queues = 1;
 	asp->tagset.queue_depth = ASP_NUM_TAGS;
-	asp->tagset.timeout = ASP_TIMEOUT_MS;
+	asp->tagset.timeout = msecs_to_jiffies(ASP_TIMEOUT_MS);
 	asp->tagset.numa_node = NUMA_NO_NODE;
 	asp->tagset.cmd_size = sizeof(struct asp_iod);
 	asp->tagset.driver_data = asp;
@@ -816,13 +830,13 @@ static int apple_asp_start_disk(struct apple_asp *asp)
 	// identify
 	// one queue for each namespace
 	cmd = kmalloc_obj(struct asp_cmd_hdr);
-	if (IS_ERR(cmd)) {
+	if (!cmd) {
 		ret = -ENOMEM;
 		goto out_free_admin_rq;
 	}
 
 	identify = kmalloc_obj(struct asp_identify);
-	if (IS_ERR(identify)) {
+	if (!identify) {
 		ret = -ENOMEM;
 		goto out_free_cmd;
 	}
@@ -887,8 +901,9 @@ static int apple_asp_start_disk(struct apple_asp *asp)
 							&asp->q_data[i]);
 		disk = asp->q_data[i].disk;
 
-		if (!disk) {
-			ret = -ENOMEM;
+		if (IS_ERR(disk)) {
+			ret = PTR_ERR(disk);
+			asp->q_data[i].disk = NULL;
 			goto out_free_disk;
 		}
 		snprintf(disk->disk_name, sizeof(disk->disk_name), "asp%dn%d",
