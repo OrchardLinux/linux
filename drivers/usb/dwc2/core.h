@@ -1455,6 +1455,8 @@ int dwc2_gadget_exit_hibernation(struct dwc2_hsotg *hsotg,
 int dwc2_gadget_enter_partial_power_down(struct dwc2_hsotg *hsotg);
 int dwc2_gadget_exit_partial_power_down(struct dwc2_hsotg *hsotg,
 					bool restore);
+bool dwc2_gadget_ungate_clock(struct dwc2_hsotg *hsotg);
+void dwc2_gadget_leave_gating(struct dwc2_hsotg *hsotg, const char *where);
 void dwc2_gadget_enter_clock_gating(struct dwc2_hsotg *hsotg);
 void dwc2_gadget_exit_clock_gating(struct dwc2_hsotg *hsotg,
 				   int rem_wakeup);
@@ -1502,6 +1504,8 @@ static inline int dwc2_gadget_enter_partial_power_down(struct dwc2_hsotg *hsotg)
 static inline int dwc2_gadget_exit_partial_power_down(struct dwc2_hsotg *hsotg,
 						      bool restore)
 { return 0; }
+static inline bool dwc2_gadget_ungate_clock(struct dwc2_hsotg *hsotg) { return false; }
+static inline void dwc2_gadget_leave_gating(struct dwc2_hsotg *hsotg, const char *where) {}
 static inline void dwc2_gadget_enter_clock_gating(struct dwc2_hsotg *hsotg) {}
 static inline void dwc2_gadget_exit_clock_gating(struct dwc2_hsotg *hsotg,
 						 int rem_wakeup) {}

@@ -317,13 +317,9 @@ static void dwc2_handle_session_req_intr(struct dwc2_hsotg *hsotg)
 					dev_err(hsotg->dev,
 						"exit power_down failed\n");
 			}
-
-			/* Exit gadget mode clock gating. */
-			if (hsotg->params.power_down ==
-			    DWC2_POWER_DOWN_PARAM_NONE && hsotg->bus_suspended &&
-			    !hsotg->params.no_clock_gating)
-				dwc2_gadget_exit_clock_gating(hsotg, 0);
 		}
+
+		dwc2_gadget_leave_gating(hsotg, "session request");
 
 		/*
 		 * Report disconnect if there is any previous session
@@ -456,6 +452,7 @@ static void dwc2_handle_wakeup_detected_intr(struct dwc2_hsotg *hsotg)
 			    !hsotg->params.no_clock_gating)
 				dwc2_gadget_exit_clock_gating(hsotg, 0);
 		} else {
+			dwc2_gadget_leave_gating(hsotg, "resume");
 			/* Change to L0 state */
 			hsotg->lx_state = DWC2_L0;
 		}

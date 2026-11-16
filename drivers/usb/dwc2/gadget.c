@@ -3333,6 +3333,8 @@ void dwc2_hsotg_disconnect(struct dwc2_hsotg *hsotg)
 
 	if (!hsotg->connected)
 		return;
+	if (dwc2_gadget_ungate_clock(hsotg))
+		hsotg->bus_suspended = false;
 
 	hsotg->connected = 0;
 	hsotg->test_mode = 0;
@@ -3773,10 +3775,8 @@ irq_retry:
 		 * A reset of a suspended bus: no resume came first, so a core
 		 * that entered clock gating on the suspend is still gated.
 		 */
-		if (lx == DWC2_L2 && !hsotg->in_ppd &&
-		    hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE &&
-		    hsotg->bus_suspended && !hsotg->params.no_clock_gating)
-			dwc2_gadget_exit_clock_gating(hsotg, 0);
+		if (!hsotg->in_ppd)
+			dwc2_gadget_leave_gating(hsotg, "USB reset");
 
 		/* Report disconnection if it is not already done. */
 		dwc2_hsotg_disconnect(hsotg);
@@ -3959,6 +3959,8 @@ static void dwc2_hsotg_ep_stop_xfr(struct dwc2_hsotg *hsotg,
 {
 	u32 epctrl_reg;
 	u32 epint_reg;
+	bool regate = dwc2_gadget_ungate_clock(hsotg) &&
+		hsotg->lx_state == DWC2_L2 && hsotg->bus_suspended;
 
 	epctrl_reg = hs_ep->dir_in ? DIEPCTL(hs_ep->index) :
 		DOEPCTL(hs_ep->index);
@@ -4045,6 +4047,8 @@ static void dwc2_hsotg_ep_stop_xfr(struct dwc2_hsotg *hsotg,
 		/* Remove global NAKs */
 		dwc2_set_bit(hsotg, DCTL, DCTL_CGOUTNAK);
 	}
+	if (regate)
+		dwc2_gadget_enter_clock_gating(hsotg);
 }
 
 /**
@@ -4649,12 +4653,9 @@ static int dwc2_hsotg_udc_stop(struct usb_gadget *gadget)
 		return -ENODEV;
 
 	/* Exit clock gating when driver is stopped. */
-	if (hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE &&
-	    hsotg->bus_suspended && !hsotg->params.no_clock_gating) {
-		spin_lock_irqsave(&hsotg->lock, flags);
-		dwc2_gadget_exit_clock_gating(hsotg, 0);
-		spin_unlock_irqrestore(&hsotg->lock, flags);
-	}
+	spin_lock_irqsave(&hsotg->lock, flags);
+	dwc2_gadget_leave_gating(hsotg, "udc stop");
+	spin_unlock_irqrestore(&hsotg->lock, flags);
 
 	/* all endpoints should be shutdown */
 	for (ep = 1; ep < hsotg->num_of_eps; ep++) {
@@ -4736,6 +4737,8 @@ static int dwc2_hsotg_pullup(struct usb_gadget *gadget, int is_on)
 	}
 
 	spin_lock_irqsave(&hsotg->lock, flags);
+	if (dwc2_gadget_ungate_clock(hsotg))
+		hsotg->bus_suspended = false;
 	if (hsotg->in_ppd) {
 		ret = dwc2_exit_partial_power_down(hsotg, 0, true);
 		if (ret) {
@@ -4771,6 +4774,8 @@ static int dwc2_hsotg_vbus_session(struct usb_gadget *gadget, int is_active)
 
 	dev_dbg(hsotg->dev, "%s: is_active: %d\n", __func__, is_active);
 	spin_lock_irqsave(&hsotg->lock, flags);
+	if (dwc2_gadget_ungate_clock(hsotg))
+		hsotg->bus_suspended = false;
 
 	/*
 	 * If controller is in partial power down state, it must exit from
@@ -5842,6 +5847,50 @@ void dwc2_gadget_enter_clock_gating(struct dwc2_hsotg *hsotg)
 }
 
 /*
+ * Clear PCGCTL.GATEHCLK/STOPPCLK regardless of software link state. No
+ * callbacks or state changes: teardown/reset callers must not resume gadget
+ * functions just before disconnecting them. Caller holds hsotg->lock.
+ */
+bool dwc2_gadget_ungate_clock(struct dwc2_hsotg *hsotg)
+{
+	u32 pcgctl;
+
+	if (hsotg->params.power_down != DWC2_POWER_DOWN_PARAM_NONE ||
+	    hsotg->in_ppd || hsotg->hibernated)
+		return false;
+	pcgctl = dwc2_readl(hsotg, PCGCTL);
+	if (!(pcgctl & (PCGCTL_GATEHCLK | PCGCTL_STOPPCLK)))
+		return false;
+	if (pcgctl & PCGCTL_GATEHCLK) {
+		pcgctl &= ~PCGCTL_GATEHCLK;
+		dwc2_writel(hsotg, pcgctl, PCGCTL);
+		udelay(5);
+	}
+	pcgctl &= ~PCGCTL_STOPPCLK;
+	dwc2_writel(hsotg, pcgctl, PCGCTL);
+	udelay(5);
+	return true;
+}
+
+/* Leave clock gating however the core got there. Caller holds hsotg->lock. */
+void dwc2_gadget_leave_gating(struct dwc2_hsotg *hsotg, const char *where)
+{
+	enum dwc2_lx_state lx = hsotg->lx_state;
+
+	if (lx == DWC2_L2 && hsotg->bus_suspended &&
+	    hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE &&
+	    !hsotg->params.no_clock_gating) {
+		dwc2_gadget_exit_clock_gating(hsotg, 0);
+		return;
+	}
+	if (dwc2_gadget_ungate_clock(hsotg)) {
+		hsotg->bus_suspended = false;
+		dev_info_ratelimited(hsotg->dev,
+				     "%s: PHY clock was gated in L%d: ungated\n", where, lx);
+	}
+}
+
+/*
  * dwc2_gadget_exit_clock_gating() - Exit controller from device clock gating.
  *
  * @hsotg: Programming view of the DWC_otg controller
@@ -5851,22 +5900,11 @@ void dwc2_gadget_enter_clock_gating(struct dwc2_hsotg *hsotg)
  */
 void dwc2_gadget_exit_clock_gating(struct dwc2_hsotg *hsotg, int rem_wakeup)
 {
-	u32 pcgctl;
 	u32 dctl;
 
 	dev_dbg(hsotg->dev, "Exiting device clock gating.\n");
 
-	/* Clear the Gate hclk. */
-	pcgctl = dwc2_readl(hsotg, PCGCTL);
-	pcgctl &= ~PCGCTL_GATEHCLK;
-	dwc2_writel(hsotg, pcgctl, PCGCTL);
-	udelay(5);
-
-	/* Phy Clock bit. */
-	pcgctl = dwc2_readl(hsotg, PCGCTL);
-	pcgctl &= ~PCGCTL_STOPPCLK;
-	dwc2_writel(hsotg, pcgctl, PCGCTL);
-	udelay(5);
+	dwc2_gadget_ungate_clock(hsotg);
 
 	if (rem_wakeup) {
 		/* Set Remote Wakeup Signaling */
