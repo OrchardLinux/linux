@@ -1457,6 +1457,19 @@ out:
 	return res;
 }
 
+/*
+ * A master that the boot loader left reading memory through this DART in
+ * bypass, such as a display pipe scanning out its boot framebuffer, keeps
+ * bypass until its driver has mapped those live addresses into the default
+ * domain and calls iommu_deferred_attach(). Translation then never starts
+ * under a fetch of an unmapped address.
+ */
+static bool apple_dart_is_attach_deferred(struct device *dev)
+{
+	return of_property_read_bool(dev->of_node,
+				     "apple,dart-deferred-attach");
+}
+
 static int apple_dart_def_domain_type(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
@@ -1503,6 +1516,7 @@ static const struct iommu_ops apple_dart_iommu_ops = {
 	.device_group = apple_dart_device_group,
 	.of_xlate = apple_dart_of_xlate,
 	.def_domain_type = apple_dart_def_domain_type,
+	.is_attach_deferred = apple_dart_is_attach_deferred,
 	.get_resv_regions = apple_dart_get_resv_regions,
 	.owner = THIS_MODULE,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
