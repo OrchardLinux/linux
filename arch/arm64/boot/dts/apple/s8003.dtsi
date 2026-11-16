@@ -94,6 +94,44 @@
 			     <AIC_IRQ 146 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_disp0>, <&ps_dp>;
 		status = "disabled";
+
+		/*
+		 * The pipe's reads as a DMA master behind dart-disp0: every
+		 * stream of its DART. Used for verified translated
+		 * scanout; it then enables the DART below and
+		 * creates this device itself, after mapping the live boot
+		 * framebuffer, so translation never starts under an unmapped
+		 * fetch.
+		 */
+		scanout {
+			iommus = <&disp0_dart 0>, <&disp0_dart 1>,
+				 <&disp0_dart 2>, <&disp0_dart 3>;
+			apple,dart-deferred-attach;
+		};
+	};
+
+	/*
+	 * ADT dart-disp0: the DART and its SMMU front end. iOS enables
+	 * each stream in both windows; only the DART owns tables and TLB
+	 * commands. The pipe maps dart1 without requesting it, so this
+	 * node owns the SMMU resource. Disabled until the display driver prepares
+	 * its live mapping and verifies translated scanout.
+	 */
+	disp0_dart: iommu@206304000 {
+		compatible = "apple,s8000-dart", "apple,s5l8960x-dart";
+		reg = <0x2 0x06304000 0x0 0x4000>,
+		      <0x2 0x06300000 0x0 0x4000>;
+		reg-names = "dart", "smmu";
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 141 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 142 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "dart", "smmu";
+		power-domains = <&ps_disp0>;
+		apple,error-reflector = /bits/ 64 <0x20fffc000>;
+		apple,fetch-config = <0x000e0303>;
+		apple,diag-config = <0x00000100>;
+		status = "disabled";
 	};
 
 	/* ADT tempsensor,s8000 (AppleT700XTempSensor): SOC and TCC blocks */
