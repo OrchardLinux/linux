@@ -1787,9 +1787,11 @@ pvr_page_table_l1_get_or_insert(struct pvr_mmu_op_context *op_ctx,
  *  * 0 on success,
  *
  *    If @should_insert is %false:
- *     * -%ENXIO if a level 0 page table would have been inserted.
+ *     * -%ENXIO if a level 0 page table would have been inserted, or if
+ *       there is no level 1 page table to look in.
  *
  *    If @should_insert is %true:
+ *     * -%EINVAL if there is no level 1 page table to insert into, or
  *     * Any error encountered while inserting the level 0 page table.
  */
 static int
@@ -1797,6 +1799,18 @@ pvr_page_table_l0_get_or_insert(struct pvr_mmu_op_context *op_ctx,
 				bool should_insert)
 {
 	struct pvr_page_table_l0 *table;
+
+	/*
+	 * A walk that does not create tables can reach a level 0 boundary with
+	 * no level 1 table: the level 1 table was absent when it was loaded,
+	 * or removing its last entry earlier in the same walk freed it. There
+	 * is then no level 0 table either.
+	 */
+	if (!op_ctx->curr_page.l1_table) {
+		if (WARN_ON_ONCE(should_insert))
+			return -EINVAL;
+		return -ENXIO;
+	}
 
 	if (pvr_page_table_l1_entry_is_valid(op_ctx->curr_page.l1_table,
 					     op_ctx->curr_page.l1_idx)) {
