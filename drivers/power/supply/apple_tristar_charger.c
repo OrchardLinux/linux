@@ -999,7 +999,7 @@ static void tristar_poll(struct work_struct *work)
 	struct tristar_charger *chg = container_of(to_delayed_work(work),
 						   struct tristar_charger, poll_work);
 	unsigned int status, old_code;
-	bool old_online;
+	bool old_online, old_present, old_usb_on;
 	u64 now = ktime_get_ns(), line_ns;
 
 	mutex_lock(&chg->lock);
@@ -1007,6 +1007,8 @@ static void tristar_poll(struct work_struct *work)
 		goto out;
 	old_code = chg->code;
 	old_online = chg->online;
+	old_present = chg->present;
+	old_usb_on = chg->usb_on;
 	if (regmap_read(chg->regmap, chg->status_base + TRISTAR_CHG_STATUS, &status)) {
 		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
 		dev_err_ratelimited(chg->dev, "PMIC status unreadable; holding the fallback\n");
@@ -1094,7 +1096,8 @@ again:
 	tristar_accessory_report(chg->acc, chg->usb_ma, chg->phase == TRISTAR_FAULT);
 	mod_delayed_work(chg->wq, &chg->poll_work,
 			 msecs_to_jiffies(TRISTAR_POLL_MS));
-	if (chg->code != old_code || chg->online != old_online)
+	if (chg->code != old_code || chg->online != old_online ||
+	    chg->present != old_present || chg->usb_on != old_usb_on)
 		power_supply_changed(chg->psy);
 out:
 	mutex_unlock(&chg->lock);
@@ -1151,6 +1154,8 @@ static void tristar_source_event(struct tristar_charger *chg)
 
 	tristar_event_withdraw(chg);
 	WRITE_ONCE(chg->epoch, chg->epoch + 1);
+	/* The USB session may continue: ask its controller for a fresh report. */
+	power_supply_changed(chg->psy);
 	mod_delayed_work(chg->wq, &chg->poll_work, 0);
 
 	now = ktime_get_ns();
@@ -1193,6 +1198,7 @@ static irqreturn_t tristar_adc_irq(int irq, void *data)
 		complete(&chg->adc_done);
 	} else {
 		/* Nobody started that conversion. */
+		dev_dbg(chg->dev, "unsolicited ADC completion: source event\n");
 		tristar_source_event(chg);
 	}
 	return IRQ_HANDLED;
