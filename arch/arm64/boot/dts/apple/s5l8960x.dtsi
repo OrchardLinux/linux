@@ -26,6 +26,13 @@
 		clock-output-names = "clkref";
 	};
 
+	spi2_clk: clock-spi2 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <60000000>;
+		clock-output-names = "spi2";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -77,6 +84,43 @@
 			#performance-domain-cells = <0>;
 		};
 
+		ans: block@208040000 {
+			compatible = "apple,s5l8960x-ans";
+			reg = <0x2 0x08040000 0x0 0x1000>;
+			mboxes = <&ans_mbox>;
+			power-domains = <&ps_ans>;
+			resets = <&ps_ans>;
+			status = "disabled";
+		};
+
+		ans_mbox: mbox@208041000 {
+			compatible = "apple,s5l8960x-akf-mailbox-v1", "apple,akf-mailbox-v1";
+			reg = <0x2 0x08041000 0x0 0x1000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 52 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 53 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 54 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 55 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_ans>;
+		};
+
+		spi2: spi@20a088000 {
+			compatible = "apple,s5l8960x-spi";
+			reg = <0x2 0x0a088000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 138 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&spi2_clk>;
+			pinctrl-0 = <&spi2_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@20a0a0000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x0a0a0000 0x0 0x4000>;
@@ -87,6 +131,19 @@
 			clocks = <&clkref>, <&clkref>;
 			clock-names = "uart", "clk_uart_baud0";
 			power-domains = <&ps_uart0>;
+			status = "disabled";
+		};
+
+		serial5: serial@20a0b4000 {
+			compatible = "apple,s5l-uart";
+			reg = <0x2 0x0a0b4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 145 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart5>;
 			status = "disabled";
 		};
 
@@ -143,6 +200,16 @@
 			power-domains = <&ps_i2c3>;
 			#address-cells = <1>;
 			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		touchclk: clock-controller@20a118000 {
+			compatible = "apple,s5l8960x-touch-clock";
+			reg = <0x2 0x0a118000 0x0 0x4000>;
+			clocks = <&clkref>;
+			power-domains = <&ps_pwm0>;
+			#clock-cells = <0>;
+			clock-frequency = <32768>;
 			status = "disabled";
 		};
 
@@ -278,6 +345,13 @@
 			i2c3_pins: i2c3-pins {
 				pinmux = <APPLE_PINMUX(172, 1)>,
 					 <APPLE_PINMUX(171, 1)>;
+			};
+
+			spi2_pins: spi2-pins {
+				pinmux = <APPLE_PINMUX(76, 1)>,
+					 <APPLE_PINMUX(77, 1)>,
+					 <APPLE_PINMUX(78, 1)>,
+					 <APPLE_PINMUX(79, 1)>;
 			};
 		};
 	};
