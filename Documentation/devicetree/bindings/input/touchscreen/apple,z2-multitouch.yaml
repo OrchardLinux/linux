@@ -19,6 +19,7 @@ properties:
       - apple,j493-touchbar
       - apple,j71b-touchscreen
       - apple,j71t-touchscreen
+      - apple,j72-touchscreen
       - apple,j81-touchscreen
       - apple,j96-touchscreen
       - apple,j172-touchscreen
@@ -47,7 +48,8 @@ properties:
   ana-supply:
     description:
       Analog supply for the touchscreen controller, where a PMIC switch
-      rather than a GPIO provides it
+      rather than a GPIO provides it. On N61 this is the Chestnut
+      high-voltage switch
 
   hv-supply:
     description: High-voltage analog supply for the touchscreen controller
@@ -67,9 +69,6 @@ properties:
 
   clocks:
     maxItems: 1
-
-  ana-supply:
-    description: N61 analog touchscreen supply from the Chestnut high-voltage switch
 
   apple,z2-prox-cal-blob:
     $ref: /schemas/types.yaml#/definitions/uint8-array
@@ -204,9 +203,61 @@ allOf:
         - clocks
         - ana-supply
         - power-ldo-gpios
+  - if:
+      properties:
+        compatible:
+          const: apple,j72-touchscreen
+    then:
+      properties:
+        pinctrl-names:
+          items:
+            - const: display-sync-active
+            - const: display-sync-inactive
+        power-ana-gpios: false
+        power-ldo-gpios: false
+        display-sync-gpios: false
+        display-sync1-gpios: false
+        hv-supply: false
+        spi-cpha: false
+        spi-cpol: false
+        apple,z2-bpw16-min-len: false
+        apple,z2-no-init-ack: false
+      required:
+        - clocks
+        - ana-supply
+        - core-supply
+        - attn-gpios
+        - pinctrl-0
+        - pinctrl-1
+        - pinctrl-names
+  - if:
+      properties:
+        compatible:
+          enum:
+            - apple,j71t-touchscreen
+            - apple,j72-touchscreen
+            - apple,j81-touchscreen
+            - apple,j96-touchscreen
+            - apple,n61-touchscreen
+    then:
+      properties:
+        ana-supply: true
     else:
       properties:
         ana-supply: false
+  - if:
+      properties:
+        compatible:
+          enum:
+            - apple,j71t-touchscreen
+            - apple,j72-touchscreen
+            - apple,j81-touchscreen
+            - apple,j96-touchscreen
+    then:
+      properties:
+        attn-gpios: true
+    else:
+      properties:
         attn-gpios: false
   - if:
       properties:
