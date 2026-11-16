@@ -12,10 +12,11 @@
  * and the Tristar's data and accessory-power routes. When the adapter is
  * unplugged, the port returns to the USB device controller.
  *
- * A charger on the adapter's power port is not identified: the Tristar mux
- * cannot be sampled while the port is a host, and the state bytes of the
- * power handshake are not decoded. While the adapter is ours, the input
- * limit is therefore 500 mA, as for any unidentified source.
+ * The powered camera adapter supplies input power while the iPad hosts
+ * its hub. After its power handshake, use the 2.1 A profile validated on
+ * this adapter with iOS and Linux. Before a successful handshake, keep
+ * the unidentified-source fallback. The charger still applies its board
+ * maximum and battery guards; no USB data-line sampling is needed here.
  *
  * Every 250 ms the policy reads the Tristar status (0x0c: bits 0-1 VBUS,
  * bit 6 orientation, bit 7 an attached plug). With a plug attached it asks
@@ -105,7 +106,8 @@ struct tristar_auto_cfg {
 	unsigned int owned_replug_polls; /* bit 7 clear this long, then back: a replug */
 	unsigned int handshake_tries;
 	unsigned int handshake_wait_ms;	/* host-on deadline for strict VBUS */
-	int input_ua;			/* host role: the source is not identified */
+	int input_ua;			/* host role, after a good power handshake */
+	int floor_ua;			/* host role, no power handshake */
 };
 
 static const struct tristar_auto_cfg tristar_auto_cfg = {
@@ -118,7 +120,8 @@ static const struct tristar_auto_cfg tristar_auto_cfg = {
 	.owned_replug_polls = 2,
 	.handshake_tries = 2,
 	.handshake_wait_ms = 15000,
-	.input_ua = 500000,
+	.input_ua = 2100000,
+	.floor_ua = 500000,
 };
 
 struct tristar_auto {
@@ -132,6 +135,7 @@ struct tristar_auto {
 	bool adapter;			/* id selects host mode */
 	unsigned int ph_tries;
 	unsigned long ph_deadline;
+	bool ph_ok;
 };
 
 struct tristar_auto_in {
@@ -261,6 +265,7 @@ static void tristar_auto_forget(struct tristar_auto *ta)
 {
 	ta->id_valid = false;
 	ta->adapter = false;
+	ta->ph_ok = false;
 	ta->ph_tries = 0;
 }
 
@@ -395,6 +400,7 @@ tristar_auto_probed(struct tristar_auto *ta, const struct tristar_auto_cfg *cfg,
 			return TRISTAR_AUTO_NONE;
 		/* A fast swap to another accessory, e.g. a computer's cable. */
 		ta->adapter = false;
+		ta->ph_ok = false;
 		ta->phase = TRISTAR_AUTO_OTHER;
 		ta->next_probe = now + cfg->probe_ms;
 		return TRISTAR_AUTO_TO_DEVICE;
@@ -405,6 +411,7 @@ tristar_auto_probed(struct tristar_auto *ta, const struct tristar_auto_cfg *cfg,
 		return TRISTAR_AUTO_NONE;
 	}
 	ta->phase = TRISTAR_AUTO_ENTER;
+	ta->ph_ok = false;
 	ta->ph_tries = 0;
 	return TRISTAR_AUTO_TO_HOST;
 }
@@ -412,7 +419,7 @@ tristar_auto_probed(struct tristar_auto *ta, const struct tristar_auto_cfg *cfg,
 /*
  * Power handshake finished. Host is already on: iOS enumerates the hub
  * before its handshake completes. After the last try, keep the port in host
- * mode.
+ * mode at the fallback input budget.
  */
 static void tristar_auto_handshake_done(struct tristar_auto *ta,
 					const struct tristar_auto_cfg *cfg, int ret)
@@ -420,6 +427,7 @@ static void tristar_auto_handshake_done(struct tristar_auto *ta,
 	if (ta->phase != TRISTAR_AUTO_HANDSHAKE)
 		return;
 	ta->ph_tries++;
+	ta->ph_ok = !ret;
 	if (ret && ta->ph_tries < cfg->handshake_tries)
 		return;
 	ta->phase = TRISTAR_AUTO_HOST;
@@ -442,8 +450,9 @@ static void tristar_auto_host_done(struct tristar_auto *ta,
 }
 
 /*
- * Input power while the adapter is ours: an unidentified source behind the
- * adapter. Returns false when the ordinary device-mode rules apply.
+ * Input power while the adapter is ours: use its validated 2.1 A profile
+ * only after a successful power handshake and with strict VBUS present.
+ * Returns false when the ordinary device-mode rules apply.
  */
 static bool tristar_auto_supply(const struct tristar_auto *ta,
 				const struct tristar_auto_cfg *cfg, int status,
@@ -457,7 +466,7 @@ static bool tristar_auto_supply(const struct tristar_auto *ta,
 	    ta->phase != TRISTAR_AUTO_HOST)
 		return false;
 	online = status >= 0 && (status & TRISTAR_AUTO_VBUS) == TRISTAR_AUTO_VBUS;
-	*current_ua = online ? cfg->input_ua : 0;
+	*current_ua = !online ? 0 : ta->ph_ok ? cfg->input_ua : cfg->floor_ua;
 	return true;
 }
 
