@@ -39,6 +39,7 @@ struct pvr_stream_cmd_defs;
  * the GPU's OPP table, the state number as opp-level; without one the GPU
  * runs in the chip's perf_state_max.
  */
+#define FENDER_CTRL			0x0000
 #define FENDER_POWER_STATE		0x1000
 #define FENDER_POWER_STATE_MASK		0x1f
 #define FENDER_POWER_REQUEST		0x10	/* | target state */
@@ -85,6 +86,7 @@ struct pvr_apple {
 	void *heap;		/* memory shared with the firmware: rings, stamps, commands */
 	struct pvr_apple_layout layout;
 	bool booted;
+	bool fault_reported;		/* once per firmware boot */
 	bool fw_ready;		/* init data handed over once: runtime PM restarts it */
 
 	struct mutex submit_lock;	/* job slots, rings, producer index, GPU VM */
@@ -218,6 +220,7 @@ struct pvr_apple {
  *	reaches when it is finished, or a negative error.
  * @engine_done: The sequence number of the last finished job of @engine. No
  *	lock held; may be called with interrupts off.
+ * @max_power_state: Highest state licensed for fault capture; optional.
  * @events: Read what the firmware posted. Before @engine_done wherever a job
  *	is waited for; may sleep.
  * @vm_init: A userspace VM was created: map what the firmware needs in it.
@@ -268,6 +271,7 @@ struct pvr_apple_chip {
 
 	int (*submit)(struct pvr_apple *apple, struct pvr_job *job);
 	u32 (*engine_done)(struct pvr_apple *apple, enum pvr_apple_engine engine);
+	u32 (*max_power_state)(struct pvr_apple *apple);
 	void (*events)(struct pvr_apple *apple);
 	int (*vm_init)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
 	void (*vm_fini)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
@@ -286,6 +290,7 @@ static inline struct device *apple_dev(struct pvr_apple *apple)
 	return from_pvr_device(apple->pvr_dev)->dev;
 }
 
+void pvr_apple_report_mmu_fault(struct pvr_apple *apple);
 int pvr_apple_fw_load(struct pvr_apple *apple, size_t max_size);
 int pvr_apple_wait_idle(struct pvr_apple *apple, unsigned int timeout_us);
 int pvr_apple_request_power_state(struct pvr_apple *apple, u32 state);

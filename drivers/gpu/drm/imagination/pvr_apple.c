@@ -680,6 +680,149 @@ static const struct dma_fence_ops pvr_apple_fence_ops = {
 	.get_timeline_name = pvr_apple_fence_timeline_name,
 };
 
+/* MMU status fields and requestor names from the G5P fault decoder. */
+struct pvr_apple_mmu_fault {
+	bool valid, read;
+	u8 type, level, requester, sideband, context;
+	u64 va;
+};
+
+static struct pvr_apple_mmu_fault pvr_apple_mmu_fault_decode(u64 s)
+{
+	struct pvr_apple_mmu_fault f = {
+		.valid = s & 1,
+		.type = (s >> 1) & 3,
+		.read = (s >> 3) & 1,
+		.level = (s >> 4) & 3,
+		.requester = (s >> 6) & 0x3f,
+		.sideband = (s >> 12) & 0xff,
+		.context = (s >> 20) & 0xff,
+		.va = (s >> 24) & 0xfffffffff0ULL,
+	};
+
+	return f;
+}
+
+static const char *const pvr_apple_mmu_fault_types[4] = {
+	"page-invalid",
+	"type1",
+	"read-only",
+	"pm-meta-protected",
+};
+
+/* Requester names, iOS kext table 6ff5ed8 (16-byte {name, class} entries; read from the j71t
+ * 16.7.10 kernelcache). A larger index prints its number only.
+ */
+static const char *const pvr_apple_mmu_requesters[] = {
+	"META",
+	"TLA",
+	"HOST",
+	"VDMM",
+	"CDM",
+	"IPP",
+	"PM",
+	"TILING",
+	"MCU_TEXAS0",
+	"PDS_TEXAS0",
+	"PBE0_TEXAS0",
+	"PBE1_TEXAS0",
+	"VDMS_BLACKPEARL0",
+	"IPF_BLACKPEARL0",
+	"ISP_BLACKPEARL0",
+	"TPF_BLACKPEARL0",
+	"USCS_BLACKPEARL0",
+	"PPP_BLACKPEARL0",
+	"VCE_BLACKPEARL0",
+	"FBCDC_BLACKPEARL0",
+	"MCU_TEXAS1",
+	"PDS_TEXAS1",
+	"PBE0_TEXAS1",
+	"PBE1_TEXAS1",
+	"MCU_TEXAS2",
+	"PDS_TEXAS2",
+	"PBE0_TEXAS2",
+	"PBE1_TEXAS2",
+	"VDMS_BLACKPEARL1",
+	"IPF_BLACKPEARL1",
+	"ISP_BLACKPEARL1",
+	"TPF_BLACKPEARL1",
+	"USCS_BLACKPEARL1",
+	"PPP_BLACKPEARL1",
+	"VCE_BLACKPEARL1",
+	"FBCDC_BLACKPEARL1",
+	"MCU_TEXAS3",
+	"PDS_TEXAS3",
+	"PBE0_TEXAS3",
+	"PBE1_TEXAS3",
+	"MCU_TEXAS4",
+	"PDS_TEXAS4",
+	"PBE0_TEXAS4",
+	"PBE1_TEXAS4",
+	"VDMS_BLACKPEARL2",
+	"IPF_BLACKPEARL2",
+	"ISP_BLACKPEARL2",
+	"TPF_BLACKPEARL2",
+	"USCS_BLACKPEARL2",
+	"PPP_BLACKPEARL2",
+	"VCE_BLACKPEARL2",
+	"FBCDC_BLACKPEARL2",
+	"MCU_TEXAS5",
+	"PDS_TEXAS5",
+	"PBE0_TEXAS5",
+	"PBE1_TEXAS5",
+};
+
+static const char *pvr_apple_mmu_requester(u32 requester)
+{
+	if (requester >= ARRAY_SIZE(pvr_apple_mmu_requesters))
+		return "?";
+	return pvr_apple_mmu_requesters[requester];
+}
+
+/* The firmware stopped on a fault: iOS reads these banks before resetting it. */
+void pvr_apple_report_mmu_fault(struct pvr_apple *apple)
+{
+	u32 ctrl, power, state, highest;
+	const char *reason;
+	unsigned int bank;
+
+	if (xchg(&apple->fault_reported, true))
+		return;
+	if (!apple->chip->max_power_state) {
+		dev_warn(apple_dev(apple), "GPU MMU fault licence refused: no licence for this chip\n");
+		return;
+	}
+	ctrl = readl(apple->fender + FENDER_CTRL);
+	power = readl(apple->fender + FENDER_POWER_STATE);
+	state = power & 0xf;
+	highest = apple->chip->max_power_state(apple);
+	if (ctrl & BIT(29))
+		reason = "power-down in progress";
+	else if (power & FENDER_POWER_REQUEST)
+		reason = "power request in flight";
+	else if (!state || state > highest)
+		reason = "state outside epoch range";
+	else
+		reason = NULL;
+	if (reason) {
+		dev_warn(apple_dev(apple),
+			 "GPU MMU fault licence refused: %s (ctrl=%#x power=%#x max=%u)\n",
+			 reason, ctrl, power, highest);
+		return;
+	}
+
+	for (bank = 0; bank < 2; bank++) {
+		u64 status = pvr_cr_read64(apple->pvr_dev, 0xe150 + bank * 8);
+		struct pvr_apple_mmu_fault f = pvr_apple_mmu_fault_decode(status);
+
+		dev_warn(apple_dev(apple),
+			 "GPU MMU fault bank=%u va=0x%llx %s type=%s level=%u requestor=%u/%s context=%u valid=%u sideband=%u\n",
+			 bank, f.va, f.read ? "read" : "write", pvr_apple_mmu_fault_types[f.type],
+			 f.level, f.requester, pvr_apple_mmu_requester(f.requester), f.context,
+			 f.valid, f.sideband);
+	}
+}
+
 /*
  * Consume the firmware's events. Completion is taken from the stamps, so the
  * events are only acknowledged: a full event ring stalls the firmware.
@@ -1319,6 +1462,7 @@ static int pvr_apple_fw_start(struct pvr_apple *apple)
 	apple->frag_seq = 0;
 	apple->frag_events = 0;
 	apple->geom_pending = false;
+	apple->fault_reported = false;
 	return apple->chip->start(apple);
 }
 

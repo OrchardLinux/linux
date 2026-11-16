@@ -71,7 +71,6 @@
  * Fender beyond the power state. The boot stream is a list of Rogue register
  * writes, two words each; Fender runs it when the core's power state leaves 0.
  */
-#define FENDER_CTRL			0x0000
 #define FENDER_CTRL_BOOT		0x40000000	/* as iOS sets it before a boot */
 #define FENDER_STREAM_STATE		0x0010		/* cleared before the stream is stored */
 #define FENDER_WAKE			0x0014
@@ -1259,8 +1258,10 @@ static int s8003_wait_done(struct pvr_apple *apple, enum pvr_apple_engine engine
 	err = read_poll_timeout(s8003_done_poll, done,
 				(s32)(done - seq) >= 0 || READ_ONCE(s->fault), 20,
 				S8003_JOB_TIMEOUT_US, false, apple, engine);
-	if (!err && (s32)(done - seq) < 0)
+	if (!err && (s32)(done - seq) < 0) {
+		pvr_apple_report_mmu_fault(apple);
 		return -EIO;
+	}
 	return err;
 }
 
@@ -2596,6 +2597,13 @@ static void pvr_apple_s8003_restore_image(struct pvr_apple *apple)
 	/* start() copies the image and builds the init data anew each time */
 }
 
+static u32 pvr_apple_s8003_max_power_state(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	return get32(s8003_object(s, S8003_PLATFORM) + 0x710);
+}
+
 const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.fw_name = "apple/gfx-s8003.bin",
 	.perf_state_max = S8003_PERF_STATE_MAX,
@@ -2619,6 +2627,7 @@ const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.report_hang = pvr_apple_s8003_report_hang,
 	.submit = pvr_apple_s8003_submit,
 	.engine_done = pvr_apple_s8003_engine_done,
+	.max_power_state = pvr_apple_s8003_max_power_state,
 	.events = pvr_apple_s8003_events,
 	.vm_init = pvr_apple_s8003_vm_init,
 	.vm_fini = pvr_apple_s8003_vm_fini,
