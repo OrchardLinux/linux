@@ -20,6 +20,50 @@ static const struct regulator_ops apple_pmic_touch_regulator_ops = {
 	.is_enabled = regulator_is_enabled_regmap,
 };
 
+/*
+ * D2089 (Anya, A7 iPad Air): the touchscreen analog supply is LDO 15 at
+ * register 0x84 bit 2. LDOs 13 to 15 share the analog bias in bits 0 and 1
+ * of that register, which must be set with any of them; like on the D2207
+ * the bias stays set when the touchscreen supply turns off, as other users
+ * may need it. The touchscreen core supply is register 0x85 bit 1.
+ */
+#define APPLE_D2089_LDO_BIAS_SHARED	0x03
+
+static int apple_d2089_touch_analog_enable(struct regulator_dev *rdev)
+{
+	return regmap_update_bits(rdev_get_regmap(rdev), rdev->desc->enable_reg,
+				  rdev->desc->enable_mask | APPLE_D2089_LDO_BIAS_SHARED,
+				  rdev->desc->enable_val | APPLE_D2089_LDO_BIAS_SHARED);
+}
+
+static const struct regulator_ops apple_d2089_touch_analog_ops = {
+	.enable = apple_d2089_touch_analog_enable,
+	.disable = regulator_disable_regmap,
+	.is_enabled = regulator_is_enabled_regmap,
+};
+
+static const struct regulator_desc apple_d2089_touch_analog = {
+	.name = "d2089-touch-analog",
+	.ops = &apple_d2089_touch_analog_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x84,
+	.enable_mask = 0x04,
+	.enable_val = 0x04,
+	.disable_val = 0,
+};
+
+static const struct regulator_desc apple_d2089_touch_core = {
+	.name = "d2089-touch-core",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x85,
+	.enable_mask = 0x02,
+	.enable_val = 0x02,
+	.disable_val = 0,
+};
+
 static const struct regulator_desc apple_d2186_touch_core = {
 	.name = "d2186-touch-core",
 	.ops = &apple_pmic_touch_regulator_ops,
@@ -177,6 +221,14 @@ static int apple_pmic_touch_regulator_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_pmic_touch_regulator_of_match[] = {
+	{
+		.compatible = "apple,d2089-touch-analog-regulator",
+		.data = &apple_d2089_touch_analog,
+	},
+	{
+		.compatible = "apple,d2089-touch-core-regulator",
+		.data = &apple_d2089_touch_core,
+	},
 	{
 		.compatible = "apple,d2186-touch-core-regulator",
 		.data = &apple_d2186_touch_core,
