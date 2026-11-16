@@ -1256,9 +1256,7 @@ static void pvr_apple_poll_work(struct work_struct *work)
 
 	if (READ_ONCE(apple->stopping))
 		return;
-	if (apple->chip->events)
-		apple->chip->events(apple);
-	else
+	if (!apple->chip->events)
 		pvr_apple_ack_events(apple);
 	if (atomic_xchg(&apple->fault_pending, 0))
 		pvr_apple_fault_pending(apple);
@@ -1302,6 +1300,11 @@ static void pvr_apple_poll_work(struct work_struct *work)
 	irq_on = apple->fw_irq_on;
 	spin_unlock_irq(&apple->fence_lock);
 	pvr_apple_jobs_retired(apple, retired);
+	/* Completion stamps need no touch. Signal first, then let S8003
+	 * touch and drain its rings. A10 acknowledgement above is unchanged.
+	 */
+	if (apple->chip->events)
+		apple->chip->events(apple);
 
 	if (!pending || READ_ONCE(apple->stopping))
 		return;
