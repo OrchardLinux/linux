@@ -121,8 +121,12 @@ struct apple_mbox_hw {
 	bool packed_endpoint;
 	/* FIFOs must be enabled through APPLE_A7IOP_MBOX_CONTROL_ENABLE */
 	bool needs_enable;
+	/* A7 V1 needs FIFO setup at probe, before its IOP is started. */
+	bool needs_early_enable;
 
 	bool has_irq_controls;
+	/* A7 IOP V1 has an enable register, without the later ACK/mask pair. */
+	bool has_irq_enable_only;
 	unsigned int irq_enable;
 	unsigned int irq_ack;
 
@@ -312,7 +316,7 @@ int apple_mbox_start(struct apple_mbox *mbox)
 	 * the mailbox level so that both hardware revisions behave almost
 	 * the same.
 	 */
-	if (mbox->hw->has_irq_controls) {
+	if (mbox->hw->has_irq_controls || mbox->hw->has_irq_enable_only) {
 		writel_relaxed(mbox->hw->irq_bit_recv_not_empty |
 				       mbox->hw->irq_bit_send_empty,
 			       mbox->regs + mbox->hw->irq_enable);
@@ -417,6 +421,18 @@ struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name)
 }
 EXPORT_SYMBOL(apple_mbox_get_byname);
 
+static void apple_mbox_enable_early(struct apple_mbox *mbox)
+{
+	if (!mbox->hw->needs_early_enable)
+		return;
+
+	/* Match the A7 V1 initialization before the client starts its IOP. */
+	writel(APPLE_A7IOP_MBOX_CONTROL_ENABLE,
+	       mbox->regs + mbox->hw->a2i_control);
+	writel(APPLE_A7IOP_MBOX_CONTROL_ENABLE,
+	       mbox->regs + mbox->hw->i2a_control);
+}
+
 static int apple_mbox_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -475,6 +491,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		return ret;
 
 	platform_set_drvdata(pdev, mbox);
+	apple_mbox_enable_early(mbox);
 	return 0;
 }
 
@@ -511,6 +528,27 @@ static const struct apple_mbox_hw apple_mbox_a7iop_hw = {
 	.irq_mask_set = APPLE_A7IOP_MBOX_IRQ_MASK_SET,
 	.irq_mask_clear = APPLE_A7IOP_MBOX_IRQ_MASK_CLEAR,
 	.irq_mask_all = APPLE_A7IOP_MBOX_IRQ_ALL,
+	.irq_bit_recv_not_empty = APPLE_A7IOP_MBOX_IRQ_I2A_NOT_EMPTY,
+	.irq_bit_send_empty = APPLE_A7IOP_MBOX_IRQ_A2I_EMPTY,
+};
+
+/* S5L8960X ANS1 uses AppleA7IOP V1. Unlike the A9/A10 V2 mailbox,
+ * its interrupt setup is a single enable write at +0x04. Its FIFOs
+ * must be enabled at probe, before the client starts the IOP; the
+ * V2 setup instead enables them when starting mailbox communication.
+ * The 64-bit endpoint/payload format and FIFO locations are shared.
+ */
+static const struct apple_mbox_hw apple_mbox_a7iop_v1_hw = {
+	.control_full = APPLE_A7IOP_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_A7IOP_MBOX_CONTROL_EMPTY,
+	.a2i_control = APPLE_A7IOP_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_A7IOP_MBOX_A2I_SEND,
+	.i2a_control = APPLE_A7IOP_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_A7IOP_MBOX_I2A_RECV,
+	.packed_endpoint = true,
+	.needs_early_enable = true,
+	.has_irq_enable_only = true,
+	.irq_enable = 0x04,
 	.irq_bit_recv_not_empty = APPLE_A7IOP_MBOX_IRQ_I2A_NOT_EMPTY,
 	.irq_bit_send_empty = APPLE_A7IOP_MBOX_IRQ_A2I_EMPTY,
 };
@@ -553,6 +591,8 @@ static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,t8010-a7iop-mailbox", .data = &apple_mbox_a7iop_hw },
+	/* The A7's ANS mailbox needs the V1 setup; listed before its fallback. */
+	{ .compatible = "apple,s5l8960x-akf-mailbox-v1", .data = &apple_mbox_a7iop_v1_hw },
 	/* A7-A8X ANS/AKF coprocessors: same FIFO, mask and packing layout as A7IOP */
 	{ .compatible = "apple,akf-mailbox-v1", .data = &apple_mbox_a7iop_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
