@@ -10,6 +10,7 @@
 
 #include <linux/acpi.h>
 #include <linux/device-id/pci.h>
+#include <linux/notifier.h>
 #include <linux/phy/phy.h>
 #include <linux/regulator/consumer.h>
 #include <linux/usb/gadget.h>
@@ -1062,6 +1063,8 @@ struct dwc2_hregs_backup {
  *			the device to draw (vbus_draw), or NULL
  * @vbus_draw_work:	Work passing @vbus_draw_ma to that power supply
  * @vbus_draw_ma:	Current the gadget may draw, from vbus_draw
+ * @vbus_draw_pending:	A new vbus_draw report must reach the supply
+ * @usb_psy_nb:	Re-report the current allowance when the supply changes
  *
  */
 struct dwc2_hsotg {
@@ -1241,7 +1244,9 @@ struct dwc2_hsotg {
 	struct dwc2_hsotg_ep *eps_out[MAX_EPS_CHANNELS];
 	const char *usb_psy_name;
 	struct work_struct vbus_draw_work;
+	struct notifier_block usb_psy_nb;
 	unsigned int vbus_draw_ma;
+	bool vbus_draw_pending;
 #endif /* CONFIG_USB_DWC2_PERIPHERAL || CONFIG_USB_DWC2_DUAL_ROLE */
 };
 

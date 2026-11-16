@@ -4787,20 +4787,54 @@ static void dwc2_hsotg_vbus_draw_work(struct work_struct *work)
 {
 	struct dwc2_hsotg *hsotg = container_of(work, struct dwc2_hsotg,
 						vbus_draw_work);
-	union power_supply_propval val;
+	union power_supply_propval val, allowed;
 	struct power_supply *psy;
+	bool pending;
 	int ret;
 
 	psy = power_supply_get_by_name(hsotg->usb_psy_name);
 	if (!psy)
 		return;
+	pending = xchg(&hsotg->vbus_draw_pending, false);
 	val.intval = READ_ONCE(hsotg->vbus_draw_ma) * 1000;
+	if (!pending &&
+	    !power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_MAX, &allowed) &&
+	    allowed.intval == val.intval)
+		goto put;
 	ret = power_supply_set_property(psy, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 					&val);
 	if (ret)
 		dev_dbg(hsotg->dev, "setting VBUS draw (%d uA) failed: %d\n",
 			val.intval, ret);
+put:
 	power_supply_put(psy);
+}
+
+/*
+ * A charger can invalidate a report on a source event without ending the USB
+ * session. Send the current allowance again, not a saved Apple grant. The
+ * composite driver replaces it on reset, disconnect and suspend. Compare the
+ * allowance, not the ramped input limit, to avoid a notification feedback loop.
+ * The notifier must not call into the supply: queue the work that may sleep.
+ */
+static int dwc2_hsotg_psy_changed(struct notifier_block *nb,
+				unsigned long event, void *data)
+{
+	struct dwc2_hsotg *hsotg = container_of(nb, struct dwc2_hsotg, usb_psy_nb);
+	struct power_supply *psy = data;
+
+	if (event == PSY_EVENT_PROP_CHANGED &&
+	    !strcmp(psy->desc->name, hsotg->usb_psy_name))
+		schedule_work(&hsotg->vbus_draw_work);
+	return NOTIFY_OK;
+}
+
+static void dwc2_hsotg_psy_unregister(void *data)
+{
+	struct dwc2_hsotg *hsotg = data;
+
+	power_supply_unreg_notifier(&hsotg->usb_psy_nb);
+	cancel_work_sync(&hsotg->vbus_draw_work);
 }
 
 static int dwc2_hsotg_vbus_draw(struct usb_gadget *gadget, unsigned int mA)
@@ -4814,6 +4848,7 @@ static int dwc2_hsotg_vbus_draw(struct usb_gadget *gadget, unsigned int mA)
 
 	/* Called in atomic context; the power supply may sleep. */
 	WRITE_ONCE(hsotg->vbus_draw_ma, mA);
+	WRITE_ONCE(hsotg->vbus_draw_pending, true);
 	schedule_work(&hsotg->vbus_draw_work);
 	return 0;
 }
@@ -5141,6 +5176,24 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 
 	dwc2_hsotg_dump(hsotg);
 
+	if (hsotg->usb_psy_name && IS_ERR_OR_NULL(hsotg->uphy)) {
+		hsotg->usb_psy_nb.notifier_call = dwc2_hsotg_psy_changed;
+		ret = power_supply_reg_notifier(&hsotg->usb_psy_nb);
+		if (ret) {
+			dwc2_hsotg_ep_free_request(&hsotg->eps_out[0]->ep,
+						 hsotg->ctrl_req);
+			return ret;
+		}
+		ret = devm_add_action_or_reset(dev, dwc2_hsotg_psy_unregister,
+					      hsotg);
+		if (ret) {
+			dwc2_hsotg_ep_free_request(&hsotg->eps_out[0]->ep,
+						 hsotg->ctrl_req);
+			return ret;
+		}
+		/* The named supply may already have registered. */
+		schedule_work(&hsotg->vbus_draw_work);
+	}
 	return 0;
 }
 
@@ -5152,8 +5205,12 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 int dwc2_hsotg_remove(struct dwc2_hsotg *hsotg)
 {
 	usb_del_gadget_udc(&hsotg->gadget);
-	if (hsotg->usb_psy_name)
+	if (hsotg->usb_psy_name) {
+		if (IS_ERR_OR_NULL(hsotg->uphy))
+			devm_release_action(hsotg->dev, dwc2_hsotg_psy_unregister,
+					    hsotg);
 		cancel_work_sync(&hsotg->vbus_draw_work);
+	}
 	dwc2_hsotg_ep_free_request(&hsotg->eps_out[0]->ep, hsotg->ctrl_req);
 
 	return 0;

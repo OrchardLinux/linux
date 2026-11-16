@@ -113,9 +113,11 @@ static int dwc2_drd_set_soft_role(struct dwc2_hsotg *hsotg, enum usb_role role)
 	spin_lock_irqsave(&hsotg->lock, flags);
 	hsotg->role_sw_hold = role != USB_ROLE_DEVICE;
 	if (dwc2_is_device_enabled(hsotg)) {
-		if (hsotg->role_sw_hold)
+		if (hsotg->role_sw_hold) {
 			dwc2_hsotg_core_disconnect(hsotg);
-		else
+			/* End the old gadget session and its current allowance. */
+			dwc2_hsotg_disconnect(hsotg);
+		} else
 			dwc2_hsotg_core_connect(hsotg);
 	}
 	spin_unlock_irqrestore(&hsotg->lock, flags);
