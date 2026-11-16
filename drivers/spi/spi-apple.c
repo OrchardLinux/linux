@@ -15,11 +15,15 @@
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
+#include <linux/limits.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/scatterlist.h>
 #include <linux/spi/spi.h>
 #include <linux/unaligned.h>
@@ -46,6 +50,8 @@
 #define APPLE_SPI_CFG_T8010_BASE	0x0010401e
 #define APPLE_SPI_CFG_T7000_BASE	0x00004018
 #define APPLE_SPI_CFG_S8000_BASE	0x00004018
+#define APPLE_SPI_CFG_S5L8960X_BASE	0x00044038
+#define APPLE_SPI_CFG_S5L8960X_AUTO_TX	BIT(0)
 #define APPLE_SPI_CFG_T8010_PIOEN	BIT(5)
 #define APPLE_SPI_CFG_T8010_16BIT	BIT(15)
 
@@ -124,10 +130,11 @@ struct apple_spi_hw {
 	/* T7000: the SPI version 1 configuration register layout. */
 	bool spi_v1;
 	/*
-	 * S8000: the T8010 register layout, driven by byte-wide PIO only,
-	 * without the descriptor format, DMA or the interrupt registers.
+	 * Byte-wide polled PIO, without descriptor DMA or interrupt registers.
 	 */
 	bool pio_only;
+	/* S5L8960X: start before TXDATA; AUTO_TX is receive-only. */
+	bool s5l8960x;
 	unsigned int min_clk_div;
 	u32 default_word_delay;
 	u32 cfg_base;
@@ -196,6 +203,17 @@ static void apple_spi_t8010_clear_status(struct apple_spi *spi)
 
 static void apple_spi_init(struct apple_spi *spi)
 {
+	if (spi->hw->s5l8960x) {
+		reg_write(spi, APPLE_SPI_PIN, APPLE_SPI_PIN_CS);
+		reg_write(spi, APPLE_SPI_CTRL,
+			  APPLE_SPI_CTRL_RX_RESET | APPLE_SPI_CTRL_TX_RESET);
+		reg_write(spi, APPLE_SPI_CFG, spi->hw->cfg_base);
+		reg_write(spi, APPLE_SPI_STATUS,
+			  reg_read(spi, APPLE_SPI_STATUS));
+		reg_write(spi, APPLE_SPI_WORD_DELAY, 0);
+		return;
+	}
+
 	if (spi->hw->legacy_status) {
 		reg_write(spi, APPLE_SPI_CTRL, 0);
 		/* S8000: leave the native chip select inactive (high). */
@@ -917,6 +935,125 @@ static int apple_spi_transfer_one_t7000(struct spi_controller *ctlr,
 	return apple_spi_transfer_one_legacy_pio(ctlr, device, t);
 }
 
+/*
+ * S5L8960X clocks constant MOSI in AUTO_TX mode, even with TXDATA queued.
+ * Explicit payloads must start before their first TXDATA write and drain
+ * RX also for transmit-only transfers. Limit all unreceived explicit words
+ * to the FIFO depth, including those already in the shift register.
+ */
+static int apple_spi_transfer_one_s5l8960x(struct spi_controller *ctlr,
+					   struct spi_device *device,
+					   struct spi_transfer *t)
+{
+	struct apple_spi *spi = spi_controller_get_devdata(ctlr);
+	unsigned int bits_per_word = t->bits_per_word ?: device->bits_per_word;
+	unsigned long rate = clk_get_rate(spi->clk);
+	unsigned int sent = 0, received = 0, iterations = 0;
+	const u8 *tx = t->tx_buf;
+	u8 *rx = t->rx_buf;
+	u32 cfg, div, status, tx_level, rx_level, word_delay;
+	u64 wire_us, delay_cycles;
+	ktime_t deadline;
+	int delay_ns, ret;
+
+	if (!t->len)
+		return 0;
+	if (!bits_per_word)
+		bits_per_word = 8;
+	if (bits_per_word != 8 || !rate || (!tx && !rx))
+		return -EINVAL;
+
+	ret = apple_spi_t8010_calc_div(spi, t->speed_hz ?: device->max_speed_hz,
+				       &div);
+	if (ret)
+		return ret;
+	t->effective_speed_hz = rate / div;
+	delay_ns = spi_delay_to_ns(&t->word_delay, t);
+	if (delay_ns < 0)
+		return delay_ns;
+	delay_cycles = DIV_ROUND_UP_ULL((u64)rate * delay_ns, NSEC_PER_SEC);
+	if (delay_cycles > U16_MAX)
+		return -EINVAL;
+	word_delay = delay_cycles;
+
+	cfg = spi->hw->cfg_base;
+	if (device->mode & SPI_CPHA)
+		cfg |= APPLE_SPI_CFG_CPHA;
+	if (device->mode & SPI_CPOL)
+		cfg |= APPLE_SPI_CFG_CPOL;
+	/* Pad sampling on J72 confirms that set bit 13 means LSB-first. */
+	if (device->mode & SPI_LSB_FIRST)
+		cfg |= APPLE_SPI_CFG_LSB_FIRST;
+	if (!tx)
+		cfg |= APPLE_SPI_CFG_S5L8960X_AUTO_TX;
+
+	wire_us = DIV_ROUND_UP_ULL((u64)t->len * 8 * USEC_PER_SEC,
+				   t->effective_speed_hz);
+	wire_us += mul_u64_u64_div_u64((u64)t->len * word_delay,
+				       USEC_PER_SEC, rate) + 1;
+	deadline = ktime_add_us(ktime_get(), wire_us +
+				  APPLE_SPI_TIMEOUT_MS * USEC_PER_MSEC);
+
+	reg_write(spi, APPLE_SPI_CTRL,
+		  APPLE_SPI_CTRL_RX_RESET | APPLE_SPI_CTRL_TX_RESET);
+	reg_write(spi, APPLE_SPI_CLKDIV, div);
+	reg_write(spi, APPLE_SPI_WORD_DELAY, word_delay);
+	reg_write(spi, APPLE_SPI_STATUS, reg_read(spi, APPLE_SPI_STATUS));
+	reg_write(spi, APPLE_SPI_CFG, cfg);
+	reg_write(spi, APPLE_SPI_TXCNT, tx ? t->len : 0);
+	reg_write(spi, APPLE_SPI_RXCNT, t->len);
+	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_RUN);
+
+	ret = 0;
+	while (received < t->len) {
+		status = reg_read(spi, APPLE_SPI_STATUS);
+		tx_level = FIELD_GET(APPLE_SPI_STATUS_T8010_TXFIFO, status);
+		rx_level = FIELD_GET(APPLE_SPI_STATUS_T8010_RXFIFO, status);
+		if (tx_level > APPLE_SPI_FIFO_DEPTH ||
+		    rx_level > APPLE_SPI_FIFO_DEPTH ||
+		    rx_level > (tx ? sent : t->len) - received) {
+			ret = -EIO;
+			break;
+		}
+
+		while (rx_level--) {
+			u8 value = reg_read(spi, APPLE_SPI_RXDATA);
+
+			if (rx)
+				rx[received] = value;
+			received++;
+		}
+		while (tx && sent < t->len && tx_level < APPLE_SPI_FIFO_DEPTH &&
+		       sent - received < APPLE_SPI_FIFO_DEPTH) {
+			reg_write(spi, APPLE_SPI_TXDATA, tx[sent]);
+			sent++;
+			tx_level++;
+		}
+		if (ktime_after(ktime_get(), deadline)) {
+			ret = -ETIMEDOUT;
+			break;
+		}
+		if (!(++iterations & 0xff))
+			cond_resched();
+		cpu_relax();
+	}
+
+	if (!ret) {
+		/* Allow the final word and its programmed delay before CS falls. */
+		fsleep(DIV_ROUND_UP(8 * USEC_PER_SEC, t->effective_speed_hz) +
+		       DIV_ROUND_UP_ULL((u64)word_delay * USEC_PER_SEC, rate) + 2);
+	}
+	/* Stop both explicit clocks and receive-only clock generation. */
+	reg_write(spi, APPLE_SPI_CTRL, 0);
+	reg_write(spi, APPLE_SPI_CFG, cfg & ~APPLE_SPI_CFG_S5L8960X_AUTO_TX);
+	reg_read(spi, APPLE_SPI_CTRL);
+	if (ret)
+		dev_err(&ctlr->dev, "S5L8960X PIO failed: %d tx %u/%u rx %u/%u\n",
+			ret, sent, tx ? t->len : 0, received, t->len);
+
+	return ret;
+}
+
 static void apple_spi_tx(struct apple_spi *spi, const void **tx_ptr, u32 *left,
 			 unsigned int bytes_per_word)
 {
@@ -1108,6 +1245,16 @@ err:
 	return ret;
 }
 
+static void apple_spi_s5l8960x_idle_pins(void *data)
+{
+	struct device *dev = data;
+	int ret;
+
+	ret = pinctrl_pm_select_sleep_state(dev);
+	if (ret)
+		dev_err(dev, "failed to restore SPI idle pins: %d\n", ret);
+}
+
 static int apple_spi_probe(struct platform_device *pdev)
 {
 	struct apple_spi *spi;
@@ -1154,7 +1301,7 @@ static int apple_spi_probe(struct platform_device *pdev)
 	ctlr->bus_num = pdev->id;
 	ctlr->num_chipselect = 1;
 	ctlr->mode_bits = SPI_CPHA | SPI_CPOL;
-	if (!spi->hw->legacy_status)
+	if (!spi->hw->legacy_status || spi->hw->s5l8960x)
 		ctlr->mode_bits |= SPI_LSB_FIRST;
 	if (spi->hw->pio_only)
 		ctlr->bits_per_word_mask = SPI_BPW_MASK(8);
@@ -1164,7 +1311,9 @@ static int apple_spi_probe(struct platform_device *pdev)
 		ctlr->bits_per_word_mask = SPI_BPW_RANGE_MASK(1, 32);
 	ctlr->prepare_message = apple_spi_prepare_message;
 	ctlr->set_cs = apple_spi_set_cs;
-	if (spi->hw->pio_only)
+	if (spi->hw->s5l8960x)
+		ctlr->transfer_one = apple_spi_transfer_one_s5l8960x;
+	else if (spi->hw->pio_only)
 		ctlr->transfer_one = apple_spi_transfer_one_legacy_pio;
 	else if (spi->hw->spi_v1)
 		ctlr->transfer_one = apple_spi_transfer_one_t7000;
@@ -1213,6 +1362,14 @@ static int apple_spi_probe(struct platform_device *pdev)
 			return ret;
 	}
 
+	if (spi->hw->s5l8960x) {
+		ret = devm_add_action_or_reset(&pdev->dev,
+					       apple_spi_s5l8960x_idle_pins,
+					       &pdev->dev);
+		if (ret)
+			return ret;
+	}
+
 	apple_spi_init(spi);
 
 	ret = devm_spi_register_controller(&pdev->dev, ctlr);
@@ -1228,6 +1385,14 @@ static const struct apple_spi_hw apple_spi_hw_s8000 = {
 	.pio_only = true,
 	.min_clk_div = 1,
 	.cfg_base = APPLE_SPI_CFG_S8000_BASE,
+};
+
+static const struct apple_spi_hw apple_spi_hw_s5l8960x = {
+	.legacy_status = true,
+	.pio_only = true,
+	.s5l8960x = true,
+	.min_clk_div = 1,
+	.cfg_base = APPLE_SPI_CFG_S5L8960X_BASE,
 };
 
 static const struct apple_spi_hw apple_spi_hw_t8010 = {
@@ -1249,6 +1414,7 @@ static const struct apple_spi_hw apple_spi_hw_default = {
 };
 
 static const struct of_device_id apple_spi_of_match[] = {
+	{ .compatible = "apple,s5l8960x-spi", .data = &apple_spi_hw_s5l8960x, },
 	{ .compatible = "apple,t7000-spi", .data = &apple_spi_hw_t7000, },
 	{ .compatible = "apple,s8000-spi", .data = &apple_spi_hw_s8000, },
 	{ .compatible = "apple,t8010-spi", .data = &apple_spi_hw_t8010, },
