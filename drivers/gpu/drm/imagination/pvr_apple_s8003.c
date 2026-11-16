@@ -261,6 +261,8 @@ struct s8003_vm {
 	u32 attached;			/* the firmware start the slots were loaded for */
 	struct s8003_pm pm[2];
 	bool pm_logged;			/* first pool sizing report for this VM */
+	u32 fb_blocks;			/* pool size the firmware's feedback asked for */
+	ktime_t fb_at;			/* when that feedback was last taken */
 };
 
 struct pvr_apple_s8003 {
@@ -2253,6 +2255,63 @@ static bool s8003_pm_clean(struct pvr_apple *apple, const struct s8003_pm *pm, u
 	       (s32)(pvr_apple_s8003_engine_done(apple, APPLE_ENGINE_FRAG) - pm->td_seq) >= 0;
 }
 
+/*
+ * The firmware reports, at 0x40 of a set's list page, the most pages of the
+ * pool a scene used and a margin (4 KiB pages) and a request for more
+ * blocks; 0x60 is 1 once the host took them. Apple's kext grows the pool
+ * from them between scenes (AGXParameterManagementMeta::
+ * growPoolFromFirmwareFeedback): to three times the high-water mark or the
+ * margin plus a block, else by the request, at most every 0x3d0901 ticks
+ * of 24 MHz.
+ */
+#define S8003_PM_FEEDBACK		0x40
+#define S8003_PM_FEEDBACK_TAKEN		0x60
+#define S8003_PM_FEEDBACK_MS		167
+#define S8003_PM_GROW_MAX		8	/* blocks per request */
+
+/* Take a VM's idle sets' feedback; submit_lock held */
+static void s8003_pm_feedback(struct pvr_apple *apple, struct s8003_vm *vm)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	ktime_t now = ktime_get();
+	unsigned int i;
+
+	lockdep_assert_held(&apple->submit_lock);
+	if (!apple->booted || (vm->fb_at && ktime_ms_delta(now, vm->fb_at) < S8003_PM_FEEDBACK_MS))
+		return;
+	for (i = 0; i < ARRAY_SIZE(vm->pm); i++) {
+		struct s8003_pm *pm = &vm->pm[i];
+		u32 high, margin, request, target;
+		u8 *list;
+
+		if (pm->set < 0 || pm->built != s->gen || !s8003_pm_idle(apple, pm))
+			continue;
+		list = s->pmsets.map + pm->set * S8003_PM_SET_SIZE + PVR_DEVICE_PAGE_SIZE;
+		if (get32(list + S8003_PM_FEEDBACK_TAKEN) == 1)
+			continue;
+		rmb();	/* the flag before the words it covers */
+		high = get32(list + S8003_PM_FEEDBACK);
+		margin = get32(list + S8003_PM_FEEDBACK + 4);
+		request = min(get32(list + S8003_PM_FEEDBACK + 12), (u32)S8003_PM_GROW_MAX);
+		put32(list + S8003_PM_FEEDBACK_TAKEN, 1);
+		wmb();
+		vm->fb_at = now;
+		/* Not from this pool: ignored */
+		if (high > pm->blocks * 32 || margin > S8003_PM_BLOCKS_MAX * 32)
+			continue;
+		target = DIV_ROUND_UP(max(3 * high, 32 + margin), 32);
+		if (target <= pm->blocks && request)
+			target = pm->blocks + request;
+		target = min(target, S8003_PM_BLOCKS_MAX);
+		if (target <= max(vm->fb_blocks, pm->blocks))
+			continue;
+		vm->fb_blocks = target;
+		dev_info(apple_dev(apple),
+			 "PM pool VM=%p grows to %u blocks from feedback: high-water %u pages, margin %u, request %u\n",
+			 vm->vm_ctx, target, high, margin, request);
+	}
+}
+
 static int s8003_submit_error(struct pvr_apple *apple, struct s8003_vm *vm,
 			      const char *engine, int err, const char *reason)
 {
@@ -2292,9 +2351,13 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	if (!pm)
 		return s8003_submit_error(apple, vm, "geometry", -EBUSY, "no PM set");
 
+	/* Process context, submit_lock held: grow through the existing pool allocator. */
+	s8003_pm_feedback(apple, vm);
 	/* As many 128 KiB blocks as the free list has 4 KiB pages, and enough for the target */
 	blocks = max(DIV_ROUND_UP(hwrt->free_lists[0]->initial_num_pages, 32),
 		     DIV_ROUND_UP(50 + rt.tiles, 32));
+	/* The existing build path allocates a larger pool while this set is idle. */
+	blocks = max(blocks, vm->fb_blocks);
 	/* Before the build, which may make the set anew */
 	pm_record = !s8003_pm_clean(apple, pm, min(blocks, S8003_PM_BLOCKS_MAX));
 	pm->clean = false;
