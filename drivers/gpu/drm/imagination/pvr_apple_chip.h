@@ -117,6 +117,16 @@ struct pvr_apple {
 	struct delayed_work poll_work;
 	struct hrtimer poll_timer;	/* rearms poll_work while jobs are pending */
 	/*
+	 * The firmware's interrupt, if the chip has one the host can take
+	 * (0: none). It is enabled while fences are pending (@fw_irq_on,
+	 * under fence_lock) and kicks poll_work; poll_work then checks again
+	 * every &pvr_apple_chip.irq_poll_us, and every apple_poll_us until
+	 * @fast_until, which a completion the firmware announced sets.
+	 */
+	int fw_irq;
+	bool fw_irq_on;
+	ktime_t fast_until;
+	/*
 	 * The last fragment job pushed: the next geometry job waits for it, as
 	 * the firmware keeps one parameter-manager scene at a time.
 	 */
@@ -260,6 +270,8 @@ struct pvr_apple_chip {
 	unsigned int scenes;
 	bool own_pm_pages;
 	unsigned int gate_off_ms;
+	/* With the firmware's interrupt taken: microseconds between checks while jobs are pending */
+	unsigned int irq_poll_us;
 
 	int (*init)(struct pvr_apple *apple);
 	int (*boot)(struct pvr_apple *apple);
@@ -284,6 +296,8 @@ struct pvr_apple_chip {
 	void (*vm_fini)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
 	unsigned int (*vm_scenes)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
 	void (*mmu_flush)(struct pvr_apple *apple);
+	/* Acknowledge the firmware's interrupt at its source; hard IRQ context */
+	void (*irq_ack)(struct pvr_apple *apple);
 };
 
 /* A new host tag must be nonzero and differ from the firmware's cached tag. */
@@ -316,5 +330,8 @@ int pvr_apple_wait_idle(struct pvr_apple *apple, unsigned int timeout_us);
 int pvr_apple_request_power_state(struct pvr_apple *apple, u32 state);
 u32 pvr_apple_start_power_state(struct pvr_apple *apple);
 int pvr_apple_fender_power_on(struct pvr_apple *apple);
+int pvr_apple_firmware_irq_init(struct pvr_apple *apple, int irq);
+void pvr_apple_firmware_event(struct pvr_apple *apple);
+void pvr_apple_firmware_progress(struct pvr_apple *apple);
 
 #endif /* PVR_APPLE_CHIP_H */

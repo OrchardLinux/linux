@@ -113,7 +113,7 @@ static void pvr_apple_recv_message(void *cookie, u8 endpoint, u64 message)
 
 	dev_dbg(apple_dev(apple), "firmware ep %#x: %#016llx\n", endpoint, message);
 	/* none is known to mean completion, but a check costs little */
-	mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
+	pvr_apple_firmware_event(apple);
 }
 
 static void pvr_apple_crashed(void *cookie, const void *crashlog, size_t size)

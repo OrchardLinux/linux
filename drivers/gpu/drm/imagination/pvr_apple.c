@@ -37,6 +37,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
 #include <linux/hrtimer.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -63,6 +64,13 @@ struct pvr_apple_fence {
 static unsigned int pvr_apple_poll_us = 100;
 module_param_named(apple_poll_us, pvr_apple_poll_us, uint, 0644);
 MODULE_PARM_DESC(apple_poll_us, "Apple A10: microseconds between job completion checks (default 100)");
+
+/*
+ * With the firmware's interrupt taken, checks stay apple_poll_us apart for
+ * this long after the firmware announced a completion: the stamps and ring
+ * watermarks that make a job done are not all in memory at once.
+ */
+#define PVR_APPLE_FAST_US	1000
 
 /* Idle time before runtime PM powers the GPU off; tunable in sysfs. */
 #define PVR_APPLE_AUTOSUSPEND_MS	1000
@@ -905,7 +913,7 @@ void pvr_apple_report_mmu_fault(struct pvr_apple *apple)
 void pvr_apple_firmware_fault(struct pvr_apple *apple)
 {
 	atomic_set(&apple->fault_pending, 1);
-	mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
+	pvr_apple_firmware_event(apple);
 }
 
 /* A reset cancels every engine: fault only the oldest bound scheduler. */
@@ -1016,13 +1024,85 @@ static void pvr_apple_jobs_retired(struct pvr_apple *apple, unsigned int n)
 		pm_runtime_put_autosuspend(dev);
 }
 
-/* Signal the fences of retired jobs; poll again while any are pending. */
+/**
+ * pvr_apple_firmware_event() - The firmware posted something: look now
+ * @apple: Apple firmware state.
+ *
+ * Any context, hard IRQ included.
+ */
+void pvr_apple_firmware_event(struct pvr_apple *apple)
+{
+	/* After a terminal shutdown nothing may run the poll work again */
+	if (!READ_ONCE(apple->stopping))
+		mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
+}
+
+/**
+ * pvr_apple_firmware_progress() - The firmware announced a finished job
+ * @apple: Apple firmware state.
+ *
+ * For a chip's events(): check again soon, until the job is done in memory.
+ */
+void pvr_apple_firmware_progress(struct pvr_apple *apple)
+{
+	WRITE_ONCE(apple->fast_until, ktime_add_us(ktime_get(), PVR_APPLE_FAST_US));
+}
+
+static irqreturn_t pvr_apple_firmware_irq(int irq, void *data)
+{
+	struct pvr_apple *apple = data;
+
+	/* At its source first, as Apple's kext does before it reads the rings */
+	apple->chip->irq_ack(apple);
+	pvr_apple_firmware_event(apple);
+	return IRQ_HANDLED;
+}
+
+/**
+ * pvr_apple_firmware_irq_init() - Take the firmware's interrupt
+ * @apple: Apple firmware state.
+ * @irq: Its Linux interrupt number.
+ *
+ * For a chip's init(), with &pvr_apple_chip.irq_ack set. The interrupt is
+ * enabled only while jobs are pending: an idle firmware raises it too.
+ *
+ * Return: 0 or a negative error; on error the jobs are polled for.
+ */
+int pvr_apple_firmware_irq_init(struct pvr_apple *apple, int irq)
+{
+	struct device *dev = apple_dev(apple);
+	int err;
+
+	if (!apple->chip->irq_ack || !apple->chip->irq_poll_us)
+		return -EINVAL;
+	err = devm_request_irq(dev, irq, pvr_apple_firmware_irq, IRQF_NO_AUTOEN,
+			       "apple-gfx-fw", apple);
+	if (err)
+		return err;
+	apple->fw_irq = irq;
+	return 0;
+}
+
+/* Enable the firmware's interrupt while jobs are pending; fence_lock held */
+static void pvr_apple_fw_irq_set_locked(struct pvr_apple *apple, bool on)
+{
+	lockdep_assert_held(&apple->fence_lock);
+	if (!apple->fw_irq || apple->fw_irq_on == on)
+		return;
+	apple->fw_irq_on = on;
+	if (on)
+		enable_irq(apple->fw_irq);
+	else
+		disable_irq_nosync(apple->fw_irq);
+}
+
+/* Signal the fences of retired jobs; check again while any are pending. */
 static void pvr_apple_poll_work(struct work_struct *work)
 {
 	struct pvr_apple *apple = container_of(work, struct pvr_apple, poll_work.work);
 	struct pvr_apple_fence *fence, *tmp;
-	unsigned int retired = 0;
-	bool pending = false;
+	unsigned int retired = 0, us;
+	bool pending = false, irq_on;
 	int engine;
 
 	if (READ_ONCE(apple->stopping))
@@ -1063,13 +1143,23 @@ static void pvr_apple_poll_work(struct work_struct *work)
 		apple->busy_ns += ktime_to_ns(ktime_sub(ktime_get(), apple->busy_since));
 		apple->busy_since = 0;
 	}
+	pvr_apple_fw_irq_set_locked(apple, pending);
+	irq_on = apple->fw_irq_on;
 	spin_unlock_irq(&apple->fence_lock);
 	pvr_apple_jobs_retired(apple, retired);
 
-	/* The firmware sends no completion message in this setup: poll. */
-	if (pending && !READ_ONCE(apple->stopping))
-		hrtimer_start(&apple->poll_timer, us_to_ktime(max(pvr_apple_poll_us, 10U)),
-			      HRTIMER_MODE_REL);
+	if (!pending || READ_ONCE(apple->stopping))
+		return;
+	/*
+	 * Without the firmware's interrupt (the A10's firmware sends no
+	 * completion message in this setup) poll. With it, check again
+	 * soon only after an announced completion; otherwise the slower
+	 * period backs the interrupt up.
+	 */
+	us = READ_ONCE(pvr_apple_poll_us);
+	if (irq_on && !ktime_before(ktime_get(), READ_ONCE(apple->fast_until)))
+		us = apple->chip->irq_poll_us;
+	hrtimer_start(&apple->poll_timer, us_to_ktime(max(us, 10U)), HRTIMER_MODE_REL);
 }
 
 static enum hrtimer_restart pvr_apple_poll_timer(struct hrtimer *timer)
@@ -1152,6 +1242,7 @@ static unsigned int pvr_apple_cancel_fences(struct pvr_apple *apple, int error)
 			cancelled++;
 		}
 	}
+	pvr_apple_fw_irq_set_locked(apple, false);
 	spin_unlock_irq(&apple->fence_lock);
 	pvr_apple_jobs_retired(apple, cancelled);
 	return cancelled;
@@ -1182,8 +1273,9 @@ static struct dma_fence *pvr_apple_job_fence(struct pvr_apple *apple, struct pvr
 	if (!apple->busy_since)
 		apple->busy_since = ktime_get();
 	list_add_tail(&fence->node, &apple->pending[engine]);
+	pvr_apple_fw_irq_set_locked(apple, true);
 	spin_unlock_irq(&apple->fence_lock);
-	mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
+	pvr_apple_firmware_event(apple);
 	return &fence->base;
 }
 
