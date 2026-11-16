@@ -24,9 +24,11 @@
  * mapped for it.
  *
  * Jobs are written as this firmware takes them, which is not the A10's way:
- * see "Jobs" below. The firmware's interrupt to the host is not taken (the
- * interrupt controller's driver cannot acknowledge it): its rings are read
- * while a job is waited for, and on a timer otherwise.
+ * see "Jobs" below. The firmware raises its interrupt to the host through
+ * the interrupt controller's software-set register, which that controller's
+ * driver never clears: the host clears it itself before it reads the rings,
+ * as Apple's kext does. It is taken while jobs are pending; otherwise the
+ * rings are read on a timer.
  *
  * The boot sequence, the layout of the shared memory, the job records and
  * every value in them are from Berkay Kösebay's G5P driver, which runs the
@@ -96,6 +98,7 @@
 /* The interrupt controller's registers the firmware uses, from its base */
 #define AIC_TIME			0x1020
 #define AIC_SW_SET			0x4000
+#define AIC_SW_CLR			0x4080	/* the host clears the firmware's interrupt here */
 
 /*
  * The firmware's GPU addresses: all in the GiB powervr's kernel VM keeps for
@@ -266,6 +269,7 @@ struct pvr_apple_s8003 {
 	ktime_t touched;		/* s8003_touch() */
 	bool failed;			/* its rings' indices are not ours any more */
 	bool fault;			/* it posted an event that is neither "alive" nor a stamp */
+	bool stamped;			/* it posted a job's stamp since events() last looked */
 
 	/*
 	 * Per VM (struct s8003_vm, by its VM context) and per start of the
@@ -292,6 +296,7 @@ struct pvr_apple_s8003 {
 	phys_addr_t rgx_phys;
 	phys_addr_t aic_phys;
 	u32 irq;			/* the firmware's interrupt to the host, as the AIC numbers it */
+	void __iomem *aic_sw_clr;	/* its word of the AIC's software-clear registers */
 
 	struct s8003_layout layout;
 	u8 *image;			/* the unpacked image, as the bootloader finds it */
@@ -975,7 +980,9 @@ static int s8003_drain(struct pvr_apple *apple, bool *alive)
 
 		if (type == S8003_EVENT_ALIVE) {
 			*alive = true;
-		} else if (type != S8003_EVENT_STAMP) {
+		} else if (type == S8003_EVENT_STAMP) {
+			WRITE_ONCE(s->stamped, true);
+		} else {
 			dev_warn_ratelimited(apple_dev(apple), "firmware fault event type=%u slot=%u: %*ph\n",
 					     type, get_unaligned_le32(e + 0x0c),
 					     S8003_EVENT_SIZE - 4, e + 4);
@@ -1211,6 +1218,9 @@ static void pvr_apple_s8003_events(struct pvr_apple *apple)
 		WRITE_ONCE(s->failed, true);
 		dev_err(apple_dev(apple), "GFX firmware's rings are no longer read\n");
 	}
+	/* A job's stamp: its watermarks follow; look again soon */
+	if (xchg(&s->stamped, false))
+		pvr_apple_firmware_progress(apple);
 }
 
 static u32 s8003_submitted(struct pvr_apple *apple, enum pvr_apple_engine engine)
@@ -2477,6 +2487,36 @@ static void s8003_free_image(void *data)
 	kvfree(data);
 }
 
+/* Hard IRQ context: clear the software-set source, before the rings are read */
+static void pvr_apple_s8003_irq_ack(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	writel(BIT(s->irq % 32), s->aic_sw_clr);
+}
+
+/*
+ * The firmware's interrupt, the node's fifth. Without it (or its register)
+ * the jobs are polled for, as before.
+ */
+static void s8003_irq_init(struct pvr_apple *apple)
+{
+	struct device *dev = apple_dev(apple);
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	int irq, err;
+
+	s->aic_sw_clr = devm_ioremap(dev, s->aic_phys + AIC_SW_CLR + 4 * (s->irq / 32), 4);
+	irq = platform_get_irq_optional(to_platform_device(dev), 4);
+	if (!s->aic_sw_clr)
+		err = -ENOMEM;
+	else if (irq < 0)
+		err = irq;
+	else
+		err = pvr_apple_firmware_irq_init(apple, irq);
+	if (err)
+		dev_warn(dev, "firmware interrupt not taken (%d): jobs are polled for\n", err);
+}
+
 static int pvr_apple_s8003_init(struct pvr_apple *apple)
 {
 	struct device *dev = apple_dev(apple);
@@ -2506,6 +2546,7 @@ static int pvr_apple_s8003_init(struct pvr_apple *apple)
 	err = s8003_parse_dt(apple);
 	if (err)
 		return err;
+	s8003_irq_init(apple);
 	err = s8003_layout_plan(&s->layout);
 	if (err)
 		return err;
@@ -2648,6 +2689,8 @@ const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.scenes = 2,
 	.own_pm_pages = true,
 	.gate_off_ms = 10,
+	/* As often as s8003_touch() runs: the firmware needs those reads to go on */
+	.irq_poll_us = 1000,
 	.init = pvr_apple_s8003_init,
 	.boot = pvr_apple_s8003_boot,
 	.start = pvr_apple_s8003_start,
@@ -2664,4 +2707,5 @@ const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.vm_fini = pvr_apple_s8003_vm_fini,
 	.vm_scenes = pvr_apple_s8003_vm_scenes,
 	.mmu_flush = pvr_apple_s8003_mmu_flush,
+	.irq_ack = pvr_apple_s8003_irq_ack,
 };
