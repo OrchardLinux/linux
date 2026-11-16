@@ -2457,36 +2457,51 @@ static int
 pvr_mmu_op_context_unmap_curr_page(struct pvr_mmu_op_context *op_ctx,
 				   u64 nr_pages)
 {
+	u64 page = 0;
 	int err;
 
-	if (nr_pages == 0)
-		return 0;
+	while (page < nr_pages) {
+		u64 skip = 0;
 
-	/*
-	 * Destroy first page outside loop, as it doesn't require a page
-	 * advance beforehand. If the L0 page table reference in
-	 * @op_ctx.curr_page is %NULL, there cannot be a mapped page at
-	 * @op_ctx.curr_page (so skip ahead).
-	 */
-	if (op_ctx->curr_page.l0_table)
+		/* Does nothing if there is no page, or no L0 table, here. */
 		pvr_page_destroy(op_ctx);
 
-	for (u64 page = 1; page < nr_pages; ++page) {
-		err = pvr_mmu_op_context_next_page(op_ctx, false);
 		/*
-		 * If the page table tree structure at @op_ctx.curr_page is
-		 * incomplete, skip ahead. We don't care about unmapping pages
-		 * that cannot exist.
-		 *
-		 * FIXME: This could be made more efficient by jumping ahead
-		 * using pvr_mmu_op_context_set_curr_page().
+		 * Without an L0 page table here, which may have just been
+		 * removed with its last page, no page up to the end of the
+		 * span of that table can be mapped. Without an L1 page table,
+		 * the same holds up to the end of the span of the L1 table.
+		 * Move to the last page of that span, so that the next advance
+		 * crosses its boundary and loads the tables after it.
 		 */
-		if (err == -ENXIO)
-			continue;
-		else if (err)
-			return err;
+		if (!op_ctx->curr_page.l1_table) {
+			skip = (u64)(ROGUE_MMUCTRL_ENTRIES_PD_VALUE - 1 -
+				     op_ctx->curr_page.l1_idx) *
+			       ROGUE_MMUCTRL_ENTRIES_PT_VALUE_X +
+			       (ROGUE_MMUCTRL_ENTRIES_PT_VALUE_X - 1 -
+				op_ctx->curr_page.l0_idx);
+		} else if (!op_ctx->curr_page.l0_table) {
+			skip = ROGUE_MMUCTRL_ENTRIES_PT_VALUE_X - 1 -
+			       op_ctx->curr_page.l0_idx;
+		}
 
-		pvr_page_destroy(op_ctx);
+		/* Stop at the last page; never advance past the range. */
+		if (skip >= nr_pages - page - 1)
+			return 0;
+
+		if (skip) {
+			if (!op_ctx->curr_page.l1_table)
+				op_ctx->curr_page.l1_idx =
+					ROGUE_MMUCTRL_ENTRIES_PD_VALUE - 1;
+			op_ctx->curr_page.l0_idx =
+				ROGUE_MMUCTRL_ENTRIES_PT_VALUE_X - 1;
+			page += skip;
+		}
+
+		err = pvr_mmu_op_context_next_page(op_ctx, false);
+		if (err && err != -ENXIO)
+			return err;
+		++page;
 	}
 
 	return 0;
