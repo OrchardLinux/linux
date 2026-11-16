@@ -73,6 +73,15 @@ config COMMON_CLK_APPLE_AOP_AUDIO
 	  This driver supports the clock of the PDM microphones on Apple A10
 	  devices, which the Always-On Processor's audio service generates.
 
+config COMMON_CLK_APPLE_S5L8960X_TOUCH
+	bool "Clock driver for Apple S5L8960X touchscreens"
+	depends on ARCH_APPLE || COMPILE_TEST
+	default ARCH_APPLE
+	help
+	  Support the touchscreen reference clock that PWM0 channel 2
+	  generates on Apple A7 (S5L8960X) devices such as the iPad Air.
+	  The other PWM channels are not exposed by this driver.
+
 config COMMON_CLK_APPLE_T8010_TOUCH
 	bool "Clock driver for Apple T7000/T8010 touchscreens"
 	depends on ARCH_APPLE || COMPILE_TEST
