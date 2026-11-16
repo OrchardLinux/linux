@@ -50,6 +50,9 @@
 struct pvr_apple_fence {
 	struct dma_fence base;
 	struct list_head node;
+	struct drm_gpu_scheduler *sched;
+	ktime_t submitted;
+	bool firmware_fault;
 };
 
 /*
@@ -321,6 +324,7 @@ static int pvr_apple_power_init(struct pvr_device *pvr_dev)
 		err = devm_mutex_init(dev, &apple->pm_lock);
 	if (err)
 		return err;
+	atomic_set(&apple->fault_pending, 0);
 	spin_lock_init(&apple->fence_lock);
 	spin_lock_init(&apple->event_lock);
 	for (i = 0; i < APPLE_ENGINES; i++)
@@ -689,6 +693,33 @@ static const struct dma_fence_ops pvr_apple_fence_ops = {
 	.get_timeline_name = pvr_apple_fence_timeline_name,
 };
 
+bool pvr_apple_fence_faulted(struct dma_fence *base)
+{
+	struct pvr_apple_fence *fence;
+
+	if (!base || base->ops != &pvr_apple_fence_ops)
+		return false;
+	fence = container_of(base, struct pvr_apple_fence, base);
+	return READ_ONCE(fence->firmware_fault);
+}
+
+/* Bind only hardware fences returned by a successful Apple submission. */
+void pvr_apple_fence_bind(struct pvr_device *pvr_dev, struct dma_fence *base,
+			  struct drm_gpu_scheduler *sched)
+{
+	struct pvr_apple *apple = to_apple(pvr_dev);
+	struct pvr_apple_fence *fence;
+	unsigned long flags;
+
+	if (!base || base->ops != &pvr_apple_fence_ops)
+		return;
+	fence = container_of(base, struct pvr_apple_fence, base);
+	spin_lock_irqsave(&apple->fence_lock, flags);
+	fence->sched = sched;
+	fence->submitted = ktime_get();
+	spin_unlock_irqrestore(&apple->fence_lock, flags);
+}
+
 /* MMU status fields and requestor names from the G5P fault decoder. */
 struct pvr_apple_mmu_fault {
 	bool valid, read;
@@ -832,6 +863,51 @@ void pvr_apple_report_mmu_fault(struct pvr_apple *apple)
 	}
 }
 
+/* Called once when a chip latches a fault, after capturing its MMU state. */
+void pvr_apple_firmware_fault(struct pvr_apple *apple)
+{
+	atomic_set(&apple->fault_pending, 1);
+	mod_delayed_work(system_highpri_wq, &apple->poll_work, 0);
+}
+
+/* A reset cancels every engine: fault only the oldest bound scheduler. */
+static void pvr_apple_fault_pending(struct pvr_apple *apple)
+{
+	static const char *const names[APPLE_ENGINES] = {
+		[APPLE_ENGINE_GEOM] = "geometry",
+		[APPLE_ENGINE_FRAG] = "fragment",
+		[APPLE_ENGINE_COMPUTE] = "compute",
+	};
+	struct pvr_apple_fence *fence, *oldest = NULL;
+	struct drm_gpu_scheduler *sched = NULL;
+	unsigned long flags;
+	u64 seqno = 0;
+	int engine, selected = 0;
+
+	spin_lock_irqsave(&apple->fence_lock, flags);
+	for (engine = 0; engine < APPLE_ENGINES; engine++) {
+		fence = list_first_entry_or_null(&apple->pending[engine],
+					 struct pvr_apple_fence, node);
+		if (!fence || !fence->sched)
+			continue;
+		if (!oldest || ktime_before(fence->submitted, oldest->submitted)) {
+			oldest = fence;
+			selected = engine;
+		}
+	}
+	if (oldest) {
+		WRITE_ONCE(oldest->firmware_fault, true);
+		sched = oldest->sched;
+		seqno = oldest->base.seqno;
+	}
+	spin_unlock_irqrestore(&apple->fence_lock, flags);
+	if (sched) {
+		dev_warn(apple_dev(apple), "firmware fault: resetting via %s job seqno=%llu\n",
+			 names[selected], seqno);
+		drm_sched_fault(sched);
+	}
+}
+
 /*
  * Consume the firmware's events. Completion is taken from the stamps, so the
  * events are only acknowledged: a full event ring stalls the firmware.
@@ -915,6 +991,8 @@ static void pvr_apple_poll_work(struct work_struct *work)
 		apple->chip->events(apple);
 	else
 		pvr_apple_ack_events(apple);
+	if (atomic_xchg(&apple->fault_pending, 0))
+		pvr_apple_fault_pending(apple);
 	spin_lock_irq(&apple->fence_lock);
 	for (engine = 0; engine < APPLE_ENGINES; engine++) {
 		u32 done = pvr_apple_engine_done(apple, engine);

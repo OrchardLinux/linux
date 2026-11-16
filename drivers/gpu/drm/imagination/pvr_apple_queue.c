@@ -57,6 +57,8 @@ static struct dma_fence *pvr_apple_run_job(struct drm_sched_job *sched_job)
 	fence = pvr_apple_submit(job);
 	if (IS_ERR(fence))
 		pvr_power_put(job->pvr_dev);
+	else
+		pvr_apple_fence_bind(job->pvr_dev, fence, sched_job->sched);
 	return fence;
 }
 
@@ -75,7 +77,10 @@ static enum drm_gpu_sched_stat pvr_apple_timedout_job(struct drm_sched_job *sche
 	 * puts it back, and drm_sched_start() completes it and the others
 	 * from their cancelled fences, so that free_job() runs for each.
 	 */
-	drm_err(from_pvr_device(job->pvr_dev), "Apple GPU job timed out\n");
+	if (pvr_apple_fence_faulted(sched_job->s_fence->parent))
+		drm_err(from_pvr_device(job->pvr_dev), "Apple GPU job lost to firmware fault\n");
+	else
+		drm_err(from_pvr_device(job->pvr_dev), "Apple GPU job timed out\n");
 	pvr_apple_report_hang(job->pvr_dev, sched_job->s_fence->parent);
 	atomic_set(&job->ctx->faulty, 1);
 	drm_sched_stop(sched, sched_job);

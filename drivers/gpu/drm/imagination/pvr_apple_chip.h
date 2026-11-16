@@ -17,6 +17,7 @@
 #include "pvr_apple.h"
 #include "pvr_device.h"
 
+#include <linux/atomic.h>
 #include <linux/dma-fence.h>
 #include <linux/hrtimer.h>
 #include <linux/io.h>
@@ -28,6 +29,7 @@
 #include <linux/workqueue.h>
 
 struct devfreq;
+struct drm_gpu_scheduler;
 struct pvr_gem_object;
 struct pvr_stream_cmd_defs;
 
@@ -110,6 +112,7 @@ struct pvr_apple {
 	u64 fence_context;		/* first of APPLE_ENGINES */
 	spinlock_t fence_lock;
 	struct list_head pending[3];	/* struct pvr_apple_fence, by seq */
+	atomic_t fault_pending;		/* a chip latched a new firmware fault */
 	struct delayed_work poll_work;
 	struct hrtimer poll_timer;	/* rearms poll_work while jobs are pending */
 	/*
@@ -301,6 +304,10 @@ static inline struct device *apple_dev(struct pvr_apple *apple)
 }
 
 void pvr_apple_report_mmu_fault(struct pvr_apple *apple);
+void pvr_apple_firmware_fault(struct pvr_apple *apple);
+bool pvr_apple_fence_faulted(struct dma_fence *fence);
+void pvr_apple_fence_bind(struct pvr_device *pvr_dev, struct dma_fence *fence,
+			  struct drm_gpu_scheduler *sched);
 int pvr_apple_fw_load(struct pvr_apple *apple, size_t max_size);
 int pvr_apple_wait_idle(struct pvr_apple *apple, unsigned int timeout_us);
 int pvr_apple_request_power_state(struct pvr_apple *apple, u32 state);

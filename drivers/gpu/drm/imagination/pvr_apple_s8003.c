@@ -979,7 +979,11 @@ static int s8003_drain(struct pvr_apple *apple, bool *alive)
 			dev_warn_ratelimited(apple_dev(apple), "firmware fault event type=%u slot=%u: %*ph\n",
 					     type, get_unaligned_le32(e + 0x0c),
 					     S8003_EVENT_SIZE - 4, e + 4);
-			WRITE_ONCE(s->fault, true);
+			if (!READ_ONCE(s->fault)) {
+				WRITE_ONCE(s->fault, true);
+				pvr_apple_report_mmu_fault(apple);
+				pvr_apple_firmware_fault(apple);
+			}
 		}
 		consumer = (consumer + 1) % APPLE_RING_ENTRIES;
 		ring_consume(ctl, consumer);
