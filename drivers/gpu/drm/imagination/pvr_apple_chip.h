@@ -88,6 +88,7 @@ struct pvr_apple {
 	bool booted;
 	bool fault_reported;		/* once per firmware boot */
 	bool fw_ready;		/* init data handed over once: runtime PM restarts it */
+	ktime_t gate_off;		/* last successful runtime power-off */
 
 	struct mutex submit_lock;	/* job slots, rings, producer index, GPU VM */
 	u32 last_seq;			/* last submitted compute job */

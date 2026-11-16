@@ -387,6 +387,13 @@ static int pvr_apple_power_on(struct pvr_device *pvr_dev)
 	struct pvr_apple *apple = to_apple(pvr_dev);
 	int err;
 
+	if (apple->chip->gate_off_ms && apple->gate_off) {
+		s64 remaining = (s64)apple->chip->gate_off_ms * USEC_PER_MSEC -
+				ktime_us_delta(ktime_get(), apple->gate_off);
+
+		if (remaining > 0)
+			msleep(DIV_ROUND_UP(remaining, USEC_PER_MSEC));
+	}
 	if (!apple->fw_ready)
 		return pvr_apple_boot(apple);
 
@@ -429,6 +436,8 @@ static int pvr_apple_power_off(struct pvr_device *pvr_dev)
 	/* the pollers run only while fences are pending; none are */
 	hrtimer_cancel(&apple->poll_timer);
 	cancel_delayed_work_sync(&apple->poll_work);
+	if (apple->chip->gate_off_ms)
+		apple->gate_off = ktime_get();
 	return 0;
 }
 
