@@ -276,6 +276,8 @@ struct pvr_apple_s8003 {
 	u32 gen;
 	spinlock_t tag_lock;		/* @tag and the host's tags in the shared memory */
 	u32 tag[S8003_SLOTS];		/* 0: slot not loaded */
+	DECLARE_BITMAP(loading, S8003_SLOTS);	/* tag held until DC_SLOT completes */
+	DECLARE_BITMAP(bump_pending, S8003_SLOTS); /* flush deferred while loading */
 	DECLARE_BITMAP(slots, S8003_SLOTS);
 	DECLARE_BITMAP(parked, S8003_SLOTS);	/* left on @park_vm's tables */
 	u32 next_slot;
@@ -1315,6 +1317,21 @@ static int s8003_device_control(struct pvr_apple *apple, const u32 (*cmd)[2], un
 				 S8003_DC_TIMEOUT_US, false, apple, ctl);
 }
 
+/* Bump a loaded slot's tag with tag_lock held; leave empty slots at zero. */
+static void s8003_slot_tag_bump(struct pvr_apple_s8003 *s, u32 slot)
+{
+	u32 tag = s->tag[slot];
+
+	lockdep_assert_held(&s->tag_lock);
+	if (!tag)
+		return;
+	tag += S8003_TAG_CATALOGUE;
+	if (!tag)
+		tag = S8003_TAG_CATALOGUE;
+	s->tag[slot] = tag;
+	put32(s8003_object(s, S8003_TAG_HOST) + 4 * slot, tag);
+}
+
 /* Point a pair of slots at a page-table root (0: at none) under @tag */
 static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, u32 tag)
 {
@@ -1326,6 +1343,7 @@ static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, 
 
 	spin_lock_irqsave(&s->tag_lock, flags);
 	for (e = 0; e < 2; e++) {
+		__set_bit(slot[e], s->loading);
 		put64(s8003_object(s, S8003_MMU_ROOT) + 8 * slot[e], root);
 		put32(s8003_object(s, S8003_TAG_HOST) + 4 * slot[e], tag);
 		s->tag[slot[e]] = tag;
@@ -1333,16 +1351,30 @@ static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, 
 	spin_unlock_irqrestore(&s->tag_lock, flags);
 
 	err = s8003_device_control(apple, cmd, 2);
-	/* The firmware copies the tag it loaded the root under */
+	if (err)
+		dev_err(apple_dev(apple), "GFX firmware slot load failed: %d\n", err);
+	/* The firmware must copy the tag we held stable while loading the root. */
 	for (e = 0; e < 2 && !err; e++) {
 		u32 seen = get32(s8003_object(s, S8003_TAG_SEEN) + 4 * slot[e]);
 
-		if (seen != tag && seen != READ_ONCE(s->tag[slot[e]]))
+		if (seen != tag) {
+			dev_err(apple_dev(apple),
+				"GFX firmware did not load slot %u: loaded tag %#x, firmware saw %#x, now %#x\n",
+				slot[e], tag, seen, READ_ONCE(s->tag[slot[e]]));
 			err = -EIO;
+		}
 	}
-	if (err)
-		dev_err(apple_dev(apple), "GFX firmware did not load slots %u and %u: %d\n",
-			slot[0], slot[1], err);
+	/* The attach holds submit_lock: deferred flushes precede the VM's job. */
+	spin_lock_irqsave(&s->tag_lock, flags);
+	for (e = 0; e < 2; e++) {
+		__clear_bit(slot[e], s->loading);
+		if (test_bit(slot[e], s->bump_pending)) {
+			s8003_slot_tag_bump(s, slot[e]);
+			__clear_bit(slot[e], s->bump_pending);
+		}
+	}
+	spin_unlock_irqrestore(&s->tag_lock, flags);
+	wmb();
 	return err;
 }
 
@@ -1406,15 +1438,10 @@ static void pvr_apple_s8003_mmu_flush(struct pvr_apple *apple)
 		return;
 	spin_lock_irqsave(&s->tag_lock, flags);
 	for (slot = S8003_SLOT_FIRST; slot < S8003_SLOTS; slot++) {
-		u32 tag = s->tag[slot];
-
-		if (!tag)
-			continue;
-		tag += S8003_TAG_CATALOGUE;
-		if (!tag)
-			tag = S8003_TAG_CATALOGUE;
-		s->tag[slot] = tag;
-		put32(s8003_object(s, S8003_TAG_HOST) + 4 * slot, tag);
+		if (test_bit(slot, s->loading))
+			__set_bit(slot, s->bump_pending);
+		else
+			s8003_slot_tag_bump(s, slot);
 	}
 	spin_unlock_irqrestore(&s->tag_lock, flags);
 	wmb();
