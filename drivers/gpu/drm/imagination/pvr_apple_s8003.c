@@ -943,7 +943,7 @@ static int s8003_ring_discard(u8 *ctl)
  * Read what the firmware posted, in the order Apple's kext does: the log
  * lanes, the events, statistics, trace. A full ring stalls the firmware.
  * Events other than "alive" and a job's stamp are a fault or a recovery
- * request: they are logged, and a job the firmware gave up times out. An
+ * request: they are logged, and end a wait for a job the firmware gave up. An
  * error is a ring whose indices are not the host's and the firmware's any
  * more.
  */
@@ -975,7 +975,8 @@ static int s8003_drain(struct pvr_apple *apple, bool *alive)
 		if (type == S8003_EVENT_ALIVE) {
 			*alive = true;
 		} else if (type != S8003_EVENT_STAMP) {
-			dev_warn_ratelimited(apple_dev(apple), "firmware event %u: %*ph\n", type,
+			dev_warn_ratelimited(apple_dev(apple), "firmware fault event type=%u slot=%u: %*ph\n",
+					     type, get_unaligned_le32(e + 0x0c),
 					     S8003_EVENT_SIZE - 4, e + 4);
 			WRITE_ONCE(s->fault, true);
 		}
@@ -1251,10 +1252,16 @@ static u32 s8003_done_poll(struct pvr_apple *apple, enum pvr_apple_engine engine
 
 static int s8003_wait_done(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 seq)
 {
+	struct pvr_apple_s8003 *s = apple->chip_data;
 	u32 done;
+	int err;
 
-	return read_poll_timeout(s8003_done_poll, done, (s32)(done - seq) >= 0, 20,
-				 S8003_JOB_TIMEOUT_US, false, apple, engine);
+	err = read_poll_timeout(s8003_done_poll, done,
+				(s32)(done - seq) >= 0 || READ_ONCE(s->fault), 20,
+				S8003_JOB_TIMEOUT_US, false, apple, engine);
+	if (!err && (s32)(done - seq) < 0)
+		return -EIO;
+	return err;
 }
 
 /*
