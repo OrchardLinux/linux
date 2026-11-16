@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * DRM/KMS driver for the Apple A9 (S8000/S8003) display pipe, disp0.
+ * DRM/KMS driver for the Apple A9/A10 display pipe, disp0.
  *
  * iBoot leaves the eDP link, the panel and the timing generator running.
  * This driver adopts that mode and never programs timings, clocks or the
@@ -26,26 +26,42 @@
  * never writing it, and leaves the display to simpledrm otherwise.
  * Scanout buffers are ordinary DMA allocations that must fall inside the
  * same 4 GiB window.
+ *
+ * With dart_scanout=1 the pipe reads through dart-disp0 instead, as on iOS,
+ * where IOMobileFramebuffer maps every swap surface through the display's
+ * IOMapper as one DART segment. Any buffer, including another device's
+ * scattered dma-buf, can then be scanned out. Probe maps the live boot
+ * framebuffer at its bypass bus address before translation starts, keeps
+ * every buffer it handed to the pipe mapped until the pipe is seen reading a
+ * newer one, and returns the DART to bypass, on the boot framebuffer, at
+ * shutdown.
  */
 
 #include <linux/aperture.h>
+#include <linux/apple-dart.h>
+#include <linux/console.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_device.h>
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/sizes.h>
+#include <linux/scatterlist.h>
+#include <linux/slab.h>
 #include <linux/timer.h>
+#include <linux/workqueue.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
@@ -71,6 +87,10 @@
 #define ADP_PARMST_STATE	GENMASK(7, 4)
 #define ADP_INTEN		0x1028
 #define ADP_STATUS		0x102c	/* W1C; reads are unmasked */
+#define ADP_CRC			0x2030	/* blend CRC, read only */
+#define ADP_CRC_CTL		0x1074	/* iOS: 1 enables blend CRC, 0 disables */
+#define ADP_CRC_CTL_EN		BIT(0)
+#define ADP_BLEND_BYPASS	0x2020	/* logged only, never written here */
 #define ADP_FRAME		0x1034	/* [15:0] frame counter */
 #define ADP_VALID		0x1038	/* bit 0: pipe state usable */
 #define ADP_FIFO_PTR		0x1040
@@ -138,6 +158,20 @@
 #define ADBE_FB_SIZE		(ADBE_PITCH * ADBE_HEIGHT)
 #define ADBE_KICK_WAIT_US	(20 * USEC_PER_MSEC)	/* iOS allows 1 s */
 #define ADBE_PARK_WAIT_US	(100 * USEC_PER_MSEC)
+/* Translated scanout: buffers held for the pipe, and when they are released. */
+#define ADBE_HOLD_MAX		8
+#define ADBE_HOLD_FRAMES	1	/* boundaries after a newer entry is seen live */
+#define ADBE_HOLD_POLL_MS	8
+#define ADBE_FRAME_MS		17	/* one 60 Hz frame, rounded up */
+/* Smallest IOVA window left below the boot framebuffer for allocations. */
+#define ADBE_DART_MIN_WINDOW	SZ_256M
+#define ADBE_VERIFY_PAGE	SZ_16K
+#define ADBE_VERIFY_IOVA_START	SZ_16M
+
+static bool dart_scanout = true;
+module_param(dart_scanout, bool, 0444);
+MODULE_PARM_DESC(dart_scanout,
+		 "Scan out through the display DART, so any dma-buf can be shown (reads back the active mode)");
 #define ADBE_FLIP_VBLANKS	3	/* complete on VBI if bit 10 never comes */
 #define ADBE_FLIP_TIMEOUT_MS	100	/* complete anyway without an interrupt */
 #define ADBE_INTEN_VBLANK	(ADP_ST_VBI | ADP_ST_APPLIED)
@@ -171,6 +205,29 @@ struct adbe {
 	bool event_applied;
 	u64 kick_seq;
 	struct timer_list flip_timer;
+
+	/* Translated scanout only (dart_scanout); scanout is NULL otherwise. */
+	struct device_node *scanout_np;
+	struct platform_device *scanout;
+	struct platform_device *dart;
+	void __iomem *dart_regs[DART_WINDOWS];
+	struct iommu_domain *domain;
+	u32 boot_iova_len;
+	/*
+	 * Framebuffers handed to the pipe, oldest first. One is released only
+	 * after the pipe has shown a newer one and ADBE_HOLD_FRAMES frame
+	 * boundaries have passed, so no buffer is unmapped while it is still
+	 * fetched.
+	 */
+	spinlock_t hold_lock;
+	struct {
+		struct drm_framebuffer *fb;
+		u32 base;
+		bool seen;	/* live base has shown this entry */
+		u16 seen_frame;	/* ADP_FRAME when it was first seen */
+	} hold[ADBE_HOLD_MAX];
+	unsigned int nhold;
+	struct delayed_work hold_work;
 };
 
 static struct adbe *to_adbe(struct drm_device *drm)
@@ -388,7 +445,7 @@ static int adbe_kick(struct adbe *adbe, u32 base, u32 stride,
  * applied in time, store the base directly and push an empty packet, as the
  * H7 pipe driver does.
  */
-static void adbe_park(struct adbe *adbe)
+static void adbe_park_pipe(struct adbe *adbe)
 {
 	unsigned long flags;
 	u32 base;
@@ -417,6 +474,131 @@ static void adbe_park(struct adbe *adbe)
 		spin_unlock_irqrestore(&adbe->drm.event_lock, flags);
 	}
 	adbe->cur_base = adbe->boot_base;
+}
+
+/*
+ * Translated scanout: drop the held framebuffers that the pipe can no
+ * longer read. The parameter FIFO applies packets in order, one at a frame
+ * boundary, and a new packet is only pushed once the previous one is out of
+ * the FIFO. Once the live base has shown an entry and ADBE_HOLD_FRAMES
+ * further boundaries have passed, every older entry is therefore finished,
+ * including ones whose update was skipped. A park is recorded as an entry
+ * without a framebuffer, so it orders against later updates like any
+ * buffer. A base that matches nothing releases nothing. @all drops every
+ * entry; callers use it only once the DART is back in bypass.
+ */
+static void adbe_hold_release(struct adbe *adbe, bool all)
+{
+	struct drm_framebuffer *drop[ADBE_HOLD_MAX];
+	unsigned int ndrop = 0, keep, i;
+	unsigned long flags;
+	u16 frame;
+	u32 hw;
+
+	hw = readl(adbe->regs + ADP_BASE) & ~ADBE_ADDR_TAG;
+	frame = readl(adbe->regs + ADP_FRAME);
+
+	spin_lock_irqsave(&adbe->hold_lock, flags);
+	if (all) {
+		ndrop = adbe->nhold;
+	} else {
+		/* The newest entry with the live base is the one on screen. */
+		for (i = adbe->nhold; i-- > 0;) {
+			if (adbe->hold[i].base == hw) {
+				if (!adbe->hold[i].seen) {
+					adbe->hold[i].seen = true;
+					adbe->hold[i].seen_frame = frame;
+				}
+				break;
+			}
+		}
+		/* Everything older than the newest entry seen long enough. */
+		for (i = adbe->nhold; i-- > 0;) {
+			if (adbe->hold[i].seen &&
+			    (u16)(frame - adbe->hold[i].seen_frame) >=
+			    ADBE_HOLD_FRAMES) {
+				ndrop = i;
+				break;
+			}
+		}
+	}
+	keep = adbe->nhold - ndrop;
+	for (i = 0; i < ndrop; i++)
+		drop[i] = adbe->hold[i].fb;
+	for (i = 0; i < keep; i++)
+		adbe->hold[i] = adbe->hold[ndrop + i];
+	adbe->nhold = keep;
+	spin_unlock_irqrestore(&adbe->hold_lock, flags);
+
+	for (i = 0; i < ndrop; i++)
+		if (drop[i])
+			drm_framebuffer_put(drop[i]);
+}
+
+static void adbe_hold_work(struct work_struct *work)
+{
+	struct adbe *adbe = container_of(to_delayed_work(work), struct adbe,
+					 hold_work);
+
+	adbe_hold_release(adbe, false);
+	/* The newest entry is the one on screen: it stays until replaced. */
+	if (READ_ONCE(adbe->nhold) > 1)
+		schedule_delayed_work(&adbe->hold_work,
+				      msecs_to_jiffies(ADBE_HOLD_POLL_MS));
+}
+
+/*
+ * Hold @fb, at bus address @bus, until the pipe has moved past it. A NULL
+ * @fb records a park on the boot framebuffer.
+ */
+static void adbe_hold_push(struct adbe *adbe, struct drm_framebuffer *fb,
+			   u32 bus)
+{
+	struct drm_framebuffer *old = NULL;
+	unsigned long flags;
+	int tries;
+
+	/* Full only if the pipe ignores updates; give it a few frames. */
+	for (tries = 0; tries < 8 && READ_ONCE(adbe->nhold) == ADBE_HOLD_MAX;
+	     tries++) {
+		msleep(ADBE_HOLD_POLL_MS);
+		adbe_hold_release(adbe, false);
+	}
+
+	if (fb)
+		drm_framebuffer_get(fb);
+	spin_lock_irqsave(&adbe->hold_lock, flags);
+	if (!fb && adbe->nhold && !adbe->hold[adbe->nhold - 1].fb) {
+		/* Already parked. */
+		spin_unlock_irqrestore(&adbe->hold_lock, flags);
+		return;
+	}
+	if (adbe->nhold == ADBE_HOLD_MAX) {
+		old = adbe->hold[0].fb;
+		memmove(&adbe->hold[0], &adbe->hold[1],
+			sizeof(adbe->hold[0]) * (ADBE_HOLD_MAX - 1));
+		adbe->nhold--;
+	}
+	adbe->hold[adbe->nhold].fb = fb;
+	adbe->hold[adbe->nhold].base = bus;
+	adbe->hold[adbe->nhold].seen = false;
+	adbe->nhold++;
+	spin_unlock_irqrestore(&adbe->hold_lock, flags);
+
+	if (old) {
+		dev_warn_ratelimited(adbe->drm.dev,
+				     "pipe not following updates, releasing the oldest held buffer\n");
+		drm_framebuffer_put(old);
+	}
+	mod_delayed_work(system_wq, &adbe->hold_work,
+			 msecs_to_jiffies(ADBE_HOLD_POLL_MS));
+}
+
+static void adbe_park(struct adbe *adbe)
+{
+	adbe_park_pipe(adbe);
+	if (adbe->scanout)
+		adbe_hold_push(adbe, NULL, adbe->boot_base & ~ADBE_ADDR_TAG);
 }
 
 static int adbe_plane_atomic_check(struct drm_plane *plane,
@@ -477,6 +659,11 @@ static void adbe_plane_atomic_update(struct drm_plane *plane,
 	adbe->next_base = adbe_tag_word(bus, adbe->boot_base);
 	adbe->next_stride = adbe_tag_word(fb->pitches[0], adbe->boot_stride);
 	adbe->next_dirty = true;
+	/* DRM drops its reference at flip completion, which may precede the
+	 * boundary the pipe applies the base at; keep it mapped until then.
+	 */
+	if (adbe->scanout)
+		adbe_hold_push(adbe, fb, bus);
 }
 
 static const struct drm_plane_helper_funcs adbe_plane_helper_funcs = {
@@ -799,7 +986,11 @@ static int adbe_check_dart_bypass(struct adbe *adbe, u32 bus, phys_addr_t pa)
 	struct platform_device *pdev = to_platform_device(adbe->drm.dev);
 	static const char * const names[DART_WINDOWS] = { "dart0", "dart1" };
 	struct device *dev = adbe->drm.dev;
+	struct device_node *scanout_np = of_get_child_by_name(dev->of_node, "scanout");
+	bool has_scanout = !!scanout_np;
 	unsigned int win, sid;
+
+	of_node_put(scanout_np);
 
 	for (win = 0; win < DART_WINDOWS; win++) {
 		struct resource *res;
@@ -825,6 +1016,12 @@ static int adbe_check_dart_bypass(struct adbe *adbe, u32 bus, phys_addr_t pa)
 		for (sid = 0; sid < DART_STREAMS && !ret; sid++) {
 			if (!((tcr >> (8 * sid)) & DART_TCR_TRANSLATE))
 				continue;
+			/* A scanout DMA child identifies dart1 as an SMMU. */
+			if (has_scanout && win == 1) {
+				dev_err(dev, "display SMMU stream %u translates: unknown scanout state\n", sid);
+				ret = -ENODEV;
+				break;
+			}
 			ret = adbe_dart_maps_scanout(dart, sid, bus, pa);
 			if (ret)
 				dev_err(dev, "display DART %s stream %u %s the scanout\n",
@@ -838,6 +1035,657 @@ static int adbe_check_dart_bypass(struct adbe *adbe, u32 bus, phys_addr_t pa)
 
 	return 0;
 }
+
+#ifdef CONFIG_IOMMU_API
+/* Non-requesting views. Only an owned, blocked rollback may force-clear
+ * residual translate bits, after the IOMMU driver has attempted the detach.
+ */
+static void adbe_dart_iounmap(void *map)
+{
+	iounmap(map);
+}
+
+static int adbe_dart_map_windows(struct adbe *adbe)
+{
+	struct platform_device *pdev = to_platform_device(adbe->drm.dev);
+	static const char * const names[] = { "dart0", "dart1" };
+	unsigned int win;
+
+	for (win = 0; win < ARRAY_SIZE(names); win++) {
+		struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[win]);
+		int ret;
+
+		if (!res)
+			return -ENODEV;
+		if (res->flags & IORESOURCE_MEM_NONPOSTED)
+			adbe->dart_regs[win] = ioremap_np(res->start, resource_size(res));
+		else
+			adbe->dart_regs[win] = ioremap(res->start, resource_size(res));
+		if (!adbe->dart_regs[win])
+			return -ENOMEM;
+		ret = devm_add_action_or_reset(adbe->drm.dev, adbe_dart_iounmap, adbe->dart_regs[win]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static void adbe_dart_capture(struct adbe *adbe, const char *phase)
+{
+	void __iomem *d = adbe->dart_regs[0], *s = adbe->dart_regs[1];
+
+	dev_info(adbe->drm.dev,
+		 "display DART %s: 0c=%08x 10=%08x 1c=%08x 20=%08x 24=%08x 2c=%08x 30=%08x\n",
+		 phase, readl(d + 0x0c), readl(d + 0x10), readl(d + 0x1c),
+		 readl(d + 0x20), readl(d + 0x24), readl(d + 0x2c), readl(d + 0x30));
+	dev_info(adbe->drm.dev,
+		 "display SMMU %s: 0c=%08x 10=%08x 14=%08x 1c=%08x 20=%08x 24=%08x 2c=%08x 1000=%08x\n",
+		 phase, readl(s + 0x0c), readl(s + 0x10), readl(s + 0x14),
+		 readl(s + 0x1c), readl(s + 0x20), readl(s + 0x24), readl(s + 0x2c), readl(s + 0x1000));
+}
+
+/* Only the primary DART has TTBRs; both front ends must translate. */
+static int adbe_check_dart_translates(struct adbe *adbe, u32 bus, phys_addr_t pa)
+{
+	void __iomem *dart = adbe->dart_regs[0], *smmu = adbe->dart_regs[1];
+	u32 tcr = readl(dart + DART_TCR), smmu_tcr = readl(smmu + DART_TCR);
+	unsigned int sid;
+	int ret;
+
+	for (sid = 0; sid < DART_STREAMS; sid++) {
+		if (!((tcr >> (8 * sid)) & DART_TCR_TRANSLATE) ||
+		    !((smmu_tcr >> (8 * sid)) & DART_TCR_TRANSLATE))
+			ret = -EIO;
+		else
+			ret = adbe_dart_maps_scanout(dart, sid, bus, pa);
+		if (ret != 1) {
+			dev_err(adbe->drm.dev, "display DART/SMMU stream %u does not map %#x to %pa\n",
+				sid, bus, &pa);
+			return ret < 0 ? ret : -EIO;
+		}
+	}
+	return 0;
+}
+
+static bool adbe_dart_is_bypass(struct adbe *adbe)
+{
+	u32 d = readl(adbe->dart_regs[0] + DART_TCR);
+	u32 s = readl(adbe->dart_regs[1] + DART_TCR);
+
+	if (d || s) {
+		dev_err(adbe->drm.dev, "display DART/SMMU still translating (%08x/%08x)\n", d, s);
+		return false;
+	}
+	return true;
+}
+
+/* Claiming the blocking domain must precede any fallback TCR write. No
+ * scanout allocations exist yet, and the pipe is back on its identity image.
+ */
+static int adbe_dart_rollback(struct adbe *adbe, struct device *sdev)
+{
+	u32 mask = 0x80808080, d, s;
+	int ret;
+
+	ret = iommu_device_claim_dma_owner(sdev, adbe);
+	d = readl(adbe->dart_regs[0] + DART_TCR);
+	s = readl(adbe->dart_regs[1] + DART_TCR);
+	if (ret) {
+		dev_err(adbe->drm.dev, "cannot return the display DART to bypass (%d)\n", ret);
+	} else if ((d | s) & mask) {
+		dev_err(adbe->drm.dev,
+			"display DART rollback left translate bits set (%08x/%08x); clearing DART then SMMU\n",
+			d, s);
+		writel(d & ~mask, adbe->dart_regs[0] + DART_TCR);
+		readl(adbe->dart_regs[0] + DART_TCR);
+		writel(s & ~mask, adbe->dart_regs[1] + DART_TCR);
+		readl(adbe->dart_regs[1] + DART_TCR);
+		d = readl(adbe->dart_regs[0] + DART_TCR);
+		s = readl(adbe->dart_regs[1] + DART_TCR);
+	}
+	dev_info(adbe->drm.dev, "display DART after-rollback dart0c=%08x smmu0c=%08x\n", d, s);
+	return ret || !adbe_dart_is_bypass(adbe) ? -EIO : 0;
+}
+
+static u32 adbe_verify_errors(struct adbe *adbe)
+{
+	u32 errors = readl(adbe->regs + ADP_STATUS) & ADP_ST_ERRORS;
+
+	if (errors)
+		writel(errors, adbe->regs + ADP_STATUS);
+	return errors;
+}
+
+/* No IRQ is requested yet. Require this packet's applied bit, two further
+ * VBIs, then two samples on successive VBIs. Preserve errors for each step.
+ */
+static int adbe_verify_show(struct adbe *adbe, u32 base, u32 stride,
+			    u32 *crc, u32 *errors)
+{
+	u32 status, frame, previous, samples[2];
+	unsigned int i;
+	int ret;
+
+	ret = adbe_kick(adbe, base, stride, NULL);
+	if (ret)
+		goto out;
+	ret = readl_poll_timeout(adbe->regs + ADP_STATUS, status,
+				 status & ADP_ST_APPLIED, 1000, ADBE_PARK_WAIT_US);
+	if (ret)
+		goto out;
+	writel(status & ADP_ST_DONE, adbe->regs + ADP_STATUS);
+	for (i = 0; i < 3; i++) {
+		previous = (u16)readl(adbe->regs + ADP_FRAME);
+		ret = readl_poll_timeout(adbe->regs + ADP_FRAME, frame,
+					 (u16)frame != previous, 1000,
+					 3 * ADBE_FRAME_MS * USEC_PER_MSEC);
+		if (ret)
+			goto out;
+		if (i)
+			samples[i - 1] = readl(adbe->regs + ADP_CRC);
+	}
+	*crc = samples[1];
+	if (readl(adbe->regs + ADP_BASE) != base ||
+	    readl(adbe->regs + ADP_STRIDE) != stride)
+		ret = -EIO;
+	else if (samples[0] != samples[1])
+		ret = -EAGAIN;
+out:
+	*errors |= adbe_verify_errors(adbe);
+	return ret;
+}
+
+static bool adbe_verify_overlap(u64 a, size_t len, u64 b, size_t blen)
+{
+	return a < b + blen && b < a + len;
+}
+
+/* All manual mappings are made before the DMA allocator sees this domain.
+ * Exclude both the boot mapping and scratch's bypass/identity mapping.
+ */
+static int adbe_verify_aliases(u32 boot, u32 scratch, size_t len, u32 alias[2])
+{
+	u64 at;
+	unsigned int n = 0;
+
+	for (at = ADBE_VERIFY_IOVA_START; at + len <= boot; at += ALIGN(len, SZ_16M)) {
+		if (adbe_verify_overlap(at, len, boot, PAGE_ALIGN(ADBE_FB_SIZE)) ||
+		    adbe_verify_overlap(at, len, scratch, len))
+			continue;
+		alias[n++] = at;
+		if (n == 2)
+			return 0;
+	}
+	return -ENOSPC;
+}
+
+/* Same allocator as adbe_dumb_create(), before drm_dev_set_dma_dev(): the
+ * parent is still in direct-DMA mode. Verify physical contiguity from its
+ * exported sg table instead of treating an opaque DMA handle as a PA.
+ */
+static struct drm_gem_dma_object *adbe_verify_pattern(struct adbe *adbe,
+						    size_t len, phys_addr_t *pa, u32 *bus)
+{
+	struct drm_gem_dma_object *obj;
+	struct sg_table *sgt;
+	struct scatterlist *sg;
+	phys_addr_t next;
+	size_t bytes = 0, off;
+	unsigned int i;
+	__le32 *pixels;
+	int ret = -ERANGE;
+
+	obj = drm_gem_dma_create(&adbe->drm, len);
+	if (IS_ERR(obj))
+		return obj;
+	sgt = drm_gem_dma_get_sg_table(obj);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		goto put;
+	}
+	*pa = sg_phys(sgt->sgl);
+	next = *pa;
+	for_each_sg(sgt->sgl, sg, sgt->orig_nents, i) {
+		if (sg_phys(sg) != next)
+			break;
+		next += sg->length;
+		bytes += sg->length;
+	}
+	sg_free_table(sgt);
+	kfree(sgt);
+	if (bytes < len || !IS_ALIGNED(*pa, ADBE_VERIFY_PAGE) ||
+	    !adbe_cpu_to_bus(adbe, *pa, len, bus))
+		goto put;
+	pixels = obj->vaddr;
+	for (off = 0; off < len; off += sizeof(*pixels)) {
+		u32 x = (off % ADBE_PITCH) / sizeof(*pixels);
+		u32 y = off / ADBE_PITCH;
+		u32 value = (x * 0x9e3779b1U) ^ (y * 0x85ebca77U);
+
+		/* A distinct opaque marker at every 16 KiB page's first pixel
+		 * guarantees that no two test pages contain the same bytes.
+		 */
+		if (!(off % ADBE_VERIFY_PAGE))
+			value = off / ADBE_VERIFY_PAGE + 1;
+		pixels[off / sizeof(*pixels)] = cpu_to_le32(0xff000000 | (value & 0xffffff));
+	}
+	wmb(); /* publish the allocator's write-combined stores */
+	dma_sync_single_for_device(drm_dev_dma_dev(&adbe->drm), obj->dma_addr,
+				   len, DMA_TO_DEVICE);
+	return obj;
+put:
+	drm_gem_object_put(&obj->base);
+	return ERR_PTR(ret);
+}
+
+/* A is a real bypass reference, before deferred attach; B/C cannot validate
+ * each other if both fetch unrelated RAM. Every exit restores the old frame
+ * before releasing scratch pages or IOVAs, and verdict dumps follow rollback.
+ */
+static int adbe_dart_verify(struct adbe *adbe, struct device *sdev,
+			    struct iommu_domain *domain, u32 iova, size_t len, int f0)
+{
+	struct drm_gem_dma_object *pattern = NULL;
+	const char *result = "INCONCLUSIVE", *reason = "fault count unavailable";
+	u32 crc[3] = {}, errors[4] = {}, alias[2], bus = 0, ignored_crc;
+	u32 crcctl[4] = {}; /* before write, after write, after A, after restore */
+	u32 blend_bypass = 0;
+	bool crcctl_written = false;
+	u32 previous_base = readl(adbe->regs + ADP_BASE);
+	u32 previous_stride = readl(adbe->regs + ADP_STRIDE);
+	u32 stride = adbe_tag_word(ADBE_PITCH, previous_stride);
+	size_t mapped_p = 0;
+	phys_addr_t pa;
+	bool mapped_id = false, mapped_a = false, restore_failed = false;
+	int f1, delta = 0, ret;
+
+	if (f0 < 0)
+		goto verdict;
+	if (!adbe_dart_is_bypass(adbe)) {
+		result = "FAIL";
+		reason = "reference is not bypass";
+		goto verdict;
+	}
+	reason = "pattern allocation failed";
+	pattern = adbe_verify_pattern(adbe, len, &pa, &bus);
+	if (IS_ERR(pattern)) {
+		pattern = NULL;
+		goto verdict;
+	}
+	reason = "no alias IOVA window";
+	if (adbe_verify_overlap(bus, len, iova, len) ||
+	    adbe_verify_aliases(iova, bus, len, alias))
+		goto cleanup;
+	reason = "alias mapping failed";
+	ret = iommu_map(domain, bus, pa, len, IOMMU_READ, GFP_KERNEL);
+	if (ret)
+		goto cleanup;
+	mapped_id = true;
+	ret = iommu_map(domain, alias[0], pa, len, IOMMU_READ, GFP_KERNEL);
+	if (ret)
+		goto cleanup;
+	mapped_a = true;
+	/* Swap exactly the first two 16 KiB pages, not the image halves. */
+	ret = iommu_map(domain, alias[1], pa + ADBE_VERIFY_PAGE,
+			ADBE_VERIFY_PAGE, IOMMU_READ, GFP_KERNEL);
+	if (ret)
+		goto cleanup;
+	mapped_p = ADBE_VERIFY_PAGE;
+	ret = iommu_map(domain, alias[1] + ADBE_VERIFY_PAGE, pa,
+			ADBE_VERIFY_PAGE, IOMMU_READ, GFP_KERNEL);
+	if (ret)
+		goto cleanup;
+	mapped_p += ADBE_VERIFY_PAGE;
+	ret = iommu_map(domain, alias[1] + mapped_p, pa + mapped_p,
+			len - mapped_p, IOMMU_READ, GFP_KERNEL);
+	if (ret)
+		goto cleanup;
+	mapped_p = len;
+
+	console_lock();
+	/* Discard inherited errors, especially a warm boot's output underrun. */
+	adbe_verify_errors(adbe);
+	/* iOS setBlendCRCEnable (ExportCRCAtVBI path): direct write of 1. */
+	crcctl[0] = readl(adbe->regs + ADP_CRC_CTL);
+	blend_bypass = readl(adbe->regs + ADP_BLEND_BYPASS);
+	writel(ADP_CRC_CTL_EN, adbe->regs + ADP_CRC_CTL);
+	crcctl_written = true;
+	crcctl[1] = readl(adbe->regs + ADP_CRC_CTL);
+	if (!(crcctl[1] & ADP_CRC_CTL_EN)) {
+		reason = "pipe CRC enable not live";
+		goto restore_crc;
+	}
+	ret = adbe_verify_show(adbe, adbe_tag_word(bus, previous_base), stride,
+			       &crc[0], &errors[0]);
+	crcctl[2] = readl(adbe->regs + ADP_CRC_CTL);
+	if (ret || !crc[0]) {
+		reason = "pipe CRC not live";
+		goto restore;
+	}
+	ret = iommu_deferred_attach(sdev, domain);
+	if (ret) {
+		result = "FAIL";
+		reason = "translation attach failed";
+		goto restore;
+	}
+	if (adbe_check_dart_translates(adbe, bus, pa) ||
+	    adbe_check_dart_translates(adbe, alias[0], pa) ||
+	    adbe_check_dart_translates(adbe, alias[1], pa + ADBE_VERIFY_PAGE)) {
+		result = "FAIL";
+		reason = "translation read-back changed";
+		goto restore;
+	}
+	ret = adbe_verify_show(adbe, adbe_tag_word(alias[0], previous_base), stride,
+			       &crc[1], &errors[1]);
+	if (ret == -EAGAIN) {
+		reason = "translated pattern CRC unstable";
+		goto restore;
+	}
+	if (ret || crc[1] != crc[0]) {
+		result = "FAIL";
+		reason = ret ? "pipe update failed" : "wrong pixels through translation";
+		goto restore;
+	}
+	ret = adbe_verify_show(adbe, adbe_tag_word(alias[1], previous_base), stride,
+			       &crc[2], &errors[2]);
+	if (ret) {
+		reason = ret == -EAGAIN ? "permuted pattern CRC unstable" : "pipe update failed";
+		if (ret != -EAGAIN)
+			result = "FAIL";
+	} else if (crc[2] == crc[0]) {
+		reason = "pipe CRC not live";
+	} else {
+		reason = NULL;
+	}
+restore:
+	/* R: previous image, including its exact base/stride tag bits. Its CRC
+	 * need not be live: applied/base/stride and the frame waits qualify it.
+	 */
+	ret = adbe_verify_show(adbe, previous_base, previous_stride,
+			       &ignored_crc, &errors[3]);
+	restore_failed = ret && ret != -EAGAIN;
+restore_crc:
+	if (crcctl_written) {
+		writel(crcctl[0], adbe->regs + ADP_CRC_CTL);
+		crcctl[3] = readl(adbe->regs + ADP_CRC_CTL);
+	}
+	console_unlock();
+	if (restore_failed) {
+		result = "FAIL";
+		reason = "previous framebuffer restore failed";
+		dev_err(adbe->drm.dev,
+			"display DART cannot restore previous scanout; retaining scratch and IOVAs\n");
+	}
+cleanup:
+	/* Never free or unmap anything the pipe might still be fetching. */
+	if (!restore_failed) {
+		bool failed = false;
+
+		if (mapped_p && iommu_unmap(domain, alias[1], mapped_p) != mapped_p)
+			failed = true;
+		if (mapped_a && iommu_unmap(domain, alias[0], len) != len)
+			failed = true;
+		if (mapped_id && iommu_unmap(domain, bus, len) != len)
+			failed = true;
+		if (failed) {
+			result = "FAIL";
+			reason = "alias unmap failed";
+		}
+	}
+verdict:
+	/* Both IRQ sources and their sticky/masked errors feed this counter. */
+	f1 = apple_dart_fault_count(&adbe->dart->dev);
+	if (f0 >= 0 && f1 >= f0)
+		delta = f1 - f0;
+	if (delta) {
+		result = "FAIL";
+		reason = "DART/SMMU fault";
+	} else if (f0 < 0 || f1 < f0) {
+		if (result[0] != 'F') {
+			result = "INCONCLUSIVE";
+			reason = "fault count unavailable";
+		}
+	}
+	/* Bit 1 is OutUnder (reported only); bits 6/9/11 are PFAlign/PFOver/RdErr. */
+	if ((errors[1] | errors[2]) & (ADP_ST_ERRORS & ~BIT(1))) {
+		result = "FAIL";
+		reason = "translated pipe error";
+	}
+	if (!reason &&
+	    (adbe_check_dart_translates(adbe, iova, adbe->boot.start) ||
+	     adbe_check_dart_translates(adbe, iova + len - SZ_4K,
+				 adbe->boot.start + len - SZ_4K))) {
+		result = "FAIL";
+		reason = "translation read-back changed";
+	}
+	ret = 0;
+	if (reason) {
+		if (restore_failed || adbe_dart_rollback(adbe, sdev))
+			ret = -EIO;
+		else
+			ret = -ENODEV;
+	}
+	if (pattern && !restore_failed && ret != -EIO)
+		drm_gem_object_put(&pattern->base);
+	/* This capture is AFTER rollback and any forced clear, never before. */
+	adbe_dart_capture(adbe, "after-verdict");
+	if (!reason) {
+		dev_info(adbe->drm.dev,
+			 "display DART self-check passed: pattern crc %08x translated %08x permuted %08x faults +%d step=A errbits=%#x step=B errbits=%#x step=C errbits=%#x step=R errbits=%#x crcctl %08x>%08x>%08x restored %08x blendbypass %08x\n",
+			 crc[0], crc[1], crc[2], delta, errors[0], errors[1], errors[2], errors[3],
+			 crcctl[0], crcctl[1], crcctl[2], crcctl[3], blend_bypass);
+	} else {
+		dev_info(adbe->drm.dev,
+			 "display DART self-check %s (%s: pattern crc %08x translated %08x permuted %08x faults +%d step=A errbits=%#x step=B errbits=%#x step=C errbits=%#x step=R errbits=%#x crcctl %08x>%08x>%08x restored %08x blendbypass %08x); %s\n",
+			result, reason, crc[0], crc[1], crc[2], delta,
+			errors[0], errors[1], errors[2], errors[3],
+			crcctl[0], crcctl[1], crcctl[2], crcctl[3], blend_bypass,
+			ret == -EIO ? "rollback unconfirmed; leaving scanout unmanaged" : "back to bypass");
+	}
+	return ret;
+}
+
+/*
+ * Enable the display DART node, bind its driver, and order this device
+ * after it for system sleep: the DART's resume resets and restores its
+ * streams, which must happen before the pipe is given an IOVA again.
+ */
+static int adbe_dart_bind(struct adbe *adbe)
+{
+	struct device *dev = adbe->drm.dev;
+	struct platform_device *pdev = NULL;
+	struct of_phandle_args args;
+	int ret = 0;
+
+	if (!IS_ENABLED(CONFIG_OF_DYNAMIC))
+		return -EOPNOTSUPP;
+
+	if (of_parse_phandle_with_args(adbe->scanout_np, "iommus",
+				       "#iommu-cells", 0, &args))
+		return -ENODEV;
+
+#ifdef CONFIG_OF_DYNAMIC
+	if (!of_device_is_available(args.np)) {
+		struct of_changeset cs;
+
+		of_changeset_init(&cs);
+		ret = of_changeset_update_prop_string(&cs, args.np, "status",
+						      "okay") ?:
+		      of_changeset_apply(&cs);
+		of_changeset_destroy(&cs);
+	}
+#endif
+
+	if (!ret) {
+		pdev = of_find_device_by_node(args.np);
+		if (!pdev) {
+			pdev = of_platform_device_create(args.np, NULL, NULL);
+			if (pdev)
+				get_device(&pdev->dev);
+		}
+		if (!pdev) {
+			ret = -ENODEV;
+		} else if (!pdev->dev.driver) {
+			dev_err(dev, "%pOF: no DART driver bound\n", args.np);
+			ret = -ENODEV;
+		} else if (!device_link_add(dev, &pdev->dev,
+					    DL_FLAG_STATELESS)) {
+			ret = -EINVAL;
+		}
+		if (ret && pdev) {
+			put_device(&pdev->dev);
+			pdev = NULL;
+		}
+	}
+	adbe->dart = pdev;
+	of_node_put(args.np);
+
+	return ret;
+}
+
+/*
+ * Switch the pipe from bypass to translated scanout. The boot framebuffer
+ * stays where the pipe reads it: its bypass bus address is mapped to its
+ * physical address in the scanout device's default domain while that
+ * domain is not yet attached (apple,dart-deferred-attach), and only then
+ * is it attached. New allocations stay below the boot framebuffer.
+ *
+ * Returns 0 in translated mode, -EIO if the DART state is unknown (the
+ * caller must leave the display alone), or another error with the pipe
+ * still reading through bypass.
+ */
+static int adbe_dart_init(struct adbe *adbe)
+{
+	struct device *dev = adbe->drm.dev;
+	u32 iova = adbe->boot_base & ~ADBE_ADDR_TAG;
+	size_t len = PAGE_ALIGN(ADBE_FB_SIZE);
+	struct platform_device *spdev;
+	struct iommu_domain *domain;
+	struct device *sdev;
+	int ret, f0;
+
+	if (iova < ADBE_DART_MIN_WINDOW || (u64)iova + len > ADBE_BUS_LIMIT ||
+	    !IS_ALIGNED(adbe->boot.start, PAGE_SIZE) ||
+	    !IS_ALIGNED(iova, PAGE_SIZE)) {
+		dev_warn(dev, "boot framebuffer at bus %#x leaves no IOVA window\n",
+			 iova);
+		return -ERANGE;
+	}
+
+	adbe->scanout_np = of_get_child_by_name(dev->of_node, "scanout");
+	if (!adbe->scanout_np)
+		return -ENODEV;
+
+	ret = adbe_dart_map_windows(adbe);
+	if (ret)
+		return ret;
+	adbe_dart_capture(adbe, "before-attach");
+
+	ret = adbe_dart_bind(adbe);
+	if (ret)
+		return ret;
+
+	spdev = of_platform_device_create(adbe->scanout_np, NULL, dev);
+	if (!spdev)
+		return -ENODEV;
+	sdev = &spdev->dev;
+	if (!device_iommu_mapped(sdev))
+		of_dma_configure(sdev, adbe->scanout_np, true);
+	if (!device_iommu_mapped(sdev)) {
+		dev_err(dev, "scanout device has no display DART\n");
+		return -ENODEV;
+	}
+	if (!sdev->iommu->attach_deferred)
+		dev_err(dev, "display DART attached before the boot framebuffer was mapped\n");
+
+	ret = dma_set_mask_and_coherent(sdev, DMA_BIT_MASK(32));
+	if (ret)
+		goto bypass;
+	/* Allocations come from below the boot framebuffer. */
+	sdev->bus_dma_limit = iova - 1;
+
+	domain = iommu_get_domain_for_dev(sdev);
+	if (!domain || (domain->type != IOMMU_DOMAIN_DMA &&
+			domain->type != IOMMU_DOMAIN_DMA_FQ)) {
+		ret = -ENODEV;
+		goto bypass;
+	}
+	ret = iommu_map(domain, iova, adbe->boot.start, len, IOMMU_READ,
+			GFP_KERNEL);
+	if (ret)
+		goto bypass;
+	if (iommu_iova_to_phys(domain, iova) != adbe->boot.start ||
+	    iommu_iova_to_phys(domain, iova + len - 1) !=
+	    adbe->boot.start + len - 1) {
+		ret = -EIO;
+		goto bypass;
+	}
+
+	f0 = apple_dart_fault_count(&adbe->dart->dev);
+	ret = adbe_dart_verify(adbe, sdev, domain, iova, len, f0);
+	if (ret)
+		return ret;
+
+	adbe->scanout = spdev;
+	adbe->domain = domain;
+	adbe->boot_iova_len = len;
+	adbe->bus_offset = 0;
+	drm_dev_set_dma_dev(&adbe->drm, sdev);
+	dev_info(dev, "scanout through the display DART, boot framebuffer at %#x\n",
+		 iova);
+
+	return 0;
+
+bypass:
+	/* An unconfirmed boot base must retain its alias mappings and domain. */
+	if ((readl(adbe->regs + ADP_BASE) & ~ADBE_ADDR_TAG) != iova) {
+		dev_err(dev, "display DART cannot restore boot scanout; leaving mappings alive\n");
+		return -EIO;
+	}
+	/* The blocking domain of this DART is bypass, as iBoot left it. */
+	if (adbe_dart_rollback(adbe, sdev))
+		return -EIO;
+	adbe_dart_capture(adbe, "after-verdict");
+	return ret == -EIO ? -ENODEV : ret;
+}
+
+/*
+ * Return the display DART to bypass with the pipe on the boot framebuffer,
+ * the state iBoot leaves and the next kernel's probe checks for.
+ */
+static void adbe_dart_exit(struct adbe *adbe)
+{
+	u32 base;
+
+	if (!adbe->scanout)
+		return;
+
+	cancel_delayed_work_sync(&adbe->hold_work);
+	base = readl(adbe->regs + ADP_BASE);
+	if (base != adbe->boot_base) {
+		dev_err(adbe->drm.dev,
+			"pipe reads %#x, not the boot framebuffer: display DART left translating\n",
+			base);
+		return;
+	}
+	/* Let the frame in flight finish on the boot framebuffer. */
+	msleep(2 * ADBE_FRAME_MS);
+	if (adbe_dart_rollback(adbe, &adbe->scanout->dev))
+		return;
+	adbe_hold_release(adbe, true);
+	adbe->scanout = NULL;
+	dev_info(adbe->drm.dev, "display DART back in bypass\n");
+}
+#else
+static int adbe_dart_init(struct adbe *adbe)
+{
+	return -EOPNOTSUPP;
+}
+
+static void adbe_dart_exit(struct adbe *adbe)
+{
+}
+#endif
 
 /* Check that the pipe runs as iBoot leaves it; reads only. */
 static int adbe_adopt(struct adbe *adbe)
@@ -983,6 +1831,8 @@ static int adbe_probe(struct platform_device *pdev)
 		return PTR_ERR(adbe);
 	platform_set_drvdata(pdev, adbe);
 	timer_setup(&adbe->flip_timer, adbe_flip_timeout, 0);
+	spin_lock_init(&adbe->hold_lock);
+	INIT_DELAYED_WORK(&adbe->hold_work, adbe_hold_work);
 
 	adbe->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(adbe->regs))
@@ -1015,6 +1865,25 @@ static int adbe_probe(struct platform_device *pdev)
 		goto put_fb;
 	}
 
+	/* Before any allocation: buffers then come from the DART's domain. */
+	if (dart_scanout) {
+		struct device_node *scanout;
+
+		scanout = of_get_child_by_name(dev->of_node, "scanout");
+		if (!scanout) {
+			dart_scanout = false;
+		} else {
+			of_node_put(scanout);
+			ret = adbe_dart_init(adbe);
+			if (ret == -EIO)
+				goto put_fb;	/* unknown DART state: leave it to simpledrm */
+			if (ret)
+				dev_warn(dev, "translated scanout unavailable (%d), using bypass\n",
+					 ret);
+			dart_scanout = !ret;
+		}
+	}
+
 	ret = adbe_modeset_init(adbe);
 	if (ret)
 		goto put_fb;
@@ -1033,19 +1902,25 @@ static int adbe_probe(struct platform_device *pdev)
 	/* From here on simpledrm is gone; the pipe still shows its buffer. */
 	ret = adbe_take_boot_fb(adbe, fb_np);
 	of_node_put(fb_np);
-	if (ret)
+	if (ret) {
+		adbe_dart_exit(adbe);
 		return dev_err_probe(dev, ret,
 				     "cannot take over the boot framebuffer\n");
+	}
 
 	ret = drm_dev_register(&adbe->drm, 0);
-	if (ret)
+	if (ret) {
+		adbe_dart_exit(adbe);
 		return ret;
+	}
 
 	drm_client_setup(&adbe->drm, NULL);
 
 	return 0;
 
 put_fb:
+	/* Nothing was flipped yet: the pipe is still on the boot framebuffer. */
+	adbe_dart_exit(adbe);
 	of_node_put(fb_np);
 	return ret;
 }
@@ -1057,6 +1932,9 @@ static void adbe_remove(struct platform_device *pdev)
 	drm_dev_unplug(&adbe->drm);
 	drm_atomic_helper_shutdown(&adbe->drm);
 	timer_delete_sync(&adbe->flip_timer);
+	if (adbe->scanout)
+		adbe_park(adbe);
+	adbe_dart_exit(adbe);
 	writel(adbe->saved_inten, adbe->regs + ADP_INTEN);
 }
 
@@ -1065,6 +1943,12 @@ static void adbe_shutdown(struct platform_device *pdev)
 	struct adbe *adbe = platform_get_drvdata(pdev);
 
 	drm_atomic_helper_shutdown(&adbe->drm);
+	if (adbe->scanout) {
+		timer_delete_sync(&adbe->flip_timer);
+		adbe_park(adbe);
+	}
+	/* A kexec'd kernel then finds the pipe as iBoot leaves it. */
+	adbe_dart_exit(adbe);
 	writel(adbe->saved_inten, adbe->regs + ADP_INTEN);
 }
 
