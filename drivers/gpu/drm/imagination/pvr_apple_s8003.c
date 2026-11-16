@@ -252,6 +252,7 @@ struct s8003_pm {
 	u32 scene;			/* the firmware start the scene belongs to; 0: none */
 	u32 ta_seq;			/* its geometry job */
 	u32 td_seq;			/* its fragment job; 0: not submitted */
+	bool clean;			/* both of its jobs were handed to the firmware */
 };
 
 struct s8003_vm {
@@ -2081,11 +2082,13 @@ static u8 *useq_put(u8 *out, const u32 *words, unsigned int n)
  * dependency object, PM set and its scene record, microsequence, stamps), the
  * microsequence, the command and both pointer-ring entries. @pm is the PM
  * set's META address, @pm_id its number. A geometry job's command hands over
- * the PM set; a fragment job's waits for the stamp at @wait_stamp to reach
- * @wait_seq, its geometry job's.
+ * the PM set, unless @pm_record is false: then it only names the previous
+ * geometry job's stamp, which that job already reached, as the G5P driver
+ * did for a clean set. A fragment job's waits for the stamp at @wait_stamp to
+ * reach @wait_seq, its geometry job's.
  */
 static void s8003_job_write(u8 *p, u32 addr, u32 global, u32 pm, u32 pm_id, u32 slot, bool frag,
-			    u32 seq, u32 wait_stamp, u32 wait_seq)
+			    u32 seq, u32 wait_stamp, u32 wait_seq, bool pm_record)
 {
 	struct s8003_job_slot at = s8003_slot_of(seq, frag);
 	u32 w = addr + at.w, record = pm + S8003_PM_RECORD;
@@ -2162,11 +2165,16 @@ static void s8003_job_write(u8 *p, u32 addr, u32 global, u32 pm, u32 pm_id, u32 
 		put32(cmd + 4, wait_stamp);
 		put32(cmd + 8, wait_seq);
 		put32(cmd + 12, wait_seq & 0x7fffffff);
-	} else {
+	} else if (pm_record) {
 		put32(cmd, S8003_CMD_PM);
 		put32(cmd + 4, slot);
 		put32(cmd + 8, pm_id);
 		put32(cmd + 12, pm);
+	} else {
+		put32(cmd, S8003_CMD_WAIT);
+		put32(cmd + 4, addr + S8003_CH_STAMP + 4);
+		put32(cmd + 8, seq - 1);
+		put32(cmd + 12, (seq - 1) & 0x7fffffff);
 	}
 	put32(p + S8003_CH_RING + ring * 4, addr + at.cmd);
 	put32(p + S8003_CH_RING + ((ring + 1) % S8003_CH_ENTRIES) * 4, w);
@@ -2229,6 +2237,22 @@ static bool s8003_pm_idle(struct pvr_apple *apple, const struct s8003_pm *pm)
 	return false;
 }
 
+/*
+ * Whether a geometry job on @pm, which needs @blocks, may go without the PM
+ * record, which has the firmware rebuild the set's free list from its block
+ * list: the set is not built anew for the job, and its last scene ran to its
+ * end in this start of the firmware (both jobs handed over, the fragment job
+ * done, no fault). A scene without a fragment job gave no pages back.
+ */
+static bool s8003_pm_clean(struct pvr_apple *apple, const struct s8003_pm *pm, u32 blocks)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	return pm->clean && pm->built == s->gen && pm->blocks >= blocks &&
+	       pm->scene == s->gen && pm->td_seq && !READ_ONCE(s->fault) &&
+	       (s32)(pvr_apple_s8003_engine_done(apple, APPLE_ENGINE_FRAG) - pm->td_seq) >= 0;
+}
+
 static int s8003_submit_error(struct pvr_apple *apple, struct s8003_vm *vm,
 			      const char *engine, int err, const char *reason)
 {
@@ -2246,6 +2270,7 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	struct s8003_pm *pm = NULL;
 	struct s8003_rt rt;
 	u32 seq, blocks;
+	bool pm_record;
 	unsigned int i;
 	int err;
 
@@ -2270,6 +2295,9 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	/* As many 128 KiB blocks as the free list has 4 KiB pages, and enough for the target */
 	blocks = max(DIV_ROUND_UP(hwrt->free_lists[0]->initial_num_pages, 32),
 		     DIV_ROUND_UP(50 + rt.tiles, 32));
+	/* Before the build, which may make the set anew */
+	pm_record = !s8003_pm_clean(apple, pm, min(blocks, S8003_PM_BLOCKS_MAX));
+	pm->clean = false;
 	err = s8003_pm_build(apple, vm, pm, min(blocks, S8003_PM_BLOCKS_MAX));
 	if (!err && !vm->pm_logged) {
 		dev_info(apple_dev(apple),
@@ -2287,11 +2315,19 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		return s8003_submit_error(apple, vm, "geometry", err, "record slot wait");
 
 	seq = apple->ta_seq + 1;
+	/*
+	 * Without the record the job waits for the previous geometry job's
+	 * stamp; only if it is there already, so that the firmware never
+	 * waits on its own stamp for it.
+	 */
+	if (!pm_record &&
+	    (s32)(pvr_apple_s8003_engine_done(apple, APPLE_ENGINE_GEOM) - apple->ta_seq) < 0)
+		pm_record = true;
 	s8003_fill_ta(p + s8003_slot_of(seq, false).w, job->cmd, job->hwrt, &rt);
 	s8003_job_write(p, s8003_channel_addr(APPLE_ENGINE_GEOM),
 			s8003_object_addr(&s->layout, S8003_CHANNEL),
 			s8003_meta_addr(s8003_pm_set_va(pm, 0)), pm->set + 1, vm->slot[0], false,
-			seq, 0, 0);
+			seq, 0, 0, pm_record);
 	pm->hwrt = job->hwrt;
 	if (s->pm_last != vm) {
 		s->pm_prev = s->pm_last;
@@ -2342,13 +2378,14 @@ static int s8003_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	s8003_job_write(p, s8003_channel_addr(APPLE_ENGINE_FRAG),
 			s8003_object_addr(&s->layout, S8003_CHANNEL + 1),
 			s8003_meta_addr(s8003_pm_set_va(pm, 0)), pm->set + 1, vm->slot[1], true, seq,
-			s8003_channel_addr(APPLE_ENGINE_GEOM) + S8003_CH_STAMP + 4, pm->ta_seq);
+			s8003_channel_addr(APPLE_ENGINE_GEOM) + S8003_CH_STAMP + 4, pm->ta_seq, true);
 	pm->td_seq = seq;
 	WRITE_ONCE(s->set_frag[pm->set], seq);
 	apple->frag_seq = seq;
 	err = s8003_publish(apple, APPLE_ENGINE_FRAG, seq, (2 * seq) % S8003_CH_ENTRIES);
 	if (err)
 		return s8003_submit_error(apple, vm, "fragment", err, "publish");
+	pm->clean = true;
 	return seq;
 }
 
