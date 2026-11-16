@@ -256,6 +256,7 @@ struct s8003_vm {
 	u32 slot[2];			/* geometry and compute, fragment; 0: none */
 	u32 attached;			/* the firmware start the slots were loaded for */
 	struct s8003_pm pm[2];
+	bool pm_logged;			/* first pool sizing report for this VM */
 };
 
 struct pvr_apple_s8003 {
@@ -2191,6 +2192,13 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	blocks = max(DIV_ROUND_UP(hwrt->free_lists[0]->initial_num_pages, 32),
 		     DIV_ROUND_UP(50 + rt.tiles, 32));
 	err = s8003_pm_build(apple, vm, pm, min(blocks, S8003_PM_BLOCKS_MAX));
+	if (!err && !vm->pm_logged) {
+		dev_info(apple_dev(apple),
+			 "PM pool VM=%p blocks=%u clamped=%u tiles=%u initial_num_pages=%u\n",
+			 vm->vm_ctx, pm->blocks, blocks > S8003_PM_BLOCKS_MAX, rt.tiles,
+			 hwrt->free_lists[0]->initial_num_pages);
+		vm->pm_logged = true;
+	}
 	if (err)
 		return s8003_submit_error(apple, vm, "geometry", err, "PM pool build failed");
 	/* The record slot of the job before the last one is free again */
