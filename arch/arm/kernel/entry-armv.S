@@ -224,6 +224,15 @@ ENDPROC(__dabt_svc)
 	.align	5
 __irq_svc:
 	svc_entry
+	@ P105 aic1q24: like lab IRQ stub — force SPSR.I, skip C irq_enter/exit.
+	ldr	r0, =apple_aic1_early_irq_escape
+	ldrb	r0, [r0]
+	cmp	r0, #0
+	beq	1001f
+	ldr	r5, [sp, #S_PSR]
+	orr	r5, r5, #PSR_I_BIT
+	svc_exit r5, irq = 1
+1001:
 	irq_handler from_user=0
 
 #ifdef CONFIG_PREEMPTION
@@ -235,6 +244,7 @@ __irq_svc:
 	blne	svc_preempt
 #endif
 
+	ldr	r5, [sp, #S_PSR]
 	svc_exit r5, irq = 1			@ return from exception
  UNWIND(.fnend		)
 ENDPROC(__irq_svc)
