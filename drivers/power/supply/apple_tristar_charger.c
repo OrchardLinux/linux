@@ -58,7 +58,6 @@
 
 /* PMIC registers, relative to their banks */
 #define TRISTAR_CHG_STATUS		0x0a	/* status bank */
-#define TRISTAR_CHG_STATUS_ONLINE	0x42
 #define TRISTAR_CHG_INPUT_LIMIT		0x03	/* control bank */
 #define TRISTAR_CHG_ADC_SELECT		0x00	/* ADC bank */
 #define TRISTAR_CHG_ADC_RESULT		0x01
@@ -947,12 +946,6 @@ static void tristar_guard(struct tristar_charger *chg, u64 now)
  * up on the source: USB serial and SSH must not depend on charging. An attachment
  * later holds USB data off again and identifies as usual. Caller holds lock.
  */
-/*
- * Input is present but no source was identified: the PMIC can stay in a
- * transitional state (e.g. 0x62) for any attachment, not only the first
- * since probe. USB data must not stay off for it: after TRISTAR_HOLD_MS
- * turn it on, at the fallback limit. Caller holds lock.
- */
 static void tristar_no_source(struct tristar_charger *chg, unsigned int status, u64 now)
 {
 	if (chg->usb_on ||
@@ -994,6 +987,21 @@ static void tristar_follow_accessory(struct tristar_charger *chg, u64 now)
 	dev_dbg(chg->dev, "%s: %u mA\n", holder, ma);
 }
 
+/*
+ * D2365 status 0x18a reads 0 without input. Its other bits describe the
+ * battery charger, not the input: iOS 16's AppleD2365PMUPowerSource status
+ * method takes bits 1:0 as charging, bit 2 as charge end and bit 4 as charge
+ * timeout, and uses them only for the charging and fully charged state. Its
+ * input-current ramp (AppleARMPMUCharger) follows the source's allowance and
+ * backs off only when the PMIC reports input limiting, which the D2365 never
+ * does. A charger that finished, timed out or does not charge still runs the
+ * system from the source, so any nonzero value keeps the grant.
+ */
+static bool tristar_input_present(unsigned int status)
+{
+	return status != 0;
+}
+
 static void tristar_poll(struct work_struct *work)
 {
 	struct tristar_charger *chg = container_of(to_delayed_work(work),
@@ -1014,8 +1022,8 @@ static void tristar_poll(struct work_struct *work)
 		dev_err_ratelimited(chg->dev, "PMIC status unreadable; holding the fallback\n");
 		goto again;
 	}
-	chg->online = status != 0;
-	if (!status) {
+	chg->online = tristar_input_present(status);
+	if (!chg->online) {
 		/* The hold of the next attachment starts when input returns. */
 		chg->hold_ns = now;
 		if (chg->present) {
@@ -1030,13 +1038,6 @@ static void tristar_poll(struct work_struct *work)
 				dev_crit(chg->dev, "Handoff write failed; input limit unverified\n");
 			dev_dbg(chg->dev, "disconnected\n");
 		}
-		tristar_no_source(chg, status, now);
-		goto again;
-	}
-	if (status != TRISTAR_CHG_STATUS_ONLINE) {
-		/* Transitional input state (e.g. 0x40 while attaching): no grant. */
-		if (chg->code > TRISTAR_CHG_FALLBACK_CODE)
-			tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
 		tristar_no_source(chg, status, now);
 		goto again;
 	}
