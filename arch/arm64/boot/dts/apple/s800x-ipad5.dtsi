@@ -176,13 +176,13 @@
 
 		/*
 		 * 0, 10: Smart Cover halls; 13: Bluetooth power enable;
-		 * 14: WLAN REG_ON.
+		 * 14: WLAN REG_ON; 22: panel supply (lcd_ldo).
 		 */
 		pmu_gpio: gpio {
 			compatible = "apple,d2365-pmic-gpio";
 			gpio-controller;
 			#gpio-cells = <2>;
-			gpio-reserved-ranges = <1 9>, <11 2>, <15 9>;
+			gpio-reserved-ranges = <1 9>, <11 2>, <15 7>, <23 1>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupts-extended = <&pinctrl_ap 76 IRQ_TYPE_LEVEL_LOW>;
@@ -404,7 +404,15 @@
 	};
 };
 
+/*
+ * ADT displayport function-lcd_ldo = PMU GPIO 22: the panel supply, off in
+ * system sleep as on iOS. Neither it nor the backlight holds up the
+ * pipe's probe; the driver looks them up before the first sleep.
+ */
 &disp0 {
+	apple,lcd-ldo-gpios = <&pmu_gpio 22 GPIO_ACTIVE_HIGH>;
+	backlight = <&dwi_bl>;
+	post-init-providers = <&pmu_gpio>, <&dwi_bl>;
 	status = "okay";
 };
 
