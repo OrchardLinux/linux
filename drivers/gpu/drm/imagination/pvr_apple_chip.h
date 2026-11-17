@@ -99,6 +99,7 @@ struct pvr_apple {
 	bool stopping;		/* terminal shutdown forbids firmware restart */
 	bool booted;
 	bool fault_reported;		/* once per firmware boot */
+	bool fault;			/* the firmware stopped on a fault in this boot */
 	bool fw_ready;		/* init data handed over once: runtime PM restarts it */
 	ktime_t gate_off;		/* last successful runtime power-off */
 
@@ -262,7 +263,6 @@ struct pvr_apple {
  * @engine_done: The sequence number of the last finished job of @engine. No
  *	lock held; may be called with interrupts off.
  * @max_power_state: Highest state licensed for fault capture; optional.
- * @fault: Read the chip firmware fault flag without waking the GPU.
  * @events: Read what the firmware posted. Before @engine_done wherever a job
  *	is waited for; may sleep.
  * @vm_init: A userspace VM was created: map what the firmware needs in it.
@@ -316,7 +316,6 @@ struct pvr_apple_chip {
 	int (*prepare_job)(struct pvr_apple *apple, struct pvr_job *job);
 	int (*submit)(struct pvr_apple *apple, struct pvr_job *job);
 	u32 (*engine_done)(struct pvr_apple *apple, enum pvr_apple_engine engine);
-	bool (*fault)(struct pvr_apple *apple);
 	u32 (*max_power_state)(struct pvr_apple *apple);
 	void (*events)(struct pvr_apple *apple);
 	int (*vm_init)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);

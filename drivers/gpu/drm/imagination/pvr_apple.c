@@ -667,9 +667,12 @@ static u32 pvr_apple_completed_seq(struct pvr_apple *apple)
 static int pvr_apple_wait(struct pvr_apple *apple, u32 seq, unsigned int timeout_us)
 {
 	u32 done;
+	int err;
 
-	return read_poll_timeout(pvr_apple_completed_seq, done, (s32)(done - seq) >= 0, 1000,
-				 timeout_us, false, apple);
+	err = read_poll_timeout(pvr_apple_completed_seq, done,
+				(s32)(done - seq) >= 0 || READ_ONCE(apple->fault), 1000,
+				timeout_us, false, apple);
+	return !err && (s32)(done - seq) < 0 ? -EIO : err;
 }
 
 static u32 pvr_apple_engine_done(struct pvr_apple *apple, enum pvr_apple_engine engine)
@@ -734,8 +737,7 @@ static int pvr_apple_jobs_show(struct seq_file *s, void *unused)
 		submitted[engine] = pvr_apple_engine_last(apple, engine);
 		done[engine] = pvr_apple_engine_done(apple, engine);
 	}
-	if (apple->chip->fault)
-		fault = apple->chip->fault(apple);
+	fault = READ_ONCE(apple->fault);
 	spin_lock_irqsave(&apple->fence_lock, flags);
 	for (engine = 0; engine < APPLE_ENGINES; engine++)
 		list_for_each_entry(fence, &apple->pending[engine], node)
@@ -774,8 +776,7 @@ static int pvr_apple_jobs_show(struct seq_file *s, void *unused)
 		seq_printf(s, "%s submitted %u done %u pending %u\n", names[engine],
 			   submitted[engine], done[engine], pending[engine]);
 	seq_printf(s, "retired_total %llu\nbusy_ns %llu\n", retired_total, busy_ns);
-	if (apple->chip->fault)
-		seq_printf(s, "fault %u\n", fault);
+	seq_printf(s, "fault %u\n", fault);
 	seq_printf(s, "runtime_pm_status %s\n", runtime_status);
 	seq_printf(s, "fw_irq %s irqs %lld\n", !apple->fw_irq ? "none" : irq_on ? "on" : "off",
 		   atomic64_read(&apple->fw_irqs));
@@ -812,8 +813,12 @@ static int pvr_apple_wait_engine(struct pvr_apple *apple, enum pvr_apple_engine 
 	 * switch of GPU VM, for every engine; 1 ms steps cost a scene-heavy
 	 * WebGL page several milliseconds per frame
 	 */
-	return read_poll_timeout(pvr_apple_engine_poll, done, (s32)(done - seq) >= 0, 20,
-				 timeout_us, false, apple, engine);
+	int err;
+
+	err = read_poll_timeout(pvr_apple_engine_poll, done,
+				(s32)(done - seq) >= 0 || READ_ONCE(apple->fault), 20,
+				timeout_us, false, apple, engine);
+	return !err && (s32)(done - seq) < 0 ? -EIO : err;
 }
 
 /* Wait until every engine retired its submitted jobs; submit_lock held */
@@ -1053,9 +1058,17 @@ void pvr_apple_report_mmu_fault(struct pvr_apple *apple)
 	}
 }
 
-/* Called once when a chip latches a fault, after capturing its MMU state. */
+/*
+ * A chip saw its firmware stop on a fault (an S8003 fault event, a T8010
+ * RTKit crash). Latch it once per boot: waits for the firmware end at once,
+ * the MMU state is captured, and the oldest bound job's scheduler resets
+ * the GPU instead of waiting for its timeout.
+ */
 void pvr_apple_firmware_fault(struct pvr_apple *apple)
 {
+	if (xchg(&apple->fault, true))
+		return;
+	pvr_apple_report_mmu_fault(apple);
 	atomic_set(&apple->fault_pending, 1);
 	pvr_apple_firmware_event(apple);
 }
@@ -1857,6 +1870,7 @@ static int pvr_apple_fw_start(struct pvr_apple *apple)
 	apple->frag_events = 0;
 	apple->geom_pending = false;
 	apple->fault_reported = false;
+	WRITE_ONCE(apple->fault, false);
 	return apple->chip->start(apple);
 }
 

@@ -124,6 +124,7 @@ static void pvr_apple_crashed(void *cookie, const void *crashlog, size_t size)
 	if (crashlog)
 		print_hex_dump(KERN_ERR, "crashlog: ", DUMP_PREFIX_OFFSET, 16, 4, crashlog, size,
 			       false);
+	pvr_apple_firmware_fault(apple);
 }
 
 static const struct apple_rtkit_ops pvr_apple_rtkit_ops = {

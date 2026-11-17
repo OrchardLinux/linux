@@ -281,7 +281,6 @@ struct pvr_apple_s8003 {
 	struct mutex event_lock;	/* the rings the firmware posts to */
 	ktime_t touched;		/* s8003_touch() */
 	bool failed;			/* its rings' indices are not ours any more */
-	bool fault;			/* it posted an event that is neither "alive" nor a stamp */
 	bool stamped;			/* it posted a job's stamp since events() last looked */
 
 	/*
@@ -1017,11 +1016,7 @@ static int s8003_drain(struct pvr_apple *apple, bool *alive)
 			dev_warn_ratelimited(apple_dev(apple), "firmware fault event type=%u slot=%u: %*ph\n",
 					     type, get_unaligned_le32(e + 0x0c),
 					     S8003_EVENT_SIZE - 4, e + 4);
-			if (!READ_ONCE(s->fault)) {
-				WRITE_ONCE(s->fault, true);
-				pvr_apple_report_mmu_fault(apple);
-				pvr_apple_firmware_fault(apple);
-			}
+			pvr_apple_firmware_fault(apple);
 		}
 		consumer = (consumer + 1) % APPLE_RING_ENTRIES;
 		ring_consume(ctl, consumer);
@@ -1354,12 +1349,11 @@ static u32 s8003_done_poll(struct pvr_apple *apple, enum pvr_apple_engine engine
 
 static int s8003_wait_done(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 seq)
 {
-	struct pvr_apple_s8003 *s = apple->chip_data;
 	u32 done;
 	int err;
 
 	err = read_poll_timeout(s8003_done_poll, done,
-				(s32)(done - seq) >= 0 || READ_ONCE(s->fault), 20,
+				(s32)(done - seq) >= 0 || READ_ONCE(apple->fault), 20,
 				S8003_JOB_TIMEOUT_US, false, apple, engine);
 	if (!err && (s32)(done - seq) < 0) {
 		pvr_apple_report_mmu_fault(apple);
@@ -2286,7 +2280,7 @@ static bool s8003_pm_clean(struct pvr_apple *apple, const struct s8003_pm *pm, u
 	struct pvr_apple_s8003 *s = apple->chip_data;
 
 	return pm->rec_seq && pm->clean && pm->built == s->gen && pm->blocks >= blocks &&
-	       pm->scene == s->gen && pm->td_seq && !READ_ONCE(s->fault) &&
+	       pm->scene == s->gen && pm->td_seq && !READ_ONCE(apple->fault) &&
 	       (s32)(pvr_apple_s8003_engine_done(apple, APPLE_ENGINE_FRAG) - pm->td_seq) >= 0;
 }
 
@@ -2358,7 +2352,7 @@ static bool pvr_apple_s8003_vm_evictable(struct pvr_apple *apple,
 	unsigned int i;
 
 	lockdep_assert_held(&apple->submit_lock);
-	if (!vm || READ_ONCE(s->fault))
+	if (!vm || READ_ONCE(apple->fault))
 		return false;
 	if (vm->attached != s->gen)
 		return true;
@@ -2751,7 +2745,7 @@ static void pvr_apple_s8003_report_hang(struct pvr_apple *apple)
 	}
 	dev_err(apple_dev(apple),
 		"hang: firmware %s, device control %u/%u, Fender state %#x\n",
-		s->failed ? "rings unreadable" : s->fault ? "posted a fault" : "posted no fault",
+		s->failed ? "rings unreadable" : READ_ONCE(apple->fault) ? "posted a fault" : "posted no fault",
 		get32(dc + S8003_RING_CONSUMER),
 		get32(dc + S8003_RING_PRODUCER), readl(apple->fender + FENDER_POWER_STATE));
 }
@@ -2792,7 +2786,7 @@ static void s8003_jobs_reset(struct pvr_apple_s8003 *s)
 		for (i = 0; i < ARRAY_SIZE(vm->pm); i++)
 			vm->pm[i].rec_seq = 0;
 	WRITE_ONCE(s->failed, false);
-	WRITE_ONCE(s->fault, false);
+	WRITE_ONCE(s->apple->fault, false);
 	memset(s->set_geom, 0, sizeof(s->set_geom));
 	memset(s->set_frag, 0, sizeof(s->set_frag));
 	memset(s->pmsets.map, 0, s->pmsets.size);
@@ -3034,13 +3028,6 @@ static u32 pvr_apple_s8003_max_power_state(struct pvr_apple *apple)
 	return get32(s8003_object(s, S8003_PLATFORM) + 0x710);
 }
 
-static bool pvr_apple_s8003_fault(struct pvr_apple *apple)
-{
-	struct pvr_apple_s8003 *s = apple->chip_data;
-
-	return READ_ONCE(s->fault);
-}
-
 static void pvr_apple_s8003_debugfs_show(struct pvr_apple *apple, struct seq_file *m)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
@@ -3082,7 +3069,6 @@ const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.prepare_job = s8003_prepare_job,
 	.submit = pvr_apple_s8003_submit,
 	.engine_done = pvr_apple_s8003_engine_done,
-	.fault = pvr_apple_s8003_fault,
 	.max_power_state = pvr_apple_s8003_max_power_state,
 	.events = pvr_apple_s8003_events,
 	.vm_init = pvr_apple_s8003_vm_init,
