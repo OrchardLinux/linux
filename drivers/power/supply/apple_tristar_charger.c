@@ -22,11 +22,12 @@
  * the capability frame: the same cable in the same orientation keeps its
  * identification.
  *
- * A source change does not reset the limit in hardware. The PMIC's event
- * controller runs the handler of its PMU line before it reads the event
- * block; that handler drops a grant to the fallback. The events that can mean
- * a source change then start a new identification; when none was latched,
- * the grant is ramped back. ADC completion is an event of its own.
+ * Once the source is identified, the PMU events that can mean a source change
+ * neither lower the input limit nor identify the source again, as in iOS 16:
+ * they pause the ramp, and the status is read again 50 ms after the last one.
+ * Only a lost input ends the grant. Before identification, such an event
+ * restarts it. A grant ramps the way iOS does: 100 mA held for 100 ms, then
+ * 100 mA steps 10 ms apart. ADC completion is an event of its own.
  *
  * Copyright The Orchard Linux contributors
  */
@@ -89,12 +90,18 @@
  * plug reads as no signature, so until then a missing one is looked for again.
  */
 #define TRISTAR_HOLD_MS			1000
-#define TRISTAR_RAMP_STEP_MS		500
-#define TRISTAR_RAMP_STEP_MA		500
+/*
+ * The input-current ramp of iOS 16 (AppleARMPMUCharger): from nothing it
+ * writes 100 mA and holds it for 100 ms, then steps up 100 mA at a time,
+ * each step waiting a tenth of a millisecond per mA of the previous one.
+ * Steps down go to the new target at once.
+ */
+#define TRISTAR_RAMP_HOLD_MS		100
+#define TRISTAR_RAMP_STEP_MA		100
+/* After the last PMU source event, the ramp waits this long, as iOS does. */
+#define TRISTAR_EVENT_DEBOUNCE_MS	50
 /* More source events than this per second means something is stuck. */
 #define TRISTAR_IRQ_STORM		200
-/* After a line withdrawal, the time its events take to be dispatched. */
-#define TRISTAR_LINE_SETTLE_MS		200
 
 enum tristar_phase {
 	TRISTAR_EMPTY,
@@ -135,17 +142,16 @@ struct tristar_charger {
 	struct mutex lock;
 
 	/*
-	 * Event attribution: a new epoch invalidates measurements and grants.
-	 * Written only by the event handlers, which the PMIC event controller
-	 * runs one after another from one thread.
+	 * Event attribution: a new epoch invalidates an identification in
+	 * progress. Written only by the event handlers, which the PMIC event
+	 * controller runs one after another from one thread.
 	 */
 	unsigned int epoch;
 	bool adc_waiting;
 	u64 storm_start_ns;
 	unsigned int storm_count;
-	/* Last withdrawal by the line handler; line_seen once the poll handled it. */
+	/* Last source event on the PMU line after identification, 0: none */
 	u64 line_ns;
-	u64 line_seen;
 
 	enum tristar_phase phase;
 	bool online;
@@ -156,9 +162,8 @@ struct tristar_charger {
 	unsigned int source_ma;
 	/* USB data is on for this attachment: the mux must stay untouched. */
 	bool usb_on;
-	/* What the USB host allows (vbus_draw), valid for usb_epoch only. */
+	/* What the USB host allows (vbus_draw) */
 	unsigned int usb_ma;
-	unsigned int usb_epoch;
 	enum power_supply_usb_type usb_type;
 	/* The identified cable, to recognize it after a source event. */
 	bool cable_known;
@@ -167,7 +172,8 @@ struct tristar_charger {
 	char source[96];
 	u64 attach_ns;		/* next identification at attach_ns + LOOK_MS */
 	u64 hold_ns;		/* identification round started */
-	u64 step_ns;
+	u64 step_ns;		/* last ramp step, 0: the ramp has not started */
+	u64 step_wait_ns;	/* before the next step up */
 	u64 guard_ns;
 	unsigned int epoch_seen;
 	/* Lightning accessory policy, on boards with a role switch */
@@ -661,16 +667,13 @@ static int tristar_identify(struct tristar_charger *chg, struct tristar_ident *i
 /* ---- Policy ---- */
 
 /*
- * A USB session reported in this epoch: a PMU source event may mean another
- * host, so it ends what the previous one allowed. Caller holds lock.
+ * What the USB host allows. As in iOS 16 (IOUSBDeviceController), only the
+ * USB session changes it: a reset, a disconnect or a suspend reported by the
+ * device controller, or the end of the attachment. A PMU source event does
+ * not. Caller holds lock.
  */
 static unsigned int tristar_usb_ma(struct tristar_charger *chg)
 {
-	if (chg->usb_epoch != READ_ONCE(chg->epoch)) {
-		dev_dbg(chg->dev, "USB budget stale: report epoch %u, source epoch %u\n",
-			chg->usb_epoch, READ_ONCE(chg->epoch));
-		return 0;
-	}
 	return chg->usb_ma;
 }
 
@@ -744,8 +747,10 @@ static void tristar_new_attachment(struct tristar_charger *chg, u64 now)
 	chg->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	chg->cable_known = false;
 	chg->epoch_seen = READ_ONCE(chg->epoch);
-	if (tristar_set_code(chg, TRISTAR_CHG_FALLBACK_CODE))
-		dev_crit(chg->dev, "Fallback write failed; input limit unverified\n");
+	WRITE_ONCE(chg->line_ns, 0);
+	/* iOS draws nothing above the attach default before the grant ramps. */
+	if (tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE))
+		dev_crit(chg->dev, "Handoff write failed; input limit unverified\n");
 	dev_dbg(chg->dev, "power connected, identifying source\n");
 }
 
@@ -758,20 +763,16 @@ static void tristar_mux_fault(struct tristar_charger *chg)
 	dev_err(chg->dev, "Tristar mux restore unverified; holding the fallback until reboot\n");
 }
 
-/* Start the grant for the identified source. Caller holds lock. */
+/* Start the grant for the identified source: ramp up to it. Caller holds lock. */
 static void tristar_grant(struct tristar_charger *chg)
 {
 	chg->target_code = tristar_target_code(chg);
-	if (chg->target_code <= TRISTAR_CHG_FALLBACK_CODE) {
-		chg->phase = TRISTAR_CHARGING;
-		dev_dbg(chg->dev, "%s: %u mA\n", chg->source,
-			tristar_code_ma(TRISTAR_CHG_FALLBACK_CODE));
-	} else {
-		chg->phase = TRISTAR_RAMPING;
-		chg->step_ns = 0;
-		dev_dbg(chg->dev, "%s: up to %u mA\n", chg->source,
-			tristar_code_ma(chg->target_code));
-	}
+	if (chg->code > chg->target_code)
+		tristar_withdraw(chg, chg->target_code);
+	chg->phase = chg->code < chg->target_code ? TRISTAR_RAMPING : TRISTAR_CHARGING;
+	chg->step_ns = 0;
+	dev_dbg(chg->dev, "%s: up to %u mA\n", chg->source,
+		tristar_code_ma(chg->target_code));
 }
 
 /*
@@ -857,12 +858,23 @@ static void tristar_run_identification(struct tristar_charger *chg, u64 now)
 	tristar_accept(chg, &id);
 }
 
+/* A source event less than TRISTAR_EVENT_DEBOUNCE_MS ago holds the ramp. */
+static bool tristar_debouncing(struct tristar_charger *chg, u64 now)
+{
+	u64 line_ns = READ_ONCE(chg->line_ns);
+
+	return line_ns &&
+	       (s64)(now - line_ns) < (s64)TRISTAR_EVENT_DEBOUNCE_MS * NSEC_PER_MSEC;
+}
+
 static void tristar_ramp_step(struct tristar_charger *chg, u64 now)
 {
 	struct tristar_pack pack;
-	unsigned int next;
+	unsigned int next, from_ma = tristar_code_ma(chg->code);
+	u64 wait;
 
-	if (chg->step_ns && now - chg->step_ns < TRISTAR_RAMP_STEP_MS * NSEC_PER_MSEC)
+	if (tristar_debouncing(chg, now) ||
+	    (chg->step_ns && now - chg->step_ns < chg->step_wait_ns))
 		return;
 	/* A read that fails says nothing about the battery: hold, and look again. */
 	if (tristar_read_pack(&pack))
@@ -873,8 +885,15 @@ static void tristar_ramp_step(struct tristar_charger *chg, u64 now)
 		dev_warn(chg->dev, "battery outside the charging window; holding the fallback\n");
 		return;
 	}
-	next = min(chg->target_code,
-		   tristar_ma_code(tristar_code_ma(chg->code) + TRISTAR_RAMP_STEP_MA));
+	if (!chg->step_ns && chg->code <= TRISTAR_CHG_HANDOFF_CODE) {
+		/* From nothing, iOS writes 100 mA and holds it. */
+		next = TRISTAR_CHG_HANDOFF_CODE;
+		wait = TRISTAR_RAMP_HOLD_MS * NSEC_PER_MSEC;
+	} else {
+		next = min(chg->target_code,
+			   tristar_ma_code(tristar_code_ma(chg->code) + TRISTAR_RAMP_STEP_MA));
+		wait = (u64)(tristar_code_ma(next) - from_ma) * (NSEC_PER_MSEC / 10);
+	}
 	if (tristar_set_code(chg, next)) {
 		chg->phase = TRISTAR_FAULT;
 		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
@@ -882,8 +901,28 @@ static void tristar_ramp_step(struct tristar_charger *chg, u64 now)
 		return;
 	}
 	chg->step_ns = now;
+	chg->step_wait_ns = wait;
 	if (next == chg->target_code)
 		chg->phase = TRISTAR_CHARGING;
+}
+
+/*
+ * While ramping, the next step or the end of a debounce is due sooner than the
+ * next poll. Caller holds lock. Returns 0 when the usual poll interval applies,
+ * which includes a step that could not be taken (an unreadable battery).
+ */
+static unsigned long tristar_ramp_delay(struct tristar_charger *chg, u64 now)
+{
+	u64 due = chg->step_ns ? chg->step_ns + chg->step_wait_ns : now;
+	u64 line_ns = READ_ONCE(chg->line_ns);
+
+	if (chg->stopping || chg->phase != TRISTAR_RAMPING)
+		return 0;
+	if (line_ns)
+		due = max(due, line_ns + TRISTAR_EVENT_DEBOUNCE_MS * NSEC_PER_MSEC);
+	if ((s64)(due - now) <= 0)
+		return 0;
+	return max(usecs_to_jiffies(div_u64(due - now, NSEC_PER_USEC)), 1UL);
 }
 
 /*
@@ -1004,6 +1043,7 @@ static bool tristar_input_present(unsigned int status)
 
 static void tristar_poll(struct work_struct *work)
 {
+	unsigned long ramp_delay = 0;
 	struct tristar_charger *chg = container_of(to_delayed_work(work),
 						   struct tristar_charger, poll_work);
 	unsigned int status, old_code;
@@ -1054,9 +1094,8 @@ static void tristar_poll(struct work_struct *work)
 		goto again;
 	}
 	if (READ_ONCE(chg->epoch) != chg->epoch_seen && chg->phase != TRISTAR_SETTLING) {
-		/* The event handler already withdrew any grant. */
+		/* An event the identification did not see: identify again. */
 		chg->epoch_seen = READ_ONCE(chg->epoch);
-		chg->line_seen = READ_ONCE(chg->line_ns);
 		chg->phase = TRISTAR_SETTLING;
 		chg->attach_ns = now;
 		chg->hold_ns = now;
@@ -1064,19 +1103,11 @@ static void tristar_poll(struct work_struct *work)
 		goto again;
 	}
 	line_ns = READ_ONCE(chg->line_ns);
-	if (line_ns != chg->line_seen) {
-		/*
-		 * The line handler withdrew the grant. Wait until the events of
-		 * that assertion have been dispatched; if none of them was a
-		 * source event, the source is unchanged: ramp back up.
-		 */
-		if ((s64)(now - line_ns) < (s64)TRISTAR_LINE_SETTLE_MS * NSEC_PER_MSEC)
-			goto again;
-		chg->line_seen = line_ns;
-		if (chg->phase == TRISTAR_CHARGING && chg->code < chg->target_code) {
-			chg->phase = TRISTAR_RAMPING;
-			chg->step_ns = 0;
-		}
+	if (line_ns && !tristar_debouncing(chg, now)) {
+		/* The status was read again after the debounce: the input stayed. */
+		cmpxchg(&chg->line_ns, line_ns, 0);
+		dev_dbg(chg->dev, "source event debounced, %u mA kept\n",
+			tristar_code_ma(chg->code));
 	}
 	tristar_follow_accessory(chg, now);
 	switch (chg->phase) {
@@ -1094,6 +1125,7 @@ static void tristar_poll(struct work_struct *work)
 		break;
 	}
 again:
+	ramp_delay = tristar_ramp_delay(chg, now);
 	tristar_accessory_report(chg->acc, chg->usb_ma, chg->phase == TRISTAR_FAULT);
 	mod_delayed_work(chg->wq, &chg->poll_work,
 			 msecs_to_jiffies(TRISTAR_POLL_MS));
@@ -1102,6 +1134,8 @@ again:
 		power_supply_changed(chg->psy);
 out:
 	mutex_unlock(&chg->lock);
+	if (ramp_delay)
+		mod_delayed_work(chg->wq, &chg->poll_work, ramp_delay);
 }
 
 /* ---- PMU events ---- */
@@ -1129,29 +1163,48 @@ static bool tristar_event_withdraw(struct tristar_charger *chg)
 
 /*
  * The PMU line asserted and the event controller has not read the events
- * yet. Withdraw first, attribute later: the grant is gone before the I2C
- * read of the event block. The poll ramps it back if no source event
- * follows (a GPIO edge or another PMU client's event).
+ * yet. iOS acts only on the events themselves, so there is nothing to do.
  */
 static irqreturn_t tristar_line_irq(int irq, void *data)
 {
-	struct tristar_charger *chg = data;
-
-	if (tristar_event_withdraw(chg))
-		WRITE_ONCE(chg->line_ns, ktime_get_ns() ?: 1);
 	return IRQ_HANDLED;
 }
 
 /*
- * A PMU event that can mean a source change. The line handler has already
- * withdrawn any grant; withdraw again in case one was raised since. Then a
- * new epoch invalidates any measurement or grant in progress.
+ * iOS 16 subscribes the same D2365 events (AppleD2365PMUPowerSource) and
+ * hands each to AppleARMPMUCharger as a power-source change. That neither
+ * lowers the input limit nor identifies the source again: it holds the ramp
+ * and reads the status again 50 ms after the last event. Do the same once
+ * the source is identified. Returns false before then.
+ */
+static bool tristar_event_debounce(struct tristar_charger *chg)
+{
+	enum tristar_phase phase = READ_ONCE(chg->phase);
+
+	if (phase != TRISTAR_RAMPING && phase != TRISTAR_CHARGING)
+		return false;
+	WRITE_ONCE(chg->line_ns, ktime_get_ns() ?: 1);
+	/* Never later than a poll already queued: events must not starve it. */
+	queue_delayed_work(chg->wq, &chg->poll_work,
+			   msecs_to_jiffies(TRISTAR_EVENT_DEBOUNCE_MS));
+	return true;
+}
+
+/*
+ * A PMU event that can mean a source change. Once the source is identified it
+ * is debounced. Before that, withdraw any grant, and a new epoch invalidates
+ * the identification in progress.
  */
 static void tristar_source_event(struct tristar_charger *chg)
 {
 	u32 reg = chg->control_base + TRISTAR_CHG_INPUT_LIMIT;
 	unsigned int i;
 	u64 now;
+
+	if (tristar_event_debounce(chg)) {
+		now = ktime_get_ns();
+		goto count;
+	}
 
 	tristar_event_withdraw(chg);
 	WRITE_ONCE(chg->epoch, chg->epoch + 1);
@@ -1160,6 +1213,7 @@ static void tristar_source_event(struct tristar_charger *chg)
 	mod_delayed_work(chg->wq, &chg->poll_work, 0);
 
 	now = ktime_get_ns();
+count:
 	if (now - chg->storm_start_ns > NSEC_PER_SEC) {
 		chg->storm_start_ns = now;
 		chg->storm_count = 0;
@@ -1263,11 +1317,9 @@ static int tristar_set_property(struct power_supply *psy,
 	report_ma = max(val->intval, 0) / 1000;
 	chg->usb_ma = chg->present && chg->usb_on ?
 		min(report_ma, chg->max_ma) : 0;
-	chg->usb_epoch = READ_ONCE(chg->epoch);
 	dev_dbg(chg->dev,
-		"USB budget: reported %u mA, accepted %u mA, present %u, data %u, epoch %u\n",
-		report_ma, chg->usb_ma, chg->present, chg->usb_on,
-		chg->usb_epoch);
+		"USB budget: reported %u mA, accepted %u mA, present %u, data %u\n",
+		report_ma, chg->usb_ma, chg->present, chg->usb_on);
 	if (!chg->stopping) {
 		tristar_update_target(chg);
 		mod_delayed_work(chg->wq, &chg->poll_work, 0);
