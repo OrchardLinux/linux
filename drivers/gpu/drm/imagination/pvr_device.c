@@ -13,6 +13,7 @@
 #include "pvr_stream.h"
 #include "pvr_vm.h"
 
+#include <drm/drm_managed.h>
 #include <drm/drm_print.h>
 
 #include <linux/bitfield.h>
@@ -804,6 +805,10 @@ pvr_device_init(struct pvr_device *pvr_dev)
 	struct drm_device *drm_dev = from_pvr_device(pvr_dev);
 	struct device *dev = drm_dev->dev;
 	int err;
+
+	err = drmm_mutex_init(drm_dev, &pvr_dev->submit_order);
+	if (err)
+		return err;
 
 	/* Get the platform-specific data based on the compatible string. */
 	pvr_dev->device_data = of_device_get_match_data(dev);

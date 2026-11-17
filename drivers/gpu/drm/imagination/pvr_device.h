@@ -94,6 +94,12 @@ struct pvr_device {
 	 */
 	struct drm_device base;
 
+	/**
+	 * @submit_order: Makes a submission whole and nests its VM locks
+	 * outside reservation locking and job arming (pvr_submit_jobs()).
+	 */
+	struct mutex submit_order;
+
 	/** @gem_reclaim: GEM residency, using base.gem_lru_mutex for all LRUs. */
 	struct {
 		struct drm_gem_lru evictable;

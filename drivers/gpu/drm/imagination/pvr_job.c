@@ -740,9 +740,6 @@ pvr_jobs_link_geom_frag(struct pvr_job_data *job_data, u32 *job_count)
  *  * -%EINVAL on invalid arguments, or
  *  * Any other error.
  */
-/* Nest all submission VM locks outside reservation locking and job arming. */
-static DEFINE_MUTEX(pvr_submit_order);
-
 int
 pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 		struct drm_pvr_ioctl_submit_jobs_args *args)
@@ -801,7 +798,7 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 		err = -ENOMEM;
 		goto out_exec_fini_unlocked;
 	}
-	err = mutex_lock_interruptible(&pvr_submit_order);
+	err = mutex_lock_interruptible(&pvr_dev->submit_order);
 	if (err)
 		goto out_exec_fini_unlocked;
 	for (u32 i = 0; i < jobs_alloced; i++) {
@@ -812,7 +809,7 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 			;
 		if (j != vm_count)
 			continue;
-		pvr_vm_submit_lock(vm, &pvr_submit_order);
+		pvr_vm_submit_lock(vm, &pvr_dev->submit_order);
 		vms[vm_count++] = vm;
 	}
 
@@ -868,7 +865,7 @@ out_exec_fini:
 	drm_exec_fini(&exec);
 	while (vm_count)
 		pvr_vm_submit_unlock(vms[--vm_count]);
-	mutex_unlock(&pvr_submit_order);
+	mutex_unlock(&pvr_dev->submit_order);
 	goto out_sync_cleanup;
 out_exec_fini_unlocked:
 	drm_exec_fini(&exec);
