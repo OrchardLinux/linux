@@ -1437,6 +1437,16 @@ static struct dma_fence *pvr_apple_job_fence(struct pvr_apple *apple, struct pvr
 	return &fence->base;
 }
 
+/*
+ * The job worker may allocate only without reclaim on a chip whose BOs can
+ * be evicted: the shrinker can then wait for the jobs this worker runs.
+ * Other chips allocate there as before.
+ */
+static gfp_t pvr_apple_job_gfp(struct pvr_apple *apple)
+{
+	return apple->chip->vm_evictable ? GFP_NOWAIT : GFP_KERNEL;
+}
+
 struct dma_fence *pvr_apple_submit_compute_job(struct pvr_device *pvr_dev,
 					       struct pvr_vm_context *vm_ctx, u64 stream,
 					       u64 ctx_state)
@@ -1444,7 +1454,7 @@ struct dma_fence *pvr_apple_submit_compute_job(struct pvr_device *pvr_dev,
 	struct pvr_apple *apple = to_apple(pvr_dev);
 	struct pvr_apple_fence *fence;
 
-	fence = kzalloc(sizeof(*fence), GFP_NOWAIT);
+	fence = kzalloc(sizeof(*fence), pvr_apple_job_gfp(apple));
 	if (!fence)
 		return ERR_PTR(-ENOMEM);
 	return pvr_apple_job_fence(apple, fence, APPLE_ENGINE_COMPUTE,
@@ -1692,8 +1702,8 @@ struct dma_fence *pvr_apple_submit_render_job(struct pvr_job *job)
 	if (apple->chip->submit)
 		return pvr_apple_submit_job(job);
 
-	fence = kzalloc(sizeof(*fence), GFP_NOWAIT);
-	hw = kmalloc(apple->chip->render_job_size, GFP_NOWAIT);
+	fence = kzalloc(sizeof(*fence), pvr_apple_job_gfp(apple));
+	hw = kmalloc(apple->chip->render_job_size, pvr_apple_job_gfp(apple));
 	if (!fence || !hw) {
 		kfree(fence);
 		kfree(hw);
@@ -1727,7 +1737,7 @@ struct dma_fence *pvr_apple_submit_job(struct pvr_job *job)
 				       APPLE_ENGINE_COMPUTE;
 	struct pvr_apple_fence *fence;
 
-	fence = kzalloc(sizeof(*fence), GFP_NOWAIT);
+	fence = kzalloc(sizeof(*fence), pvr_apple_job_gfp(apple));
 	if (!fence)
 		return ERR_PTR(-ENOMEM);
 	return pvr_apple_job_fence(apple, fence, engine, apple->chip->submit(apple, job));
