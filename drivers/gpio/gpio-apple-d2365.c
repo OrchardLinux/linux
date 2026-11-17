@@ -138,6 +138,7 @@ struct apple_pmic_gpio {
 	DECLARE_BITMAP(enabled, APPLE_PMIC_IRQS_MAX);	/* unmasked while awake */
 	DECLARE_BITMAP(wake, APPLE_PMIC_EVENTS_MAX);	/* unmasked while asleep */
 	DECLARE_BITMAP(wake_only, APPLE_PMIC_EVENTS_MAX); /* apple,wake-events */
+	DECLARE_BITMAP(sleep_armed, APPLE_PMIC_EVENTS_MAX); /* unmasked for this sleep */
 	u8 mask[APPLE_PMIC_EVENT_BYTES_MAX];		/* as last written */
 	u8 boot_mask[APPLE_PMIC_EVENT_BYTES_MAX];
 	int wake_delta;			/* parent wake references to apply */
@@ -282,6 +283,16 @@ static int apple_pmic_irq_set_wake(struct irq_data *data, unsigned int on)
 	/* The line interrupt only runs while the system is awake. */
 	if (hwirq >= gpio->nevents)
 		return -EINVAL;
+	/*
+	 * The sleep mask was written in our suspend callback and the bus is
+	 * not used again before resume: a wake request arriving now (a
+	 * dedicated wake IRQ, armed at the start of the noirq phase) leaves
+	 * its event masked. Its consumer must arm it in its own suspend.
+	 */
+	if (on && gpio->suspended && !test_bit(hwirq, gpio->wake))
+		dev_dbg(gpio->chip.parent,
+			"event 0x%lx armed for wake after the sleep mask was written: it cannot wake this sleep\n",
+			hwirq);
 	if (on && !test_bit(hwirq, gpio->wake)) {
 		__set_bit(hwirq, gpio->wake);
 		gpio->wake_delta++;
@@ -728,6 +739,7 @@ static int apple_pmic_gpio_suspend(struct device *dev)
 	ret = apple_pmic_event_sync(gpio, armed);
 	if (ret)
 		goto unwind;
+	bitmap_copy(gpio->sleep_armed, armed, gpio->nevents);
 	gpio->suspended = true;
 	gpio->wake_only_armed = wake_only;
 	mutex_unlock(&gpio->irq_lock);
@@ -745,6 +757,7 @@ static int apple_pmic_gpio_suspend(struct device *dev)
 			mutex_lock(&gpio->irq_lock);
 			gpio->suspended = false;
 			gpio->wake_only_armed = false;
+			bitmap_zero(gpio->sleep_armed, APPLE_PMIC_EVENTS_MAX);
 			goto unwind_enabled;
 		}
 		gpio->parent_wake_armed = true;
@@ -767,6 +780,29 @@ unwind_enabled:
 	return ret;
 }
 
+/*
+ * Every event unmasked for the sleep can end it, and the PM core can only
+ * name the PMU line (one interrupt for all of them). Read the block here,
+ * still gated, so the log names the events that ended the sleep; the others
+ * latched in sleep (a hall line that moves with the sleep power state, a
+ * charger status event) could not have woken it and are named apart.
+ */
+static void apple_pmic_wake_report(struct apple_pmic_gpio *gpio,
+				   const unsigned long *latched)
+{
+	struct device *dev = gpio->chip.parent;
+	DECLARE_BITMAP(woke, APPLE_PMIC_EVENTS_MAX);
+	DECLARE_BITMAP(other, APPLE_PMIC_EVENTS_MAX);
+
+	bitmap_and(woke, latched, gpio->sleep_armed, gpio->nevents);
+	bitmap_andnot(other, latched, gpio->sleep_armed, gpio->nevents);
+	if (!bitmap_empty(woke, gpio->nevents))
+		dev_dbg(dev, "wake: PMU event(s) %*pbl\n", gpio->nevents, woke);
+	if (!bitmap_empty(other, gpio->nevents))
+		dev_dbg(dev, "PMU event(s) %*pbl latched in sleep, not armed\n",
+			gpio->nevents, other);
+}
+
 static int apple_pmic_gpio_resume(struct device *dev)
 {
 	struct apple_pmic_gpio *gpio = dev_get_drvdata(dev);
@@ -783,13 +819,16 @@ static int apple_pmic_gpio_resume(struct device *dev)
 	ret = apple_pmic_event_sync(gpio, gpio->enabled);
 	if (ret)
 		dev_warn(dev, "event mask write failed: %d\n", ret);
-	armed = gpio->wake_only_armed;
+	armed = !bitmap_empty(gpio->sleep_armed, gpio->nevents);
 	gpio->wake_only_armed = false;
 	bitmap_zero(pending, APPLE_PMIC_EVENTS_MAX);
 	if (armed) {
 		/* Still gated: the thread cannot take the wake reason first. */
 		read = !apple_pmic_event_read(gpio, latched, pending);
+		if (read)
+			apple_pmic_wake_report(gpio, latched);
 	}
+	bitmap_zero(gpio->sleep_armed, APPLE_PMIC_EVENTS_MAX);
 	gpio->suspended = false;
 	gpio->retries = 0;
 	/* An event that arrived while gated is still latched, unless read here. */
