@@ -5,6 +5,8 @@ config DRM_APPLE_ADBE
 	depends on ARCH_APPLE || COMPILE_TEST
 	select APERTURE_HELPERS
 	select DRM_CLIENT_SELECTION
+	select DRM_DISPLAY_DP_HELPER
+	select DRM_DISPLAY_HELPER
 	select DRM_GEM_DMA_HELPER
 	select DRM_KMS_HELPER
 	help
@@ -12,6 +14,7 @@ config DRM_APPLE_ADBE
 	  (S8000/S8003), as used in the iPad 5. It adopts the mode the
 	  bootloader leaves running, takes the framebuffer over from
 	  simpledrm, and adds page flips and vblank interrupts. It never
-	  programs timings, clocks or the eDP link.
+	  programs timings or clocks, and trains the eDP link only to bring
+	  the panel back after a sleep with its supply off.
 
 	  If M is selected, the module is called apple_adbe_drm.
