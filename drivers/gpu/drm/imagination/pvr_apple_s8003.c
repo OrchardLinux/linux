@@ -270,7 +270,6 @@ struct s8003_vm {
 	u32 slot[2];			/* geometry and compute, fragment; 0: none */
 	u32 attached;			/* the firmware start the slots were loaded for */
 	struct s8003_pm pm[2];
-	bool pm_logged;			/* first pool sizing report for this VM */
 	u32 fb_blocks;			/* pool size the firmware's feedback asked for */
 	ktime_t fb_at;			/* when that feedback was last taken */
 };
@@ -311,14 +310,6 @@ struct pvr_apple_s8003 {
 	u32 set_frag[S8003_PM_SETS];
 	unsigned long wb_sets;
 	struct s8003_vm *pm_last, *pm_prev; /* last two scenes for cache-line reads */
-
-	/* For debugfs: the reads s8003_touch() made, and the waits for the firmware */
-	atomic64_t touches, touch_ns, touch_lines;
-	atomic64_t done_polls, ring_polls;
-	/* Under submit_lock: PM record or none per geometry job, pool feedback */
-	u64 pm_full, pm_clean, pm_clean_queued, pm_rec_unreached;
-	u64 fb_reads, fb_grows;
-	u32 fb_max_blocks;
 	struct pvr_vm_context *park_vm;	/* maps what every VM maps, nothing else */
 
 	/* Bus addresses the firmware is told: its registers' and ours */
@@ -1286,9 +1277,7 @@ static void pvr_apple_s8003_events(struct pvr_apple *apple)
 	/* An eighth early, so that a check every S8003_TOUCH_US always touches */
 	if (ktime_us_delta(now, READ_ONCE(s->touched)) + S8003_TOUCH_US / 8 >= S8003_TOUCH_US) {
 		WRITE_ONCE(s->touched, now);
-		atomic64_add(s8003_touch(s), &s->touch_lines);
-		atomic64_add(ktime_to_ns(ktime_sub(ktime_get(), now)), &s->touch_ns);
-		atomic64_inc(&s->touches);
+		s8003_touch(s);
 	}
 	if (!READ_ONCE(s->failed) && s8003_drain(apple, &alive)) {
 		WRITE_ONCE(s->failed, true);
@@ -1340,9 +1329,6 @@ static u32 pvr_apple_s8003_engine_done(struct pvr_apple *apple, enum pvr_apple_e
 
 static u32 s8003_done_poll(struct pvr_apple *apple, enum pvr_apple_engine engine)
 {
-	struct pvr_apple_s8003 *s = apple->chip_data;
-
-	atomic64_inc(&s->done_polls);
 	pvr_apple_s8003_events(apple);
 	return pvr_apple_s8003_engine_done(apple, engine);
 }
@@ -1383,9 +1369,6 @@ static int s8003_doorbell(struct pvr_apple *apple, u32 dm)
 
 static u32 s8003_ring_consumer(struct pvr_apple *apple, u8 *ctl)
 {
-	struct pvr_apple_s8003 *s = apple->chip_data;
-
-	atomic64_inc(&s->ring_polls);
 	pvr_apple_s8003_events(apple);
 	return ring_read(ctl, S8003_RING_CONSUMER);
 }
@@ -2325,7 +2308,6 @@ static void s8003_pm_feedback(struct pvr_apple *apple, struct s8003_vm *vm)
 		put32(list + S8003_PM_FEEDBACK_TAKEN, 1);
 		wmb();
 		vm->fb_at = now;
-		s->fb_reads++;
 		/* Not from this pool: ignored */
 		if (high > pm->blocks * 32 || margin > S8003_PM_BLOCKS_MAX * 32)
 			continue;
@@ -2336,11 +2318,9 @@ static void s8003_pm_feedback(struct pvr_apple *apple, struct s8003_vm *vm)
 		if (target <= max(vm->fb_blocks, pm->blocks))
 			continue;
 		vm->fb_blocks = target;
-		s->fb_grows++;
-		s->fb_max_blocks = max(s->fb_max_blocks, target);
-		dev_info(apple_dev(apple),
-			 "PM pool VM=%p grows to %u blocks from feedback: high-water %u pages, margin %u, request %u\n",
-			 vm->vm_ctx, target, high, margin, request);
+		dev_dbg(apple_dev(apple),
+			"PM pool VM=%p grows to %u blocks from feedback: high-water %u pages, margin %u, request %u\n",
+			vm->vm_ctx, target, high, margin, request);
 	}
 }
 
@@ -2527,13 +2507,6 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	pm_record = !s8003_pm_clean(apple, pm, min(blocks, S8003_PM_BLOCKS_MAX));
 	pm->clean = false;
 	err = s8003_pm_build(apple, vm, pm, min(blocks, S8003_PM_BLOCKS_MAX));
-	if (!err && !vm->pm_logged) {
-		dev_info(apple_dev(apple),
-			 "PM pool VM=%p blocks=%u clamped=%u tiles=%u initial_num_pages=%u\n",
-			 vm->vm_ctx, pm->blocks, blocks > S8003_PM_BLOCKS_MAX, rt.tiles,
-			 hwrt->free_lists[0]->initial_num_pages);
-		vm->pm_logged = true;
-	}
 	if (err)
 		return s8003_submit_error(apple, vm, "geometry", err, "PM pool build failed");
 	/* The record slot of the job before the last one is free again */
@@ -2547,17 +2520,9 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		u32 done = pvr_apple_s8003_engine_done(apple, APPLE_ENGINE_GEOM);
 
 		/* The last rebuild must be visible; a newer ordinary TA need not be. */
-		if ((s32)(done - pm->rec_seq) < 0) {
+		if ((s32)(done - pm->rec_seq) < 0)
 			pm_record = true;
-			s->pm_rec_unreached++;
-		} else if ((s32)(done - apple->ta_seq) < 0) {
-			s->pm_clean_queued++;
-		}
 	}
-	if (pm_record)
-		s->pm_full++;
-	else
-		s->pm_clean++;
 	s8003_fill_ta(p + s8003_slot_of(seq, false).w, job->cmd, job->hwrt, &rt);
 	s8003_job_write(p, s8003_channel_addr(APPLE_ENGINE_GEOM),
 			s8003_object_addr(&s->layout, S8003_CHANNEL),
@@ -3028,21 +2993,6 @@ static u32 pvr_apple_s8003_max_power_state(struct pvr_apple *apple)
 	return get32(s8003_object(s, S8003_PLATFORM) + 0x710);
 }
 
-static void pvr_apple_s8003_debugfs_show(struct pvr_apple *apple, struct seq_file *m)
-{
-	struct pvr_apple_s8003 *s = apple->chip_data;
-
-	seq_printf(m, "touch count %lld ns %lld lines %lld\n", atomic64_read(&s->touches),
-		   atomic64_read(&s->touch_ns), atomic64_read(&s->touch_lines));
-	seq_printf(m, "pm_record full %llu clean %llu clean_queued %llu rec_unreached %llu\n",
-		   READ_ONCE(s->pm_full), READ_ONCE(s->pm_clean),
-		   READ_ONCE(s->pm_clean_queued), READ_ONCE(s->pm_rec_unreached));
-	seq_printf(m, "pm_pool feedback %llu grows %llu max_blocks %u\n", READ_ONCE(s->fb_reads),
-		   READ_ONCE(s->fb_grows), READ_ONCE(s->fb_max_blocks));
-	seq_printf(m, "s8003_wait_polls done %lld ring %lld\n", atomic64_read(&s->done_polls),
-		   atomic64_read(&s->ring_polls));
-}
-
 const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.fw_name = "apple/gfx-s8003.bin",
 	.perf_state_max = S8003_PERF_STATE_MAX,
@@ -3077,5 +3027,4 @@ const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.vm_evictable = pvr_apple_s8003_vm_evictable,
 	.mmu_flush = pvr_apple_s8003_mmu_flush,
 	.irq_ack = pvr_apple_s8003_irq_ack,
-	.debugfs_show = pvr_apple_s8003_debugfs_show,
 };
