@@ -58,6 +58,9 @@
 #include "apple_tristar_accessory.h"
 
 /* PMIC registers, relative to their banks */
+#define TRISTAR_CHG_CONNECTED		0x09	/* status bank */
+#define TRISTAR_CHG_CONNECTED_NOW	BIT(0)
+#define TRISTAR_CHG_CONNECTED_NEW	BIT(1)
 #define TRISTAR_CHG_STATUS		0x0a	/* status bank */
 #define TRISTAR_CHG_INPUT_LIMIT		0x03	/* control bank */
 #define TRISTAR_CHG_ADC_SELECT		0x00	/* ADC bank */
@@ -1034,18 +1037,33 @@ static void tristar_follow_accessory(struct tristar_charger *chg, u64 now)
 }
 
 /*
- * D2365 status 0x18a reads 0 without input. Its other bits describe the
- * battery charger, not the input: iOS 16's AppleD2365PMUPowerSource status
- * method takes bits 1:0 as charging, bit 2 as charge end and bit 4 as charge
- * timeout, and uses them only for the charging and fully charged state. Its
- * input-current ramp (AppleARMPMUCharger) follows the source's allowance and
- * backs off only when the PMIC reports input limiting, which the D2365 never
- * does. A charger that finished, timed out or does not charge still runs the
- * system from the source, so any nonzero value keeps the grant.
+ * Input presence is the D2365's connection state 0x189, as iOS 16 decides it
+ * (AppleD2365PMUPowerSource): bit 0 is "connected", and a new connection also
+ * needs bit 1. The charger status 0x18a is not presence. Its bits describe
+ * the battery charger: the same method takes bits 1:0 as charging, bit 2 as
+ * charge end and bit 4 as charge timeout, for the charging and fully charged
+ * state only. It can also read 0 with the input still there: behind the
+ * powered camera adapter it alternated between 0x40 and 0 every 100-300 ms
+ * during the ramp while 0x189 bit 0 stayed set. iOS's input-current ramp
+ * (AppleARMPMUCharger) follows the source's allowance and backs off only when
+ * the PMIC reports input limiting, which the D2365 never does, so a charger
+ * that finished, timed out or does not charge keeps the grant.
+ *
+ * Every board this driver binds has a D2365: the status, control and ADC
+ * registers above are the D2365's. An unreadable 0x189 says nothing: keep
+ * the last decision.
  */
-static bool tristar_input_present(unsigned int status)
+static bool tristar_input_present(struct tristar_charger *chg)
 {
-	return status != 0;
+	unsigned int connected;
+
+	if (regmap_read(chg->regmap, chg->status_base + TRISTAR_CHG_CONNECTED, &connected)) {
+		dev_err_ratelimited(chg->dev, "PMIC connection state unreadable\n");
+		return chg->online;
+	}
+	if (!(connected & TRISTAR_CHG_CONNECTED_NOW))
+		return false;
+	return chg->present || (connected & TRISTAR_CHG_CONNECTED_NEW);
 }
 
 static void tristar_poll(struct work_struct *work)
@@ -1069,7 +1087,7 @@ static void tristar_poll(struct work_struct *work)
 		dev_err_ratelimited(chg->dev, "PMIC status unreadable; holding the fallback\n");
 		goto again;
 	}
-	chg->online = tristar_input_present(status);
+	chg->online = tristar_input_present(chg);
 	if (!chg->online) {
 		/* The hold of the next attachment starts when input returns. */
 		chg->hold_ns = now;
