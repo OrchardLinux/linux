@@ -122,6 +122,14 @@ properties:
       if the device's initial baud rate in normal mode is not supported by the
       host or if the device requires autobaud mode startup before loading FW.
 
+  apple,wlan:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The Wi-Fi function of the same Apple module. Apple fits modules from
+      several vendors, each needing its own Patchram, and only the Wi-Fi
+      function can read the module vendor from its OTP. The Patchram is
+      chosen by the vendor that the Wi-Fi driver reads.
+
   interrupts:
     items:
       - description: Handle to the line HOST_WAKE used to wake
