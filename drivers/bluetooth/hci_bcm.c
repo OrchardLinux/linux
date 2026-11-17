@@ -120,6 +120,8 @@ struct bcm_device_data {
  * @pcm_int_params: keep the initial PCM configuration
  * @use_autobaud_mode: start Bluetooth device in autobaud mode
  * @max_autobaud_speed: max baudrate supported by device in autobaud mode
+ * @fw_variant: module vendor whose Patchram this controller needs, if the
+ *	board comes with modules from several vendors
  */
 struct bcm_device {
 	/* Must be the first member, hci_serdev.c expects this. */
@@ -165,6 +167,7 @@ struct bcm_device {
 	bool			use_autobaud_mode;
 	u8			pcm_int_params[5];
 	u32			max_autobaud_speed;
+	const char		*fw_variant;
 };
 
 /* generic bcm uart resources */
@@ -655,7 +658,9 @@ static int bcm_setup(struct hci_uart *hu)
 		host_set_baudrate(hu, speed);
 	}
 
-	err = btbcm_initialize(hu->hdev, &fw_load_done, use_autobaud_mode);
+	err = btbcm_initialize_variant(hu->hdev, &fw_load_done,
+				       use_autobaud_mode,
+				       bcm->dev ? bcm->dev->fw_variant : NULL);
 	if (err)
 		return err;
 
@@ -1286,6 +1291,64 @@ static int bcm_acpi_probe(struct bcm_device *dev)
 }
 #endif /* CONFIG_ACPI */
 
+/*
+ * Apple builds these controllers into a combined Wi-Fi and Bluetooth module
+ * from one of several vendors, and each vendor's module needs its own
+ * Patchram. Only the Wi-Fi function can tell which module this is: brcmfmac
+ * reads the vendor from the chip's OTP and records it in its device tree
+ * node. Wait for that while the Wi-Fi driver may still probe; without it,
+ * the generic Patchram names are used as before.
+ */
+static const struct {
+	const char *otp;
+	const char *name;
+} bcm_apple_module_vendors[] = {
+	{ "m", "MUR" },	/* Murata */
+	{ "u", "USI" },
+};
+
+static int bcm_of_get_fw_variant(struct bcm_device *bdev)
+{
+	struct device_node *wlan;
+	const char *vendor;
+	int i, err;
+
+	wlan = of_parse_phandle(bdev->dev->of_node, "apple,wlan", 0);
+	if (!wlan)
+		return 0;
+
+	if (!of_device_is_available(wlan)) {
+		of_node_put(wlan);
+		return 0;
+	}
+
+	err = of_property_read_string(wlan, "apple,module-vendor", &vendor);
+	if (err) {
+		of_node_put(wlan);
+		err = driver_deferred_probe_check_state(bdev->dev);
+		if (err == -EPROBE_DEFER)
+			return err;
+		dev_info(bdev->dev,
+			 "Wi-Fi module vendor unknown, using generic Patchram names\n");
+		return 0;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(bcm_apple_module_vendors); i++) {
+		if (!strcmp(vendor, bcm_apple_module_vendors[i].otp)) {
+			bdev->fw_variant = bcm_apple_module_vendors[i].name;
+			break;
+		}
+	}
+	if (!bdev->fw_variant)
+		dev_warn(bdev->dev, "Unknown Wi-Fi module vendor '%s'\n", vendor);
+	else
+		dev_info(bdev->dev, "Wi-Fi module vendor %s\n",
+			 bdev->fw_variant);
+
+	of_node_put(wlan);
+	return 0;
+}
+
 static int bcm_of_probe(struct bcm_device *bdev)
 {
 	bdev->use_autobaud_mode = device_property_read_bool(bdev->dev,
@@ -1297,7 +1360,7 @@ static int bcm_of_probe(struct bcm_device *bdev)
 	bdev->irq = of_irq_get_byname(bdev->dev->of_node, "host-wakeup");
 	bdev->irq_active_low = irq_get_trigger_type(bdev->irq)
 			     & (IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_LEVEL_LOW);
-	return 0;
+	return bcm_of_get_fw_variant(bdev);
 }
 
 static int bcm_probe(struct platform_device *pdev)

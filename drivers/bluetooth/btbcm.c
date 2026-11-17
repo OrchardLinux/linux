@@ -35,7 +35,7 @@
 #define BDADDR_BCM43341B (&(bdaddr_t) {{0xac, 0x1f, 0x00, 0x1b, 0x34, 0x43}})
 
 #define BCM_FW_NAME_LEN			64
-#define BCM_FW_NAME_COUNT_MAX		4
+#define BCM_FW_NAME_COUNT_MAX		6
 /* For kmalloc-ing the fw-name array instead of putting it on the stack */
 typedef char bcm_fw_name[BCM_FW_NAME_LEN];
 
@@ -575,7 +575,13 @@ static const char *btbcm_get_board_name(struct device *dev)
 #endif
 }
 
-int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode)
+/*
+ * @variant names the module a board's controller sits on, when the board
+ * comes with modules from several vendors that each need their own Patchram.
+ * Its file names are tried before the generic ones.
+ */
+int btbcm_initialize_variant(struct hci_dev *hdev, bool *fw_load_done,
+			     bool use_autobaud_mode, const char *variant)
 {
 	u16 subver, rev, pid, vid;
 	struct sk_buff *skb;
@@ -659,6 +665,18 @@ int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud
 	if (!fw_name)
 		return -ENOMEM;
 
+	if (board_name && variant) {
+		if (hw_name) {
+			snprintf(fw_name[fw_name_count], BCM_FW_NAME_LEN,
+				 "brcm/%s%s.%s-%s.hcd", hw_name, postfix,
+				 board_name, variant);
+			fw_name_count++;
+		}
+		snprintf(fw_name[fw_name_count], BCM_FW_NAME_LEN,
+			 "brcm/BCM%s.%s-%s.hcd", postfix, board_name, variant);
+		fw_name_count++;
+	}
+
 	if (hw_name) {
 		if (board_name) {
 			snprintf(fw_name[fw_name_count], BCM_FW_NAME_LEN,
@@ -703,6 +721,13 @@ int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud
 
 	kfree(fw_name);
 	return 0;
+}
+EXPORT_SYMBOL_GPL(btbcm_initialize_variant);
+
+int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode)
+{
+	return btbcm_initialize_variant(hdev, fw_load_done, use_autobaud_mode,
+					NULL);
 }
 EXPORT_SYMBOL_GPL(btbcm_initialize);
 

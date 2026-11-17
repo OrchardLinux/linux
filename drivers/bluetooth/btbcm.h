@@ -64,6 +64,8 @@ int btbcm_setup_patchram(struct hci_dev *hdev);
 int btbcm_setup_apple(struct hci_dev *hdev);
 
 int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode);
+int btbcm_initialize_variant(struct hci_dev *hdev, bool *fw_load_done,
+			     bool use_autobaud_mode, const char *variant);
 int btbcm_finalize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode);
 
 #else
@@ -111,6 +113,14 @@ static inline int btbcm_setup_apple(struct hci_dev *hdev)
 }
 
 static inline int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode)
+{
+	return 0;
+}
+
+static inline int btbcm_initialize_variant(struct hci_dev *hdev,
+					   bool *fw_load_done,
+					   bool use_autobaud_mode,
+					   const char *variant)
 {
 	return 0;
 }
