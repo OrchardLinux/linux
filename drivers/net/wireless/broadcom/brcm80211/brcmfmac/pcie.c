@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/firmware.h>
+#include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
@@ -2004,6 +2005,39 @@ brcmf_pcie_parse_otp_sys_vendor(struct brcmf_pciedev_info *devinfo,
 	return 0;
 }
 
+/*
+ * Apple's Wi-Fi and Bluetooth share one module, and the Bluetooth Patchram
+ * differs per module vendor, which only the Wi-Fi OTP tells. Record the
+ * vendor in this device's DT node so that hci_bcm can pick its Patchram.
+ */
+static void brcmf_pcie_publish_otp_vendor(struct brcmf_pciedev_info *devinfo)
+{
+	struct device_node *np = devinfo->pdev->dev.of_node;
+	struct property *prop;
+
+	if (!np || !devinfo->otp.valid ||
+	    of_property_present(np, "apple,module-vendor"))
+		return;
+
+	prop = kzalloc(sizeof(*prop), GFP_KERNEL);
+	if (!prop)
+		return;
+
+	prop->name = kstrdup("apple,module-vendor", GFP_KERNEL);
+	prop->value = kstrdup(devinfo->otp.vendor, GFP_KERNEL);
+	if (!prop->name || !prop->value)
+		goto free;
+	prop->length = strlen(prop->value) + 1;
+
+	if (!of_add_property(np, prop))
+		return;
+
+free:
+	kfree(prop->value);
+	kfree(prop->name);
+	kfree(prop);
+}
+
 static int
 brcmf_pcie_parse_otp(struct brcmf_pciedev_info *devinfo, u8 *otp, size_t size)
 {
@@ -2557,6 +2591,7 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			brcmf_err(bus, "failed to parse OTP\n");
 			goto fail_brcmf;
 		}
+		brcmf_pcie_publish_otp_vendor(devinfo);
 		break;
 	case BRCMF_FWVENDOR_CYW:
 	default:
