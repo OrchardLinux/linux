@@ -167,6 +167,14 @@ struct tristar_charger {
 	bool usb_on;
 	/* What the USB host allows (vbus_draw) */
 	unsigned int usb_ma;
+	/*
+	 * From prepare to complete of a system sleep: the device controller's
+	 * reports are its own suspend, not the host's.
+	 */
+	bool sleeping;
+	/* A report held over sleep, applied at complete */
+	bool usb_report_held;
+	unsigned int usb_report_ma;
 	enum power_supply_usb_type usb_type;
 	/* The identified cable, to recognize it after a source event. */
 	bool cable_known;
@@ -698,8 +706,10 @@ static void tristar_set_usb(struct tristar_charger *chg, bool on)
 	if (ret)
 		dev_err(chg->dev, "cannot turn USB data %s (%d)\n", on ? "on" : "off", ret);
 	chg->usb_on = on || ret;
-	if (!chg->usb_on)
+	if (!chg->usb_on) {
 		chg->usb_ma = 0;
+		chg->usb_report_held = false;
+	}
 }
 
 /* The highest grant the source allows, up to the board maximum. */
@@ -1325,13 +1335,21 @@ static int tristar_get_property(struct power_supply *psy,
  * an Apple host's current grant. Not writable from user space. Only a
  * session this driver turned on counts: without VBUS sensing the controller
  * keeps reporting bus suspend and resume after its host is gone.
+ *
+ * A system sleep disconnects the device controller from its host: that is
+ * not the host lowering its grant, and iOS keeps the granted current across
+ * sleep. A report from prepare to complete is held and applied at complete;
+ * after the wake the host's enumeration sets the budget as usual. No supply
+ * change is reported while the system sleeps: it is a wakeup event, and it
+ * would abort the suspend that caused it. A plug or unplug wakes the system
+ * and ends the attachment, which drops a held report.
  */
 static int tristar_set_property(struct power_supply *psy,
 				enum power_supply_property psp,
 				const union power_supply_propval *val)
 {
 	struct tristar_charger *chg = power_supply_get_drvdata(psy);
-	unsigned int old_code, old_ma, report_ma;
+	unsigned int old_code, old_ma, report_ma, accept_ma;
 
 	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
 		return -EINVAL;
@@ -1340,8 +1358,17 @@ static int tristar_set_property(struct power_supply *psy,
 	old_code = chg->code;
 	old_ma = tristar_usb_ma(chg);
 	report_ma = max(val->intval, 0) / 1000;
-	chg->usb_ma = chg->present && chg->usb_on ?
-		min(report_ma, chg->max_ma) : 0;
+	accept_ma = chg->present && chg->usb_on ? min(report_ma, chg->max_ma) : 0;
+	if (chg->sleeping) {
+		chg->usb_report_ma = accept_ma;
+		chg->usb_report_held = accept_ma != old_ma;
+		dev_dbg(chg->dev, "USB budget: reported %u mA, %u mA kept over sleep\n",
+			report_ma, old_ma);
+		mutex_unlock(&chg->lock);
+		return 0;
+	}
+	chg->usb_report_held = false;
+	chg->usb_ma = accept_ma;
 	dev_dbg(chg->dev,
 		"USB budget: reported %u mA, accepted %u mA, present %u, data %u\n",
 		report_ma, chg->usb_ma, chg->present, chg->usb_on);
@@ -1579,11 +1606,47 @@ static void tristar_shutdown(struct platform_device *pdev)
 }
 
 /*
+ * From here until complete, a USB budget report is the device controller's
+ * own suspend (it disconnects from its host), not the host's: see
+ * tristar_set_property().
+ */
+static int tristar_prepare(struct device *dev)
+{
+	struct tristar_charger *chg = dev_get_drvdata(dev);
+
+	mutex_lock(&chg->lock);
+	chg->sleeping = true;
+	mutex_unlock(&chg->lock);
+	return 0;
+}
+
+static void tristar_complete(struct device *dev)
+{
+	struct tristar_charger *chg = dev_get_drvdata(dev);
+	bool changed = false;
+
+	mutex_lock(&chg->lock);
+	chg->sleeping = false;
+	if (chg->usb_report_held) {
+		chg->usb_report_held = false;
+		chg->usb_ma = chg->usb_report_ma;
+		tristar_update_target(chg);
+		mod_delayed_work(chg->wq, &chg->poll_work, 0);
+		changed = true;
+	}
+	mutex_unlock(&chg->lock);
+
+	if (changed)
+		power_supply_changed(chg->psy);
+}
+
+/*
  * A plug or unplug wakes the system, so sleep hides no source swap and an
- * identified charger keeps its limit: a tablet left on one charges at full
- * rate. A USB host may be asleep too and is owed no more than the handoff, so
- * it parks there and is identified again on resume, as is anything without a
- * plug event to rely on.
+ * identified source keeps its grant, as in iOS 16, which keeps a USB host's
+ * granted current across sleep too (IOAccessoryUSBCurrentLimit): a tablet
+ * left on a charger or a computer charges at the same rate while it sleeps.
+ * Anything without a plug event to rely on parks at the handoff and is
+ * identified again on resume.
  *
  * Sleep never waits for the charger. iOS 16 (AppleARMPMUCharger) cancels the
  * ramp on sleep and leaves the limit as written; after wake the ramp goes on
@@ -1602,8 +1665,7 @@ static int tristar_suspend(struct device *dev)
 
 	mutex_lock(&chg->lock);
 	keep = chg->plug_irq && device_may_wakeup(dev) && chg->present &&
-	       (chg->phase == TRISTAR_RAMPING || chg->phase == TRISTAR_CHARGING) &&
-	       !tristar_usb_ma(chg);
+	       (chg->phase == TRISTAR_RAMPING || chg->phase == TRISTAR_CHARGING);
 	chg->stopping = true;
 	if (!keep) {
 		chg->present = false;
@@ -1640,7 +1702,11 @@ static int tristar_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(tristar_pm_ops, tristar_suspend, tristar_resume);
+static const struct dev_pm_ops tristar_pm_ops = {
+	.prepare = pm_sleep_ptr(tristar_prepare),
+	.complete = pm_sleep_ptr(tristar_complete),
+	SYSTEM_SLEEP_PM_OPS(tristar_suspend, tristar_resume)
+};
 
 static const struct of_device_id tristar_of_match[] = {
 	{ .compatible = "apple,tristar-charger" },
