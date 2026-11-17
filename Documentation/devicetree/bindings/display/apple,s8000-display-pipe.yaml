@@ -32,15 +32,30 @@ properties:
 
   reg:
     minItems: 3
-    maxItems: 8
+    maxItems: 9
 
   reg-names:
     minItems: 3
-    maxItems: 8
+    maxItems: 9
 
   interrupts:
     minItems: 5
     maxItems: 6
+
+  apple,lcd-ldo-gpios:
+    maxItems: 1
+    description:
+      The panel supply enable (the Apple device tree's function-lcd_ldo on
+      the displayport node). With it, the panel is switched off in system
+      sleep and the eDP link is trained again on wake over the DisplayPort
+      transmitter's AUX channel (the "dp" register window), leaving the pipe
+      and the transmitter as the bootloader set them.
+
+  backlight:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The panel's backlight, which must stay off until the panel is back
+      after a wake.
 
   power-domains:
     minItems: 2
@@ -55,17 +70,21 @@ allOf:
     then:
       properties:
         reg:
+          minItems: 3
           items:
             - description:
                 ADP window, with the control and interrupt registers, the
                 parameter FIFO port and the pipe layer registers
             - description: Display DART (dart-disp0), first window
             - description: Display DART (dart-disp0), second window
+            - description: DisplayPort transmitter (displayport)
         reg-names:
+          minItems: 3
           items:
             - const: adp
             - const: dart0
             - const: dart1
+            - const: dp
         interrupts:
           items:
             - description:
@@ -96,6 +115,7 @@ allOf:
             - description: Seven-register side block
             - description: Display DART (dart-disp0), first window
             - description: Display DART (dart-disp0), second window
+            - description: DisplayPort transmitter (displayport)
 
         reg-names:
           minItems: 6
@@ -108,6 +128,7 @@ allOf:
             - const: side
             - const: dart0
             - const: dart1
+            - const: dp
 
         interrupts:
           items:
