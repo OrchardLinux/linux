@@ -339,6 +339,7 @@ config BACKLIGHT_APPLE_DSI
 config BACKLIGHT_APPLE_DWI
 	tristate "Apple DWI 2-Wire Interface Backlight Driver"
 	depends on ARCH_APPLE || COMPILE_TEST
+	depends on I2C
 	help
 	  Say Y to enable the backlight driver for backlight controllers
 	  attached via the Apple DWI 2-wire interface which is found in some
