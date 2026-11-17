@@ -2196,11 +2196,42 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * Did the DART keep its translation state over the sleep? A DART whose power
+ * domain stayed on (the display pipe's, always on while it scans out) reads
+ * back what was saved, with translation set up on some stream; one that lost
+ * power reads its reset values.
+ */
+static bool apple_dart_kept_state(struct apple_dart *dart)
+{
+	unsigned int sid, idx;
+	bool active = false;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		if (dart->hw->read_tcr(dart, sid) != dart->save_tcr[sid])
+			return false;
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+			if (readl(dart->regs + DART_TTBR(dart, sid, idx)) !=
+			    dart->save_ttbr[sid][idx])
+				return false;
+		active |= dart->save_tcr[sid] != 0;
+	}
+	return active;
+}
+
 static __maybe_unused int apple_dart_resume(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	unsigned int sid, idx;
 	int ret;
+
+	/*
+	 * A DART that kept its state may still be translating for a master
+	 * that never stopped, such as a display pipe scanning out: a reset
+	 * would turn its translation off under it. Leave it as it is.
+	 */
+	if (apple_dart_kept_state(dart))
+		return 0;
 
 	ret = apple_dart_hw_reset(dart);
 	if (ret) {
