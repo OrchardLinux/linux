@@ -24,6 +24,7 @@ void tristar_accessory_stop(struct tristar_accessory *acc);
 void tristar_accessory_report(struct tristar_accessory *acc, unsigned int usb_ma,
 			      bool mux_fault);
 const char *tristar_accessory_holds(struct tristar_accessory *acc, unsigned int *ma);
+bool tristar_accessory_identifying(struct tristar_accessory *acc);
 #else
 static inline int tristar_accessory_probe(struct device *dev, struct i2c_client *tristar,
 					  struct mutex *lock,
@@ -49,6 +50,11 @@ static inline const char *tristar_accessory_holds(struct tristar_accessory *acc,
 						  unsigned int *ma)
 {
 	return NULL;
+}
+
+static inline bool tristar_accessory_identifying(struct tristar_accessory *acc)
+{
+	return false;
 }
 #endif
 

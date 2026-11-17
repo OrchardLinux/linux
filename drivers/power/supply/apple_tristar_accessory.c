@@ -39,6 +39,13 @@
  * the role switch calls back into the charger (the status sample below, the
  * gadget's vbus_draw) with its own lock held.
  *
+ * The digital ID comes first. iOS measures the USB data lines only through
+ * the route that the decoded ID selects (its pin-voltage operation refuses
+ * any other route), so it never drives or samples them before the ID is
+ * known. The charger likewise leaves the mux alone from a plug edge until
+ * the first GetID after it has finished (see
+ * tristar_accessory_identifying()).
+ *
  * Copyright The Orchard Linux contributors
  */
 
@@ -136,6 +143,7 @@ struct tristar_auto {
 	unsigned int ph_tries;
 	unsigned long ph_deadline;
 	bool ph_ok;
+	bool id_pending;		/* no GetID result since the plug edge */
 };
 
 struct tristar_auto_in {
@@ -329,6 +337,7 @@ tristar_auto_step(struct tristar_auto *ta, const struct tristar_auto_cfg *cfg,
 		if (attached) {
 			ta->phase = TRISTAR_AUTO_DEVICE;
 			ta->next_probe = in->now + cfg->settle_ms;
+			ta->id_pending = true;
 		}
 		return TRISTAR_AUTO_NONE;
 	case TRISTAR_AUTO_DEVICE:
@@ -339,6 +348,7 @@ tristar_auto_step(struct tristar_auto *ta, const struct tristar_auto_cfg *cfg,
 		if (edge) {
 			ta->phase = TRISTAR_AUTO_DEVICE;
 			ta->next_probe = in->now + cfg->settle_ms;
+			ta->id_pending = true;
 		}
 		if (!tristar_auto_due(in->now, ta->next_probe))
 			return TRISTAR_AUTO_NONE;
@@ -387,6 +397,7 @@ tristar_auto_probed(struct tristar_auto *ta, const struct tristar_auto_cfg *cfg,
 {
 	bool adapter;
 
+	ta->id_pending = false;
 	if (ta->phase != TRISTAR_AUTO_DEVICE && ta->phase != TRISTAR_AUTO_OTHER &&
 	    ta->phase != TRISTAR_AUTO_HOST)
 		return TRISTAR_AUTO_NONE;
@@ -739,6 +750,21 @@ const char *tristar_accessory_holds(struct tristar_accessory *acc, unsigned int 
 	if (acc->host)
 		return "USB host mode";
 	return NULL;
+}
+
+/**
+ * tristar_accessory_identifying - whether the attachment's digital ID is being read
+ * @acc: accessory policy, or NULL
+ *
+ * True from a plug edge until the first GetID after it has finished, with
+ * or without an ID. Meanwhile the charger must not route or excite the USB
+ * data lines; it still bounds its own wait. Caller holds the charger lock.
+ *
+ * Return: true while that GetID is pending.
+ */
+bool tristar_accessory_identifying(struct tristar_accessory *acc)
+{
+	return acc && acc->autop.phase == TRISTAR_AUTO_DEVICE && acc->autop.id_pending;
 }
 
 /**

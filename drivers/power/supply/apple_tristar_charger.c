@@ -835,6 +835,13 @@ static void tristar_run_identification(struct tristar_charger *chg, u64 now)
 		tristar_reconfirm(chg, now, expired);
 		return;
 	}
+	/*
+	 * iOS measures the data lines only on the USB route that the digital
+	 * ID selects. While the accessory policy reads that ID, leave the mux
+	 * alone, but never beyond the hold.
+	 */
+	if (!expired && tristar_accessory_identifying(chg->acc))
+		return;
 	ret = tristar_identify(chg, &id);
 	if (ret == -EUCLEAN) {
 		tristar_mux_fault(chg);
