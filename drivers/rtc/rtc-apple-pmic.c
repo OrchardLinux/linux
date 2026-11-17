@@ -16,7 +16,6 @@
 #include <linux/rtc.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
-#include <linux/pm_wakeirq.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -54,6 +53,8 @@ struct apple_pmic_rtc_regs {
  * @base:		RTC base address
  * @offset:		offset from epoch in seconds
  * @offset_dirty:	offset needs to be stored on shutdown
+ * @alarm_irq:		alarm PMU event interrupt, 0 without one
+ * @wake_armed:		the alarm is armed as a wake source for this sleep
  */
 struct apple_pmic_rtc {
 	struct rtc_device *rtc;
@@ -64,6 +65,8 @@ struct apple_pmic_rtc {
 	u32 base;
 	int offset;
 	bool offset_dirty;
+	int alarm_irq;
+	bool wake_armed;
 };
 
 static int apple_pmic_rtc_read_nvmem_offset(struct apple_pmic_rtc *ap_rtc)
@@ -377,10 +380,7 @@ static int apple_pmic_rtc_probe(struct platform_device *pdev)
 				return dev_err_probe(&pdev->dev, rc,
 						     "cannot request alarm IRQ\n");
 			device_init_wakeup(&pdev->dev, true);
-			rc = devm_pm_set_wake_irq(&pdev->dev, irq);
-			if (rc)
-				return dev_err_probe(&pdev->dev, rc,
-						     "cannot set alarm wake IRQ\n");
+			ap_rtc->alarm_irq = irq;
 			ap_rtc->rtc->ops = &apple_pmic_rtc_alarm_ops;
 			dev_info(&pdev->dev,
 				 "D2365 alarm at 0x%03x on PMU event IRQ %d\n",
@@ -401,12 +401,44 @@ static void apple_pmic_shutdown(struct platform_device *pdev)
 		apple_pmic_rtc_write_nvmem_offset(ap_rtc, ap_rtc->offset);
 }
 
+/*
+ * The alarm is a PMU event, and the PMU event controller writes its sleep
+ * mask in its own suspend callback: only events armed for wake by then stay
+ * unmasked. A dedicated wake IRQ (dev_pm_set_wake_irq()) is armed later, at
+ * the start of the noirq phase, so the alarm event stayed masked and never
+ * woke the system. Arm it here instead: as a consumer of the controller's
+ * interrupt, this device suspends before the controller does.
+ */
+static int apple_pmic_rtc_suspend(struct device *dev)
+{
+	struct apple_pmic_rtc *ap_rtc = dev_get_drvdata(dev);
+
+	if (ap_rtc->alarm_irq > 0 && device_may_wakeup(dev))
+		ap_rtc->wake_armed = !enable_irq_wake(ap_rtc->alarm_irq);
+	return 0;
+}
+
+static int apple_pmic_rtc_resume(struct device *dev)
+{
+	struct apple_pmic_rtc *ap_rtc = dev_get_drvdata(dev);
+
+	if (ap_rtc->wake_armed) {
+		disable_irq_wake(ap_rtc->alarm_irq);
+		ap_rtc->wake_armed = false;
+	}
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_pmic_rtc_pm_ops, apple_pmic_rtc_suspend,
+				apple_pmic_rtc_resume);
+
 static struct platform_driver apple_pmic_rtc_driver = {
 	.probe		= apple_pmic_rtc_probe,
 	.shutdown	= apple_pmic_shutdown,
 	.driver	= {
 		.name		= "rtc-apple-pmic",
 		.of_match_table	= apple_pmic_id_table,
+		.pm		= pm_sleep_ptr(&apple_pmic_rtc_pm_ops),
 	},
 };
 
