@@ -784,6 +784,17 @@ static void apple_vxd_device_run(void *priv)
 		return;
 	}
 
+	/*
+	 * A system sleep took the firmware down with the domain: start it
+	 * again before the job, as AppleD5500's submitCommandInternal does.
+	 * Once it runs this returns at once.
+	 */
+	ret = apple_vxd_boot_firmware(vxd);
+	if (ret) {
+		apple_vxd_job_finish(ctx, VB2_BUF_STATE_ERROR);
+		return;
+	}
+
 	ret = desc->ops->run(ctx);
 	if (ret)
 		apple_vxd_job_finish(ctx, VB2_BUF_STATE_ERROR);
@@ -895,7 +906,9 @@ static int apple_vxd_open(struct file *filp)
 	/*
 	 * The DEVA firmware boots on the first open, from the image loaded
 	 * before this node was registered, and keeps running (and the block
-	 * powered) until the driver is unbound. Later opens find it running.
+	 * powered) until the driver is unbound or the system sleeps. Later
+	 * opens find it running; after a sleep, the next open or job boots it
+	 * again.
 	 */
 	ret = apple_vxd_boot_firmware(vxd);
 	if (ret)

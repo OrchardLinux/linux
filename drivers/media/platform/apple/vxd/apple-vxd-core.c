@@ -226,18 +226,20 @@ void apple_vxd_run_postamble(struct apple_vxd_ctx *ctx,
 		v4l2_ctrl_request_complete(src_req, &ctx->ctrl_hdl);
 }
 
-/* Runtime PM stubs: the genpd (ps_vdec) does all the work. */
-static int apple_vxd_runtime_resume(struct device *dev)
+/* The domain is on again: enable the core before anything reads it. */
+static void apple_vxd_integ_enable(struct apple_vxd_dev *vxd)
 {
-	struct apple_vxd_dev *vxd = dev_get_drvdata(dev);
-
-	/* The domain is on again: enable the core before anything reads it. */
 	if (vxd->integ) {
 		writel(readl(vxd->integ + VXD_INTEG_CTRL) | VXD_INTEG_CTRL_ENABLE,
 		       vxd->integ + VXD_INTEG_CTRL);
 		udelay(VXD_INTEG_ENABLE_DELAY_US);
 	}
+}
 
+/* Runtime PM stubs: the genpd (ps_vdec) does all the work. */
+static int apple_vxd_runtime_resume(struct device *dev)
+{
+	apple_vxd_integ_enable(dev_get_drvdata(dev));
 	return 0;
 }
 
@@ -246,7 +248,49 @@ static int apple_vxd_runtime_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * System sleep turns the vdec domain off whatever the runtime PM state, and
+ * the MTX loses the firmware with it: after a wake every message went to
+ * rings that no longer existed ("TO_MTX indices out of range") and every
+ * decode failed.  AppleD5500 starts the core again from the next
+ * submission: submitCommandInternal (0xfffffff00628a8d4) powers an
+ * unpowered core up (PowerUpDeviceInternal, 0xfffffff00628baf8) and loads
+ * and starts the firmware again (0xfffffff00628d340) before it queues the
+ * command.  Do the same: stop taking jobs, let the one in flight finish,
+ * and take the firmware down with the domain; the next job (or open) boots
+ * it from the kept image.
+ */
+static int apple_vxd_suspend(struct device *dev)
+{
+	struct apple_vxd_dev *vxd = dev_get_drvdata(dev);
+
+	if (vxd->m2m_dev)
+		v4l2_m2m_suspend(vxd->m2m_dev);
+	/* The watchdog finishes a job that never completes, so it goes last. */
+	flush_work(&vxd->job_done_work);
+	cancel_delayed_work_sync(&vxd->watchdog_work);
+	apple_vxd_fw_cleanup(vxd);
+	return 0;
+}
+
+static int apple_vxd_resume(struct device *dev)
+{
+	struct apple_vxd_dev *vxd = dev_get_drvdata(dev);
+
+	/*
+	 * Runtime PM still counts the device active across the sleep, so its
+	 * resume callback does not run: the domain came back on without the
+	 * core enabled.
+	 */
+	if (!pm_runtime_status_suspended(dev))
+		apple_vxd_integ_enable(vxd);
+	if (vxd->m2m_dev)
+		v4l2_m2m_resume(vxd->m2m_dev);
+	return 0;
+}
+
 static const struct dev_pm_ops apple_vxd_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(apple_vxd_suspend, apple_vxd_resume)
 	RUNTIME_PM_OPS(apple_vxd_runtime_suspend, apple_vxd_runtime_resume, NULL)
 };
 
