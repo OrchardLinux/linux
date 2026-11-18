@@ -17,6 +17,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_data/s3c-hsotg.h>
 #include <linux/reset.h>
+#include <linux/suspend.h>
 
 #include <linux/usb/of.h>
 
@@ -646,6 +647,74 @@ error:
 	return retval;
 }
 
+/*
+ * Suspend-to-idle with params.s2idle_keep_session: a peripheral session the
+ * host has addressed, in L0 or bus-suspended in L2, is left as it is. The
+ * controller and its PHY stay powered and the device stays connected, so the
+ * host keeps the device configured and keeps its current grant. The
+ * controller's interrupt is off while the system sleeps: the host sees NAKs,
+ * and what it sent is handled on resume. Putting the controller and its PHY
+ * on the wakeup path keeps their power domains on, for domains that stay on
+ * for it (GENPD_FLAG_ACTIVE_WAKEUP).
+ */
+static bool dwc2_keep_session_for_s2idle(struct dwc2_hsotg *dwc2)
+{
+	/* Connected: a bound and enabled gadget the host has addressed. */
+	if (!dwc2->params.s2idle_keep_session || !pm_suspend_no_platform() ||
+	    !dwc2_is_device_mode(dwc2) || !dwc2_is_device_connected(dwc2) ||
+	    (dwc2->lx_state != DWC2_L0 && dwc2->lx_state != DWC2_L2))
+		return false;
+
+	device_set_awake_path(dwc2->dev);
+	if (dwc2->phy && dwc2->phy->dev.parent)
+		device_set_awake_path(dwc2->phy->dev.parent);
+	dwc2->session_kept_for_s2idle = 1;
+	dev_info(dwc2->dev, "keeping the USB session over sleep (L%d)\n",
+		 dwc2->lx_state);
+	return true;
+}
+
+/*
+ * The session was kept over suspend-to-idle. If the controller still has
+ * its state, there is nothing to do: events the host caused while the system
+ * slept (a bus resume, a reset) are handled by the interrupt handler as
+ * usual. If it lost its state anyway (its power domain went off), disconnect
+ * and reconnect as a system sleep without a kept session does.
+ */
+static int dwc2_resume_kept_session(struct dwc2_hsotg *dwc2)
+{
+	unsigned long flags;
+	int ret;
+
+	dwc2->session_kept_for_s2idle = 0;
+	if (dwc2_readl(dwc2, GUSBCFG) & GUSBCFG_TOUTCAL_MASK)
+		return 0;
+
+	dev_warn(dwc2->dev, "controller lost its state in sleep, reconnecting\n");
+	spin_lock_irqsave(&dwc2->lock, flags);
+	/* Bus-suspended or not, the session is gone. */
+	dwc2->lx_state = DWC2_L0;
+	spin_unlock_irqrestore(&dwc2->lock, flags);
+	dwc2_hsotg_suspend(dwc2);
+
+	ret = __dwc2_lowlevel_hw_disable(dwc2);
+	if (ret)
+		return ret;
+	ret = __dwc2_lowlevel_hw_enable(dwc2);
+	if (ret)
+		return ret;
+
+	if (!dwc2->role_sw)
+		dwc2_force_dr_mode(dwc2);
+	else
+		dwc2_drd_resume(dwc2);
+
+	if (dwc2_is_device_mode(dwc2))
+		ret = dwc2_hsotg_resume(dwc2);
+
+	return ret;
+}
+
 static int __maybe_unused dwc2_suspend(struct device *dev)
 {
 	struct dwc2_hsotg *dwc2 = dev_get_drvdata(dev);
@@ -653,6 +722,9 @@ static int __maybe_unused dwc2_suspend(struct device *dev)
 	int ret = 0;
 
 	if (!dwc2->ll_hw_enabled)
+		return 0;
+
+	if (dwc2_keep_session_for_s2idle(dwc2))
 		return 0;
 
 	is_device_mode = dwc2_is_device_mode(dwc2);
@@ -734,6 +806,9 @@ static int __maybe_unused dwc2_resume(struct device *dev)
 
 	if (!dwc2->ll_hw_enabled)
 		return 0;
+
+	if (dwc2->session_kept_for_s2idle)
+		return dwc2_resume_kept_session(dwc2);
 
 	if (dwc2->phy_off_for_suspend && dwc2->ll_hw_enabled) {
 		ret = __dwc2_lowlevel_hw_enable(dwc2);

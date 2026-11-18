@@ -368,6 +368,15 @@ enum dwc2_ep0_state {
  * @no_clock_gating:	Specifies whether to avoid clock gating feature.
  *			0 - No (use clock gating)
  *			1 - Yes (avoid it)
+ * @s2idle_keep_session: Specifies whether a peripheral session the host
+ *			has addressed stays up over suspend-to-idle: the
+ *			controller and PHY stay powered and the device stays
+ *			connected, instead of disconnecting from the host.
+ *			Needs power domains that stay on for a device on the
+ *			wakeup path; if the controller loses its state anyway,
+ *			it reconnects on resume as without this.
+ *			0 - No (disconnect, default)
+ *			1 - Yes
  * @lpm:		Enable LPM support.
  *			0 - No
  *			1 - Yes
@@ -467,6 +476,7 @@ struct dwc2_core_params {
 #define DWC2_POWER_DOWN_PARAM_PARTIAL		1
 #define DWC2_POWER_DOWN_PARAM_HIBERNATION	2
 	bool no_clock_gating;
+	bool s2idle_keep_session;
 
 	bool lpm;
 	bool lpm_clock_gating;
@@ -883,6 +893,8 @@ struct dwc2_hregs_backup {
  * @reset_phy_on_wake:	Quirk saying that we should assert PHY reset on a
  *			remote wakeup.
  * @phy_off_for_suspend: Status of whether we turned the PHY off at suspend.
+ * @session_kept_for_s2idle: The peripheral session was left up over
+ *			suspend-to-idle (params.s2idle_keep_session).
  * @need_phy_for_wake:	Quirk saying that we should keep the PHY on at
  *			suspend if we need USB to wake us up.
  * @frame_number:       Frame number read from the core. For both device
@@ -1091,6 +1103,7 @@ struct dwc2_hsotg {
 	unsigned int reset_phy_on_wake:1;
 	unsigned int need_phy_for_wake:1;
 	unsigned int phy_off_for_suspend:1;
+	unsigned int session_kept_for_s2idle:1;
 	u16 frame_number;
 
 	struct phy *phy;

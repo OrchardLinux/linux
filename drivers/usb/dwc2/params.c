@@ -310,6 +310,11 @@ static void dwc2_set_apple_silicon_params(struct dwc2_hsotg *hsotg)
 
 	p->speed = DWC2_SPEED_PARAM_HIGH;
 	p->power_down = DWC2_POWER_DOWN_PARAM_NONE;
+	/*
+	 * As in iOS, where the device controller drops its bus session only
+	 * for power-off and restart, never for sleep.
+	 */
+	p->s2idle_keep_session = true;
 	p->g_rx_fifo_size = 539;
 	p->host_nperio_tx_fifo_size = 16;
 	p->g_np_tx_fifo_size = 16;
