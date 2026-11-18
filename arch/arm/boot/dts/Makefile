@@ -39,3 +39,4 @@ subdir-y += unisoc
 subdir-y += vt8500
 subdir-y += xen
 subdir-y += xilinx
+dtb-$(CONFIG_ARCH_APPLE_S5L) += ipad-mini1.dtb
