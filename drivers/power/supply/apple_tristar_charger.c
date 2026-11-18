@@ -790,8 +790,12 @@ static void tristar_grant(struct tristar_charger *chg)
 
 /*
  * Take an identification and turn USB data on. Even a charger signature does
- * not rule out a host: some ports show one until a device draws current.
- * Caller holds lock.
+ * not rule out a host: some ports show one until a device draws current. A
+ * BC1.2 dedicated charging port does: it shorts D+ to D-, so no host is behind
+ * it, and the controller's pull-up on that pair reads as a bus reset and a
+ * source event, which would start the identification over every few seconds.
+ * USB data stays off on a DCP; a port that changes its mode later is a new
+ * source event and is identified again. Caller holds lock.
  */
 static void tristar_accept(struct tristar_charger *chg, const struct tristar_ident *id)
 {
@@ -801,7 +805,7 @@ static void tristar_accept(struct tristar_charger *chg, const struct tristar_ide
 	chg->cable_known = id->sampled;
 	chg->usbc = id->usbc;
 	chg->orientation = id->orientation;
-	tristar_set_usb(chg, true);
+	tristar_set_usb(chg, id->type != POWER_SUPPLY_USB_TYPE_DCP);
 	tristar_grant(chg);
 }
 
