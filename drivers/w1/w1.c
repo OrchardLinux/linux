@@ -78,6 +78,7 @@ static void w1_slave_release(struct device *dev)
 
 	dev_dbg(dev, "%s: Releasing %s [%p]\n", __func__, sl->name, sl);
 
+	of_node_put(sl->dev.of_node);
 	w1_family_put(sl->family);
 	sl->master->slave_count--;
 }
@@ -666,6 +667,22 @@ static int w1_family_notify(unsigned long action, struct w1_slave *sl)
 	return 0;
 }
 
+static struct device_node *w1_slave_of_node(struct w1_slave *sl)
+{
+	struct device *parent = sl->master->dev.parent;
+	struct device_node *child;
+
+	if (!parent)
+		return of_find_matching_node(sl->master->dev.of_node,
+					     sl->family->of_match_table);
+	if (!parent->of_node)
+		return NULL;
+	for_each_available_child_of_node(parent->of_node, child)
+		if (of_match_node(sl->family->of_match_table, child))
+			return child;
+	return NULL;
+}
+
 static int __w1_attach_slave_device(struct w1_slave *sl)
 {
 	int err;
@@ -675,8 +692,7 @@ static int __w1_attach_slave_device(struct w1_slave *sl)
 	sl->dev.bus = &w1_bus_type;
 	sl->dev.release = &w1_slave_release;
 	sl->dev.groups = w1_slave_groups;
-	sl->dev.of_node = of_find_matching_node(sl->master->dev.of_node,
-						sl->family->of_match_table);
+	sl->dev.of_node = w1_slave_of_node(sl);
 
 	dev_set_name(&sl->dev, "%02x-%012llx",
 		 (unsigned int) sl->reg_num.family,
@@ -697,7 +713,6 @@ static int __w1_attach_slave_device(struct w1_slave *sl)
 		dev_err(&sl->dev,
 			"Device registration [%s] failed. err=%d\n",
 			dev_name(&sl->dev), err);
-		of_node_put(sl->dev.of_node);
 		put_device(&sl->dev);
 		return err;
 	}
