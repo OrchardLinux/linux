@@ -62,6 +62,7 @@ struct bq27xxx_hdq_data {
 	bool use_remaining_capacity;
 	/* Cached telemetry, refreshed periodically (always for the BQ27545) */
 	bool cache_only;
+	unsigned int read_budget_ms;
 };
 
 static int w1_bq27000_read(struct w1_slave *sl, unsigned int reg)
@@ -124,6 +125,8 @@ static int bq27xxx_battery_hdq_add_slave(struct w1_slave *sl)
 
 	di->dev = &sl->dev;
 	match = of_match_node(sl->family->of_match_table, sl->dev.of_node);
+	if (sl->master->dev.parent && !match)
+		return -ENODEV;
 	if (match) {
 		const struct bq27xxx_hdq_data *data = match->data;
 
@@ -136,6 +139,7 @@ static int bq27xxx_battery_hdq_add_slave(struct w1_slave *sl)
 			di->num_cache_properties = data->num_cache_properties;
 		}
 		di->cache_use_remaining_capacity = data->use_remaining_capacity;
+		di->cache_read_budget_ms = data->read_budget_ms;
 	} else {
 		di->chip = BQ27000;
 		di->name = "bq27000-battery";
@@ -197,6 +201,7 @@ static const struct bq27xxx_hdq_data bq27541_data = {
 static const struct bq27xxx_hdq_data bq27540_j120_data = {
 	.chip = BQ27541,
 	.cache_only = true,
+	.read_budget_ms = 5000,
 	.cache_properties = bq27540_j120_cache_props,
 	.num_cache_properties = ARRAY_SIZE(bq27540_j120_cache_props),
 	.use_remaining_capacity = true,

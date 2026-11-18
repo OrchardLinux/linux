@@ -83,6 +83,10 @@ struct bq27xxx_device_info {
 	bool cache_use_remaining_capacity;
 	/* Optional periodic refresh interval for cache-only transports. */
 	unsigned int cache_refresh_ms;
+	/* Bound admission of new register reads during a cached refresh. */
+	unsigned int cache_read_budget_ms;
+	unsigned long cache_read_deadline;
+	bool cache_read_active;
 	int charge_design_full;
 	int voltage_min_design;
 	int voltage_max_design;

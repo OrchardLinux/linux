@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/apple,j120-bq27540.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J120 BQ27540 HDQ fuel gauge
+
+maintainers:
+  - tompta1 <546706+tompta1@users.noreply.github.com>
+
+description: |
+  The J120 battery gauge uses HDQ and the BQ27541 register layout. Its
+  telemetry profile uses RemainingCapacity rather than NominalAvailableCapacity.
+  It is a child of an HDQ bus, not an I2C device.
+
+properties:
+  compatible:
+    items:
+      - const: apple,j120-bq27540
+      - const: ti,bq27540-hdq
+
+  monitored-battery:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Battery characteristics, if independently known.
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    hdq {
+        fuel-gauge {
+            compatible = "apple,j120-bq27540", "ti,bq27540-hdq";
+        };
+    };

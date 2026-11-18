@@ -1192,7 +1192,14 @@ static inline int bq27xxx_read(struct bq27xxx_device_info *di, int reg_index,
 	if (!di || di->regs[reg_index] == INVALID_REG_ADDR)
 		return -EINVAL;
 
+	if (di->cache_read_active &&
+	    time_after_eq(jiffies, di->cache_read_deadline))
+		return -ETIMEDOUT;
+
 	ret = di->bus.read(di, di->regs[reg_index], single);
+	if (ret >= 0 && di->cache_read_active &&
+	    time_after_eq(jiffies, di->cache_read_deadline))
+		ret = -ETIMEDOUT;
 	if (ret < 0)
 		dev_dbg(di->dev, "failed to read register 0x%02x (index %d)\n",
 			di->regs[reg_index], reg_index);
@@ -2118,6 +2125,11 @@ static void bq27xxx_battery_refresh_cache(struct bq27xxx_device_info *di)
 	mutex_lock(&di->lock);
 	if (di->removed)
 		goto out_unlock;
+	if (di->cache_read_budget_ms) {
+		di->cache_read_deadline = jiffies +
+			msecs_to_jiffies(di->cache_read_budget_ms);
+		di->cache_read_active = true;
+	}
 
 	cache = di->cache;
 
@@ -2203,6 +2215,7 @@ out_error:
 		power_supply_changed(di->bat);
 
 out_unlock:
+	di->cache_read_active = false;
 	if (!di->removed && di->cache_refresh_ms)
 		queue_delayed_work(system_freezable_wq, &di->work,
 				   msecs_to_jiffies(di->cache_refresh_ms));
