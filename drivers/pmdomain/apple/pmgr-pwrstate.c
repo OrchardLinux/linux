@@ -308,7 +308,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	clock_only = of_property_read_bool(node, "apple,clock-gate-only");
 	if (!clock_only) {
-		ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
+		/*
+		 * A domain stays on over system sleep while a device in it is
+		 * on the wakeup path, e.g. a USB device controller that keeps
+		 * its bus session over suspend-to-idle.
+		 */
+		ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE | GENPD_FLAG_ACTIVE_WAKEUP;
 		ps->genpd.name = name;
 		ps->genpd.power_on = apple_pmgr_ps_power_on;
 		ps->genpd.power_off = apple_pmgr_ps_power_off;
