@@ -150,12 +150,10 @@
 #define DART_PTE_ADDR		GENMASK_ULL(35, 12)
 
 #define ADBE_ALIGN		64	/* plane base and stride */
+#define ADBE_MIN_SIZE		32	/* panel width and height */
+#define ADBE_MAX_SIZE		4096
 #define ADBE_ADDR_TAG		(ADBE_ALIGN - 1)	/* low bits of base/stride */
 #define ADBE_BUS_LIMIT		BIT_ULL(32)
-#define ADBE_WIDTH		1536
-#define ADBE_HEIGHT		2048
-#define ADBE_PITCH		(ADBE_WIDTH * 4)
-#define ADBE_FB_SIZE		(ADBE_PITCH * ADBE_HEIGHT)
 #define ADBE_KICK_WAIT_US	(20 * USEC_PER_MSEC)	/* iOS allows 1 s */
 #define ADBE_PARK_WAIT_US	(100 * USEC_PER_MSEC)
 /* Translated scanout: buffers held for the pipe, and when they are released. */
@@ -186,6 +184,10 @@ struct adbe {
 	void __iomem *boot_va;
 	struct resource boot;
 	u64 bus_offset;
+	/* The panel mode iBoot left running, and its boot framebuffer. */
+	struct drm_display_mode mode;
+	u32 pitch;
+	size_t fb_size;
 	u32 boot_base;
 	u32 boot_stride;
 	u32 saved_inten;
@@ -235,9 +237,36 @@ static struct adbe *to_adbe(struct drm_device *drm)
 	return container_of(drm, struct adbe, drm);
 }
 
-static const struct drm_display_mode adbe_mode = {
-	DRM_MODE_INIT(60, ADBE_WIDTH, ADBE_HEIGHT, 148, 197),
+/*
+ * Physical size of the known panels, matched by the boot framebuffer. Any
+ * other panel is adopted with its size unknown.
+ */
+static const struct {
+	u16 width, height;	/* pixels */
+	u16 width_mm, height_mm;
+} adbe_panels[] = {
+	{ 1536, 2048, 148, 197 },	/* 9.7-inch iPad 5 and iPad 6 */
+	{ 1620, 2160, 155, 207 },	/* 10.2-inch iPad 7 */
 };
+
+/* The fixed mode of the panel iBoot left running, at its boot size. */
+static void adbe_init_mode(struct adbe *adbe, u32 width, u32 height)
+{
+	const struct drm_display_mode mode = {
+		DRM_MODE_INIT(60, width, height, 0, 0),
+	};
+	unsigned int i;
+
+	adbe->mode = mode;
+	for (i = 0; i < ARRAY_SIZE(adbe_panels); i++) {
+		if (adbe_panels[i].width == width &&
+		    adbe_panels[i].height == height) {
+			adbe->mode.width_mm = adbe_panels[i].width_mm;
+			adbe->mode.height_mm = adbe_panels[i].height_mm;
+			break;
+		}
+	}
+}
 
 static u32 adbe_tag_word(u32 value, u32 tag)
 {
@@ -451,7 +480,7 @@ static void adbe_park_pipe(struct adbe *adbe)
 	u32 base;
 
 	if (!adbe->boot_black) {
-		memset_io(adbe->boot_va, 0, ADBE_FB_SIZE);
+		memset_io(adbe->boot_va, 0, adbe->fb_size);
 		wmb();	/* publish the write-combined stores before the flip */
 		adbe->boot_black = true;
 	}
@@ -623,13 +652,13 @@ static int adbe_plane_atomic_check(struct drm_plane *plane,
 	if (ret || !new_state->visible)
 		return ret;
 
-	if (fb->pitches[0] % ADBE_ALIGN || fb->pitches[0] < ADBE_PITCH ||
+	if (fb->pitches[0] % ADBE_ALIGN || fb->pitches[0] < adbe->pitch ||
 	    fb->pitches[0] > SZ_32K) {
 		drm_dbg_kms(plane->dev, "pitch %u unsupported\n", fb->pitches[0]);
 		return -EINVAL;
 	}
 	addr = drm_fb_dma_get_gem_addr(fb, new_state, 0);
-	len = (u64)fb->pitches[0] * (ADBE_HEIGHT - 1) + ADBE_PITCH;
+	len = (u64)fb->pitches[0] * (adbe->mode.vdisplay - 1) + adbe->pitch;
 	if (!adbe_cpu_to_bus(adbe, addr, len, &bus)) {
 		drm_dbg_kms(plane->dev, "buffer %pad not reachable by the pipe\n",
 			    &addr);
@@ -694,11 +723,12 @@ static int adbe_crtc_atomic_check(struct drm_crtc *crtc,
 {
 	struct drm_crtc_state *crtc_state =
 		drm_atomic_get_new_crtc_state(state, crtc);
+	struct adbe *adbe = to_adbe(crtc->dev);
 
 	if (!crtc_state->enable)
 		return 0;
-	if (crtc_state->mode.hdisplay != ADBE_WIDTH ||
-	    crtc_state->mode.vdisplay != ADBE_HEIGHT)
+	if (crtc_state->mode.hdisplay != adbe->mode.hdisplay ||
+	    crtc_state->mode.vdisplay != adbe->mode.vdisplay)
 		return -EINVAL;
 
 	return drm_atomic_helper_check_crtc_primary_plane(crtc_state);
@@ -803,7 +833,9 @@ static const struct drm_crtc_funcs adbe_crtc_funcs = {
 
 static int adbe_connector_get_modes(struct drm_connector *connector)
 {
-	return drm_connector_helper_get_modes_fixed(connector, &adbe_mode);
+	struct adbe *adbe = to_adbe(connector->dev);
+
+	return drm_connector_helper_get_modes_fixed(connector, &adbe->mode);
 }
 
 static const struct drm_connector_helper_funcs adbe_connector_helper_funcs = {
@@ -877,12 +909,26 @@ static struct device_node *adbe_find_boot_fb(struct adbe *adbe)
 			      of_property_read_u32(np, "height", &height) ?:
 			      of_property_read_u32(np, "stride", &stride) ?:
 			      of_property_read_string(np, "format", &format);
-		if (ret || width != ADBE_WIDTH || height != ADBE_HEIGHT ||
-		    stride != ADBE_PITCH || strcmp(format, "x8r8g8b8") ||
-		    resource_size(&adbe->boot) < ADBE_FB_SIZE) {
+		/*
+		 * The driver never programs timings: it adopts whatever panel
+		 * iBoot left running. iBoot may pad rows, e.g. a 1620-pixel
+		 * row to 6528 bytes.
+		 */
+		if (ret || width < ADBE_MIN_SIZE || width > ADBE_MAX_SIZE ||
+		    height < ADBE_MIN_SIZE || height > ADBE_MAX_SIZE ||
+		    stride < width * 4 || stride > SZ_32K ||
+		    stride % ADBE_ALIGN ||
+		    strcmp(format, "x8r8g8b8") ||
+		    resource_size(&adbe->boot) < (u64)stride * height) {
+			dev_err(adbe->drm.dev,
+				"boot framebuffer %ux%u, stride %u, %s not supported\n",
+				width, height, stride, format);
 			of_node_put(np);
 			return ERR_PTR(-EINVAL);
 		}
+		adbe_init_mode(adbe, width, height);
+		adbe->pitch = stride;
+		adbe->fb_size = (size_t)stride * height;
 		return np;
 	}
 
@@ -1209,7 +1255,7 @@ static int adbe_verify_aliases(u32 boot, u32 scratch, size_t len, u32 alias[2])
 	unsigned int n = 0;
 
 	for (at = ADBE_VERIFY_IOVA_START; at + len <= boot; at += ALIGN(len, SZ_16M)) {
-		if (adbe_verify_overlap(at, len, boot, PAGE_ALIGN(ADBE_FB_SIZE)) ||
+		if (adbe_verify_overlap(at, len, boot, len) ||
 		    adbe_verify_overlap(at, len, scratch, len))
 			continue;
 		alias[n++] = at;
@@ -1258,8 +1304,8 @@ static struct drm_gem_dma_object *adbe_verify_pattern(struct adbe *adbe,
 		goto put;
 	pixels = obj->vaddr;
 	for (off = 0; off < len; off += sizeof(*pixels)) {
-		u32 x = (off % ADBE_PITCH) / sizeof(*pixels);
-		u32 y = off / ADBE_PITCH;
+		u32 x = (off % adbe->pitch) / sizeof(*pixels);
+		u32 y = off / adbe->pitch;
 		u32 value = (x * 0x9e3779b1U) ^ (y * 0x85ebca77U);
 
 		/* A distinct opaque marker at every 16 KiB page's first pixel
@@ -1293,7 +1339,7 @@ static int adbe_dart_verify(struct adbe *adbe, struct device *sdev,
 	bool crcctl_written = false;
 	u32 previous_base = readl(adbe->regs + ADP_BASE);
 	u32 previous_stride = readl(adbe->regs + ADP_STRIDE);
-	u32 stride = adbe_tag_word(ADBE_PITCH, previous_stride);
+	u32 stride = adbe_tag_word(adbe->pitch, previous_stride);
 	size_t mapped_p = 0;
 	phys_addr_t pa;
 	bool mapped_id = false, mapped_a = false, restore_failed = false;
@@ -1558,7 +1604,7 @@ static int adbe_dart_init(struct adbe *adbe)
 {
 	struct device *dev = adbe->drm.dev;
 	u32 iova = adbe->boot_base & ~ADBE_ADDR_TAG;
-	size_t len = PAGE_ALIGN(ADBE_FB_SIZE);
+	size_t len = PAGE_ALIGN(adbe->fb_size);
 	struct platform_device *spdev;
 	struct iommu_domain *domain;
 	struct device *sdev;
@@ -1717,7 +1763,7 @@ static int adbe_adopt(struct adbe *adbe)
 	 * the boot framebuffer's physical address. Anything else means the
 	 * pipe reads through a translation this driver does not manage.
 	 */
-	if ((stride & ~ADBE_ADDR_TAG) != ADBE_PITCH ||
+	if ((stride & ~ADBE_ADDR_TAG) != adbe->pitch ||
 	    (base & ~ADBE_ADDR_TAG) != lower_32_bits(adbe->boot.start))
 		return dev_err_probe(dev, -ENODEV,
 				     "plane %#x/%#x is not the boot framebuffer %pa\n",
@@ -1848,8 +1894,7 @@ static int adbe_probe(struct platform_device *pdev)
 	fb_np = adbe_find_boot_fb(adbe);
 	if (IS_ERR(fb_np))
 		return dev_err_probe(dev, PTR_ERR(fb_np),
-				     "no %ux%u boot framebuffer\n",
-				     ADBE_WIDTH, ADBE_HEIGHT);
+				     "no supported boot framebuffer\n");
 
 	ret = adbe_adopt(adbe);
 	if (ret)
@@ -1859,7 +1904,7 @@ static int adbe_probe(struct platform_device *pdev)
 	if (ret)
 		goto put_fb;
 
-	adbe->boot_va = devm_ioremap_wc(dev, adbe->boot.start, ADBE_FB_SIZE);
+	adbe->boot_va = devm_ioremap_wc(dev, adbe->boot.start, adbe->fb_size);
 	if (!adbe->boot_va) {
 		ret = -ENOMEM;
 		goto put_fb;
