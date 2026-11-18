@@ -433,23 +433,23 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 		goto done;
 	}
 
-	/* Setup default scan channel time */
+	/* Setup default scan channel and unassoc times.  Not every firmware
+	 * takes them: Apple's BCM4329 build for the iPad 2 (4.221.122,
+	 * "...-minioctl-...") answers both with an error, and nothing depends
+	 * on them -- escan asks for the firmware's own times (-1) anyway.
+	 */
 	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_SCAN_CHANNEL_TIME,
 				    BRCMF_DEFAULT_SCAN_CHANNEL_TIME);
-	if (err) {
-		bphy_err(drvr, "BRCMF_C_SET_SCAN_CHANNEL_TIME error (%d)\n",
-			 err);
-		goto done;
-	}
+	if (err)
+		brcmf_info("BRCMF_C_SET_SCAN_CHANNEL_TIME error (%d), firmware default kept\n",
+			   err);
 
-	/* Setup default scan unassoc time */
 	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_SCAN_UNASSOC_TIME,
 				    BRCMF_DEFAULT_SCAN_UNASSOC_TIME);
-	if (err) {
-		bphy_err(drvr, "BRCMF_C_SET_SCAN_UNASSOC_TIME error (%d)\n",
-			 err);
-		goto done;
-	}
+	if (err)
+		brcmf_info("BRCMF_C_SET_SCAN_UNASSOC_TIME error (%d), firmware default kept\n",
+			   err);
+	err = 0;
 
 	/* Enable tx beamforming, errors can be ignored (not supported) */
 	(void)brcmf_fil_iovar_int_set(ifp, "txbf", 1);

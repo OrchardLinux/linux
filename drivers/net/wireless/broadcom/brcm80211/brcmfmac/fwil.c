@@ -184,6 +184,40 @@ brcmf_create_iovar(const char *name, const char *data, u32 datalen,
 }
 
 
+/*
+ * Apple's BCM4329 firmware for the iPad 2 (4.221.122, a "minioctl" build)
+ * refuses some security settings as iovars and takes them only as the
+ * ioctls they started out as -- wpa_auth at least: every connect failed with
+ * "set wpa_auth failed (-52)".  When the iovar is refused, the ioctl is tried.
+ */
+#define BRCMF_C_GET_WPA_AUTH_LEGACY	164
+#define BRCMF_C_SET_WPA_AUTH_LEGACY	165
+
+static const struct {
+	const char *name;
+	u32 get, set;
+} brcmf_fil_legacy_cmds[] = {
+	{ "wsec", BRCMF_C_GET_WSEC, BRCMF_C_SET_WSEC },
+	{ "auth", BRCMF_C_GET_AUTH, BRCMF_C_SET_AUTH },
+	{ "wpa_auth", BRCMF_C_GET_WPA_AUTH_LEGACY, BRCMF_C_SET_WPA_AUTH_LEGACY },
+};
+
+static s32 brcmf_fil_legacy(struct brcmf_if *ifp, const char *name, void *data,
+			    u32 len, bool set, s32 err)
+{
+	unsigned int i;
+
+	if (err != -EBADE || len != sizeof(__le32) || ifp->bsscfgidx)
+		return err;
+	for (i = 0; i < ARRAY_SIZE(brcmf_fil_legacy_cmds); i++) {
+		if (strcmp(name, brcmf_fil_legacy_cmds[i].name))
+			continue;
+		return brcmf_fil_cmd_data(ifp, set ? brcmf_fil_legacy_cmds[i].set :
+					  brcmf_fil_legacy_cmds[i].get, data, len, set);
+	}
+	return err;
+}
+
 s32
 brcmf_fil_iovar_data_set(struct brcmf_if *ifp, const char *name, const void *data,
 			 u32 len)
@@ -203,6 +237,7 @@ brcmf_fil_iovar_data_set(struct brcmf_if *ifp, const char *name, const void *dat
 	if (buflen) {
 		err = brcmf_fil_cmd_data(ifp, BRCMF_C_SET_VAR, drvr->proto_buf,
 					 buflen, true);
+		err = brcmf_fil_legacy(ifp, name, (void *)data, len, true, err);
 	} else {
 		err = -EPERM;
 		bphy_err(drvr, "Creating iovar failed\n");
@@ -230,6 +265,8 @@ brcmf_fil_iovar_data_get(struct brcmf_if *ifp, const char *name, void *data,
 					 buflen, false);
 		if (err == 0)
 			memcpy(data, drvr->proto_buf, len);
+		else
+			err = brcmf_fil_legacy(ifp, name, data, len, false, err);
 	} else {
 		err = -EPERM;
 		bphy_err(drvr, "Creating iovar failed\n");
@@ -310,6 +347,7 @@ brcmf_fil_bsscfg_data_set(struct brcmf_if *ifp, const char *name,
 	if (buflen) {
 		err = brcmf_fil_cmd_data(ifp, BRCMF_C_SET_VAR, drvr->proto_buf,
 					 buflen, true);
+		err = brcmf_fil_legacy(ifp, name, data, len, true, err);
 	} else {
 		err = -EPERM;
 		bphy_err(drvr, "Creating bsscfg failed\n");
@@ -337,6 +375,8 @@ brcmf_fil_bsscfg_data_get(struct brcmf_if *ifp, const char *name,
 					 buflen, false);
 		if (err == 0)
 			memcpy(data, drvr->proto_buf, len);
+		else
+			err = brcmf_fil_legacy(ifp, name, data, len, false, err);
 	} else {
 		err = -EPERM;
 		bphy_err(drvr, "Creating bsscfg failed\n");
