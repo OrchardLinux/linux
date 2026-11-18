@@ -40,6 +40,7 @@ properties:
               - apple,aria-pmic
               - apple,august-pmic
               - apple,autumn-pmic
+              - apple,d2355-pmic
           - const: apple,i2c-pmic
       - items:
           - enum:
@@ -62,12 +63,17 @@ properties:
   gpio:
     $ref: /schemas/gpio/apple,d2365-pmic-gpio.yaml
 
+  events:
+    $ref: /schemas/interrupt-controller/apple,pmic-events.yaml
+
   poweroff:
     $ref: /schemas/power/reset/apple,d2365-poweroff.yaml#
 
 patternProperties:
   "^charger@[0-9a-f]+$":
-    $ref: /schemas/power/supply/apple,d2365-charger.yaml
+    oneOf:
+      - $ref: /schemas/power/supply/apple,d2365-charger.yaml
+      - $ref: /schemas/power/supply/apple,d2355-tristar-charger.yaml
 
   "^backlight(@[0-9a-f]+)?$":
     $ref: /schemas/leds/backlight/apple,pmic-bl.yaml
