@@ -38,6 +38,7 @@
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/i2c.h>
+#include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/jiffies.h>
@@ -68,7 +69,11 @@
  * device tree gives, and how its ADC is driven. The functions are the same
  * on both PMICs; the addresses are not.
  */
+static const struct tristar_chip_info tristar_d2365_chip;
+static const struct tristar_chip_info tristar_d2355_chip;
+
 struct tristar_pmic {
+	const struct tristar_chip_info *chip;
 	u8 connected;		/* status bank: connection state */
 	u8 connected_new;	/* the bit that also marks a new connection */
 	u8 status;		/* status bank: battery charger state */
@@ -81,6 +86,7 @@ struct tristar_pmic {
 
 /* D2365 (iPad 5, iPad 6), from iOS 16 AppleD2365PMUPowerSource */
 static const struct tristar_pmic tristar_d2365 = {
+	.chip = &tristar_d2365_chip,
 	.connected = 0x09,
 	.connected_new = BIT(1),
 	.status = 0x0a,
@@ -98,6 +104,7 @@ static const struct tristar_pmic tristar_d2365 = {
  * after each read. The plug event is event 0.
  */
 static const struct tristar_pmic tristar_d2207 = {
+	.chip = &tristar_d2365_chip,
 	.connected = 0x00,
 	.connected_new = BIT(3),
 	.status = 0x02,
@@ -120,6 +127,7 @@ static const struct tristar_pmic tristar_d2207 = {
  * event is event 0.
  */
 static const struct tristar_pmic tristar_d2089 = {
+	.chip = &tristar_d2365_chip,
 	.connected = 0x00,
 	.connected_new = BIT(3),
 	.status = 0x02,
@@ -128,6 +136,14 @@ static const struct tristar_pmic tristar_d2089 = {
 	.adc_result = 0x02,
 	.adc_rearm = true,
 	.plug_event = 0,
+};
+
+/* D2355 reads connection state via its own status callback and a companion ADC. */
+static const struct tristar_pmic tristar_d2355 = {
+	.chip = &tristar_d2355_chip,
+	.adc_start = 1,
+	.adc_result = 1,
+	.plug_event = 72,
 };
 
 /* Interrupts: the PMU line, ADC completion, then the source-change events. */
@@ -186,9 +202,37 @@ enum cbtl_route {
 	CBTL_ROUTE_UART2,
 };
 
+struct tristar_charger;
+struct tristar_pack;
+
+/* Keep shared charging policy independent of the PMIC input-limit registers. */
+struct tristar_chip_info {
+	int (*prepare)(struct tristar_charger *chg);
+	bool (*pack_allows)(struct tristar_charger *chg, const struct tristar_pack *pack);
+	unsigned int status_size, control_size;
+	u8 adc_error_mask;
+	bool strict_limit_errors;
+	bool require_pack_telemetry;
+	bool invalidate_on_line;
+	int (*read_limit)(struct tristar_charger *chg, unsigned int *code);
+	int (*write_limit)(struct tristar_charger *chg, unsigned int code);
+	unsigned int (*code_ma)(struct tristar_charger *chg, unsigned int code);
+	unsigned int (*ma_code)(struct tristar_charger *chg, unsigned int ma);
+	int (*read_status)(struct tristar_charger *chg, unsigned int *status);
+	unsigned int handoff_code;
+	unsigned int attach_code;
+	unsigned int online_status;
+	unsigned int ramp_step_ms;
+	unsigned int fallback_code;
+};
+
 struct tristar_charger {
+	const struct tristar_chip_info *chip;
+	void *chip_data;
+	bool probe_ready;
 	struct device *dev;
 	struct regmap *regmap;
+	struct regmap *adc_regmap;
 	struct i2c_client *tristar;
 	struct power_supply *psy;
 	struct usb_role_switch *role_sw;
@@ -199,9 +243,8 @@ struct tristar_charger {
 	unsigned int nirqs;
 	int plug_irq;			/* wakes the system, 0 without one */
 	const struct tristar_pmic *pmic;
-	u32 connected_reg;
-	u32 status_reg;
-	u32 limit_reg;
+	u32 status_base;
+	u32 control_base;
 	u32 adc_base;
 	unsigned int max_ma;
 
@@ -257,26 +300,68 @@ struct tristar_charger {
 	bool usb_held;
 };
 
-static unsigned int tristar_code_ma(unsigned int code)
+static unsigned int tristar_d2365_code_ma(struct tristar_charger *chg, unsigned int code)
 {
 	return code * 25 / 2 + 75;
 }
 
 /* Round down: quantization must never exceed a permitted current. */
-static unsigned int tristar_ma_code(unsigned int ma)
+static unsigned int tristar_d2365_ma_code(struct tristar_charger *chg, unsigned int ma)
 {
 	return ma <= 75 ? 0 : (ma - 75) * 2 / 25;
 }
 
+static int tristar_d2365_read_limit(struct tristar_charger *chg,
+				    unsigned int *code)
+{
+	return regmap_read(chg->regmap,
+			   chg->control_base + chg->pmic->input_limit, code);
+}
+
+static int tristar_d2365_write_limit(struct tristar_charger *chg,
+				     unsigned int code)
+{
+	return regmap_write(chg->regmap,
+			    chg->control_base + chg->pmic->input_limit, code);
+}
+
+static int tristar_d2365_read_status(struct tristar_charger *chg,
+				     unsigned int *status)
+{
+	return regmap_read(chg->regmap,
+			   chg->status_base + chg->pmic->status, status);
+}
+
+static const struct tristar_chip_info tristar_d2365_chip = {
+	.adc_error_mask = 0x80,
+	.read_limit = tristar_d2365_read_limit,
+	.write_limit = tristar_d2365_write_limit,
+	.code_ma = tristar_d2365_code_ma,
+	.ma_code = tristar_d2365_ma_code,
+	.read_status = tristar_d2365_read_status,
+	.handoff_code = TRISTAR_CHG_HANDOFF_CODE,
+	.attach_code = TRISTAR_CHG_HANDOFF_CODE,
+	.fallback_code = TRISTAR_CHG_FALLBACK_CODE,
+};
+
+static unsigned int tristar_code_ma(struct tristar_charger *chg, unsigned int code)
+{
+	return chg->chip->code_ma(chg, code);
+}
+
+static unsigned int tristar_ma_code(struct tristar_charger *chg, unsigned int ma)
+{
+	return chg->chip->ma_code(chg, ma);
+}
+
 static int tristar_set_code(struct tristar_charger *chg, unsigned int code)
 {
-	u32 reg = chg->limit_reg;
 	unsigned int readback;
 	int ret;
 
-	ret = regmap_write(chg->regmap, reg, code);
+	ret = chg->chip->write_limit(chg, code);
 	if (!ret)
-		ret = regmap_read(chg->regmap, reg, &readback);
+		ret = chg->chip->read_limit(chg, &readback);
 	if (!ret && readback != code)
 		ret = -EIO;
 	if (!ret)
@@ -333,8 +418,10 @@ static int tristar_read_pack(struct tristar_pack *pack)
 }
 
 /* Grants above the fallback are allowed only inside these pack limits. */
-static bool tristar_pack_allows_grant(const struct tristar_pack *pack)
+static bool tristar_pack_allows_grant(struct tristar_charger *chg, const struct tristar_pack *pack)
 {
+	if (chg->chip->pack_allows)
+		return chg->chip->pack_allows(chg, pack);
 	return pack->temp >= 50 && pack->temp <= 400 &&
 	       pack->voltage_uv >= 3200000 && pack->voltage_uv <= 4350000 &&
 	       pack->current_ua >= -3000000 && pack->current_ua <= 3000000;
@@ -491,7 +578,7 @@ static int tristar_adc_mv(struct tristar_charger *chg, unsigned int epoch,
 
 	reinit_completion(&chg->adc_done);
 	WRITE_ONCE(chg->adc_waiting, true);
-	ret = regmap_write(chg->regmap, chg->adc_base, chg->pmic->adc_start);
+	ret = regmap_write(chg->adc_regmap, chg->adc_base, chg->pmic->adc_start);
 	if (ret) {
 		WRITE_ONCE(chg->adc_waiting, false);
 		return ret;
@@ -502,18 +589,18 @@ static int tristar_adc_mv(struct tristar_charger *chg, unsigned int epoch,
 	}
 	if (READ_ONCE(chg->epoch) != epoch)
 		return -ESTALE;
-	ret = regmap_bulk_read(chg->regmap, chg->adc_base + chg->pmic->adc_result,
+	ret = regmap_bulk_read(chg->adc_regmap, chg->adc_base + chg->pmic->adc_result,
 			       value, sizeof(value));
 	if (!ret && chg->pmic->adc_rearm) {
-		ret = regmap_update_bits(chg->regmap, chg->adc_base,
+		ret = regmap_update_bits(chg->adc_regmap, chg->adc_base,
 					 TRISTAR_CHG_ADC_START, 0);
 		if (!ret)
-			ret = regmap_update_bits(chg->regmap, chg->adc_base + 1,
+			ret = regmap_update_bits(chg->adc_regmap, chg->adc_base + 1,
 						 TRISTAR_CHG_ADC_LATCH, 0);
 	}
 	if (ret)
 		return ret;
-	if (value[0] & 0x80)
+	if (value[0] & chg->chip->adc_error_mask)
 		return -EIO;
 	raw = (value[0] & 0x0f) | ((u32)value[1] << 4);
 	*mv = (((u64)raw * 5000 * 16 + 40 * 65536) / 1000) * 1000 / 65536;
@@ -790,9 +877,9 @@ static unsigned int tristar_target_code(struct tristar_charger *chg)
 {
 	unsigned int ma = max(chg->source_ma, tristar_usb_ma(chg));
 
-	if (ma <= tristar_code_ma(TRISTAR_CHG_FALLBACK_CODE))
-		return TRISTAR_CHG_FALLBACK_CODE;
-	return tristar_ma_code(min(ma, chg->max_ma));
+	if (ma <= tristar_code_ma(chg, chg->chip->fallback_code))
+		return chg->chip->fallback_code;
+	return tristar_ma_code(chg, min(ma, chg->max_ma));
 }
 
 /* Follow a changed allowance once the source is identified. Caller holds lock. */
@@ -834,9 +921,8 @@ static void tristar_new_attachment(struct tristar_charger *chg, u64 now)
 	chg->cable_known = false;
 	chg->epoch_seen = READ_ONCE(chg->epoch);
 	WRITE_ONCE(chg->line_ns, 0);
-	/* iOS draws nothing above the attach default before the grant ramps. */
-	if (tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE))
-		dev_crit(chg->dev, "Handoff write failed; input limit unverified\n");
+	if (tristar_set_code(chg, chg->chip->attach_code))
+		dev_crit(chg->dev, "Attach write failed; input limit unverified\n");
 	dev_dbg(chg->dev, "power connected, identifying source\n");
 }
 
@@ -845,7 +931,7 @@ static void tristar_mux_fault(struct tristar_charger *chg)
 {
 	chg->phase = TRISTAR_FAULT;
 	strscpy(chg->source, "Tristar mux restore failed", sizeof(chg->source));
-	tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
+	tristar_withdraw(chg, chg->chip->fallback_code);
 	dev_err(chg->dev, "Tristar mux restore unverified; holding the fallback until reboot\n");
 }
 
@@ -858,7 +944,7 @@ static void tristar_grant(struct tristar_charger *chg)
 	chg->phase = chg->code < chg->target_code ? TRISTAR_RAMPING : TRISTAR_CHARGING;
 	chg->step_ns = 0;
 	dev_dbg(chg->dev, "%s: up to %u mA\n", chg->source,
-		tristar_code_ma(chg->target_code));
+		tristar_code_ma(chg, chg->target_code));
 }
 
 /*
@@ -878,7 +964,8 @@ static void tristar_accept(struct tristar_charger *chg, const struct tristar_ide
 	chg->cable_known = id->sampled;
 	chg->usbc = id->usbc;
 	chg->orientation = id->orientation;
-	tristar_set_usb(chg, id->type != POWER_SUPPLY_USB_TYPE_DCP);
+	tristar_set_usb(chg, chg->chip != &tristar_d2365_chip ||
+			id->type != POWER_SUPPLY_USB_TYPE_DCP);
 	tristar_grant(chg);
 }
 
@@ -967,33 +1054,37 @@ static bool tristar_debouncing(struct tristar_charger *chg, u64 now)
 static void tristar_ramp_step(struct tristar_charger *chg, u64 now)
 {
 	struct tristar_pack pack;
-	unsigned int next, from_ma = tristar_code_ma(chg->code);
+	unsigned int next, from_ma = tristar_code_ma(chg, chg->code);
 	u64 wait;
 
 	if (tristar_debouncing(chg, now) ||
 	    (chg->step_ns && now - chg->step_ns < chg->step_wait_ns))
 		return;
-	/* A read that fails says nothing about the battery: hold, and look again. */
-	if (tristar_read_pack(&pack))
+	if (tristar_read_pack(&pack)) {
+		if (chg->chip->require_pack_telemetry)
+			tristar_withdraw(chg, chg->chip->fallback_code);
 		return;
-	if (!tristar_pack_allows_grant(&pack)) {
+	}
+	if (!tristar_pack_allows_grant(chg, &pack)) {
 		chg->phase = TRISTAR_CHARGING;
-		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
+		tristar_withdraw(chg, chg->chip->fallback_code);
 		dev_warn(chg->dev, "battery outside the charging window; holding the fallback\n");
 		return;
 	}
-	if (!chg->step_ns && chg->code <= TRISTAR_CHG_HANDOFF_CODE) {
+	if (chg->chip->ramp_step_ms) {
+		next = min(chg->target_code, tristar_ma_code(chg, from_ma + TRISTAR_RAMP_STEP_MA));
+		wait = chg->chip->ramp_step_ms * NSEC_PER_MSEC;
+	} else if (!chg->step_ns && chg->code <= chg->chip->handoff_code) {
 		/* From nothing, iOS writes 100 mA and holds it. */
-		next = TRISTAR_CHG_HANDOFF_CODE;
+		next = chg->chip->handoff_code;
 		wait = TRISTAR_RAMP_HOLD_MS * NSEC_PER_MSEC;
 	} else {
-		next = min(chg->target_code,
-			   tristar_ma_code(tristar_code_ma(chg->code) + TRISTAR_RAMP_STEP_MA));
-		wait = (u64)(tristar_code_ma(next) - from_ma) * (NSEC_PER_MSEC / 10);
+		next = min(chg->target_code, tristar_ma_code(chg, from_ma + TRISTAR_RAMP_STEP_MA));
+		wait = (u64)(tristar_code_ma(chg, next) - from_ma) * (NSEC_PER_MSEC / 10);
 	}
 	if (tristar_set_code(chg, next)) {
 		chg->phase = TRISTAR_FAULT;
-		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
+		tristar_withdraw(chg, chg->chip->fallback_code);
 		dev_err(chg->dev, "input-limit write failed; holding the fallback\n");
 		return;
 	}
@@ -1031,23 +1122,32 @@ static unsigned long tristar_ramp_delay(struct tristar_charger *chg, u64 now)
  */
 static void tristar_check_limit(struct tristar_charger *chg)
 {
-	u32 reg = chg->limit_reg;
 	unsigned int hw, code = chg->code;
 
-	if (regmap_read(chg->regmap, reg, &hw) || hw == code)
+	int ret = chg->chip->read_limit(chg, &hw);
+
+	if (ret) {
+		if (chg->chip->strict_limit_errors) {
+			tristar_set_code(chg, chg->chip->fallback_code);
+			chg->phase = TRISTAR_FAULT;
+			dev_err_ratelimited(chg->dev, "input limit unverified (%d); holding fallback\n", ret);
+		}
+		return;
+	}
+	if (hw == code)
 		return;
 	dev_warn_ratelimited(chg->dev, "input limit changed to %u mA by the PMIC; restoring\n",
-			     tristar_code_ma(hw));
+			     tristar_code_ma(chg, hw));
 	if (hw > code) {
 		if (tristar_set_code(chg, code))
 			dev_crit(chg->dev, "Input-limit write failed; limit unverified\n");
 		return;
 	}
-	if (tristar_set_code(chg, min_t(unsigned int, code, TRISTAR_CHG_FALLBACK_CODE))) {
+	if (tristar_set_code(chg, min_t(unsigned int, code, chg->chip->fallback_code))) {
 		dev_crit(chg->dev, "Fallback write failed; input limit unverified\n");
 		return;
 	}
-	if (code > TRISTAR_CHG_FALLBACK_CODE) {
+	if (code > chg->chip->fallback_code) {
 		chg->phase = TRISTAR_RAMPING;
 		chg->step_ns = 0;
 	}
@@ -1063,12 +1163,15 @@ static void tristar_guard(struct tristar_charger *chg, u64 now)
 	tristar_check_limit(chg);
 	if (chg->phase != TRISTAR_CHARGING)
 		return;
-	if (tristar_read_pack(&pack))
+	if (tristar_read_pack(&pack)) {
+		if (chg->chip->require_pack_telemetry)
+			tristar_withdraw(chg, chg->chip->fallback_code);
 		return;
-	if (chg->code > TRISTAR_CHG_FALLBACK_CODE && !tristar_pack_allows_grant(&pack)) {
-		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
+	}
+	if (chg->code > chg->chip->fallback_code && !tristar_pack_allows_grant(chg, &pack)) {
+		tristar_withdraw(chg, chg->chip->fallback_code);
 		dev_warn(chg->dev, "battery outside the charging window; holding the fallback\n");
-	} else if (chg->code < chg->target_code && tristar_pack_allows_grant(&pack)) {
+	} else if (chg->code < chg->target_code && tristar_pack_allows_grant(chg, &pack)) {
 		/* Back inside the window: no replug needed to charge again. */
 		chg->phase = TRISTAR_RAMPING;
 		chg->step_ns = 0;
@@ -1144,7 +1247,7 @@ static bool tristar_input_present(struct tristar_charger *chg)
 {
 	unsigned int connected;
 
-	if (regmap_read(chg->regmap, chg->connected_reg, &connected)) {
+	if (regmap_read(chg->regmap, chg->status_base + chg->pmic->connected, &connected)) {
 		dev_err_ratelimited(chg->dev, "PMIC connection state unreadable\n");
 		return chg->online;
 	}
@@ -1169,12 +1272,12 @@ static void tristar_poll(struct work_struct *work)
 	old_online = chg->online;
 	old_present = chg->present;
 	old_usb_on = chg->usb_on;
-	if (regmap_read(chg->regmap, chg->status_reg, &status)) {
-		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
+	if (chg->chip->read_status(chg, &status)) {
+		tristar_withdraw(chg, chg->chip->fallback_code);
 		dev_err_ratelimited(chg->dev, "PMIC status unreadable; holding the fallback\n");
 		goto again;
 	}
-	chg->online = tristar_input_present(chg);
+	chg->online = chg->chip->online_status ? status != 0 : tristar_input_present(chg);
 	if (!chg->online) {
 		/* The hold of the next attachment starts when input returns. */
 		chg->hold_ns = now;
@@ -1186,10 +1289,16 @@ static void tristar_poll(struct work_struct *work)
 			chg->source_ma = 0;
 			chg->usb_ma = 0;
 			chg->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
-			if (tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE))
+			if (tristar_set_code(chg, chg->chip->handoff_code))
 				dev_crit(chg->dev, "Handoff write failed; input limit unverified\n");
 			dev_dbg(chg->dev, "disconnected\n");
 		}
+		tristar_no_source(chg, status, now);
+		goto again;
+	}
+	if (chg->chip->online_status && status != chg->chip->online_status) {
+		/* Transitional input state: no grant. */
+		tristar_withdraw(chg, chg->chip->fallback_code);
 		tristar_no_source(chg, status, now);
 		goto again;
 	}
@@ -1219,7 +1328,7 @@ static void tristar_poll(struct work_struct *work)
 		/* The status was read again after the debounce: the input stayed. */
 		cmpxchg(&chg->line_ns, line_ns, 0);
 		dev_dbg(chg->dev, "source event debounced, %u mA kept\n",
-			tristar_code_ma(chg->code));
+			tristar_code_ma(chg, chg->code));
 	}
 	tristar_follow_accessory(chg, now);
 	switch (chg->phase) {
@@ -1259,15 +1368,14 @@ out:
  */
 static bool tristar_event_withdraw(struct tristar_charger *chg)
 {
-	u32 reg = chg->limit_reg;
 	unsigned int readback;
 
-	if (READ_ONCE(chg->code) <= TRISTAR_CHG_FALLBACK_CODE)
+	if (READ_ONCE(chg->code) <= chg->chip->fallback_code)
 		return false;
-	if (!regmap_write(chg->regmap, reg, TRISTAR_CHG_FALLBACK_CODE) &&
-	    !regmap_read(chg->regmap, reg, &readback) &&
-	    readback == TRISTAR_CHG_FALLBACK_CODE)
-		WRITE_ONCE(chg->code, TRISTAR_CHG_FALLBACK_CODE);
+	if (!chg->chip->write_limit(chg, chg->chip->fallback_code) &&
+	    !chg->chip->read_limit(chg, &readback) &&
+	    readback == chg->chip->fallback_code)
+		WRITE_ONCE(chg->code, chg->chip->fallback_code);
 	else
 		dev_crit(chg->dev, "PMU event: withdrawal write failed\n");
 	return true;
@@ -1279,6 +1387,16 @@ static bool tristar_event_withdraw(struct tristar_charger *chg)
  */
 static irqreturn_t tristar_line_irq(int irq, void *data)
 {
+	struct tristar_charger *chg = data;
+
+	if (!chg->chip->invalidate_on_line)
+		return IRQ_HANDLED;
+
+	/* J120 ADC and source events arrive through different controllers. */
+	WRITE_ONCE(chg->epoch, READ_ONCE(chg->epoch) + 1);
+	smp_mb(); /* Publish invalidation before checking the grant. */
+	if (tristar_event_withdraw(chg))
+		WRITE_ONCE(chg->line_ns, ktime_get_ns() ?: 1);
 	return IRQ_HANDLED;
 }
 
@@ -1312,7 +1430,7 @@ static void tristar_source_event(struct tristar_charger *chg)
 	unsigned int i;
 	u64 now;
 
-	if (tristar_event_debounce(chg)) {
+	if (!chg->chip->invalidate_on_line && tristar_event_debounce(chg)) {
 		now = ktime_get_ns();
 		goto count;
 	}
@@ -1331,7 +1449,7 @@ count:
 	}
 	if (++chg->storm_count > TRISTAR_IRQ_STORM) {
 		WRITE_ONCE(chg->phase, TRISTAR_FAULT);
-		if (tristar_set_code(chg, TRISTAR_CHG_FALLBACK_CODE))
+		if (tristar_set_code(chg, chg->chip->fallback_code))
 			dev_crit(chg->dev, "PMU source events storming; input limit unverified\n");
 		else
 			dev_crit(chg->dev, "PMU source events storming; holding the fallback\n");
@@ -1390,7 +1508,7 @@ static int tristar_get_property(struct power_supply *psy,
 			val->intval = POWER_SUPPLY_USB_TYPE_SDP;
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
-		val->intval = tristar_code_ma(chg->code) * 1000;
+		val->intval = tristar_code_ma(chg, chg->code) * 1000;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		/* What the identified source or USB host allows; 0 when unknown. */
@@ -1514,6 +1632,8 @@ static void tristar_put_role_switch(void *data)
 	usb_role_switch_put(data);
 }
 
+#include "apple_tristar_d2355.h"
+
 /* Leave the limit as iBoot did, so a reboot or a kexec'd kernel starts safe. */
 static void tristar_stop(struct tristar_charger *chg, const char *reason)
 {
@@ -1527,7 +1647,7 @@ static void tristar_stop(struct tristar_charger *chg, const char *reason)
 	cancel_delayed_work_sync(&chg->poll_work);
 	tristar_accessory_stop(chg->acc);
 	mutex_lock(&chg->lock);
-	if (tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE))
+	if (tristar_set_code(chg, chg->chip->handoff_code))
 		dev_crit(chg->dev, "%s: handoff restore failed\n", reason);
 	/* Without this driver nothing holds USB data off. */
 	tristar_set_usb(chg, true);
@@ -1539,6 +1659,24 @@ static void tristar_stop_action(void *data)
 	tristar_stop(data, "remove");
 }
 
+/* IRQ resources unwind first; stop work before the power supply is freed. */
+static void tristar_abort_probe(void *data)
+{
+	struct tristar_charger *chg = data;
+
+	if (chg->probe_ready)
+		return;
+	mutex_lock(&chg->lock);
+	chg->stopping = true;
+	mutex_unlock(&chg->lock);
+	cancel_delayed_work_sync(&chg->poll_work);
+	mutex_lock(&chg->lock);
+	if (tristar_set_code(chg, chg->chip->handoff_code))
+		dev_crit(chg->dev, "probe failure: input handoff failed\n");
+	tristar_set_usb(chg, true);
+	mutex_unlock(&chg->lock);
+}
+
 static int tristar_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1546,31 +1684,33 @@ static int tristar_probe(struct platform_device *pdev)
 	struct tristar_charger *chg;
 	struct device_node *np;
 	unsigned int code, i;
-	u32 max_ua, base;
+	u32 max_ua;
 	int ret;
 
 	chg = devm_kzalloc(dev, sizeof(*chg), GFP_KERNEL);
 	if (!chg)
 		return -ENOMEM;
 	chg->dev = dev;
+	chg->pmic = device_get_match_data(dev);
+	if (!chg->pmic)
+		return -ENODEV;
+	chg->chip = chg->pmic->chip;
 	chg->regmap = dev_get_regmap(dev->parent, NULL);
 	if (!chg->regmap)
 		return dev_err_probe(dev, -ENODEV, "parent regmap unavailable\n");
 
-	chg->pmic = device_get_match_data(dev);
-	if (!chg->pmic)
-		return -ENODEV;
+	chg->adc_regmap = chg->regmap;
 	ret = tristar_get_bank(dev, "status",
-			       max(chg->pmic->connected, chg->pmic->status) + 1, &base);
-	if (ret)
-		return ret;
-	chg->connected_reg = base + chg->pmic->connected;
-	chg->status_reg = base + chg->pmic->status;
-	ret = tristar_get_bank(dev, "control", chg->pmic->input_limit + 1, &base);
-	if (ret)
-		return ret;
-	chg->limit_reg = base + chg->pmic->input_limit;
-	ret = tristar_get_bank(dev, "adc", chg->pmic->adc_result + 2, &chg->adc_base);
+			       max_t(unsigned int, chg->chip->status_size,
+				     max(chg->pmic->connected, chg->pmic->status) + 1),
+			       &chg->status_base);
+	if (!ret)
+		ret = tristar_get_bank(dev, "control",
+				       max_t(unsigned int, chg->chip->control_size,
+					     chg->pmic->input_limit + 1),
+				       &chg->control_base);
+	if (!ret)
+		ret = tristar_get_bank(dev, "adc", chg->pmic->adc_result + 2, &chg->adc_base);
 	if (ret)
 		return ret;
 
@@ -1578,6 +1718,11 @@ static int tristar_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "missing board input-current maximum\n");
 	chg->max_ma = max_ua / 1000;
+	if (chg->chip->prepare) {
+		ret = chg->chip->prepare(chg);
+		if (ret)
+			return dev_err_probe(dev, ret, "PMIC preparation failed\n");
+	}
 
 	np = of_parse_phandle(dev->of_node, "apple,tristar", 0);
 	if (!np)
@@ -1632,23 +1777,29 @@ static int tristar_probe(struct platform_device *pdev)
 		return ret;
 
 	/* Never adopt a limit we cannot explain; anything higher drops to the fallback. */
-	ret = regmap_read(chg->regmap, chg->limit_reg, &code);
+	ret = chg->chip->read_limit(chg, &code);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read the input-current limit\n");
 	chg->code = code;
-	if (code > TRISTAR_CHG_FALLBACK_CODE) {
-		dev_warn(dev, "Input limit %u mA at probe; dropping to %u mA\n",
-			 tristar_code_ma(code), tristar_code_ma(TRISTAR_CHG_FALLBACK_CODE));
-		ret = tristar_set_code(chg, TRISTAR_CHG_FALLBACK_CODE);
-		if (ret)
-			return dev_err_probe(dev, ret, "failed to lower the input-current limit\n");
-	}
 
 	config.drv_data = chg;
 	config.fwnode = dev_fwnode(dev);
 	chg->psy = devm_power_supply_register(dev, &tristar_desc, &config);
 	if (IS_ERR(chg->psy))
 		return dev_err_probe(dev, PTR_ERR(chg->psy), "failed to register power supply\n");
+
+	/* Register before changing limits or requesting IRQs. */
+	ret = devm_add_action_or_reset(dev, tristar_abort_probe, chg);
+	if (ret)
+		return ret;
+	if (code > chg->chip->fallback_code) {
+		dev_warn(dev, "Input limit %u mA at probe; dropping to %u mA\n",
+			 tristar_code_ma(chg, code), tristar_code_ma(chg, chg->chip->fallback_code));
+		ret = tristar_set_code(chg, chg->chip->fallback_code);
+		if (ret)
+			return dev_err_probe(dev, ret, "failed to lower the input-current limit\n");
+	}
+
 
 	for (i = 0; i < chg->nirqs; i++) {
 		ret = devm_request_threaded_irq(dev, chg->irqs[i], NULL,
@@ -1664,6 +1815,7 @@ static int tristar_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, tristar_stop_action, chg);
 	if (ret)
 		return ret;
+	chg->probe_ready = true;
 
 	if (chg->plug_irq) {
 		ret = device_init_wakeup(dev, true);
@@ -1755,7 +1907,7 @@ static int tristar_suspend(struct device *dev)
 	if (!keep) {
 		chg->present = false;
 		chg->phase = TRISTAR_EMPTY;
-		ret = tristar_set_code(chg, TRISTAR_CHG_HANDOFF_CODE);
+		ret = tristar_set_code(chg, chg->chip->handoff_code);
 		if (ret)
 			chg->stopping = false;
 	}
@@ -1797,6 +1949,7 @@ static const struct of_device_id tristar_of_match[] = {
 	{ .compatible = "apple,d2089-tristar-charger", .data = &tristar_d2089 },
 	{ .compatible = "apple,d2207-tristar-charger", .data = &tristar_d2207 },
 	{ .compatible = "apple,tristar-charger", .data = &tristar_d2365 },
+	{ .compatible = "apple,d2355-tristar-charger", .data = &tristar_d2355 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, tristar_of_match);
