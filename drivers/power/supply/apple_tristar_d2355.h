@@ -82,7 +82,7 @@ static unsigned int tristar_d2355_ma_code(struct tristar_charger *chg,
 static int tristar_d2355_write_limit(struct tristar_charger *chg, unsigned int code)
 {
 	struct tristar_d2355 *hw = chg->chip_data;
-	unsigned int control, check, epoch = READ_ONCE(chg->epoch);
+	unsigned int control, check, epoch = atomic_read(&chg->epoch);
 	unsigned int allowance;
 	u8 raw = 8;
 	bool disabled;
@@ -138,7 +138,7 @@ static int tristar_d2355_write_limit(struct tristar_charger *chg, unsigned int c
 	if (!ret && check != (control | BIT(2)))
 		ret = -ESTALE;
 	if (!ret && code > chg->chip->fallback_code &&
-	    epoch != READ_ONCE(chg->epoch))
+	    epoch != atomic_read(&chg->epoch))
 		ret = -ESTALE;
 	if (!ret)
 		ret = regmap_write(chg->regmap, chg->control_base, control & ~BIT(2));
@@ -154,7 +154,7 @@ static int tristar_d2355_write_limit(struct tristar_charger *chg, unsigned int c
 		smp_mb(); /* Pairs with invalidation before IRQ withdrawal. */
 	}
 	if (!ret && code > chg->chip->fallback_code &&
-	    epoch != READ_ONCE(chg->epoch))
+	    epoch != atomic_read(&chg->epoch))
 		ret = -ESTALE;
 	if (ret) {
 		recovery = tristar_d2355_disable(chg);

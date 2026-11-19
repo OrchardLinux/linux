@@ -33,6 +33,7 @@
  * Copyright The Orchard Linux contributors
  */
 
+#include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -253,10 +254,10 @@ struct tristar_charger {
 
 	/*
 	 * Event attribution: a new epoch invalidates an identification in
-	 * progress. Written only by the event handlers, which the PMIC event
-	 * controller runs one after another from one thread.
+	 * progress. D2355 line and source handlers can run on separate IRQ
+	 * threads and must each invalidate the grant under consideration.
 	 */
-	unsigned int epoch;
+	atomic_t epoch;
 	bool adc_waiting;
 	u64 storm_start_ns;
 	unsigned int storm_count;
@@ -587,7 +588,7 @@ static int tristar_adc_mv(struct tristar_charger *chg, unsigned int epoch,
 		WRITE_ONCE(chg->adc_waiting, false);
 		return -ETIMEDOUT;
 	}
-	if (READ_ONCE(chg->epoch) != epoch)
+	if (atomic_read(&chg->epoch) != epoch)
 		return -ESTALE;
 	ret = regmap_bulk_read(chg->adc_regmap, chg->adc_base + chg->pmic->adc_result,
 			       value, sizeof(value));
@@ -790,7 +791,7 @@ static int tristar_identify_usba(struct tristar_charger *chg, unsigned int orien
 /* Caller holds lock. */
 static int tristar_identify(struct tristar_charger *chg, struct tristar_ident *id)
 {
-	unsigned int epoch = READ_ONCE(chg->epoch), orientation;
+	unsigned int epoch = atomic_read(&chg->epoch), orientation;
 	const char *holder;
 	bool usbc;
 	u8 route, state;
@@ -919,7 +920,7 @@ static void tristar_new_attachment(struct tristar_charger *chg, u64 now)
 	chg->source_ma = 0;
 	chg->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	chg->cable_known = false;
-	chg->epoch_seen = READ_ONCE(chg->epoch);
+	chg->epoch_seen = atomic_read(&chg->epoch);
 	WRITE_ONCE(chg->line_ns, 0);
 	if (tristar_set_code(chg, chg->chip->attach_code))
 		dev_crit(chg->dev, "Attach write failed; input limit unverified\n");
@@ -989,13 +990,13 @@ static void tristar_reconfirm(struct tristar_charger *chg, u64 now, bool expired
 		return;
 	}
 	ret = cbtl_capability(chg, &usbc, &orientation);
-	if (!ret && READ_ONCE(chg->epoch) == chg->epoch_seen &&
+	if (!ret && atomic_read(&chg->epoch) == chg->epoch_seen &&
 	    usbc == chg->usbc && orientation == chg->orientation) {
 		dev_dbg(chg->dev, "same cable after the source event\n");
 		tristar_grant(chg);
 		return;
 	}
-	chg->epoch_seen = READ_ONCE(chg->epoch);
+	chg->epoch_seen = atomic_read(&chg->epoch);
 	if (!expired)
 		return;		/* look again on the next poll */
 	dev_dbg(chg->dev, "cable changed during the USB session (%d)\n", ret);
@@ -1024,9 +1025,9 @@ static void tristar_run_identification(struct tristar_charger *chg, u64 now)
 		tristar_mux_fault(chg);
 		return;
 	}
-	if (ret || READ_ONCE(chg->epoch) != chg->epoch_seen) {
+	if (ret || atomic_read(&chg->epoch) != chg->epoch_seen) {
 		/* The source changed while identifying: look again once it settles. */
-		chg->epoch_seen = READ_ONCE(chg->epoch);
+		chg->epoch_seen = atomic_read(&chg->epoch);
 		if (!expired) {
 			chg->attach_ns = now;
 			return;
@@ -1314,9 +1315,9 @@ static void tristar_poll(struct work_struct *work)
 			tristar_unhold_usb(chg);
 		goto again;
 	}
-	if (READ_ONCE(chg->epoch) != chg->epoch_seen && chg->phase != TRISTAR_SETTLING) {
+	if (atomic_read(&chg->epoch) != chg->epoch_seen && chg->phase != TRISTAR_SETTLING) {
 		/* An event the identification did not see: identify again. */
-		chg->epoch_seen = READ_ONCE(chg->epoch);
+		chg->epoch_seen = atomic_read(&chg->epoch);
 		chg->phase = TRISTAR_SETTLING;
 		chg->attach_ns = now;
 		chg->hold_ns = now;
@@ -1381,6 +1382,14 @@ static bool tristar_event_withdraw(struct tristar_charger *chg)
 	return true;
 }
 
+static bool tristar_invalidate_source(struct tristar_charger *chg)
+{
+	atomic_inc(&chg->epoch);
+	/* Publish invalidation before checking for a concurrent current grant. */
+	smp_mb__after_atomic();
+	return tristar_event_withdraw(chg);
+}
+
 /*
  * The PMU line asserted and the event controller has not read the events
  * yet. iOS acts only on the events themselves, so there is nothing to do.
@@ -1392,10 +1401,7 @@ static irqreturn_t tristar_line_irq(int irq, void *data)
 	if (!chg->chip->invalidate_on_line)
 		return IRQ_HANDLED;
 
-	/* J120 ADC and source events arrive through different controllers. */
-	WRITE_ONCE(chg->epoch, READ_ONCE(chg->epoch) + 1);
-	smp_mb(); /* Publish invalidation before checking the grant. */
-	if (tristar_event_withdraw(chg))
+	if (tristar_invalidate_source(chg))
 		WRITE_ONCE(chg->line_ns, ktime_get_ns() ?: 1);
 	return IRQ_HANDLED;
 }
@@ -1435,8 +1441,7 @@ static void tristar_source_event(struct tristar_charger *chg)
 		goto count;
 	}
 
-	tristar_event_withdraw(chg);
-	WRITE_ONCE(chg->epoch, chg->epoch + 1);
+	tristar_invalidate_source(chg);
 	/* The USB session may continue: ask its controller for a fresh report. */
 	power_supply_changed(chg->psy);
 	mod_delayed_work(chg->wq, &chg->poll_work, 0);
@@ -1691,6 +1696,7 @@ static int tristar_probe(struct platform_device *pdev)
 	if (!chg)
 		return -ENOMEM;
 	chg->dev = dev;
+	atomic_set(&chg->epoch, 0);
 	chg->pmic = device_get_match_data(dev);
 	if (!chg->pmic)
 		return -ENODEV;
