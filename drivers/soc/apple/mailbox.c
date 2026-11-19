@@ -553,6 +553,8 @@ static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
 	{ .compatible = "apple,t8010-a7iop-mailbox", .data = &apple_mbox_a7iop_hw },
+	/* A7-A8X ANS/AKF coprocessors: same FIFO, mask and packing layout as A7IOP */
+	{ .compatible = "apple,akf-mailbox-v1", .data = &apple_mbox_a7iop_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
 	{}
 };
