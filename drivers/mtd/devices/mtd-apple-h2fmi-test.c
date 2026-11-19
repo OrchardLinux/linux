@@ -237,6 +237,42 @@ static void h2fmi_raw_write_ownership_test(struct kunit *test)
 	apple_ppn_release_sftl(&access);
 }
 
+/* SDR bring-up facts from Cascadia's PIO driver for both package profiles. */
+static void h2fmi_sdr_facts_test(struct kunit *test)
+{
+	static const u8 ppn_155[H2FMI_ID_SIZE] = { 'P', 'P', 'N', 1, 5, 5, 0, 0 };
+	u8 params[H2FMI_PARAMS_SIZE], id[H2FMI_ID_SIZE];
+	struct h2fmi_geometry g;
+	u32 addr0, addr1;
+
+	KUNIT_EXPECT_TRUE(test, h2fmi_ppn_id(ppn_155));
+	memcpy(id, ppn_155, sizeof(id));
+	id[5] = 7;
+	KUNIT_EXPECT_TRUE(test, h2fmi_ppn_id(id));
+	id[4] = 4;
+	KUNIT_EXPECT_FALSE(test, h2fmi_ppn_id(id));
+	memcpy(id, ppn_155, sizeof(id));
+	id[2] = 'X';
+	KUNIT_EXPECT_FALSE(test, h2fmi_ppn_id(id));
+
+	h2fmi_test_params(params, ppn_16gb);
+	KUNIT_ASSERT_EQ(test, h2fmi_parse_geometry(params, sizeof(params), &g), 0);
+	KUNIT_EXPECT_EQ(test, h2fmi_bad_block_bytes(&g), 133U);
+	h2fmi_test_params(params, ppn_64gb);
+	KUNIT_ASSERT_EQ(test, h2fmi_parse_geometry(params, sizeof(params), &g), 0);
+	KUNIT_EXPECT_EQ(test, h2fmi_bad_block_bytes(&g), 261U);
+	KUNIT_EXPECT_EQ(test, h2fmi_bad_block_feature(0), 0x84);
+	KUNIT_EXPECT_EQ(test, h2fmi_bad_block_feature(7), 0x784);
+
+	/* 0A <16448, column 0, row> 37 */
+	h2fmi_full_address(0xc27ff, &addr0, &addr1);
+	KUNIT_EXPECT_EQ(test, addr0, 0x4040U);
+	KUNIT_EXPECT_EQ(test, addr1, 0xc27ffU);
+	/* Four units of four sectors carry the whole raw page. */
+	KUNIT_EXPECT_EQ(test, 4 * H2FMI_SDR_SECTOR, H2FMI_CHUNK_RAW);
+	KUNIT_EXPECT_EQ(test, H2FMI_CHUNKS * H2FMI_CHUNK_RAW, H2FMI_PAGE_RAW);
+}
+
 static struct kunit_case h2fmi_test_cases[] = {
 	KUNIT_CASE(h2fmi_raw_write_ownership_test),
 	KUNIT_CASE(h2fmi_geometry_test),
@@ -247,6 +283,7 @@ static struct kunit_case h2fmi_test_cases[] = {
 	KUNIT_CASE(h2fmi_status_test),
 	KUNIT_CASE(h2fmi_slc_row_test),
 	KUNIT_CASE(h2fmi_program_status_test),
+	KUNIT_CASE(h2fmi_sdr_facts_test),
 	{}
 };
 

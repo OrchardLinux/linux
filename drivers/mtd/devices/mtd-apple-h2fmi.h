@@ -3,6 +3,7 @@
 #define MTD_APPLE_H2FMI_H
 
 #include <linux/bits.h>
+#include <linux/math.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -139,6 +140,46 @@ static inline int h2fmi_page_status(u8 status)
 static inline bool h2fmi_raw_page_erased(u8 status, const u8 *raw)
 {
 	return status == PPN_ST_ERASED && !memchr_inv(raw, 0xff, H2FMI_PAGE_RAW);
+}
+
+/*
+ * SDR operation, as Cascadia's PIO driver runs the A5 controller after its own
+ * NAND reset: the package is held at the low-power interface timing until
+ * feature 0x180 selects the asynchronous interface, then runs at the working
+ * timing measured on the P105 (dc 2, rs 3, rh 2, ws 1, wh 0).
+ */
+#define H2FMI_IF_CTRL_LOW_POWER	0xffff
+#define H2FMI_IF_CTRL_SDR	0x23210
+#define H2FMI_FEATURE_POWER	0x0180
+#define H2FMI_POWER_ASYNC	2
+#define H2FMI_FEATURE_FIRMWARE	0x9080
+#define H2FMI_FIRMWARE_SIZE	16
+#define H2FMI_FEATURE_BAD_BLOCKS	0x84
+#define H2FMI_ID_SIZE		8
+#define H2FMI_SDR_SECTOR	1028	/* a page unit moves as four sectors */
+
+/* Read ID answers "PPN" and the protocol version; both packages are PPN 1.5. */
+static inline bool h2fmi_ppn_id(const u8 *id)
+{
+	return !memcmp(id, "PPN", 3) && id[3] == 1 && id[4] == 5;
+}
+
+/* Feature 0x84 | cau << 8 returns one bit per block of that CAU. */
+static inline u32 h2fmi_bad_block_bytes(const struct h2fmi_geometry *g)
+{
+	return DIV_ROUND_UP(g->blocks, 8);
+}
+
+static inline u16 h2fmi_bad_block_feature(unsigned int cau)
+{
+	return H2FMI_FEATURE_BAD_BLOCKS | cau << 8;
+}
+
+/* An SDR page read sends the full address: u16 byte count, u16 column, row. */
+static inline void h2fmi_full_address(u32 row, u32 *addr0, u32 *addr1)
+{
+	*addr0 = H2FMI_PAGE_RAW;
+	*addr1 = row;
 }
 
 /* CMD 79 reports ready at bit 6 and program failure at bits 0 and 4. */

@@ -12,7 +12,9 @@
  * Every register use and every command sequence here comes from iBEC's own
  * disassembly (H2fmi.c, H2fmi_ppn.c, fmiss_ppn.c) by way of the userspace tool
  * this is a port of, tools/nand/ppn.c, which read the whole NAND bit-for-bit
- * repeatably.  docs/research/p105-nand.md is the notebook.
+ * repeatably.  docs/research/p105-nand.md is the notebook.  When iBoot did not
+ * leave the interface in DDR, the SDR bring-up and transfer shapes follow
+ * Project Cascadia's PIO driver (apple_ppn.c) and its specification.
  *
  * Geometry is read from each PPN package before registering any MTDs.
  * The supported packages have one CE per bus and either two or eight CAUs.
@@ -36,6 +38,7 @@
 #include <linux/module.h>
 #include <linux/mtd/apple-ppn-access.h>
 #include <linux/mtd/apple-ppn.h>
+#include <linux/ktime.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
@@ -73,6 +76,13 @@
 #define FMC_STATUS		0x44
 #define FMC_NAND_STATUS		0x48
 #define FMC_STATUS_MASK		0x4c
+#define FMC_ADDR1		0x1c
+
+#define ECC_INIT		0x14	/* FMI + 0x80014 */
+#define FMI_ALL_EVENTS		0x10f
+#define FMI_POLL_DONE		BIT(8)
+#define FMC_ON_SDR		1
+#define FMC_ON_DDR		5
 
 /* Every command sequence the driver issues.  A sequence that is not listed
  * does not run. Only the single-row final erase command is needed. */
@@ -87,6 +97,11 @@ static const u8 h2fmi_ops[][2] = {
 	{ 0x17, 0x00 },		/* PPN program confirm */
 	{ 0x79, 0x00 },		/* PPN mutation status */
 	{ 0x6a, 0xd7 },		/* PPN erase, one normal row */
+	{ 0xff, 0x00 },		/* NAND reset (SDR bring-up) */
+	{ 0x90, 0x00 },		/* read ID (SDR bring-up) */
+	{ 0xee, 0xe7 },		/* PPN get feature */
+	{ 0xef, 0x00 },		/* PPN set feature, address phase */
+	{ 0xe7, 0x00 },		/* PPN set feature confirm */
 };
 
 struct h2fmi_bus {
@@ -96,6 +111,8 @@ struct h2fmi_bus {
 	struct mutex lock;	/* one command sequence on this bus at a time */
 	u8 *page;		/* one raw page; only touched under lock */
 	struct h2fmi_geometry geometry;
+	u32 if_ctrl;		/* SDR timing restored by every software reset */
+	bool sdr;		/* this driver reset the package to SDR */
 	bool failed;		/* block further I/O in this driver instance */
 };
 
@@ -299,6 +316,378 @@ static void h2fmi_device_reset(struct h2fmi_bus *b, u32 on, u32 if_ctrl)
 	writel(if_ctrl, b->fmc + FMC_IF_CTRL);
 }
 
+/*
+ * SDR operation. Cascadia's driver resets the package and runs it in SDR,
+ * where every operation starts and ends with a software reset of the bus,
+ * a status poll completes on FMI status bit 8 and a page moves as four
+ * units of 4112 bytes, each one start of four 1028-byte sectors. A page read
+ * sends the full address and clocks the page out unless the package reports
+ * a general error.
+ */
+static void h2fmi_sdr_reset(struct h2fmi_bus *b)
+{
+	writel(6, b->fmi + FMI_CONTROL);
+	writel(FMC_ON_SDR, b->fmc + FMC_ON);
+	writel(b->if_ctrl, b->fmc + FMC_IF_CTRL);
+}
+
+static void h2fmi_sdr_clear(struct h2fmi_bus *b)
+{
+	writel(0, b->fmc + FMC_INTMASK);
+	writel(0, b->fmi + FMI_INTEN);
+	writel(0x31ffff, b->fmc + FMC_STATUS);
+	writel(FMI_ALL_EVENTS, b->fmi + FMI_STATUS);
+}
+
+static int h2fmi_sdr_poll(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *status)
+{
+	ktime_t end = ktime_add_us(ktime_get(), 2000000);
+
+	h2fmi_sdr_clear(b);
+	writel(b->if_ctrl & ~0x100000u, b->fmc + FMC_IF_CTRL);
+	writel(0x4040, b->fmc + FMC_STATUS_MASK);
+	writel(0, b->fmc + FMC_DATANUM);
+	writel(0x20, b->fmc + FMC_INTMASK);
+	writel(0x50, b->fmc + FMC_RW_CTRL);
+	while (!(readl(b->fmi + FMI_STATUS) & FMI_POLL_DONE)) {
+		if (ktime_after(ktime_get(), end)) {
+			writel(0, b->fmc + FMC_RW_CTRL);
+			writel(b->if_ctrl, b->fmc + FMC_IF_CTRL);
+			dev_err(fmi->dev, "SDR status timeout\n");
+			return -ETIMEDOUT;
+		}
+		cpu_relax();
+	}
+	*status = readl(b->fmc + FMC_NAND_STATUS);
+	writel(FMI_POLL_DONE, b->fmi + FMI_STATUS);
+	writel(0, b->fmc + FMC_RW_CTRL);
+	writel(b->if_ctrl, b->fmc + FMC_IF_CTRL);
+	return 0;
+}
+
+/* Operation status (77 7D) and its poll. */
+static int h2fmi_sdr_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *status)
+{
+	int ret = h2fmi_cmd_write(fmi, b, 0x77, 0x7d);
+
+	if (ret)
+		return ret;
+	writel(3, b->fmc + FMC_RW_CTRL);
+	ret = h2fmi_wait(fmi, b->fmc, FMC_STATUS, 3, 3);
+	return ret ? ret : h2fmi_sdr_poll(fmi, b, status);
+}
+
+static int h2fmi_sdr_fifo(struct h2fmi *fmi, struct h2fmi_bus *b)
+{
+	u32 v;
+	int ret;
+
+	ret = readl_poll_timeout(b->fmi + FMI_DMA_STATUS, v, v & 0x18, 0, 100000);
+	if (ret)
+		dev_err(fmi->dev, "SDR PIO timeout: FMI+0x1c = 0x%08x\n", v);
+	return ret;
+}
+
+/* One start per 4112-byte unit: four sectors of 1028 bytes. */
+static void h2fmi_sdr_unit_start(struct h2fmi_bus *b, bool transmit)
+{
+	h2fmi_sdr_clear(b);
+	writel(5, b->fmi + FMI_CONFIG);
+	writel(H2FMI_SDR_SECTOR << 8 | 4, b->fmi + FMI_PIO_CONFIG);
+	writel(transmit ? 5 : 3, b->fmi + FMI_CONTROL);
+}
+
+/* The units arrive in the stream order of the raw page. */
+static int h2fmi_sdr_receive(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *raw)
+{
+	unsigned int sector, word;
+	int ret;
+
+	for (sector = 0; sector < H2FMI_PAGE_RAW / H2FMI_SDR_SECTOR; sector++) {
+		u8 *p = raw + sector * H2FMI_SDR_SECTOR;
+
+		if (!(sector % 4))
+			h2fmi_sdr_unit_start(b, false);
+		ret = h2fmi_sdr_fifo(fmi, b);
+		if (ret)
+			return ret;
+		for (word = 0; word < H2FMI_SDR_SECTOR; word += 4)
+			put_unaligned_le32(readl(b->fmi + FMI_DATA), p + word);
+	}
+	return 0;
+}
+
+/* Transmit mirrors the receive; each unit ends with the done bit. */
+static int h2fmi_sdr_transmit(struct h2fmi *fmi, struct h2fmi_bus *b, const u8 *raw)
+{
+	unsigned int sector, word;
+	int ret;
+
+	for (sector = 0; sector < H2FMI_PAGE_RAW / H2FMI_SDR_SECTOR; sector++) {
+		const u8 *p = raw + sector * H2FMI_SDR_SECTOR;
+
+		if (!(sector % 4))
+			h2fmi_sdr_unit_start(b, true);
+		ret = h2fmi_sdr_fifo(fmi, b);
+		if (ret)
+			return ret;
+		for (word = 0; word < H2FMI_SDR_SECTOR; word += 4)
+			writel(get_unaligned_le32(p + word), b->fmi + FMI_DATA);
+		if (sector % 4 == 3) {
+			ret = h2fmi_wait(fmi, b->fmi, FMI_STATUS, 2, 2);
+			if (ret)
+				return ret;
+		}
+	}
+	return 0;
+}
+
+/* One transfer of at most 1024 bytes, as feature data moves. */
+static int h2fmi_sdr_burst(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *buf, u32 bytes,
+			   bool transmit)
+{
+	u32 word;
+	int ret;
+
+	writel(5, b->fmi + FMI_CONFIG);
+	writel((bytes << 8 & 0x7fc00) | 1, b->fmi + FMI_PIO_CONFIG);
+	writel(transmit ? 5 : 3, b->fmi + FMI_CONTROL);
+	ret = h2fmi_sdr_fifo(fmi, b);
+	if (ret)
+		return ret;
+	for (word = 0; word < bytes; word += 4) {
+		if (transmit)
+			writel(get_unaligned_le32(buf + word), b->fmi + FMI_DATA);
+		else
+			put_unaligned_le32(readl(b->fmi + FMI_DATA), buf + word);
+	}
+	return transmit ? h2fmi_wait(fmi, b->fmi, FMI_STATUS, 2, 2) : 0;
+}
+
+static int h2fmi_cmd_addr(struct h2fmi *fmi, struct h2fmi_bus *b, u8 op, u32 addr, int naddr)
+{
+	int ret = h2fmi_cmd_write(fmi, b, op, 0);
+
+	if (ret)
+		return ret;
+	writel(addr, b->fmc + FMC_ADDR0);
+	writel((naddr + 7) & 7, b->fmc + FMC_ADDRNUM);
+	writel(9, b->fmc + FMC_RW_CTRL);
+	return h2fmi_wait(fmi, b->fmc, FMC_STATUS, 9, 9);
+}
+
+/* Parameters (92 97) or a feature (EE E7): status, 7A, data, 77. A tail
+ * shorter than a word moves as one more 4-byte transfer.
+ */
+static int h2fmi_sdr_get(struct h2fmi *fmi, struct h2fmi_bus *b, u8 op, u8 op2, u32 address,
+			 int naddr, u8 *buf, u32 length)
+{
+	u32 done = 0;
+	u8 status = 0;
+	int ret;
+
+	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+	h2fmi_sdr_clear(b);
+	ret = h2fmi_cmd_addr_cmd(fmi, b, op, op2, address, naddr);
+	if (!ret)
+		ret = h2fmi_sdr_status(fmi, b, &status);
+	if (!ret && status != PPN_ST_GOOD)
+		ret = -EIO;
+	if (!ret)
+		ret = h2fmi_cmd1(fmi, b, 0x7a);
+	while (!ret && done < length) {
+		u32 bytes = min_t(u32, length - done, 0x400);
+		u8 tail[4];
+
+		if (bytes >= 4) {
+			bytes &= ~3u;
+			ret = h2fmi_sdr_burst(fmi, b, buf + done, bytes, false);
+		} else {
+			ret = h2fmi_sdr_burst(fmi, b, tail, 4, false);
+			memcpy(buf + done, tail, bytes);
+		}
+		done += bytes;
+	}
+	writel(6, b->fmi + FMI_CONTROL);
+	if (!ret)
+		ret = h2fmi_cmd1(fmi, b, 0x77);
+	writel(0, b->fmc + FMC_CE_CTRL);
+	return ret;
+}
+
+/* Set feature: EF and two address bytes, one word out, E7, status, 77. */
+static int h2fmi_sdr_set(struct h2fmi *fmi, struct h2fmi_bus *b, u16 feature, u32 value)
+{
+	u8 word[4], status = 0;
+	int ret;
+
+	put_unaligned_le32(value, word);
+	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+	writel(6, b->fmi + FMI_CONTROL);
+	ret = h2fmi_cmd_addr(fmi, b, 0xef, feature, 2);
+	if (!ret) {
+		h2fmi_sdr_clear(b);
+		ret = h2fmi_sdr_burst(fmi, b, word, sizeof(word), true);
+	}
+	if (!ret)
+		ret = h2fmi_cmd1(fmi, b, 0xe7);
+	if (!ret)
+		ret = h2fmi_sdr_status(fmi, b, &status);
+	if (!ret && status != PPN_ST_GOOD)
+		ret = -EIO;
+	if (!ret)
+		ret = h2fmi_cmd1(fmi, b, 0x77);
+	writel(6, b->fmi + FMI_CONTROL);
+	writel(0, b->fmc + FMC_CE_CTRL);
+	h2fmi_sdr_reset(b);
+	return ret;
+}
+
+static int h2fmi_sdr_id(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *id)
+{
+	u32 v;
+	int ret;
+
+	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+	h2fmi_sdr_clear(b);
+	ret = h2fmi_cmd_addr(fmi, b, 0x90, 0, 1);
+	if (!ret) {
+		writel(0, b->fmi + FMI_CONFIG);
+		writel(H2FMI_ID_SIZE << 8 | 1, b->fmi + FMI_PIO_CONFIG);
+		writel(3, b->fmi + FMI_CONTROL);
+		ret = readl_poll_timeout(b->fmi + FMI_STATUS, v, v & 2, 0, 100000);
+	}
+	if (!ret) {
+		put_unaligned_le32(readl(b->fmi + FMI_DATA), id);
+		put_unaligned_le32(readl(b->fmi + FMI_DATA), id + 4);
+	}
+	writel(0, b->fmc + FMC_CE_CTRL);
+	h2fmi_sdr_reset(b);
+	return ret;
+}
+
+/*
+ * Bring both packages up in SDR in the order Cascadia's driver read the
+ * whole 16 GB device with: software resets, the ECC window's init register,
+ * a NAND reset of the populated CE at the low-power timing, read ID, the
+ * parameters, the asynchronous power state on each CE once both are reset
+ * (without it every array read fails), the working timing, the firmware
+ * version and every CAU's bad-block table. Caller holds both bus locks.
+ */
+static int h2fmi_sdr_bringup(struct h2fmi *fmi)
+{
+	struct h2fmi_geometry g;
+	u8 id[H2FMI_ID_SIZE], firmware[H2FMI_FIRMWARE_SIZE];
+	unsigned int i, cau;
+	int ret;
+
+	for (i = 0; i < H2FMI_BUSES; i++) {
+		struct h2fmi_bus *b = &fmi->bus[i];
+
+		b->sdr = true;
+		b->if_ctrl = 0;
+		h2fmi_sdr_reset(b);
+		writel(0, b->ecc + ECC_INIT);
+	}
+	for (i = 0; i < H2FMI_BUSES; i++) {
+		struct h2fmi_bus *b = &fmi->bus[i];
+
+		writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+		udelay(10);
+		ret = h2fmi_cmd1(fmi, b, 0xff);
+		writel(0, b->fmc + FMC_CE_CTRL);
+		if (ret)
+			return ret;
+		msleep(50);
+		b->if_ctrl = H2FMI_IF_CTRL_LOW_POWER;
+		writel(b->if_ctrl, b->fmc + FMC_IF_CTRL);
+		ret = h2fmi_sdr_id(fmi, b, id);
+		if (ret)
+			return ret;
+		if (!h2fmi_ppn_id(id)) {
+			dev_err(fmi->dev, "bus %u: ID %*ph is not PPN 1.5\n", i, H2FMI_ID_SIZE, id);
+			return -ENODEV;
+		}
+	}
+	ret = h2fmi_sdr_get(fmi, &fmi->bus[0], 0x92, 0x97, 0, 1, fmi->bus[0].page,
+			    H2FMI_PARAMS_SIZE);
+	if (!ret)
+		ret = h2fmi_parse_geometry(fmi->bus[0].page, H2FMI_PARAMS_SIZE, &g);
+	if (ret)
+		return ret;
+	for (i = 0; i < H2FMI_BUSES; i++) {
+		ret = h2fmi_sdr_set(fmi, &fmi->bus[i], H2FMI_FEATURE_POWER, H2FMI_POWER_ASYNC);
+		if (ret) {
+			dev_err(fmi->dev, "bus %u: power state: %d\n", i, ret);
+			return ret;
+		}
+	}
+	for (i = 0; i < H2FMI_BUSES; i++) {
+		fmi->bus[i].if_ctrl = H2FMI_IF_CTRL_SDR;
+		writel(H2FMI_IF_CTRL_SDR, fmi->bus[i].fmc + FMC_IF_CTRL);
+	}
+	ret = h2fmi_sdr_get(fmi, &fmi->bus[0], 0xee, 0xe7, H2FMI_FEATURE_FIRMWARE, 2,
+			    firmware, sizeof(firmware));
+	if (ret)
+		return ret;
+	for (i = 0; i < H2FMI_BUSES; i++)
+		for (cau = 0; cau < g.caus; cau++) {
+			ret = h2fmi_sdr_get(fmi, &fmi->bus[i], 0xee, 0xe7,
+					    h2fmi_bad_block_feature(cau), 2, fmi->bus[i].page,
+					    h2fmi_bad_block_bytes(&g));
+			if (ret) {
+				dev_err(fmi->dev, "bus %u CAU %u: bad-block table: %d\n",
+					i, cau, ret);
+				return ret;
+			}
+		}
+	dev_info(fmi->dev, "PPN %*ph, firmware %*pE, SDR\n", H2FMI_ID_SIZE, id,
+		 H2FMI_FIRMWARE_SIZE, firmware);
+	return 0;
+}
+
+/* Caller holds b->lock. A page read in SDR, or the parameters. */
+static int h2fmi_sdr_read(struct h2fmi *fmi, struct h2fmi_bus *b, u8 op, u32 row,
+			  u8 *buffer, u32 length, u8 *status)
+{
+	u32 addr0, addr1;
+	int ret, end_ret = 0;
+
+	if (op == 0x92) {
+		h2fmi_sdr_reset(b);
+		ret = h2fmi_sdr_get(fmi, b, 0x92, 0x97, 0, 1, buffer, length);
+		*status = ret ? 0 : PPN_ST_GOOD;
+		h2fmi_sdr_reset(b);
+		return ret;
+	}
+	if (length != H2FMI_PAGE_RAW)
+		return -EINVAL;
+	h2fmi_full_address(row, &addr0, &addr1);
+	h2fmi_sdr_reset(b);
+	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+	h2fmi_sdr_clear(b);
+	ret = h2fmi_cmd_write(fmi, b, 0x0a, 0x37);
+	if (!ret) {
+		writel(addr0, b->fmc + FMC_ADDR0);
+		writel(addr1, b->fmc + FMC_ADDR1);
+		writel((8 + 7) & 7, b->fmc + FMC_ADDRNUM);
+		writel(0xb, b->fmc + FMC_RW_CTRL);
+		ret = h2fmi_wait(fmi, b->fmc, FMC_STATUS, 0xb, 0xb);
+	}
+	if (!ret)
+		ret = h2fmi_sdr_status(fmi, b, status);
+	/* The package has committed to the data unless it reports a general error. */
+	if (!ret && !(*status & BIT(4))) {
+		ret = h2fmi_cmd1(fmi, b, 0x7a);
+		if (!ret)
+			ret = h2fmi_sdr_receive(fmi, b, buffer);
+		end_ret = h2fmi_cmd1(fmi, b, 0x77);
+	}
+	writel(0, b->fmc + FMC_CE_CTRL);
+	h2fmi_sdr_reset(b);
+	return ret ? ret : end_ret;
+}
+
 /* Caller holds b->lock. All exits release CE and restore inherited state. */
 static int h2fmi_read_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 				  u8 op, u8 op2, u32 address, int naddr,
@@ -310,6 +699,12 @@ static int h2fmi_read_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 	*status = 0;
 	if (b->failed)
 		return -EIO;
+	if (b->sdr) {
+		ret = h2fmi_sdr_read(fmi, b, op, address, buffer, length, status);
+		if (ret)
+			b->failed = true;
+		return ret;
+	}
 	on = readl(b->fmc + FMC_ON);
 	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
 	if (on != 5)
@@ -447,6 +842,26 @@ static int h2fmi_program_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 
 	if (b->failed)
 		return -EIO;
+	if (b->sdr) {
+		/* The confirm follows the last unit with no stop in between. */
+		h2fmi_sdr_reset(b);
+		writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+		h2fmi_sdr_clear(b);
+		ret = h2fmi_write_address(fmi, b, row);
+		if (!ret)
+			ret = h2fmi_sdr_transmit(fmi, b, raw);
+		if (!ret)
+			ret = h2fmi_cmd1(fmi, b, 0x17);
+		if (!ret)
+			ret = h2fmi_cmd1(fmi, b, 0x79);
+		if (!ret)
+			ret = h2fmi_sdr_poll(fmi, b, &status);
+		if (!ret)
+			ret = h2fmi_program_status(status);
+		writel(0, b->fmc + FMC_CE_CTRL);
+		h2fmi_sdr_reset(b);
+		goto done;
+	}
 	on = readl(b->fmc + FMC_ON);
 	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
 	if (on != 5)
@@ -467,6 +882,7 @@ static int h2fmi_program_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 		ret = h2fmi_program_status(status);
 	writel(0, b->fmc + FMC_CE_CTRL);
 	h2fmi_device_reset(b, on, if_ctrl);
+done:
 	if (ret) {
 		b->failed = true;
 		dev_err(fmi->dev, "PPN program row %08x: status %02x, error %d\n",
@@ -672,6 +1088,23 @@ static int h2fmi_erase_transaction(struct h2fmi *fmi, struct h2fmi_bus *b, u32 r
 
 	if (b->failed)
 		return -EIO;
+	if (b->sdr) {
+		h2fmi_sdr_reset(b);
+		writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+		h2fmi_sdr_clear(b);
+		ret = h2fmi_cmd_addr_cmd(fmi, b, 0x6a, 0xd7, row, 4);
+		if (!ret)
+			ret = h2fmi_cmd1(fmi, b, 0x79);
+		if (!ret)
+			ret = h2fmi_sdr_poll(fmi, b, &queued);
+		if (!ret)
+			ret = h2fmi_sdr_status(fmi, b, &completed);
+		if (!ret)
+			ret = h2fmi_cmd1(fmi, b, 0x77);
+		writel(0, b->fmc + FMC_CE_CTRL);
+		h2fmi_sdr_reset(b);
+		goto done;
+	}
 	on = readl(b->fmc + FMC_ON);
 	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
 	if (on != 5)
@@ -688,6 +1121,7 @@ static int h2fmi_erase_transaction(struct h2fmi *fmi, struct h2fmi_bus *b, u32 r
 		ret = h2fmi_cmd1(fmi, b, 0x77);
 	writel(0, b->fmc + FMC_CE_CTRL);
 	h2fmi_device_reset(b, on, if_ctrl);
+done:
 	if (!ret && (queued != PPN_ST_GOOD || completed != PPN_ST_GOOD)) {
 		dev_err(fmi->dev, "PPN erase row %08x: queue %02x, completion %02x\n",
 			row, queued, completed);
@@ -976,10 +1410,22 @@ static int h2fmi_probe(struct platform_device *pdev)
 			return -ENOMEM;
 
 		/* iBoot read the NAND to boot and leaves the block clocked and
-		 * in DDR.  Nothing here turns it on: if iBoot did not, the
-		 * state this driver would have to restore is not known. */
+		 * in DDR.  Nothing here turns the clocks on.  If the interface
+		 * is not in DDR, the packages are reset and run in SDR. */
 		dev_info(&pdev->dev, "bus %d: FMC_ON=0x%08x IF_CTRL=0x%08x\n",
 			 i, readl(b->fmc + FMC_ON), readl(b->fmc + FMC_IF_CTRL));
+	}
+
+	/* Without iBoot's DDR state, bring both packages up in SDR first. */
+	if (readl(fmi->bus[0].fmc + FMC_ON) != FMC_ON_DDR ||
+	    readl(fmi->bus[1].fmc + FMC_ON) != FMC_ON_DDR) {
+		mutex_lock(&fmi->bus[0].lock);
+		mutex_lock_nested(&fmi->bus[1].lock, SINGLE_DEPTH_NESTING);
+		ret = h2fmi_sdr_bringup(fmi);
+		mutex_unlock(&fmi->bus[1].lock);
+		mutex_unlock(&fmi->bus[0].lock);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret, "PPN SDR bring-up failed\n");
 	}
 
 	/* Query both packages before publishing any part of the inventory. */
