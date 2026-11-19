@@ -30,28 +30,73 @@
 #include <linux/soc/apple/sio.h>
 #include <linux/xarray.h>
 
-#define APPLE_SIO_REMAP_AP_LO		0x0008
-#define APPLE_SIO_REMAP_AP_HI		0x0010
-#define APPLE_SIO_REMAP_IOP_LO		0x0018
-#define APPLE_SIO_REMAP_IOP_HI		0x0020
-#define APPLE_SIO_REMAP_SIZE_LO		0x0028
-#define APPLE_SIO_REMAP_SIZE_HI		0x0030
-#define APPLE_SIO_REMAP_ENABLE		0x0038
-#define APPLE_SIO_CPU_CONTROL		0x0044
+/*
+ * AppleA7IOP register layout. Version 2 (S8000, T8010) and version 1 (T7000
+ * and T7001, the A8 and A8X) differ only in where the registers sit; iOS's
+ * AppleA7IOPV1 and AppleA7IOPV2 program them in the same order.
+ */
+struct apple_sio_regs {
+	u32 remap_ap_lo;
+	u32 remap_ap_hi;
+	u32 remap_iop_lo;
+	u32 remap_iop_hi;
+	u32 remap_size_lo;
+	u32 remap_size_hi;
+	u32 remap_enable;
+	u32 cpu_control;
+	u32 time_lo;
+	u32 time_hi;
+	u32 mbox;		/* base of the mailbox registers below */
+	bool mirror;		/* V2: mask writes are mirrored at 0xc00/0xc04 */
+	bool legacy_status;	/* V2: an older IRQ status at 0xb84 */
+	bool enable_tx;		/* V1: the AP enables the A2I FIFO itself */
+};
+
 #define APPLE_SIO_CPU_RUN		BIT(4)
 #define APPLE_SIO_TIME_CONTROL		0x080c
 #define APPLE_SIO_IRQ_STATUS_LEGACY	0x0b84
 #define APPLE_SIO_IRQ_STATUS		0x0b88
-#define APPLE_SIO_QUEUE_INIT_B		0x0c00
-#define APPLE_SIO_QUEUE_START_B		0x0c04
-#define APPLE_SIO_QUEUE_INIT_A		0x4000
-#define APPLE_SIO_QUEUE_START_A		0x4004
-#define APPLE_SIO_TX_STATUS		0x4008
-#define APPLE_SIO_TX_MESSAGE		0x4010
-#define APPLE_SIO_RX_STATUS		0x4020
-#define APPLE_SIO_RX_MESSAGE		0x4038
-#define APPLE_SIO_TIME_LO		0xc030
-#define APPLE_SIO_TIME_HI		0xc038
+#define APPLE_SIO_MASK_SET_MIRROR	0x0c00
+#define APPLE_SIO_MASK_CLEAR_MIRROR	0x0c04
+
+/* Mailbox registers, relative to apple_sio_regs.mbox */
+#define APPLE_SIO_MASK_SET		0x00
+#define APPLE_SIO_MASK_CLEAR		0x04
+#define APPLE_SIO_TX_STATUS		0x08
+#define APPLE_SIO_TX_MESSAGE		0x10
+#define APPLE_SIO_RX_STATUS		0x20
+#define APPLE_SIO_RX_MESSAGE		0x38
+
+static const struct apple_sio_regs apple_sio_regs_v2 = {
+	.remap_ap_lo = 0x08,
+	.remap_ap_hi = 0x10,
+	.remap_iop_lo = 0x18,
+	.remap_iop_hi = 0x20,
+	.remap_size_lo = 0x28,
+	.remap_size_hi = 0x30,
+	.remap_enable = 0x38,
+	.cpu_control = 0x44,
+	.time_lo = 0xc030,
+	.time_hi = 0xc038,
+	.mbox = 0x4000,
+	.mirror = true,
+	.legacy_status = true,
+};
+
+static const struct apple_sio_regs apple_sio_regs_v1 = {
+	.remap_ap_lo = 0x08,
+	.remap_ap_hi = 0x0c,
+	.remap_iop_lo = 0x10,
+	.remap_iop_hi = 0x14,
+	.remap_size_lo = 0x18,
+	.remap_size_hi = 0x1c,
+	.remap_enable = 0x20,
+	.cpu_control = 0x28,
+	.time_lo = 0x810,
+	.time_hi = 0x818,
+	.mbox = 0x1000,
+	.enable_tx = true,
+};
 
 #define APPLE_SIO_MBOX_ENABLE		BIT(0)
 #define APPLE_SIO_MBOX_EMPTY		BIT(17)
@@ -82,6 +127,7 @@
 #define APPLE_SIO_SETUP_COMMANDS	10
 
 struct apple_sio_hw {
+	const struct apple_sio_regs *regs;
 	const struct apple_sio_dma_range *dma_ranges;
 	unsigned int num_dma_ranges;
 };
@@ -114,6 +160,8 @@ struct apple_sio {
 	bool irq_requested;
 	bool irq_enabled;
 	void __iomem *base;
+	void __iomem *mbox;
+	const struct apple_sio_regs *regs;
 	void *firmware_buffer;
 	dma_addr_t firmware_dma;
 	size_t firmware_size;
@@ -363,17 +411,18 @@ static irqreturn_t apple_sio_irq(int irq, void *data)
 	u32 status;
 
 	sio->irq_count++;
-	sio->last_irq_legacy =
-		readl_relaxed(sio->base + APPLE_SIO_IRQ_STATUS_LEGACY);
+	if (sio->regs->legacy_status)
+		sio->last_irq_legacy =
+			readl_relaxed(sio->base + APPLE_SIO_IRQ_STATUS_LEGACY);
 	sio->last_irq = readl_relaxed(sio->base + APPLE_SIO_IRQ_STATUS);
 	while (count < APPLE_SIO_RX_DRAIN_LIMIT) {
-		status = readl_relaxed(sio->base + APPLE_SIO_RX_STATUS);
+		status = readl_relaxed(sio->mbox + APPLE_SIO_RX_STATUS);
 		sio->last_rx_status = status;
 		if (!apple_sio_can_read(status))
 			break;
 
 		sio->last_rx_message =
-			readq_relaxed(sio->base + APPLE_SIO_RX_MESSAGE);
+			readq_relaxed(sio->mbox + APPLE_SIO_RX_MESSAGE);
 		apple_sio_dispatch(sio, sio->last_rx_message);
 		count++;
 	}
@@ -396,7 +445,7 @@ static int apple_sio_send(struct apple_sio *sio, u64 message)
 		goto out_unlock;
 	}
 
-	ret = readl_poll_timeout(sio->base + APPLE_SIO_TX_STATUS, status,
+	ret = readl_poll_timeout(sio->mbox + APPLE_SIO_TX_STATUS, status,
 				 apple_sio_can_write(status), 10,
 				 APPLE_SIO_TX_TIMEOUT_US);
 	if (ret)
@@ -408,7 +457,7 @@ static int apple_sio_send(struct apple_sio *sio, u64 message)
 		goto out_hw_unlock;
 	}
 
-	status = readl_relaxed(sio->base + APPLE_SIO_TX_STATUS);
+	status = readl_relaxed(sio->mbox + APPLE_SIO_TX_STATUS);
 	if (!apple_sio_can_write(status)) {
 		ret = -EBUSY;
 		goto out_hw_unlock;
@@ -416,7 +465,7 @@ static int apple_sio_send(struct apple_sio *sio, u64 message)
 
 	dma_wmb();
 	sio->last_tx_message = message;
-	writeq_relaxed(message, sio->base + APPLE_SIO_TX_MESSAGE);
+	writeq_relaxed(message, sio->mbox + APPLE_SIO_TX_MESSAGE);
 
 out_hw_unlock:
 	spin_unlock_irqrestore(&sio->tx_hw_lock, flags);
@@ -437,7 +486,7 @@ static int apple_sio_send_atomic(struct apple_sio *sio, u64 message)
 		goto out_unlock;
 	}
 
-	status = readl_relaxed(sio->base + APPLE_SIO_TX_STATUS);
+	status = readl_relaxed(sio->mbox + APPLE_SIO_TX_STATUS);
 	sio->last_tx_status = status;
 	if (!apple_sio_can_write(status)) {
 		ret = -EBUSY;
@@ -446,7 +495,7 @@ static int apple_sio_send_atomic(struct apple_sio *sio, u64 message)
 
 	dma_wmb();
 	sio->last_tx_message = message;
-	writeq_relaxed(message, sio->base + APPLE_SIO_TX_MESSAGE);
+	writeq_relaxed(message, sio->mbox + APPLE_SIO_TX_MESSAGE);
 
 out_unlock:
 	spin_unlock_irqrestore(&sio->tx_hw_lock, flags);
@@ -785,11 +834,11 @@ static void apple_sio_stop(struct apple_sio *sio)
 	}
 	mutex_lock(&sio->tx_lock);
 	spin_lock_irq(&sio->tx_hw_lock);
-	control = readl(sio->base + APPLE_SIO_CPU_CONTROL);
+	control = readl(sio->base + sio->regs->cpu_control);
 	writel(control & ~APPLE_SIO_CPU_RUN,
-	       sio->base + APPLE_SIO_CPU_CONTROL);
-	readl(sio->base + APPLE_SIO_CPU_CONTROL);
-	writel(0, sio->base + APPLE_SIO_REMAP_ENABLE);
+	       sio->base + sio->regs->cpu_control);
+	readl(sio->base + sio->regs->cpu_control);
+	writel(0, sio->base + sio->regs->remap_enable);
 	spin_unlock_irq(&sio->tx_hw_lock);
 	mutex_unlock(&sio->tx_lock);
 
@@ -808,11 +857,11 @@ static int apple_sio_start(struct apple_sio *sio, const char *firmware_name)
 	u32 status;
 	int ret;
 
-	control = readl(sio->base + APPLE_SIO_CPU_CONTROL);
+	control = readl(sio->base + sio->regs->cpu_control);
 	if (control & APPLE_SIO_CPU_RUN) {
 		/* Left running by the boot chain: reset it through the PMGR. */
 		ret = device_reset_optional(sio->dev);
-		control = readl(sio->base + APPLE_SIO_CPU_CONTROL);
+		control = readl(sio->base + sio->regs->cpu_control);
 		if (ret || (control & APPLE_SIO_CPU_RUN))
 			return dev_err_probe(sio->dev, ret ?: -EBUSY,
 					     "SmartIO CPU is already running\n");
@@ -841,37 +890,46 @@ static int apple_sio_start(struct apple_sio *sio, const char *firmware_name)
 	sio->firmware_dma = dma;
 	sio->firmware_size = size;
 
-	writel(0, sio->base + APPLE_SIO_REMAP_IOP_LO);
-	writel(0, sio->base + APPLE_SIO_REMAP_IOP_HI);
-	writel(lower_32_bits(size), sio->base + APPLE_SIO_REMAP_SIZE_LO);
-	writel(upper_32_bits(size), sio->base + APPLE_SIO_REMAP_SIZE_HI);
-	writel(lower_32_bits(dma), sio->base + APPLE_SIO_REMAP_AP_LO);
-	writel(upper_32_bits(dma), sio->base + APPLE_SIO_REMAP_AP_HI);
-	writel(1, sio->base + APPLE_SIO_REMAP_ENABLE);
+	writel(0, sio->base + sio->regs->remap_iop_lo);
+	writel(0, sio->base + sio->regs->remap_iop_hi);
+	writel(lower_32_bits(size), sio->base + sio->regs->remap_size_lo);
+	writel(upper_32_bits(size), sio->base + sio->regs->remap_size_hi);
+	writel(lower_32_bits(dma), sio->base + sio->regs->remap_ap_lo);
+	writel(upper_32_bits(dma), sio->base + sio->regs->remap_ap_hi);
+	writel(1, sio->base + sio->regs->remap_enable);
 
-	writel(0x1111, sio->base + APPLE_SIO_QUEUE_INIT_A);
-	writel(0x1111, sio->base + APPLE_SIO_QUEUE_INIT_B);
-	writel(1, sio->base + APPLE_SIO_QUEUE_START_A);
-	writel(1, sio->base + APPLE_SIO_QUEUE_START_B);
-	writel(0x1000, sio->base + APPLE_SIO_QUEUE_START_A);
-	writel(0x1000, sio->base + APPLE_SIO_QUEUE_START_B);
-	status = readl(sio->base + APPLE_SIO_RX_STATUS);
+	/* Mask everything, then unmask inbox-empty and outbox-not-empty. */
+	writel(0x1111, sio->mbox + APPLE_SIO_MASK_SET);
+	if (sio->regs->mirror)
+		writel(0x1111, sio->base + APPLE_SIO_MASK_SET_MIRROR);
+	writel(1, sio->mbox + APPLE_SIO_MASK_CLEAR);
+	if (sio->regs->mirror)
+		writel(1, sio->base + APPLE_SIO_MASK_CLEAR_MIRROR);
+	writel(0x1000, sio->mbox + APPLE_SIO_MASK_CLEAR);
+	if (sio->regs->mirror)
+		writel(0x1000, sio->base + APPLE_SIO_MASK_CLEAR_MIRROR);
+	status = readl(sio->mbox + APPLE_SIO_RX_STATUS);
 	writel(status | APPLE_SIO_MBOX_ENABLE,
-	       sio->base + APPLE_SIO_RX_STATUS);
+	       sio->mbox + APPLE_SIO_RX_STATUS);
+	if (sio->regs->enable_tx) {
+		status = readl(sio->mbox + APPLE_SIO_TX_STATUS);
+		writel(status | APPLE_SIO_MBOX_ENABLE,
+		       sio->mbox + APPLE_SIO_TX_STATUS);
+	}
 
 	control = readl(sio->base + APPLE_SIO_TIME_CONTROL);
 	writel(control & ~BIT(1), sio->base + APPLE_SIO_TIME_CONTROL);
 	counter = arch_timer_read_counter();
-	writel(lower_32_bits(counter), sio->base + APPLE_SIO_TIME_LO);
-	writel(upper_32_bits(counter), sio->base + APPLE_SIO_TIME_HI);
+	writel(lower_32_bits(counter), sio->base + sio->regs->time_lo);
+	writel(upper_32_bits(counter), sio->base + sio->regs->time_hi);
 	writel(control | BIT(1), sio->base + APPLE_SIO_TIME_CONTROL);
 
 	/* Requested disabled: a stale interrupt must not start region setup. */
 	sio->irq_enabled = true;
 	enable_irq(sio->irq);
-	control = readl(sio->base + APPLE_SIO_CPU_CONTROL);
+	control = readl(sio->base + sio->regs->cpu_control);
 	writel(control | APPLE_SIO_CPU_RUN,
-	       sio->base + APPLE_SIO_CPU_CONTROL);
+	       sio->base + sio->regs->cpu_control);
 
 	ready_timeout = msecs_to_jiffies(APPLE_SIO_READY_TIMEOUT_MS);
 	if (!wait_for_completion_timeout(&sio->ready, ready_timeout)) {
@@ -977,6 +1035,8 @@ static int apple_sio_probe(struct platform_device *pdev)
 		ret = PTR_ERR(sio->base);
 		goto out_pm_put;
 	}
+	sio->regs = hw->regs;
+	sio->mbox = sio->base + hw->regs->mbox;
 
 	irq = platform_get_irq(pdev, APPLE_SIO_RX_IRQ_INDEX);
 	if (irq < 0) {
@@ -1093,6 +1153,7 @@ static const struct apple_sio_dma_range apple_sio_s8000_dma_ranges[] = {
 };
 
 static const struct apple_sio_hw apple_sio_s8000_hw = {
+	.regs = &apple_sio_regs_v2,
 	.dma_ranges = apple_sio_s8000_dma_ranges,
 	.num_dma_ranges = ARRAY_SIZE(apple_sio_s8000_dma_ranges),
 };
@@ -1109,11 +1170,25 @@ static const struct apple_sio_dma_range apple_sio_t8010_dma_ranges[] = {
 };
 
 static const struct apple_sio_hw apple_sio_t8010_hw = {
+	.regs = &apple_sio_regs_v2,
 	.dma_ranges = apple_sio_t8010_dma_ranges,
 	.num_dma_ranges = ARRAY_SIZE(apple_sio_t8010_dma_ranges),
 };
 
+/* MCA0 (headset codec) and MCA3 (speakers), as described by the J81 ADT. */
+static const struct apple_sio_dma_range apple_sio_t7000_dma_ranges[] = {
+	{ 0x28, 0x29 },
+	{ 0x2e, 0x2f },
+};
+
+static const struct apple_sio_hw apple_sio_t7000_hw = {
+	.regs = &apple_sio_regs_v1,
+	.dma_ranges = apple_sio_t7000_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_t7000_dma_ranges),
+};
+
 static const struct of_device_id apple_sio_of_match[] = {
+	{ .compatible = "apple,t7000-sio", .data = &apple_sio_t7000_hw },
 	{ .compatible = "apple,s8000-sio", .data = &apple_sio_s8000_hw },
 	{ .compatible = "apple,t8010-sio", .data = &apple_sio_t8010_hw },
 	{}
@@ -1132,7 +1207,8 @@ static struct platform_driver apple_sio_driver = {
 };
 module_platform_driver(apple_sio_driver);
 
+MODULE_FIRMWARE("apple/t7000-smartio.bin");
 MODULE_FIRMWARE("apple/s8000-smartio.bin");
 MODULE_FIRMWARE("apple/t8010-smartio.bin");
-MODULE_DESCRIPTION("Apple S8000/T8010 SmartIO coprocessor driver");
+MODULE_DESCRIPTION("Apple T7000/S8000/T8010 SmartIO coprocessor driver");
 MODULE_LICENSE("Dual MIT/GPL");
