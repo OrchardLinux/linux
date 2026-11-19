@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple VFL/SwissPPNFTL recovery and append for the measured 64 GB PPN layout.
+ * Apple VFL/SwissPPNFTL recovery for the measured 16 GB and 64 GB PPN layouts,
+ * and append for the 64 GB layout.
  *
  * Format and replay rules are ported from Orchard's P105 Python reference
  * (ftl_map.py, ftl_load.py, ftl_log.py and ftl_append.py). It was checked
@@ -36,6 +37,7 @@
 #define SFTL_MAX_CONTEXTS 16U
 #define SFTL_META	16U
 #define SFTL_CHUNK	4096U
+#define SFTL_PAD	0xffff0000U
 #define SFTL_TRIM	0xffff0001U
 /* cxtSaveSB serializes the role in byte zero of each 8-byte block entry. */
 enum sftl_block_role {
@@ -64,23 +66,44 @@ struct sftl_geometry {
 	u16 subblocks;		/* FTL superblocks, VFL header +12 and +14 */
 	u16 vfl_pages;		/* SLC pages in one VFL bank member */
 	u16 vfl_first;		/* lowest physical block of a VFL member */
-	u16 bootstrap;		/* block whose page zero seeds the member list */
+	u16 bootstrap[2];	/* blocks whose page zero can seed the member list */
+	u16 nr_bootstrap;
 	u16 map_batch;		/* native map records are a multiple of this */
 	u32 disk_pages;		/* logical pages exported as the disk */
 	u32 lpages;		/* logical pages including the hidden tail */
 	bool writer;		/* append, reclamation and checkpoints are modelled */
+	bool summary_sequences;	/* a summary may consume one sequence per chunk */
 };
 
 /* 64 GB Hynix PPN with 13G36 (iOS 9.3.5) on the media. */
 static const struct sftl_geometry sftl_64gb = {
 	.buses = 2, .caus = 8, .lanes = 16, .blocks = 2088, .pages = 128,
-	.subblocks = 2086, .vfl_pages = 64, .vfl_first = 2056, .bootstrap = 2087,
+	.subblocks = 2086, .vfl_pages = 64, .vfl_first = 2056,
+	.bootstrap = { 2087 }, .nr_bootstrap = 1,
 	.map_batch = APPLE_SFTL_NATIVE_MAP_BATCH,
 	.disk_pages = 15625000, .lpages = 15625016, .writer = true,
 };
 
+/*
+ * 16 GB Hynix PPN with 12H321 (iOS 8.4.1) on the media, as Cascadia
+ * measured it: two CAUs per bus, 1064 blocks of 256 pages, banks in the
+ * order (bus 0, cau 0), (bus 1, cau 0), (bus 0, cau 1), (bus 1, cau 1),
+ * 1055 superblocks of 4096 slots, the VFL in blocks 1062 and 1063 of every
+ * bank, 3906250 exported and 16 hidden logical pages. A context has at
+ * least 32 range records, rounded up to a multiple of 16, and a summary of
+ * 4 or 8 chunks may count its own chunks in its sequence span.
+ */
+static const struct sftl_geometry sftl_16gb = {
+	.buses = 2, .caus = 2, .lanes = 4, .blocks = 1064, .pages = 256,
+	.subblocks = 1055, .vfl_pages = 128, .vfl_first = 1062,
+	.bootstrap = { 1063, 1062 }, .nr_bootstrap = 2,
+	.map_batch = 16,
+	.disk_pages = 3906250, .lpages = 3906266, .summary_sequences = true,
+};
+
 static const struct sftl_geometry *const sftl_geometries[] = {
 	&sftl_64gb,
+	&sftl_16gb,
 };
 
 struct sftl_run {
@@ -434,33 +457,40 @@ struct sftl_vfl_scan {
 static int sftl_vfl_members(struct apple_sftl *sftl)
 {
 	struct apple_sftl_vfl_member *members = sftl->vfl_source.members;
-	unsigned int lane, i, j;
+	unsigned int lane = 0, i, j, seed;
+	u16 block = 0;
 	u8 status;
 	int ret;
 
 	/* An interrupted erase can remove the usual lane-zero seed. Search only
-	 * page zero in the measured bootstrap block for a surviving member list.
+	 * page zero in the measured bootstrap blocks for a surviving member list.
+	 * Where both VFL banks are bootstrap blocks, the older one may be erased.
 	 */
-	for (lane = 0; lane < sftl->geo->lanes; lane++) {
-		ret = sftl->ppn->ops->read_page(sftl->ppn->priv, lane & 1, lane >> 1,
-						sftl->geo->bootstrap, 0, true, sftl->page,
-						sftl->oob, &status);
-		if (ret)
-			return ret;
-		/* Some nonmembers report 45 at the bootstrap coordinate. Once
-		 * discovered, every actual member is reread with strict status.
-		 */
-		if (status == 0x45)
-			continue;
-		if (status != 0x40 && status != 0x49)
-			return -EIO;
-		if (status == 0x40 && get_unaligned_le32(sftl->oob) == 0x00ffff20)
+	for (seed = 0; seed < sftl->geo->nr_bootstrap; seed++) {
+		block = sftl->geo->bootstrap[seed];
+		for (lane = 0; lane < sftl->geo->lanes; lane++) {
+			ret = sftl->ppn->ops->read_page(sftl->ppn->priv, lane & 1, lane >> 1,
+							block, 0, true, sftl->page,
+							sftl->oob, &status);
+			if (ret)
+				return ret;
+			/* Some nonmembers report 45 at the bootstrap coordinate. Once
+			 * discovered, every actual member is reread with strict status.
+			 */
+			if (status == 0x45)
+				continue;
+			if (status != 0x40 && status != 0x49)
+				return -EIO;
+			if (status == 0x40 && get_unaligned_le32(sftl->oob) == 0x00ffff20)
+				break;
+			if (!sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE) ||
+			    !sftl_erased(sftl->oob, sizeof(sftl->oob)))
+				return -EBADMSG;
+		}
+		if (lane < sftl->geo->lanes)
 			break;
-		if (!sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE) ||
-		    !sftl_erased(sftl->oob, sizeof(sftl->oob)))
-			return -EBADMSG;
 	}
-	if (lane == sftl->geo->lanes)
+	if (seed == sftl->geo->nr_bootstrap)
 		return -EBADMSG;
 	for (i = 0; i < 8; i++) {
 		const u8 *row = sftl->page + 0x100 + 4 * i;
@@ -476,9 +506,9 @@ static int sftl_vfl_members(struct apple_sftl *sftl)
 				return -EBADMSG;
 		__set_bit(members[i].block, sftl->vfl_reserved);
 	}
-	if (lane) {
+	if (lane || seed) {
 		for (i = 0; i < 8; i++)
-			if (members[i].lane == lane && members[i].block == sftl->geo->bootstrap)
+			if (members[i].lane == lane && members[i].block == block)
 				return 0;
 		return -EBADMSG;
 	}
@@ -1421,10 +1451,28 @@ static int sftl_footer(struct apple_sftl *sftl, const u8 *head, u32 block,
 				goto out;
 		}
 	}
-	if (terminated && position == pages * 4 - chunks)
-		ret = sftl_remember_user_seq(sftl, block, footer, index / SFTL_META);
-	else
+	if (!terminated || position != pages * 4 - chunks) {
 		ret = -EBADMSG;
+		goto out;
+	}
+	/* 12H321 summaries can count their own chunks after the last run. The
+	 * sequences belong to the summary and to no record of another block.
+	 */
+	if (sftl->geo->summary_sequences && span == relative_end + chunks) {
+		u32 address = block * sftl_stride(sftl) + pages * 4 - chunks, k;
+
+		for (k = 0; k < chunks; k++) {
+			u64 sequence = base + relative_end + k;
+
+			if (sequence <= sftl->checkpoint_sequence)
+				continue;
+			ret = sftl_record_add(journal, (u64)0x1c << 56 | sequence, U32_MAX,
+					      address + k);
+			if (ret)
+				goto out;
+		}
+	}
+	ret = sftl_remember_user_seq(sftl, block, footer, index / SFTL_META);
 out:
 	kfree(footer);
 	return ret;
@@ -1567,7 +1615,9 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads, struct sftl_re
 		ret = -EBADMSG;
 		if (sequence != expected++)
 			goto out;
-		if (sftl_kind(record) == 0x1f)
+		/* Context and summary chunks, and padding, map nothing. */
+		if (sftl_kind(record) == 0x1f || sftl_kind(record) == 0x1c ||
+		    record->key == SFTL_PAD)
 			continue;
 		if (sftl_kind(record) == 2 && record->key == SFTL_TRIM) {
 			const u8 *payload;

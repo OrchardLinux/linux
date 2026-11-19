@@ -745,9 +745,10 @@ static int h2fmi_register_sftl(struct h2fmi *fmi)
 		.pages = g->pages,
 	};
 
-	/* This recovery implementation supports the measured 64 GB profile. */
-	if (!IS_ENABLED(CONFIG_MTD_APPLE_SFTL) || g->caus != 8 ||
-	    g->blocks != 2088 || g->pages != 128 || g->slc_pages != 64)
+	/* The recovery supports the measured 64 GB and 16 GB profiles. */
+	if (!IS_ENABLED(CONFIG_MTD_APPLE_SFTL) ||
+	    !((g->caus == 8 && g->blocks == 2088 && g->pages == 128 && g->slc_pages == 64) ||
+	      (g->caus == 2 && g->blocks == 1064 && g->pages == 256 && g->slc_pages == 128)))
 		return 0;
 	fmi->ppn_ops.read_page = h2fmi_ppn_read;
 	fmi->ppn_ops.program_page = h2fmi_ppn_program;

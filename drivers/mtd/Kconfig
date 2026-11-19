@@ -211,8 +211,9 @@ config MTD_APPLE_SFTL
 	depends on BLOCK
 	help
 	  Recover the logical block medium stored in Apple VFL/SwissPPNFTL
-	  metadata on the measured 64 GB Hynix PPN layout. The H2FMI driver
-	  supplies canonical page reads through its aggregate PPN provider.
+	  metadata on the measured 64 GB and 16 GB Hynix PPN layouts. The
+	  H2FMI driver supplies canonical page reads through its aggregate PPN
+	  provider. The 16 GB layout is read-only.
 	  Recovery can expose a complete older generation read-only after an
 	  interrupted native save. Unsupported geometry, conflicting replicas
 	  and unaccounted journal gaps stop recovery.

@@ -11,9 +11,20 @@ address view. The controller serializes each complete transaction.
 Supported format
 ----------------
 
-This implementation supports the measured 64 GB Hynix PPN profile with two
-buses and eight CAUs per bus. Each CAU has 2,088 blocks of 128 pages. Profile
-selection uses discovered geometry. Other layouts return ``-EOPNOTSUPP``.
+This implementation supports two measured Hynix PPN profiles, each with two
+buses. The 64 GB package has eight CAUs per bus, each with 2,088 blocks of 128
+pages, and carries 13G36 (iOS 9.3.5) storage. The 16 GB package has two CAUs
+per bus, each with 1,064 blocks of 256 pages, and carries 12H321 (iOS 8.4.1)
+storage; its lanes are ordered (bus 0, CAU 0), (bus 1, CAU 0), (bus 0, CAU 1),
+(bus 1, CAU 1). Profile selection uses discovered geometry. Other layouts
+return ``-EOPNOTSUPP``. The 16 GB profile is read-only: its writer,
+reclamation and checkpoint formats are not modelled.
+
+The 16 GB profile seeds the VFL member list from page zero of block 1063 or,
+when that bank is erased, block 1062. Its contexts have 1,055 superblocks and
+at least 32 range records in multiples of 16. Its summaries are 4 or 8 chunks
+and can count their own chunks in the sequence span; replay accounts for
+those sequences. On both profiles, padding records map nothing.
 
 Recovery selects four agreeing VFL checkpoint copies and checks each
 replicated lane table. A VFL superblock has an 8,192-unit address stride;
@@ -27,9 +38,10 @@ Open blocks are scanned completely because an interrupted stripe may leave an
 erased lane before another completed lane. Summary allocation spans also
 preserve the next sequence floor when it exceeds the last visible record.
 
-The map has 15,625,016 entries, including sixteen internal keys. The block
-device exposes 15,625,000 entries, or 64,000,000,000 bytes, with 512-byte
-sector reads and optional read-modify-write sector updates. Linux's disk name
+The 64 GB map has 15,625,016 entries, including sixteen internal keys. The
+block device exposes 15,625,000 entries, or 64,000,000,000 bytes; on the 16 GB
+profile 3,906,266 and 3,906,250 entries, or 16,000,000,000 bytes. The disk has
+512-byte sector reads and optional read-modify-write sector updates. Linux's disk name
 is ``applesftlN``. LwVM and filesystem interpretation happen above this
 logical provider. Encrypted partition contents remain ciphertext.
 

@@ -3119,6 +3119,356 @@ static void sftl_test_gc_preserves_last_sequences(struct kunit *test)
 	apple_sftl_checkpoint_free(f->checkpoint);
 }
 
+/*
+ * Synthetic 16 GB medium: two CAUs per bus, 1064 blocks of 256 pages, four
+ * lanes, 1055 superblocks of 4096 slots. No captured device bytes.
+ */
+#define T16_LANES		4U
+#define T16_PAGES		256U
+#define T16_BLOCKS		1064U
+#define T16_SUBBLOCKS		1055U
+#define T16_STRIDE		(T16_LANES * T16_PAGES * 4)
+#define T16_LPAGES		3906266U
+#define T16_DISK		3906250U
+#define T16_UNMAPPED		0x7fffffU
+#define T16_CONTEXT		1U
+#define T16_CONTEXT_BASE	1000000ULL
+#define T16_RECORDS		56U	/* 24 fixed, 32 range records */
+#define T16_OLD			2U	/* closed before the checkpoint */
+#define T16_OLD_BASE		100ULL
+#define T16_NEW			5U	/* closed after it, lane 2 retired */
+#define T16_NEW_LBA		2000U
+#define T16_NEW_RUN		10U
+#define T16_SUMMARY		4U
+
+struct t16_fixture {
+	struct apple_ppn provider;
+	struct apple_ppn_ops ops;
+	u16 vfl_block;		/* bank holding the VFL; the other is erased */
+	u16 range_records;	/* range records in the context */
+	bool summary_own_span;	/* the new block's span counts its summary */
+	bool new_block;
+};
+
+static unsigned int t16_lanes(u32 block)
+{
+	return block == T16_NEW ? 3 : T16_LANES;
+}
+
+static u16 t16_usage(unsigned int lane, u32 block)
+{
+	if (!block)
+		return 0xb002;
+	if (block == T16_NEW && lane == 2)
+		return 0xbffe;
+	if (block >= 1062)
+		return 0xbff1;
+	if (block >= T16_SUBBLOCKS)
+		return 0xb003;
+	return 0;
+}
+
+static void t16_meta(u8 *meta, u8 kind, u8 flags, u64 sequence, u32 key, u32 high)
+{
+	put_unaligned_le64(sequence << 16 | (u16)flags << 8 | kind, meta);
+	put_unaligned_le32(key, meta + 8);
+	put_unaligned_le32(high, meta + 12);
+}
+
+/* The VFL bank: header at page 0, lane tables at 1..4, the checkpoint at 5. */
+static int t16_vfl(struct t16_fixture *f, unsigned int lane, u32 block,
+		   unsigned int page, u8 *data, u8 *oob, u8 *status)
+{
+	u16 group = block == 1063 ? 0 : 1;
+	unsigned int i;
+
+	if (block != f->vfl_block || page > T16_LANES + 1)
+		return 0;
+	*status = 0x40;
+	memset(data, 0, APPLE_PPN_PAGE_SIZE);
+	memset(oob, 0, APPLE_PPN_OOB_SIZE);
+	oob[0] = 0x20;
+	put_unaligned_le32(0xfffffff0 - page, oob + 4);
+	if (!page || page == T16_LANES + 1) {
+		oob[1] = 0xff;
+		oob[2] = 0xff;
+		put_unaligned_le32(U32_MAX, data);
+		put_unaligned_le32(T16_DISK, data + 4);
+		put_unaligned_le32(0x100000, data + 8);
+		put_unaligned_le16(T16_SUBBLOCKS, data + 12);
+		put_unaligned_le16(T16_SUBBLOCKS, data + 14);
+		for (i = 0; i < 8; i++) {
+			put_unaligned_le16(i < 4 ? 1063 : 1062, data + 0x100 + 4 * i);
+			data[0x100 + 4 * i + 2] = i % 4;
+		}
+		for (i = 0; i < T16_LANES; i++)
+			put_unaligned_le16(group << 15 | (i + 1), data + 0x200 + 32 * i);
+		return 0;
+	}
+	oob[1] = page - 1;
+	for (i = 0; i < T16_BLOCKS; i++)
+		put_unaligned_le16(t16_usage(page - 1, i), data + 2 * i);
+	memset(data + 2 * T16_BLOCKS, 0xff, APPLE_PPN_PAGE_SIZE - 2 * T16_BLOCKS);
+	return 0;
+}
+
+static void t16_context_record(struct t16_fixture *f, u32 index, u8 *payload, u8 *meta)
+{
+	static const struct {
+		u8 subtype, records;
+		u16 entries;
+	} groups[] = { { 1, 4, 0 }, { 2, 4, 0 }, { 3, 4, 512 }, { 5, 8, 256 }, { 6, 4, 1024 } };
+	u32 i, first = 0, start = 0, entries = 0;
+	u8 subtype = 4;
+
+	memset(payload, 0, 4096);
+	for (i = 0; i < ARRAY_SIZE(groups); first += groups[i++].records) {
+		if (index >= first + groups[i].records)
+			continue;
+		subtype = groups[i].subtype;
+		start = (index - first) * groups[i].entries;
+		entries = start >= T16_SUBBLOCKS ? 0 :
+			  min_t(u32, groups[i].entries, T16_SUBBLOCKS - start);
+		break;
+	}
+	t16_meta(meta, 0x1f, subtype, T16_CONTEXT_BASE + index, 0, U32_MAX);
+	put_unaligned_le16(start, meta + 8);
+	put_unaligned_le16(entries, meta + 10);
+	if (index == 0) {
+		put_unaligned_le32(1, payload);
+		put_unaligned_le32(T16_CONTEXT, payload + 4);
+	} else if (index == 3) {
+		put_unaligned_le32(T16_SUBBLOCKS, payload + 4096 - 4);
+	} else if (subtype == 3) {
+		for (i = 0; i < entries; i++) {
+			u32 block = start + i;
+
+			payload[8 * i] = block == T16_CONTEXT ? 7 : block == T16_OLD ? 3 :
+					 block == 0 ? 8 : 9;
+			if (block == T16_OLD)
+				put_unaligned_le16(1024, payload + 8 * i + 2);
+		}
+	} else if (subtype == 4 && index == 24) {
+		/* LBAs 0..1023 live in the old block; the rest is unmapped. */
+		put_unaligned_le32(0, payload);
+		put_unaligned_le32(0xfffffff0, payload + 4);
+		put_unaligned_le32(T16_OLD * T16_STRIDE, payload + 8);
+		put_unaligned_le32(1024, payload + 12);
+		put_unaligned_le32(T16_UNMAPPED, payload + 16);
+		put_unaligned_le32(T16_LPAGES - 1024, payload + 20);
+		put_unaligned_le32(U32_MAX, payload + 24);
+	} else if (subtype == 4) {
+		memset(payload, 0xff, 8);
+	}
+}
+
+static u32 t16_new_slots(void)
+{
+	return 3 * T16_PAGES * 4 - T16_SUMMARY;
+}
+
+/* Address slot -> contents of the old, new and context blocks. */
+static void t16_slot(struct t16_fixture *f, u32 block, u32 slot, u8 *payload, u8 *meta)
+{
+	u32 slots = t16_lanes(block) * T16_PAGES * 4;
+
+	memset(payload, 0xff, 4096);
+	memset(meta, 0xff, 16);
+	if (block == T16_CONTEXT) {
+		if (slot < 24 + f->range_records)
+			t16_context_record(f, slot, payload, meta);
+		return;
+	}
+	if (block == T16_OLD) {
+		if (slot >= slots - T16_SUMMARY) {
+			t16_meta(meta, 0x1c, T16_SUMMARY << 1, T16_OLD_BASE,
+				 slots - T16_SUMMARY, 0);
+			put_unaligned_le16(T16_SUMMARY, meta + 12);
+			put_unaligned_le16(0xffff, meta + 14);
+			memset(payload, 0, 4096);
+			if (slot == slots - T16_SUMMARY) {
+				put_unaligned_le32(0, payload);
+				put_unaligned_le32(0, payload + 4);
+				put_unaligned_le32(0, payload + 8);
+				put_unaligned_le32(slots - T16_SUMMARY, payload + 12);
+			}
+			return;
+		}
+		memset(payload, 'o' + slot % 7, 4096);
+		put_unaligned_le32(slot, payload);
+		t16_meta(meta, 1, 0, T16_OLD_BASE + slot, slot, 0);
+		return;
+	}
+	if (block == T16_NEW && f->new_block) {
+		u64 base = T16_CONTEXT_BASE + 24 + f->range_records;
+
+		if (slot >= t16_new_slots()) {
+			u32 index = slot - t16_new_slots();
+
+			t16_meta(meta, 0x1c, T16_SUMMARY << 1, base,
+				 t16_new_slots() + (f->summary_own_span ? T16_SUMMARY : 0), 0);
+			put_unaligned_le16(T16_SUMMARY, meta + 12);
+			put_unaligned_le16(0xffff, meta + 14);
+			memset(payload, 0, 4096);
+			if (!index) {
+				/* One data run, then padding up to the summary. */
+				put_unaligned_le32(0, payload);
+				put_unaligned_le32(base >> 16, payload + 4);
+				put_unaligned_le32(T16_NEW_LBA, payload + 8);
+				put_unaligned_le32(T16_NEW_RUN, payload + 12);
+				put_unaligned_le32(T16_NEW_RUN, payload + 16);
+				put_unaligned_le32(base >> 16, payload + 20);
+				put_unaligned_le32(0xffff0000, payload + 24);
+				put_unaligned_le32(t16_new_slots() - T16_NEW_RUN, payload + 28);
+			}
+			return;
+		}
+		if (slot < T16_NEW_RUN) {
+			memset(payload, 'n', 4096);
+			put_unaligned_le32(T16_NEW_LBA + slot, payload);
+			t16_meta(meta, 1, 0, base + slot, T16_NEW_LBA + slot, (base + slot) >> 16);
+		} else {
+			memset(payload, 0, 4096);
+			t16_meta(meta, 1, 0, base + slot, 0xffff0000, (base + slot) >> 16);
+		}
+	}
+}
+
+static int t16_read_page(void *priv, unsigned int bus, unsigned int cau,
+			 unsigned int block, unsigned int page, bool context,
+			 u8 *data, u8 *oob, u8 *status)
+{
+	struct t16_fixture *f = priv;
+	unsigned int lane = cau * 2 + bus, width, index, chunk, i;
+
+	if (bus >= 2 || cau >= 2 || block >= T16_BLOCKS ||
+	    page >= (context ? T16_PAGES / 2 : T16_PAGES))
+		return -EINVAL;
+	memset(data, 0xff, APPLE_PPN_PAGE_SIZE);
+	memset(oob, 0xff, APPLE_PPN_OOB_SIZE);
+	*status = 0x49;
+	if (context)
+		return t16_vfl(f, lane, block, page, data, oob, status);
+	if (block >= T16_SUBBLOCKS || t16_usage(lane, block))
+		return 0;
+	width = t16_lanes(block);
+	/* Lanes of the superblock in order, the retired lane skipped. */
+	for (index = 0, i = 0; i < lane; i++)
+		if (!t16_usage(i, block))
+			index++;
+	for (chunk = 0; chunk < 4; chunk++)
+		t16_slot(f, block, (page * width + index) * 4 + chunk,
+			 data + chunk * 4096, oob + chunk * 16);
+	if (memchr_inv(oob, 0xff, APPLE_PPN_OOB_SIZE))
+		*status = 0x40;
+	return 0;
+}
+
+static struct t16_fixture *t16_fixture(struct kunit *test)
+{
+	struct t16_fixture *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+
+	if (!f)
+		return NULL;
+	f->ops.read_page = t16_read_page;
+	f->provider = (struct apple_ppn) {
+		.ops = &f->ops, .priv = f, .buses = 2, .caus = 2,
+		.blocks = T16_BLOCKS, .pages = T16_PAGES,
+	};
+	f->vfl_block = 1063;
+	f->range_records = 32;
+	f->new_block = true;
+	f->summary_own_span = true;
+	return f;
+}
+
+static void t16_expect_page(struct kunit *test, struct apple_sftl *sftl, u32 lba,
+			    u8 fill, u32 first_word)
+{
+	u8 *data = kunit_kmalloc(test, 4096, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, lba, data), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(data), first_word);
+	KUNIT_EXPECT_EQ(test, data[4], fill);
+	KUNIT_EXPECT_EQ(test, data[4095], fill);
+}
+
+/* The reader registers on the 16 GB layout, read-only, through a summary
+ * that counts its own chunks and a padded run, and exposes 16 GB.
+ */
+static void sftl_test_16gb_medium(struct kunit *test)
+{
+	struct t16_fixture *f = t16_fixture(test);
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
+	u8 *data = kunit_kmalloc(test, 4096, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_TRUE(test, info.read_only);
+	KUNIT_EXPECT_EQ(test, info.disk_pages, T16_DISK);
+	KUNIT_EXPECT_EQ(test, info.logical_pages, T16_LPAGES);
+	KUNIT_EXPECT_EQ(test, info.checkpoint_sequence, T16_CONTEXT_BASE + T16_RECORDS - 1);
+	KUNIT_EXPECT_EQ(test, info.journal_sequence,
+			T16_CONTEXT_BASE + T16_RECORDS + t16_new_slots() + T16_SUMMARY - 1);
+	t16_expect_page(test, sftl, 0, 'o', 0);
+	t16_expect_page(test, sftl, 1023, 'o' + 1023 % 7, 1023);
+	t16_expect_page(test, sftl, T16_NEW_LBA + 3, 'n', T16_NEW_LBA + 3);
+	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 1500, data), 0);
+	KUNIT_EXPECT_TRUE(test, !memchr_inv(data, 0, 4096));
+	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, T16_LPAGES - 1, data), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_read(sftl, T16_LPAGES, data), -EINVAL);
+	memset(data, 'w', 4096);
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, 0, data, 1), -EROFS);
+	t16_expect_page(test, sftl, 0, 'o', 0);
+	apple_sftl_free(sftl);
+}
+
+/* When bank 1063 is erased, the member list comes from bank 1062. */
+static void sftl_test_16gb_second_bootstrap(struct kunit *test)
+{
+	struct t16_fixture *f = t16_fixture(test);
+	struct apple_sftl *sftl = NULL;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->vfl_block = 1062;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	t16_expect_page(test, sftl, T16_NEW_LBA, 'n', T16_NEW_LBA);
+	apple_sftl_free(sftl);
+	f->vfl_block = 0;
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+	KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+}
+
+/* 12H321 range records come in multiples of 16; a summary span that counts
+ * its own chunks is accounted only when exactly those chunks are missing.
+ */
+static void sftl_test_16gb_context_rules(struct kunit *test)
+{
+	struct t16_fixture *f = t16_fixture(test);
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->range_records = 48;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_free(sftl);
+	/* A context cut inside its range records leaves no generation. */
+	f->range_records = 40;
+	KUNIT_EXPECT_LT(test, apple_sftl_load(&f->provider, &sftl), 0);
+	f->range_records = 32;
+	/* Without the summary's own span the sequence ends at the last pad. */
+	f->summary_own_span = false;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.journal_sequence,
+			T16_CONTEXT_BASE + T16_RECORDS + t16_new_slots() - 1);
+	apple_sftl_free(sftl);
+}
+
 static struct kunit_case apple_sftl_cases[] = {
 	KUNIT_CASE(sftl_test_rotate_mounted),
 	KUNIT_CASE(sftl_test_vfl_rotation_cuts),
@@ -3173,6 +3523,9 @@ static struct kunit_case apple_sftl_cases[] = {
 	KUNIT_CASE(sftl_test_preserve_footer_allocation_floor),
 	KUNIT_CASE(sftl_test_reject_other_geometry),
 	KUNIT_CASE(sftl_test_reject_inactive_lane_gap),
+	KUNIT_CASE(sftl_test_16gb_medium),
+	KUNIT_CASE(sftl_test_16gb_second_bootstrap),
+	KUNIT_CASE(sftl_test_16gb_context_rules),
 	{}
 };
 
