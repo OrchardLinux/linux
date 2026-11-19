@@ -25,7 +25,8 @@
  *
  * Pages are read and programmed whole, data and metadata together.  The
  * raw MTD devices provide no erase. A page is only programmed when it
- * reads back erased, and every program is read back and compared.
+ * reads back erased, and every program is read back and compared.  After a
+ * failed transaction the packages are reset before the next one.
  * Logical-address translation and allocation belong to the FTL above.
  */
 
@@ -116,6 +117,9 @@ struct h2fmi_bus {
 	bool failed;		/* block further I/O in this driver instance */
 };
 
+/* Resets after failed transactions in one driver instance. */
+#define H2FMI_MAX_RESETS	8
+
 struct h2fmi_die {
 	struct h2fmi *fmi;
 	u8 bus;
@@ -135,6 +139,8 @@ struct h2fmi {
 	struct platform_device *sftl;
 	struct apple_ppn_ops ppn_ops;
 	struct apple_ppn_access access;
+	bool reset_needed;	/* a transaction failed; reset before the next */
+	unsigned int resets;
 };
 
 /*
@@ -573,8 +579,9 @@ static int h2fmi_sdr_id(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *id)
  * parameters, the asynchronous power state on each CE once both are reset
  * (without it every array read fails), the working timing, the firmware
  * version and every CAU's bad-block table. Caller holds both bus locks.
+ * After a failure, expect is the geometry already in use.
  */
-static int h2fmi_sdr_bringup(struct h2fmi *fmi)
+static int h2fmi_sdr_bringup(struct h2fmi *fmi, const struct h2fmi_geometry *expect)
 {
 	struct h2fmi_geometry g;
 	u8 id[H2FMI_ID_SIZE], firmware[H2FMI_FIRMWARE_SIZE];
@@ -615,6 +622,9 @@ static int h2fmi_sdr_bringup(struct h2fmi *fmi)
 		ret = h2fmi_parse_geometry(fmi->bus[0].page, H2FMI_PARAMS_SIZE, &g);
 	if (ret)
 		return ret;
+	/* After a failure, the parameters must describe the package in use. */
+	if (expect && memcmp(expect, &g, sizeof(g)))
+		return -ENODEV;
 	for (i = 0; i < H2FMI_BUSES; i++) {
 		ret = h2fmi_sdr_set(fmi, &fmi->bus[i], H2FMI_FEATURE_POWER, H2FMI_POWER_ASYNC);
 		if (ret) {
@@ -643,6 +653,55 @@ static int h2fmi_sdr_bringup(struct h2fmi *fmi)
 		}
 	dev_info(fmi->dev, "PPN %*ph, firmware %*pE, SDR\n", H2FMI_ID_SIZE, id,
 		 H2FMI_FIRMWARE_SIZE, firmware);
+	return 0;
+}
+
+/*
+ * A failed transaction leaves the package state unknown. iBEC and Cascadia
+ * recover by resetting the packages and running the bring-up again; the
+ * failed operation itself is still reported. Caller holds b->lock.
+ */
+static void h2fmi_fail(struct h2fmi *fmi)
+{
+	WRITE_ONCE(fmi->reset_needed, true);
+}
+
+static int h2fmi_recover(struct h2fmi *fmi)
+{
+	unsigned int i;
+	int ret = 0;
+
+	mutex_lock(&fmi->bus[0].lock);
+	mutex_lock_nested(&fmi->bus[1].lock, SINGLE_DEPTH_NESTING);
+	if (fmi->bus[0].failed || fmi->bus[1].failed) {
+		ret = -EIO;
+	} else if (fmi->reset_needed) {
+		ret = fmi->resets++ < H2FMI_MAX_RESETS ?
+		      h2fmi_sdr_bringup(fmi, &fmi->bus[0].geometry) : -EIO;
+		for (i = 0; ret && i < H2FMI_BUSES; i++)
+			fmi->bus[i].failed = true;
+		if (ret)
+			dev_err(fmi->dev, "PPN reset %u failed (%d), stopping\n", fmi->resets, ret);
+		else
+			dev_warn(fmi->dev, "PPN packages reset after a failed transaction (%u)\n",
+				 fmi->resets);
+		fmi->reset_needed = false;
+	}
+	mutex_unlock(&fmi->bus[1].lock);
+	mutex_unlock(&fmi->bus[0].lock);
+	return ret;
+}
+
+/* Take a bus for one transaction, resetting the packages first if needed. */
+static int h2fmi_lock(struct h2fmi *fmi, struct h2fmi_bus *b)
+{
+	if (READ_ONCE(fmi->reset_needed)) {
+		int ret = h2fmi_recover(fmi);
+
+		if (ret)
+			return ret;
+	}
+	mutex_lock(&b->lock);
 	return 0;
 }
 
@@ -702,7 +761,7 @@ static int h2fmi_read_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 	if (b->sdr) {
 		ret = h2fmi_sdr_read(fmi, b, op, address, buffer, length, status);
 		if (ret)
-			b->failed = true;
+			h2fmi_fail(fmi);
 		return ret;
 	}
 	on = readl(b->fmc + FMC_ON);
@@ -729,7 +788,7 @@ static int h2fmi_read_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 	writel(0, b->fmc + FMC_CE_CTRL);
 	h2fmi_device_reset(b, on, if_ctrl);
 	if (ret || end_ret) {
-		b->failed = true;
+		h2fmi_fail(fmi);
 		return ret ? ret : end_ret;
 	}
 	return 0;
@@ -832,7 +891,7 @@ static int h2fmi_write_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *status
 	return h2fmi_poll_status(fmi, b, status);
 }
 
-/* Caller holds the bus lock. A failed mutation permanently stops this bus. */
+/* Caller holds the bus lock. A failed mutation resets the packages first. */
 static int h2fmi_program_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 				     u32 row, const u8 *raw)
 {
@@ -884,7 +943,7 @@ static int h2fmi_program_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 	h2fmi_device_reset(b, on, if_ctrl);
 done:
 	if (ret) {
-		b->failed = true;
+		h2fmi_fail(fmi);
 		dev_err(fmi->dev, "PPN program row %08x: status %02x, error %d\n",
 			row, status, ret);
 	}
@@ -928,7 +987,11 @@ static int h2fmi_program_page(struct h2fmi *fmi, struct h2fmi_bus *b,
 	if (!expected)
 		return -ENOMEM;
 	h2fmi_join_page(expected, data, oob);
-	mutex_lock(&b->lock);
+	ret = h2fmi_lock(fmi, b);
+	if (ret) {
+		kfree(expected);
+		return ret;
+	}
 	ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row, 4,
 				     b->page, H2FMI_PAGE_RAW, &status);
 	if (ret)
@@ -944,7 +1007,7 @@ static int h2fmi_program_page(struct h2fmi *fmi, struct h2fmi_bus *b,
 				     b->page, H2FMI_PAGE_RAW, &status);
 	if (ret || status != PPN_ST_GOOD ||
 	    memcmp(b->page, expected, H2FMI_PAGE_RAW)) {
-		b->failed = true;
+		h2fmi_fail(fmi);
 		ret = ret ? ret : -EIO;
 		dev_err(fmi->dev, "PPN readback row %08x: status %02x, error %d\n",
 			row, status, ret);
@@ -1007,7 +1070,9 @@ static int h2fmi_read_page_at(struct mtd_info *mtd, loff_t from,
 	if (ret)
 		return ret;
 
-	mutex_lock(&b->lock);
+	ret = h2fmi_lock(fmi, b);
+	if (ret)
+		return ret;
 	/* Supported PPN 1.5 packages require four row cycles, even when the
 	 * fourth byte is zero. This is independent of the geometry's width.
 	 */
@@ -1049,7 +1114,9 @@ static int h2fmi_ppn_read(void *priv, unsigned int bus, unsigned int cau,
 	/* Retired pages have no data phase. Never return a stale page buffer. */
 	memset(data, 0, H2FMI_PAGE_DATA);
 	memset(oob, 0, H2FMI_PAGE_OOB);
-	mutex_lock(&b->lock);
+	ret = h2fmi_lock(fmi, b);
+	if (ret)
+		return ret;
 	ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row, 4,
 				     b->page, H2FMI_PAGE_RAW, status);
 	if (!ret && h2fmi_page_status(*status) >= 0) {
@@ -1147,7 +1214,9 @@ static int h2fmi_ppn_erase(void *priv, unsigned int bus, unsigned int cau,
 	if (ret)
 		return ret;
 
-	mutex_lock(&b->lock);
+	ret = h2fmi_lock(fmi, b);
+	if (ret)
+		return ret;
 	ret = h2fmi_erase_transaction(fmi, b, row);
 	for (page = 0; !ret && page < b->geometry.pages; page++) {
 		ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row + page, 4,
@@ -1159,7 +1228,7 @@ static int h2fmi_ppn_erase(void *priv, unsigned int bus, unsigned int cau,
 		}
 	}
 	if (ret)
-		b->failed = true;
+		h2fmi_fail(fmi);
 	mutex_unlock(&b->lock);
 	return ret;
 }
@@ -1421,7 +1490,7 @@ static int h2fmi_probe(struct platform_device *pdev)
 	    readl(fmi->bus[1].fmc + FMC_ON) != FMC_ON_DDR) {
 		mutex_lock(&fmi->bus[0].lock);
 		mutex_lock_nested(&fmi->bus[1].lock, SINGLE_DEPTH_NESTING);
-		ret = h2fmi_sdr_bringup(fmi);
+		ret = h2fmi_sdr_bringup(fmi, NULL);
 		mutex_unlock(&fmi->bus[1].lock);
 		mutex_unlock(&fmi->bus[0].lock);
 		if (ret)
