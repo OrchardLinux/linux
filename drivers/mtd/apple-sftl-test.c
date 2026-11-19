@@ -1203,7 +1203,10 @@ static void sftl_test_append_interrupted_footer_replays(struct kunit *test)
 	}
 }
 
-static void sftl_test_append_torn_metadata_rejected(struct kunit *test)
+/* A torn data page gives its block up and a fresh load skips it. A torn
+ * summary page still stops the writer and the medium is rejected.
+ */
+static void sftl_test_append_torn_metadata(struct kunit *test)
 {
 	static const unsigned int torn[] = {1, 121};
 	unsigned int index;
@@ -1211,6 +1214,7 @@ static void sftl_test_append_torn_metadata_rejected(struct kunit *test)
 	for (index = 0; index < ARRAY_SIZE(torn); index++) {
 		struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
 		struct apple_sftl *sftl = NULL;
+		struct apple_sftl_info info;
 		u8 *data = kunit_kmalloc(test, 16384, GFP_KERNEL);
 
 		KUNIT_ASSERT_NOT_NULL(test, f);
@@ -1220,15 +1224,102 @@ static void sftl_test_append_torn_metadata_rejected(struct kunit *test)
 		memset(data, 'T', 16384);
 		if (torn[index] == 1)
 			KUNIT_EXPECT_EQ(test,
-					apple_sftl_write(sftl, TEST_APPEND_BASE, data, 1), -EIO);
+					apple_sftl_write(sftl, TEST_APPEND_BASE, data, 1), 0);
 		else
 			KUNIT_EXPECT_EQ(test, sftl_test_fill_append(sftl, data), -EIO);
 		apple_sftl_free(sftl);
 		sftl = NULL;
-		KUNIT_EXPECT_LT(test, apple_sftl_load(&f->provider, &sftl), 0);
-		KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+		if (torn[index] != 1) {
+			KUNIT_EXPECT_LT(test, apple_sftl_load(&f->provider, &sftl), 0);
+			KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+			continue;
+		}
+		/* The torn page's sequences are a hole the load accounts. */
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		apple_sftl_get_info(sftl, &info);
+		KUNIT_EXPECT_FALSE(test, info.read_only);
+		KUNIT_EXPECT_EQ(test, info.journal_sequence, TEST_APPEND_FIRST + 7);
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE, data), 0);
+		sftl_test_expect_fill(test, data, 'T');
 		apple_sftl_free(sftl);
 	}
+}
+
+static void sftl_test_torn_page(struct sftl_fixture *f, unsigned int page)
+{
+	struct sftl_test_page *torn = kunit_kmalloc(f->test, sizeof(*torn), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(f->test, torn);
+	memset(torn->data, 0x3c, sizeof(torn->data));
+	memset(torn->oob, 0x5a, sizeof(torn->oob));
+	KUNIT_ASSERT_EQ(f->test, sftl_test_program_page(f, 0, 0, 5, page, torn->data, torn->oob), 0);
+}
+
+/* Cascadia's give_up_torn: something else cut a program short (its
+ * 2026-11-16 incident). The load keeps the open block read-write, the
+ * first write moves its live pages out, and later loads skip the page.
+ */
+static void sftl_test_torn_page_at_load(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
+	u8 *data = kunit_kmalloc(test, 16384, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	for (i = 0; i < 2; i++) {
+		memset(data, 'p' + i, 16384);
+		KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + i * 4, data, 4), 0);
+	}
+	apple_sftl_free(sftl);
+	sftl = NULL;
+	sftl_test_torn_page(f, 2);
+
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_FALSE(test, info.read_only);
+	KUNIT_EXPECT_EQ(test, info.journal_sequence, TEST_APPEND_FIRST + 11);
+	KUNIT_EXPECT_EQ(test, info.sequence, TEST_APPEND_FIRST + 11);
+	memset(data, 'q', 16384);
+	KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 8, data, 4), 0);
+	/* Two moved pages and the new one land in the next block. */
+	KUNIT_EXPECT_NOT_NULL(test, sftl_test_written(f, 1, 0, 2));
+	KUNIT_EXPECT_NULL(test, sftl_test_written(f, 1, 0, 3));
+	KUNIT_EXPECT_NULL(test, sftl_test_written(f, 0, 0, 3));
+	apple_sftl_free(sftl);
+	sftl = NULL;
+
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.journal_sequence, TEST_APPEND_FIRST + 23);
+	for (i = 0; i < 12; i++) {
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE + i, data), 0);
+		sftl_test_expect_fill(test, data, i < 8 ? 'p' + i / 4 : 'q');
+	}
+	apple_sftl_free(sftl);
+}
+
+/* Only the last programmed page of an open block may be torn. */
+static void sftl_test_torn_page_not_last(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct apple_sftl *sftl = NULL;
+	u8 *data = kunit_kmalloc(test, 4096, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	memset(data, 'n', 4096);
+	KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE, data, 1), 0);
+	apple_sftl_free(sftl);
+	sftl = NULL;
+	sftl_test_torn_page(f, 1);
+	sftl_test_torn_page(f, 2);
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+	KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
 }
 
 static void sftl_test_append_scans_entire_candidate(struct kunit *test)
@@ -3159,9 +3250,13 @@ static void sftl_test_gc_relocation_stops_before_erase(struct kunit *test)
 		sftl_test_gc_relocated_data(test, sftl, data, 0);
 		apple_sftl_free(sftl);
 		if (modes[mode].copy_error) {
-			struct sftl_test_page *page = sftl_test_written(f, 1, 0, 1);
+			/* A malformed last page is skipped as torn; a malformed
+			 * page before a valid one is still rejected.
+			 */
+			struct sftl_test_page *page = sftl_test_written(f, 1, 0, 0);
 
 			KUNIT_ASSERT_NOT_NULL(test, page);
+			KUNIT_ASSERT_NOT_NULL(test, sftl_test_written(f, 1, 0, 1));
 			put_unaligned_le32(3, page->oob + 12);
 			KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
 			apple_sftl_free(sftl);
@@ -3588,7 +3683,9 @@ static struct kunit_case apple_sftl_cases[] = {
 	KUNIT_CASE(sftl_test_append_failures_exhaust_blocks),
 	KUNIT_CASE(sftl_test_append_uncertain_program_replays),
 	KUNIT_CASE(sftl_test_append_interrupted_footer_replays),
-	KUNIT_CASE(sftl_test_append_torn_metadata_rejected),
+	KUNIT_CASE(sftl_test_append_torn_metadata),
+	KUNIT_CASE(sftl_test_torn_page_at_load),
+	KUNIT_CASE(sftl_test_torn_page_not_last),
 	KUNIT_CASE(sftl_test_append_scans_entire_candidate),
 	KUNIT_CASE(sftl_test_append_reserves_vfl_members),
 	KUNIT_CASE(sftl_test_append_closes_at_sequence_limit),

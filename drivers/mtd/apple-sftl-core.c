@@ -160,6 +160,13 @@ struct apple_sftl {
 	 * data moves to the append point; they are never programmed again.
 	 */
 	DECLARE_BITMAP(abandoned, SFTL_MAX_BLOCKS);
+	/* Open blocks whose last programmed page did not read back at load.
+	 * torn_after holds the sequence before each such page; its four
+	 * sequences may be missing from the journal.
+	 */
+	DECLARE_BITMAP(torn, SFTL_MAX_BLOCKS);
+	u64 torn_after[SFTL_FAIL_MAX];
+	u32 nr_torn;
 	u32 failures;
 	bool evacuate;
 	u8 *stage, *move;	/* the page being appended, a page being moved */
@@ -1339,6 +1346,16 @@ static bool sftl_user_epoch_valid(const struct apple_sftl *sftl, const u8 *meta,
 	return user_epoch == sequence >> 16;
 }
 
+static bool sftl_journal_meta(const struct apple_sftl *sftl, const u8 *meta)
+{
+	u64 sequence = sftl_sequence(meta);
+
+	return sftl_erased(meta, SFTL_META) ||
+		((meta[0] == 1 || meta[0] == 2) &&
+		 sftl_user_epoch_valid(sftl, meta, sequence) &&
+		 (meta[0] == 1 ? meta[1] <= 1 : meta[1] == 0));
+}
+
 static int sftl_add_journal(const struct apple_sftl *sftl, struct sftl_records *journal,
 			    const u8 *meta, u32 address, u64 checkpoint)
 {
@@ -1346,11 +1363,49 @@ static int sftl_add_journal(const struct apple_sftl *sftl, struct sftl_records *
 
 	if (sequence <= checkpoint || sftl_erased(meta, SFTL_META))
 		return 0;
-	if ((meta[0] != 1 && meta[0] != 2) ||
-	    !sftl_user_epoch_valid(sftl, meta, sequence) ||
-	    (meta[0] == 1 ? meta[1] > 1 : meta[1] != 0))
+	if (!sftl_journal_meta(sftl, meta))
 		return -EBADMSG;
 	return sftl_record_add(journal, sftl_stamp(meta), get_unaligned_le32(meta + 8), address);
+}
+
+/*
+ * Cascadia's give_up_torn, at load: a program that failed or was cut off
+ * can leave a page whose metadata is not a record, or an erased status
+ * over programmed bytes. Only the last programmed page of an open block
+ * may be such a page; what it held was never acknowledged or was written
+ * again elsewhere with higher sequences. Remember where its sequences
+ * began. Read errors, refresh and unknown statuses still stop recovery.
+ */
+static int sftl_note_torn(struct apple_sftl *sftl, u32 block, u64 after)
+{
+	if (test_bit(block, sftl->torn) || sftl->nr_torn == SFTL_FAIL_MAX)
+		return -EBADMSG;
+	__set_bit(block, sftl->torn);
+	sftl->torn_after[sftl->nr_torn++] = after;
+	return 0;
+}
+
+/* A torn page's four sequences may be missing after the given sequence. */
+static bool sftl_take_torn(struct apple_sftl *sftl, u64 last)
+{
+	u32 i;
+
+	for (i = 0; i < sftl->nr_torn; i++)
+		if (sftl->torn_after[i] <= last) {
+			sftl->torn_after[i] = U64_MAX;
+			return true;
+		}
+	return false;
+}
+
+/* Read a page of an open block; one retry after a provider error. */
+static int sftl_read_open(struct apple_sftl *sftl, u32 address, unsigned int *chunk)
+{
+	int ret = sftl_read_address(sftl, address, chunk);
+
+	if (ret && ret != -ENOMEM && ret != -ERANGE)
+		ret = sftl_read_address(sftl, address, chunk);
+	return ret;
 }
 
 static int sftl_remember_user_seq(struct apple_sftl *sftl, u32 block, const u8 *footer, u32 runs)
@@ -1546,35 +1601,61 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads, struct sftl_re
 
 	for (block = 1; block < sftl->geo->subblocks; block++) {
 		const u8 *head = heads + block * SFTL_META;
-		bool complete_prefix = true, partial_footer = false;
-		u64 base = sftl_sequence(head), next = base;
+		bool complete_prefix = true, partial_footer = false, torn = false;
+		u64 base = sftl_sequence(head), next = base, last = 0;
 
 		if (head[0] != 1 && head[0] != 2)
 			continue;
 		pages = hweight16(sftl->lanes[block]) * sftl->geo->pages;
-		ret = sftl_read_address(sftl, block * stride + (pages - 1) * 4, &chunk);
-		if (ret)
+		ret = sftl_read_open(sftl, block * stride + (pages - 1) * 4, &chunk);
+		if (ret && ret != -EBADMSG)
 			goto out;
-		if (sftl->oob[0] == 0x1c) {
+		if (!ret && sftl->oob[0] == 0x1c) {
 			ret = sftl_footer(sftl, head, block, pages, journal, &floor);
 			if (ret)
 				goto out;
 			continue;
 		}
-		if (!sftl_erased(sftl->oob, sizeof(sftl->oob)) ||
-		    !sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE)) {
-			ret = -EBADMSG;
-			goto out;
-		}
-		for (position = 0; position < pages; position++) {
-			ret = sftl_read_address(sftl, block * stride + position * 4, &chunk);
-			if (ret)
-				goto out;
-			if (sftl_erased(sftl->oob, sizeof(sftl->oob)) &&
-			    !sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE)) {
+		/* A full block of records needs a summary. A last page that is
+		 * torn is found by the scan below.
+		 */
+		if (!ret && !sftl_erased(sftl->oob, sizeof(sftl->oob))) {
+			for (chunk = 0; chunk < 4; chunk++)
+				if (!sftl_journal_meta(sftl, sftl->oob + chunk * SFTL_META))
+					break;
+			if (chunk == 4) {
 				ret = -EBADMSG;
 				goto out;
 			}
+		}
+		for (position = 0; position < pages; position++) {
+			bool erased, records;
+
+			ret = sftl_read_open(sftl, block * stride + position * 4, &chunk);
+			if (ret && ret != -EBADMSG)
+				goto out;
+			erased = !ret && sftl_erased(sftl->oob, sizeof(sftl->oob));
+			if (erased && !sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE))
+				ret = -EBADMSG;
+			records = !ret && !erased && sftl->oob[0] != 0x1c;
+			for (chunk = 0; records && chunk < 4; chunk++)
+				if (!sftl_journal_meta(sftl, sftl->oob + chunk * SFTL_META))
+					ret = -EBADMSG;
+			/* Nothing may follow a torn page in its block. */
+			if (torn && (ret || !erased)) {
+				ret = -EBADMSG;
+				goto out;
+			}
+			if (ret) {
+				ret = sftl_note_torn(sftl, block, last);
+				if (ret)
+					goto out;
+				torn = true;
+				complete_prefix = false;
+				continue;
+			}
+			for (chunk = 0; records && chunk < 4; chunk++)
+				last = max(last, sftl_sequence(sftl->oob + chunk * SFTL_META));
 			if (position < pages - SFTL_FOOTER_CHUNKS / 4) {
 				for (chunk = 0; chunk < 4; chunk++) {
 					const u8 *meta = sftl->oob + chunk * SFTL_META;
@@ -1624,6 +1705,8 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads, struct sftl_re
 		u64 sequence = record->stamp & SFTL_SEQUENCE;
 
 		ret = -EBADMSG;
+		if (sequence == expected + 4 && sftl_take_torn(sftl, expected - 1))
+			expected = sequence;
 		if (sequence != expected++)
 			goto out;
 		/* Context and summary chunks, and padding, map nothing. */
@@ -1663,6 +1746,9 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads, struct sftl_re
 		sftl->sequence = sequence;
 	}
 	sftl->journal_sequence = expected - 1;
+	/* A torn page after the last record keeps its sequences reserved. */
+	if (sftl_take_torn(sftl, sftl->journal_sequence) && floor <= sftl->journal_sequence + 4)
+		sftl->journal_sequence += 4;
 	sftl->sequence = max(sftl->journal_sequence, floor);
 	ret = 0;
 out:
@@ -1733,14 +1819,17 @@ int apple_sftl_load(struct apple_ppn *provider, struct apple_sftl **out)
 	for (block = 1; block < geo->subblocks; block++) {
 		if (!sftl->lanes[block])
 			continue;
-		ret = sftl_read_address(sftl, block * sftl_stride(sftl), &chunk);
-		if (ret)
+		ret = sftl_read_open(sftl, block * sftl_stride(sftl), &chunk);
+		if (ret && ret != -EBADMSG)
 			goto failed;
+		/* A torn first page is scanned as an open block with no records. */
+		if (ret || (sftl_erased(sftl->oob, sizeof(sftl->oob)) &&
+			    !sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE))) {
+			memset(heads + block * SFTL_META, 0, SFTL_META);
+			heads[block * SFTL_META] = 1;
+			continue;
+		}
 		if (sftl_erased(sftl->oob, sizeof(sftl->oob))) {
-			if (!sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE)) {
-				ret = -EBADMSG;
-				goto failed;
-			}
 			__set_bit(block, sftl->candidates);
 		} else if (sftl->oob[0] == 0x1f || sftl->oob[0] == 1 || sftl->oob[0] == 2) {
 			memcpy(heads + block * SFTL_META, sftl->oob, SFTL_META);
@@ -1850,6 +1939,12 @@ static int sftl_writer_prepare(struct apple_sftl *sftl)
 			__set_bit(block, sftl->used);
 	__set_bit(0, sftl->used);
 	sftl_mark_mapped(sftl, sftl->used);
+	/* Move live data out of torn blocks before the first new write. */
+	for_each_set_bit(block, sftl->torn, sftl->geo->blocks) {
+		__set_bit(block, sftl->used);
+		__set_bit(block, sftl->abandoned);
+		sftl->evacuate = true;
+	}
 	sftl->writer_prepared = true;
 	return 0;
 }
@@ -2802,8 +2897,8 @@ static int sftl_close_block(struct apple_sftl *sftl)
  *
  * A failed page that reads back erased consumed nothing, so its sequences
  * are offered again. One that reads back exactly as programmed holds valid
- * records, so its sequences stay used. Anything else is a torn page, which
- * a fresh load rejects; the writer stops.
+ * records, and a torn one is skipped by a fresh load; their sequences stay
+ * used. A torn summary page stops the writer.
  */
 static int sftl_give_up(struct apple_sftl *sftl, u32 address, const u8 *data,
 			const u8 *oob, int err)
@@ -2820,9 +2915,13 @@ static int sftl_give_up(struct apple_sftl *sftl, u32 address, const u8 *data,
 		sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE);
 	landed = !ret && !memcmp(sftl->oob, oob, sizeof(sftl->oob)) &&
 		 !memcmp(sftl->page, data, APPLE_PPN_PAGE_SIZE);
-	if (!blank && !landed)
+	/* A torn summary is not recognised at load. */
+	if (!blank && !landed && oob[0] == 0x1c)
 		goto stop;
-	if (landed && oob[0] != 0x1c) {
+	/* A torn data page is the block's last programmed page: a fresh load
+	 * skips it and accounts its four sequences, which are not reused.
+	 */
+	if (!blank && oob[0] != 0x1c) {
 		sftl->sequence += 4;
 		sftl->journal_sequence = sftl->sequence;
 	}

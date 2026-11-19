@@ -99,12 +99,27 @@ closed. Every logical page the map still places in that block moves to a new
 append block with a fresh sequence, keeping its type and, for relocated user
 data, its user epoch; the failed request follows. A failed page that reads
 back erased consumed nothing, so its sequences are offered again; one that
-reads back exactly as programmed keeps its records and sequences. A torn page
-stops the writer. A further failure gives up the new block too; after eight
+reads back exactly as programmed, or torn, keeps its sequences used. A torn
+summary page stops the writer. A further failure gives up the new block too;
+after eight
 failures in one session the writer stops. The VFL is never changed: a really
 bad block fails again under iOS, which retires it. Without blank blocks the
 request returns ``-ENOSPC`` and the move resumes with the next request.
 Relocation during reclamation still stops on any failure.
+
+Torn pages at load
+------------------
+
+A program that failed or was cut short, for example by something else
+resetting the controller, can leave a torn page: status good but metadata
+that is not a record, or erased status over programmed bytes. Recovery
+accepts one torn page per open block when it is that block's last programmed
+page, and lets the journal miss exactly its four sequences, in the middle or
+at the end. Read errors, refresh and unknown statuses still stop recovery, as
+does a torn page followed by another programmed page or a torn summary.
+Before its first write the writer gives every such block up as above: its
+live pages move and the block is never programmed again. As with a failed
+program, no checkpoint records the block as awaiting erase.
 
 The block frontend preserves untouched sectors in partial 4 KiB updates and
 groups up to four logical pages per program. Every acknowledged write has
