@@ -140,6 +140,8 @@ static int bq27xxx_battery_hdq_add_slave(struct w1_slave *sl)
 		}
 		di->cache_use_remaining_capacity = data->use_remaining_capacity;
 		di->cache_read_budget_ms = data->read_budget_ms;
+		if (data->read_budget_ms)
+			di->cache_max_age_ms = di->cache_refresh_ms + data->read_budget_ms;
 	} else {
 		di->chip = BQ27000;
 		di->name = "bq27000-battery";

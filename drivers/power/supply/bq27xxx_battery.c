@@ -53,6 +53,7 @@
 #include <linux/power_supply.h>
 #include <linux/slab.h>
 #include <linux/of.h>
+#include <linux/timekeeping.h>
 
 #include <linux/power/bq27xxx_battery.h>
 
@@ -2108,6 +2109,12 @@ void bq27xxx_battery_update(struct bq27xxx_device_info *di)
 }
 EXPORT_SYMBOL_GPL(bq27xxx_battery_update);
 
+static bool bq27xxx_cache_expired(const struct bq27xxx_device_info *di)
+{
+	return di->cache_max_age_ms && di->cache.flags >= 0 &&
+	       !ktime_before(ktime_get_boottime(), di->cache_valid_until);
+}
+
 static void bq27xxx_battery_refresh_cache(struct bq27xxx_device_info *di)
 {
 	union power_supply_propval current_now;
@@ -2116,6 +2123,7 @@ static void bq27xxx_battery_refresh_cache(struct bq27xxx_device_info *di)
 	union power_supply_propval value;
 	union power_supply_propval voltage;
 	struct bq27xxx_reg_cache cache;
+	ktime_t valid_until = 0;
 	bool single_flags;
 	bool changed;
 	int capacity;
@@ -2125,6 +2133,8 @@ static void bq27xxx_battery_refresh_cache(struct bq27xxx_device_info *di)
 	mutex_lock(&di->lock);
 	if (di->removed)
 		goto out_unlock;
+	if (di->cache_max_age_ms)
+		valid_until = ktime_add_ms(ktime_get_boottime(), di->cache_max_age_ms);
 	if (di->cache_read_budget_ms) {
 		di->cache_read_deadline = jiffies +
 			msecs_to_jiffies(di->cache_read_budget_ms);
@@ -2190,8 +2200,10 @@ static void bq27xxx_battery_refresh_cache(struct bq27xxx_device_info *di)
 		bq27xxx_cache_value(&cache.power_avg, ret, &value);
 	}
 
-	changed = memcmp(&di->cache, &cache, sizeof(cache)) != 0;
+	changed = memcmp(&di->cache, &cache, sizeof(cache)) != 0 ||
+		  bq27xxx_cache_expired(di);
 	di->cache = cache;
+	di->cache_valid_until = valid_until;
 	di->last_status = status;
 	di->last_update = jiffies;
 
@@ -2405,6 +2417,10 @@ static int bq27xxx_battery_get_cached_property(struct power_supply *psy,
 	int ret;
 
 	mutex_lock(&di->lock);
+	if (bq27xxx_cache_expired(di)) {
+		ret = -ENODATA;
+		goto out_unlock;
+	}
 	if (psp != POWER_SUPPLY_PROP_PRESENT && di->cache.flags < 0) {
 		ret = di->cache.flags;
 		goto out_unlock;

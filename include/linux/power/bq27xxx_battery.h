@@ -83,6 +83,9 @@ struct bq27xxx_device_info {
 	bool cache_use_remaining_capacity;
 	/* Optional periodic refresh interval for cache-only transports. */
 	unsigned int cache_refresh_ms;
+	/* Optional maximum age of a sample, measured from the first register read. */
+	unsigned int cache_max_age_ms;
+	ktime_t cache_valid_until;
 	/* Bound admission of new register reads during a cached refresh. */
 	unsigned int cache_read_budget_ms;
 	unsigned long cache_read_deadline;
