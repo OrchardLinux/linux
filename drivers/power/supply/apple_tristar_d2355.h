@@ -2,6 +2,8 @@
 /* D2355 hardware operations for the shared Tristar charging policy. */
 #include "apple_d2355_current.h"
 
+#define D2355_TRISTAR_STATUS_ONLINE	0x42
+
 struct tristar_d2355 {
 	struct d2355_calibration calibration;
 	struct mutex io_lock;
@@ -183,7 +185,7 @@ static int tristar_d2355_read_status(struct tristar_charger *chg, unsigned int *
 	 * charger feedback and can be clear while the input limit is set.
 	 */
 	if (!ret)
-		*status = bytes[1] & BIT(7) ? TRISTAR_CHG_STATUS_ONLINE : 0;
+		*status = bytes[1] & BIT(7) ? D2355_TRISTAR_STATUS_ONLINE : 0;
 	return ret;
 }
 
@@ -272,7 +274,7 @@ static const struct tristar_chip_info tristar_d2355_chip = {
 	.read_status = tristar_d2355_read_status,
 	.handoff_code = 0,
 	.attach_code = 8,
-	.online_status = 0x42,
+	.online_status = D2355_TRISTAR_STATUS_ONLINE,
 	.ramp_step_ms = 500,
 	.fallback_code = 8, /* Preserve measured J120 80 mA baseline until identified. */
 };
