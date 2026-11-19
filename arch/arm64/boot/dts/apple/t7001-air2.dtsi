@@ -184,6 +184,15 @@
 	};
 };
 
+/*
+ * Speaker amplifiers (two MAX98721, at 0x31 and 0x34 in Apple's device
+ * tree). No driver binds them yet; the bus is enabled so they can be
+ * identified from user space.
+ */
+&i2c1 {
+	status = "okay";
+};
+
 &serial5 {
 	pinctrl-0 = <&uart5_pins>;
 	pinctrl-names = "default";
