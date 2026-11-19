@@ -151,6 +151,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_MAX98504
 	imply SND_SOC_MAX98520
 	imply SND_SOC_MAX9867
+	imply SND_SOC_MAX98721
 	imply SND_SOC_MAX98925
 	imply SND_SOC_MAX98926
 	imply SND_SOC_MAX98927
@@ -1458,6 +1459,15 @@ config SND_SOC_MAX98504
 config SND_SOC_MAX9867
 	tristate "Maxim MAX9867 CODEC"
 	depends on I2C
+
+config SND_SOC_MAX98721
+	tristate "Maxim MAX98721 speaker amplifier"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Enable support for the Maxim MAX98721 boosted class-D speaker
+	  amplifier, as used in the Apple iPad Air 2. It is driven as a TDM
+	  consumer with the register map of the MAX98925.
 
 config SND_SOC_MAX98925
 	tristate
