@@ -1168,6 +1168,48 @@ static void sftl_test_append_uncertain_program_replays(struct kunit *test)
 	apple_sftl_free(sftl);
 }
 
+/* Cascadia's device fault script (tools/nand-faults/faults.sh) on synthetic
+ * media: a program that fails before reaching the NAND, later one that
+ * lands but reports failure, each under a stream of writes. Every write
+ * succeeds, and the data survive a fresh load with a writable journal.
+ */
+static void sftl_test_fault_ladder(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
+	u8 *data = kunit_kmalloc(test, 16384, GFP_KERNEL);
+	unsigned int page;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	f->fail_program = 6;
+	for (page = 0; page < 24; page++) {
+		if (page == 12) {
+			f->fail_program = f->programs + 4;
+			f->uncertain_program = true;
+		}
+		memset(data, 'A' + page, 16384);
+		KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + page * 4, data, 4), 0);
+	}
+	/* Two blocks were given up; the third holds everything. */
+	KUNIT_EXPECT_NOT_NULL(test, sftl_test_written(f, 2, 0, 23));
+	KUNIT_EXPECT_NULL(test, sftl_test_written(f, 2, 0, 24));
+	KUNIT_EXPECT_EQ(test, f->program_outside, 0U);
+	apple_sftl_free(sftl);
+	sftl = NULL;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_FALSE(test, info.read_only);
+	KUNIT_EXPECT_EQ(test, info.journal_sequence, info.sequence);
+	for (page = 0; page < 96; page++) {
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE + page, data), 0);
+		sftl_test_expect_fill(test, data, 'A' + page / 4);
+	}
+	apple_sftl_free(sftl);
+}
+
 static void sftl_test_append_interrupted_footer_replays(struct kunit *test)
 {
 	static const struct {
@@ -3682,6 +3724,7 @@ static struct kunit_case apple_sftl_cases[] = {
 	KUNIT_CASE(sftl_test_append_failure_moves_live_pages),
 	KUNIT_CASE(sftl_test_append_failures_exhaust_blocks),
 	KUNIT_CASE(sftl_test_append_uncertain_program_replays),
+	KUNIT_CASE(sftl_test_fault_ladder),
 	KUNIT_CASE(sftl_test_append_interrupted_footer_replays),
 	KUNIT_CASE(sftl_test_append_torn_metadata),
 	KUNIT_CASE(sftl_test_torn_page_at_load),

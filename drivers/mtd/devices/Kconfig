@@ -224,6 +224,20 @@ config MTD_APPLE_H2FMI
 
 	  If unsure, say N.
 
+config MTD_APPLE_H2FMI_FAULT_INJECT
+	bool "Test-only program and erase failure injection"
+	depends on MTD_APPLE_H2FMI && FAULT_INJECTION_DEBUG_FS
+	default n
+	help
+	  Adds debugfs fault-injection attributes under apple-h2fmi/ that
+	  make a page program fail before or after it reaches the NAND, or a
+	  block erase fail, to exercise the translation layer's failure
+	  handling on a tablet.  A failure reported after programming resets
+	  the packages as a real one does.
+
+	  Never enable this on a device whose NAND holds data you need.
+	  Say N.
+
 config MTD_APPLE_H2FMI_KUNIT_TEST
 	tristate "KUnit tests for Apple H2FMI PPN geometry" if !KUNIT_ALL_TESTS
 	depends on KUNIT

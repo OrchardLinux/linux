@@ -30,7 +30,9 @@
  * Logical-address translation and allocation belong to the FTL above.
  */
 
+#include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/fault-inject.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
@@ -119,6 +121,46 @@ struct h2fmi_bus {
 
 /* Resets after failed transactions in one driver instance. */
 #define H2FMI_MAX_RESETS	8
+
+/*
+ * Test-only failure injection (CONFIG_MTD_APPLE_H2FMI_FAULT_INJECT), as
+ * Cascadia's driver offers it for exercising the translation layer's
+ * failure paths on a tablet: debugfs apple-h2fmi/fail_program makes a page
+ * program fail without programming, fail_program_landed reports failure
+ * after the page was programmed and read back, and fail_erase fails a
+ * block erase before it starts. Each takes the usual fault-injection
+ * attributes (probability, interval, times, ...).
+ */
+#ifdef CONFIG_MTD_APPLE_H2FMI_FAULT_INJECT
+static DECLARE_FAULT_ATTR(h2fmi_fail_program);
+static DECLARE_FAULT_ATTR(h2fmi_fail_program_landed);
+static DECLARE_FAULT_ATTR(h2fmi_fail_erase);
+
+static void h2fmi_remove_debugfs(void *dir)
+{
+	debugfs_remove_recursive(dir);
+}
+
+static int h2fmi_fault_init(struct device *dev)
+{
+	struct dentry *dir = debugfs_create_dir("apple-h2fmi", NULL);
+
+	fault_create_debugfs_attr("fail_program", dir, &h2fmi_fail_program);
+	fault_create_debugfs_attr("fail_program_landed", dir, &h2fmi_fail_program_landed);
+	fault_create_debugfs_attr("fail_erase", dir, &h2fmi_fail_erase);
+	dev_warn(dev, "test-only failure injection is built in\n");
+	return devm_add_action_or_reset(dev, h2fmi_remove_debugfs, dir);
+}
+
+#define h2fmi_inject(attr)	should_fail(&(attr), 1)
+#else
+static int h2fmi_fault_init(struct device *dev)
+{
+	return 0;
+}
+
+#define h2fmi_inject(attr)	false
+#endif
 
 struct h2fmi_die {
 	struct h2fmi *fmi;
@@ -1000,6 +1042,11 @@ static int h2fmi_program_page(struct h2fmi *fmi, struct h2fmi_bus *b,
 		ret = -EEXIST;
 		goto out;
 	}
+	if (h2fmi_inject(h2fmi_fail_program)) {
+		dev_warn(fmi->dev, "PPN program row %08x: injected failure\n", row);
+		ret = -EIO;
+		goto out;
+	}
 	ret = h2fmi_program_transaction(fmi, b, row, expected);
 	if (ret)
 		goto out;
@@ -1012,6 +1059,12 @@ static int h2fmi_program_page(struct h2fmi *fmi, struct h2fmi_bus *b,
 		dev_err(fmi->dev, "PPN readback row %08x: status %02x, error %d\n",
 			row, status, ret);
 		goto out;
+	}
+	if (h2fmi_inject(h2fmi_fail_program_landed)) {
+		dev_warn(fmi->dev, "PPN program row %08x: injected failure after programming\n",
+			 row);
+		h2fmi_fail(fmi);
+		ret = -EIO;
 	}
 out:
 	mutex_unlock(&b->lock);
@@ -1214,6 +1267,10 @@ static int h2fmi_ppn_erase(void *priv, unsigned int bus, unsigned int cau,
 	if (ret)
 		return ret;
 
+	if (h2fmi_inject(h2fmi_fail_erase)) {
+		dev_warn(fmi->dev, "PPN erase row %08x: injected failure\n", row);
+		return -EIO;
+	}
 	ret = h2fmi_lock(fmi, b);
 	if (ret)
 		return ret;
@@ -1523,7 +1580,9 @@ static int h2fmi_probe(struct platform_device *pdev)
 		}
 	}
 
-	ret = h2fmi_register_sftl(fmi);
+	ret = h2fmi_fault_init(&pdev->dev);
+	if (!ret)
+		ret = h2fmi_register_sftl(fmi);
 	if (ret) {
 		for (i = 0; i < fmi->ndies; i++)
 			mtd_device_unregister(&fmi->mtd[i]);
