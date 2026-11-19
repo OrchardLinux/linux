@@ -26,6 +26,7 @@ properties:
       - apple,j172-touchscreen
       - apple,d11-touchscreen
       - apple,d111-touchscreen
+      - apple,d21-touchscreen
       - apple,n61-touchscreen
       - apple,n102-touchscreen
       - apple,n66-touchscreen
@@ -357,6 +358,18 @@ allOf:
         - clocks
         - hv-supply
         - core-supply
+        - spi-cpha
+        - spi-cpol
+        - apple,z2-no-init-ack
+
+  - if:
+      properties:
+        compatible:
+          const: apple,d21-touchscreen
+    then:
+      required:
+        - clocks
+        - hv-supply
         - spi-cpha
         - spi-cpol
         - apple,z2-no-init-ack
