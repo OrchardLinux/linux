@@ -57,6 +57,7 @@ struct apple_sftl_runtime_stats {
 int apple_sftl_account_refresh(struct apple_sftl_checkpoint *image,
 			       const struct apple_sftl_runtime_stats *runtime);
 bool apple_sftl_native_context_tag(u32 index, const u8 *meta);
+bool apple_sftl_native_context_tag_for(u32 subblocks, u32 index, const u8 *meta);
 
 void apple_sftl_summarize_user_seq(struct apple_sftl_user_seq *out, const u8 *runs, u32 count);
 int apple_sftl_account_user_seq(struct apple_sftl_snapshot *snapshot,

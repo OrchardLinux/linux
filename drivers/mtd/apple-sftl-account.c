@@ -22,36 +22,56 @@
 #define SFTL_SB_PER_RECORD	(APPLE_SFTL_CHUNK / SFTL_SB_ENTRY_BYTES)
 #define SFTL_MAX_WEAR		0xffff
 
-bool apple_sftl_native_context_tag(u32 index, const u8 *meta)
+/* Records per native section: every section fills whole 4-record pages. */
+static u32 sftl_section_records(u32 subblocks, u32 per_record)
 {
+	return round_up(DIV_ROUND_UP(subblocks, per_record), 4);
+}
+
+/*
+ * The fixed native records are, in order: base (4), statistics (4), block
+ * table, closed-block user sequences and read counts, each sized from the
+ * superblock count. Range records follow them.
+ */
+bool apple_sftl_native_context_tag_for(u32 subblocks, u32 index, const u8 *meta)
+{
+	u32 sb_start = SFTL_SB_START;
+	u32 user_start = sb_start + sftl_section_records(subblocks, SFTL_SB_PER_RECORD);
+	u32 read_start = user_start + sftl_section_records(subblocks, APPLE_SFTL_CHUNK / 16);
+	u32 end = read_start + sftl_section_records(subblocks, APPLE_SFTL_CHUNK / 4);
 	u32 start = 0, entries = 0, stride = 0;
 	u8 subtype;
 
 	if (index < SFTL_STATS_START)
 		subtype = 1;
-	else if (index < SFTL_SB_START)
+	else if (index < sb_start)
 		subtype = 2;
-	else if (index < SFTL_USER_SEQ_START) {
+	else if (index < user_start) {
 		subtype = 3;
 		stride = SFTL_SB_PER_RECORD;
-		start = (index - SFTL_SB_START) * stride;
-	} else if (index < SFTL_READ_COUNT_START) {
+		start = (index - sb_start) * stride;
+	} else if (index < read_start) {
 		subtype = 5;
 		stride = APPLE_SFTL_CHUNK / 16;
-		start = (index - SFTL_USER_SEQ_START) * stride;
-	} else if (index < APPLE_SFTL_ACCOUNT_RECORDS) {
+		start = (index - user_start) * stride;
+	} else if (index < end) {
 		subtype = 6;
 		stride = APPLE_SFTL_CHUNK / 4;
-		start = (index - SFTL_READ_COUNT_START) * stride;
+		start = (index - read_start) * stride;
 	} else {
 		subtype = 4;
 	}
-	if (start < APPLE_SFTL_SUBBLOCKS)
-		entries = min(stride, APPLE_SFTL_SUBBLOCKS - start);
+	if (start < subblocks)
+		entries = min(stride, subblocks - start);
 	return meta && meta[0] == 0x1f && meta[1] == subtype &&
 		get_unaligned_le16(meta + 8) == start &&
 		get_unaligned_le16(meta + 10) == entries &&
 		get_unaligned_le32(meta + 12) == U32_MAX;
+}
+
+bool apple_sftl_native_context_tag(u32 index, const u8 *meta)
+{
+	return apple_sftl_native_context_tag_for(APPLE_SFTL_SUBBLOCKS, index, meta);
 }
 
 /* Native close (0x8108bd60) samples the user sequence high word once per
