@@ -70,6 +70,7 @@ struct sftl_fixture {
 	u16 vfl_tail_marker;
 	unsigned int programs;
 	unsigned int fail_program;
+	unsigned int fail_from;		/* every program from this one fails */
 	unsigned int tear_program;
 	unsigned int program_outside;
 	bool uncertain_program;
@@ -435,7 +436,8 @@ static int sftl_test_program_page(void *priv, unsigned int bus, unsigned int cau
 	if (sftl_test_written(f, slot, lane, page))
 		return -EEXIST;
 	failure = f->programs == f->fail_program;
-	if (failure && !f->uncertain_program)
+	if ((failure && !f->uncertain_program) ||
+	    (f->fail_from && f->programs >= f->fail_from))
 		return -EIO;
 	if (!f->written[slot]) {
 		f->written[slot] = kunit_kcalloc(f->test, 16 * 128,
@@ -1037,37 +1039,112 @@ static void sftl_test_append_replay_full_lanes(struct kunit *test)
 	apple_sftl_free(sftl);
 }
 
-static void sftl_test_append_failure_stops_io(struct kunit *test)
+/* A failed program gives the block up for the session (Cascadia's
+ * section 4.9). Nothing reached the page, so its sequences are offered
+ * again at a fresh block and the journal stays contiguous.
+ */
+static void sftl_test_append_failure_gives_up_block(struct kunit *test)
 {
 	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
 	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
 	u8 *data = kunit_kmalloc(test, 4096, GFP_KERNEL);
-	unsigned int programs;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	KUNIT_ASSERT_NOT_NULL(test, data);
 	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
 	f->fail_program = 1;
 	memset(data, 'F', 4096);
-	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE, data, 1), -EIO);
-	programs = f->programs;
-	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE, data, 1), -EIO);
-	KUNIT_EXPECT_EQ(test, apple_sftl_flush(sftl), -EIO);
-	KUNIT_EXPECT_EQ(test, apple_sftl_read(sftl, 0, data), -EIO);
-	KUNIT_EXPECT_EQ(test, f->programs, programs);
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE, data, 1), 0);
+	KUNIT_EXPECT_EQ(test, f->programs, 2U);
 	KUNIT_EXPECT_EQ(test, f->program_outside, 0U);
+	KUNIT_EXPECT_NULL(test, sftl_test_written(f, 0, 0, 0));
+	KUNIT_EXPECT_NOT_NULL(test, sftl_test_written(f, 1, 0, 0));
+	KUNIT_EXPECT_EQ(test, apple_sftl_flush(sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.sequence, TEST_APPEND_FIRST + 3);
+	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE, data), 0);
+	sftl_test_expect_fill(test, data, 'F');
 	apple_sftl_free(sftl);
 	sftl = NULL;
 	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.journal_sequence, TEST_APPEND_FIRST + 3);
 	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE, data), 0);
-	sftl_test_expect_fill(test, data, 0);
+	sftl_test_expect_fill(test, data, 'F');
 	apple_sftl_free(sftl);
 }
 
+/* Live pages already in the given-up block move ahead of the failed one. */
+static void sftl_test_append_failure_moves_live_pages(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
+	u8 *data = kunit_kmalloc(test, 16384, GFP_KERNEL);
+	unsigned int program;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	f->fail_program = 4;
+	for (program = 0; program < 4; program++) {
+		memset(data, 'a' + program, 16384);
+		KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + program * 4,
+						       data, 4), 0);
+	}
+	/* Three moved pages, then the failed one, at the next block. */
+	KUNIT_EXPECT_EQ(test, f->programs, 8U);
+	KUNIT_EXPECT_NOT_NULL(test, sftl_test_written(f, 1, 0, 3));
+	KUNIT_EXPECT_NULL(test, sftl_test_written(f, 1, 0, 4));
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.sequence, TEST_APPEND_FIRST - 1 + 7 * 4);
+	apple_sftl_free(sftl);
+	sftl = NULL;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	for (program = 0; program < 16; program++) {
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE + program, data), 0);
+		sftl_test_expect_fill(test, data, 'a' + program / 4);
+	}
+	apple_sftl_free(sftl);
+}
+
+/* Each block that fails is given up; without blank blocks the request fails,
+ * the data already written stays readable and a fresh load sees no gap.
+ */
+static void sftl_test_append_failures_exhaust_blocks(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct apple_sftl *sftl = NULL;
+	u8 *data = kunit_kmalloc(test, 4096, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	memset(data, 'E', 4096);
+	KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE, data, 1), 0);
+	f->fail_from = 2;
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 1, data, 1), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, f->programs, 4U);
+	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE, data), 0);
+	sftl_test_expect_fill(test, data, 'E');
+	apple_sftl_free(sftl);
+	sftl = NULL;
+	f->fail_from = 0;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE, data), 0);
+	sftl_test_expect_fill(test, data, 'E');
+	apple_sftl_free(sftl);
+}
+
+/* The page landed although completion failed: its records stay valid and
+ * their sequences are not offered again.
+ */
 static void sftl_test_append_uncertain_program_replays(struct kunit *test)
 {
 	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
 	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
 	u8 *data = kunit_kmalloc(test, 4096, GFP_KERNEL);
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -1076,12 +1153,16 @@ static void sftl_test_append_uncertain_program_replays(struct kunit *test)
 	f->fail_program = 1;
 	f->uncertain_program = true;
 	memset(data, 'U', 4096);
-	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE, data, 1), -EIO);
-	KUNIT_EXPECT_EQ(test, apple_sftl_flush(sftl), -EIO);
-	KUNIT_EXPECT_EQ(test, f->programs, 1U);
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE, data, 1), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_flush(sftl), 0);
+	KUNIT_EXPECT_EQ(test, f->programs, 2U);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.sequence, TEST_APPEND_FIRST + 7);
 	apple_sftl_free(sftl);
 	sftl = NULL;
 	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.journal_sequence, TEST_APPEND_FIRST + 7);
 	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE, data), 0);
 	sftl_test_expect_fill(test, data, 'U');
 	apple_sftl_free(sftl);
@@ -1090,9 +1171,9 @@ static void sftl_test_append_uncertain_program_replays(struct kunit *test)
 static void sftl_test_append_interrupted_footer_replays(struct kunit *test)
 {
 	static const struct {
-		unsigned int program;
+		unsigned int program, total;
 		bool uncertain;
-	} stop[] = {{121, false}, {122, false}, {128, false}, {128, true}};
+	} stop[] = {{121, 249, false}, {122, 250, false}, {128, 256, false}, {128, 256, true}};
 	unsigned int index;
 
 	for (index = 0; index < ARRAY_SIZE(stop); index++) {
@@ -1105,9 +1186,14 @@ static void sftl_test_append_interrupted_footer_replays(struct kunit *test)
 		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
 		f->fail_program = stop[index].program;
 		f->uncertain_program = stop[index].uncertain;
-		KUNIT_EXPECT_EQ(test, sftl_test_fill_append(sftl, data), -EIO);
-		KUNIT_EXPECT_EQ(test, f->programs, stop[index].program);
-		KUNIT_EXPECT_EQ(test, apple_sftl_flush(sftl), -EIO);
+		/* A failed summary page gives the block up: 480 live pages move
+		 * to the next block, which closes with its own summary.
+		 */
+		KUNIT_EXPECT_EQ(test, sftl_test_fill_append(sftl, data), 0);
+		KUNIT_EXPECT_EQ(test, f->programs, stop[index].total);
+		KUNIT_EXPECT_EQ(test, apple_sftl_flush(sftl), 0);
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE + 479, data), 0);
+		sftl_test_expect_fill(test, data, 120);
 		apple_sftl_free(sftl);
 		sftl = NULL;
 		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
@@ -3497,7 +3583,9 @@ static struct kunit_case apple_sftl_cases[] = {
 	KUNIT_CASE(sftl_test_append_replay_open),
 	KUNIT_CASE(sftl_test_append_replay_closed),
 	KUNIT_CASE(sftl_test_append_replay_full_lanes),
-	KUNIT_CASE(sftl_test_append_failure_stops_io),
+	KUNIT_CASE(sftl_test_append_failure_gives_up_block),
+	KUNIT_CASE(sftl_test_append_failure_moves_live_pages),
+	KUNIT_CASE(sftl_test_append_failures_exhaust_blocks),
 	KUNIT_CASE(sftl_test_append_uncertain_program_replays),
 	KUNIT_CASE(sftl_test_append_interrupted_footer_replays),
 	KUNIT_CASE(sftl_test_append_torn_metadata_rejected),

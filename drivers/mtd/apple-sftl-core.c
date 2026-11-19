@@ -9,6 +9,7 @@
  * or device data. Unsupported formats fail before a block device is created.
  */
 #include <linux/bitops.h>
+#include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
@@ -49,6 +50,8 @@ enum sftl_block_role {
 };
 
 #define SFTL_FOOTER_CHUNKS 32U
+#define SFTL_FAIL_MAX 8U	/* program failures per session before the writer stops */
+#define SFTL_RETRY 1		/* the block was given up: offer the page again */
 #define SFTL_CLAIM_TIMEOUT (500U * HZ)
 #define SFTL_FOOTER_BYTES (SFTL_FOOTER_CHUNKS * SFTL_CHUNK)
 #define SFTL_GC_MAP_BYTES (8U * 1024 * 1024) /* per map, on the measured 512 MiB P105 */
@@ -153,6 +156,14 @@ struct apple_sftl {
 	bool writer_prepared;
 	u8 *page;
 	u8 oob[APPLE_PPN_OOB_SIZE];
+	/* Blocks given up after a failed program in this session. Their live
+	 * data moves to the append point; they are never programmed again.
+	 */
+	DECLARE_BITMAP(abandoned, SFTL_MAX_BLOCKS);
+	u32 failures;
+	bool evacuate;
+	u8 *stage, *move;	/* the page being appended, a page being moved */
+	u8 stage_oob[APPLE_PPN_OOB_SIZE], move_oob[APPLE_PPN_OOB_SIZE];
 	struct mutex lock; /* serializes reads and the shared page buffer */
 	bool failed;
 };
@@ -1763,6 +1774,8 @@ void apple_sftl_free(struct apple_sftl *sftl)
 		return;
 	sftl_clear_runs(sftl);
 	kvfree(sftl->footer);
+	kvfree(sftl->stage);
+	kvfree(sftl->move);
 	kvfree(sftl->context.items);
 	kvfree(sftl->closed_user_seq);
 	kfree(sftl->page);
@@ -1827,7 +1840,9 @@ static int sftl_writer_prepare(struct apple_sftl *sftl)
 	if (!sftl->ppn->ops->program_page)
 		return -EROFS;
 	sftl->footer = kvzalloc(SFTL_FOOTER_BYTES, GFP_KERNEL);
-	if (!sftl->footer)
+	sftl->stage = kvmalloc(APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+	sftl->move = kvmalloc(APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+	if (!sftl->footer || !sftl->stage || !sftl->move)
 		return -ENOMEM;
 	for (block = 0; block < sftl->geo->blocks; block++)
 		if (test_bit(block, sftl->reserved) || test_bit(block, sftl->vfl_reserved) ||
@@ -2741,6 +2756,9 @@ void apple_sftl_set_checkpoint_ops(struct apple_sftl *sftl,
 }
 EXPORT_SYMBOL_GPL(apple_sftl_set_checkpoint_ops);
 
+static int sftl_give_up(struct apple_sftl *sftl, u32 address, const u8 *data,
+			const u8 *oob, int err);
+
 static int sftl_close_block(struct apple_sftl *sftl)
 {
 	u64 span = sftl->sequence - sftl->append_base + 1;
@@ -2755,16 +2773,17 @@ static int sftl_close_block(struct apple_sftl *sftl)
 	put_unaligned_le16(SFTL_FOOTER_CHUNKS, meta + 12);
 	put_unaligned_le16(0xffff, meta + 14);
 	for (chunk = 0; chunk < 4; chunk++)
-		memcpy(sftl->oob + chunk * SFTL_META, meta, SFTL_META);
+		memcpy(sftl->stage_oob + chunk * SFTL_META, meta, SFTL_META);
 	for (index = 0; index < SFTL_FOOTER_CHUNKS / 4; index++) {
 		u32 address = sftl->append_block * sftl_stride(sftl) +
 			      sftl->append_capacity + index * 4;
+		const u8 *data = sftl->footer + index * APPLE_PPN_PAGE_SIZE;
 
-		ret = sftl_program_address(sftl, address,
-					   sftl->footer + index * APPLE_PPN_PAGE_SIZE,
-					   sftl->oob);
+		ret = sftl_program_address(sftl, address, data, sftl->stage_oob);
+		/* A summary consumes no sequence. A given-up block moves its data. */
 		if (ret)
-			return ret;
+			return sftl_give_up(sftl, address, data, sftl->stage_oob, ret) == SFTL_RETRY ?
+			       0 : -EIO;
 	}
 	ret = sftl_remember_user_seq(sftl, sftl->append_block, sftl->footer, sftl->footer_runs);
 	if (ret)
@@ -2773,11 +2792,225 @@ static int sftl_close_block(struct apple_sftl *sftl)
 	return 0;
 }
 
+/*
+ * Program failures (Cascadia's specification, section 4.9): program nothing
+ * more into the block in this session and do not close it. Every live page
+ * the map places there moves to the append point with a new sequence,
+ * keeping its type and, for relocated user data, its user epoch, as
+ * reclamation does. The VFL is never touched; a really bad block meets its
+ * next failure under iOS, which retires it.
+ *
+ * A failed page that reads back erased consumed nothing, so its sequences
+ * are offered again. One that reads back exactly as programmed holds valid
+ * records, so its sequences stay used. Anything else is a torn page, which
+ * a fresh load rejects; the writer stops.
+ */
+static int sftl_give_up(struct apple_sftl *sftl, u32 address, const u8 *data,
+			const u8 *oob, int err)
+{
+	u32 block = sftl->append_block;
+	unsigned int chunk;
+	bool blank, landed;
+	int ret;
+
+	if (err == -EINVAL || err == -ERANGE || ++sftl->failures > SFTL_FAIL_MAX)
+		goto stop;
+	ret = sftl_read_address(sftl, address, &chunk);
+	blank = !ret && sftl_erased(sftl->oob, sizeof(sftl->oob)) &&
+		sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE);
+	landed = !ret && !memcmp(sftl->oob, oob, sizeof(sftl->oob)) &&
+		 !memcmp(sftl->page, data, APPLE_PPN_PAGE_SIZE);
+	if (!blank && !landed)
+		goto stop;
+	if (landed && oob[0] != 0x1c) {
+		sftl->sequence += 4;
+		sftl->journal_sequence = sftl->sequence;
+	}
+	dev_warn(sftl->ppn->dev, "program at %#x failed (%d): block %u given up\n",
+		 address, err, block);
+	__set_bit(block, sftl->abandoned);
+	sftl->append_block = U32_MAX;
+	sftl->evacuate = true;
+	return SFTL_RETRY;
+stop:
+	sftl->failed = true;
+	return err;
+}
+
+/* Stamp a page for the append point. A relocated type-1 user page keeps
+ * the user epoch it was first written with; every other record carries the
+ * epoch of its new sequence.
+ */
+static void sftl_stamp_page(struct apple_sftl *sftl, u8 *oob, bool relocated)
+{
+	unsigned int chunk;
+
+	for (chunk = 0; chunk < 4; chunk++) {
+		u8 *meta = oob + chunk * SFTL_META;
+		u64 sequence = sftl->sequence + 1 + chunk;
+		bool keep = relocated && meta[0] == 1 && !meta[1] &&
+			    get_unaligned_le32(meta + 8) < sftl->geo->lpages;
+
+		put_unaligned_le64(sequence << 16 | get_unaligned_le16(meta), meta);
+		if (!keep)
+			put_unaligned_le32(sequence >> 16, meta + 12);
+	}
+}
+
+/*
+ * Program one page at the append point and publish it. SFTL_RETRY means the
+ * block was given up and the page must be offered again after evacuation.
+ */
+static int sftl_append_once(struct apple_sftl *sftl, const u8 *page, u8 *oob, bool relocated)
+{
+	unsigned int chunk;
+	u32 address;
+	int ret;
+
+	if (sftl->append_block == U32_MAX) {
+		ret = sftl_claim_block(sftl);
+		if (ret)
+			return ret;
+	}
+	if (sftl->sequence > SFTL_SEQUENCE - 4)
+		return -EOVERFLOW;
+	sftl_stamp_page(sftl, oob, relocated);
+	address = sftl->append_block * sftl_stride(sftl) + sftl->append_position;
+	ret = sftl_program_address(sftl, address, page, oob);
+	if (ret)
+		return sftl_give_up(sftl, address, page, oob, ret);
+	for (chunk = 0; chunk < 4; chunk++) {
+		ret = sftl_replace(sftl, get_unaligned_le32(oob + chunk * SFTL_META + 8), 1,
+				   address + chunk);
+		if (ret) {
+			sftl->failed = true;
+			return ret;
+		}
+		sftl_append_summary(sftl, oob + chunk * SFTL_META);
+	}
+	sftl->sequence += 4;
+	sftl->journal_sequence = sftl->sequence;
+	sftl->append_position += 4;
+	if (sftl->append_position == sftl->append_capacity) {
+		ret = sftl_close_block(sftl);
+		if (ret)
+			sftl->failed = true;
+	}
+	return ret;
+}
+
+/* Logical pages the map still places in given-up blocks, in logical order. */
+static int sftl_collect_abandoned(struct apple_sftl *sftl, u32 **out, u32 *count)
+{
+	u32 stride = sftl_stride(sftl), n = 0, pass, *keys = NULL;
+	struct rb_node *node;
+
+	for (pass = 0; pass < 2; pass++) {
+		for (node = rb_first(&sftl->runs); node; node = rb_next(node)) {
+			const struct sftl_run *run = rb_entry(node, struct sftl_run, node);
+			u32 first, last, block;
+
+			if (run->provider == SFTL_UNMAPPED)
+				continue;
+			first = run->provider;
+			last = run->provider + run->end - run->start - 1;
+			for (block = first / stride; block <= last / stride; block++) {
+				u32 from = max(first, block * stride);
+				u32 to = min(last, block * stride + stride - 1), a;
+
+				if (!test_bit(block, sftl->abandoned))
+					continue;
+				for (a = from; a <= to; a++) {
+					if (keys)
+						keys[n] = run->start + a - first;
+					n++;
+				}
+			}
+		}
+		if (pass || !n)
+			break;
+		keys = kvmalloc_array(n, sizeof(*keys), GFP_NOIO);
+		if (!keys)
+			return -ENOMEM;
+		n = 0;
+	}
+	*out = keys;
+	*count = n;
+	return 0;
+}
+
+/* Read up to four live pages for relocation; a short tail repeats the last. */
+static int sftl_load_move(struct apple_sftl *sftl, const u32 *keys, u32 count, u32 first)
+{
+	unsigned int c, chunk;
+	int ret;
+
+	for (c = 0; c < 4; c++) {
+		u32 key = keys[min(first + c, count - 1)];
+		const struct sftl_run *run = sftl_find(sftl, key);
+		const u8 *meta;
+
+		if (!run || run->provider == SFTL_UNMAPPED)
+			return -EBADMSG;
+		ret = sftl_read_address(sftl, run->provider + key - run->start, &chunk);
+		if (ret)
+			return ret;
+		meta = sftl->oob + chunk * SFTL_META;
+		if ((meta[0] != 1 && meta[0] != 2) || get_unaligned_le32(meta + 8) != key)
+			return -EBADMSG;
+		memcpy(sftl->move + c * SFTL_CHUNK, sftl->page + chunk * SFTL_CHUNK, SFTL_CHUNK);
+		memcpy(sftl->move_oob + c * SFTL_META, meta, SFTL_META);
+	}
+	return 0;
+}
+
+/* Move everything out of the given-up blocks. Another failure gives up the
+ * new block as well and starts over from the map.
+ */
+static int sftl_evacuate(struct apple_sftl *sftl)
+{
+	u32 *keys = NULL, count = 0, i;
+	int ret = 0;
+
+	while (sftl->evacuate && !ret) {
+		sftl->evacuate = false;
+		kvfree(keys);
+		ret = sftl_collect_abandoned(sftl, &keys, &count);
+		for (i = 0; !ret && i < count && !sftl->evacuate; i += 4) {
+			ret = sftl_load_move(sftl, keys, count, i);
+			if (ret) {
+				sftl->failed = true;
+				break;
+			}
+			ret = sftl_append_once(sftl, sftl->move, sftl->move_oob, true);
+			if (ret == SFTL_RETRY)
+				ret = 0;
+		}
+	}
+	/* Leave unfinished work for the next request unless the writer stopped. */
+	if (ret && !sftl->failed)
+		sftl->evacuate = true;
+	kvfree(keys);
+	return ret;
+}
+
+static int sftl_append(struct apple_sftl *sftl, const u8 *page, u8 *oob, bool relocated)
+{
+	int ret;
+
+	do {
+		ret = sftl_evacuate(sftl);
+		if (!ret)
+			ret = sftl_append_once(sftl, page, oob, relocated);
+	} while (ret == SFTL_RETRY);
+	if (!ret)
+		ret = sftl_evacuate(sftl);
+	return ret;
+}
+
 int apple_sftl_write(struct apple_sftl *sftl, u32 logical_page,
 		     const u8 *data, unsigned int count)
 {
-	u64 first_sequence;
-	u32 address;
 	unsigned int chunk;
 	int ret;
 
@@ -2796,47 +3029,13 @@ int apple_sftl_write(struct apple_sftl *sftl, u32 logical_page,
 	ret = sftl_writer_prepare(sftl);
 	if (ret)
 		goto out;
-	if (sftl->append_block == U32_MAX) {
-		ret = sftl_claim_block(sftl);
-		if (ret)
-			goto out;
-	}
-	if (sftl->sequence > SFTL_SEQUENCE - 4) {
-		ret = -EOVERFLOW;
-		goto out;
-	}
-	address = sftl->append_block * sftl_stride(sftl) + sftl->append_position;
-	first_sequence = sftl->sequence + 1;
 	for (chunk = 0; chunk < 4; chunk++) {
 		unsigned int index = min(chunk, count - 1);
 
-		memcpy(sftl->page + chunk * SFTL_CHUNK,
-		       data + index * SFTL_CHUNK, SFTL_CHUNK);
-		sftl_data_meta(sftl->oob + chunk * SFTL_META,
-			       first_sequence + chunk, logical_page + index);
+		memcpy(sftl->stage + chunk * SFTL_CHUNK, data + index * SFTL_CHUNK, SFTL_CHUNK);
+		sftl_data_meta(sftl->stage_oob + chunk * SFTL_META, 0, logical_page + index);
 	}
-	ret = sftl_program_address(sftl, address, sftl->page, sftl->oob);
-	if (ret)
-		goto failed;
-	for (chunk = 0; chunk < 4; chunk++) {
-		u32 key = logical_page + min(chunk, count - 1);
-
-		ret = sftl_replace(sftl, key, 1, address + chunk);
-		if (ret)
-			goto failed;
-		sftl_append_summary(sftl, sftl->oob + chunk * SFTL_META);
-	}
-	sftl->sequence += 4;
-	sftl->journal_sequence = sftl->sequence;
-	sftl->append_position += 4;
-	if (sftl->append_position == sftl->append_capacity) {
-		ret = sftl_close_block(sftl);
-		if (ret)
-			goto failed;
-	}
-	goto out;
-failed:
-	sftl->failed = true;
+	ret = sftl_append(sftl, sftl->stage, sftl->stage_oob, false);
 out:
 	mutex_unlock(&sftl->lock);
 	return ret;

@@ -87,8 +87,24 @@ The recovered allocation floor can exceed the last visible journal record.
 This implementation retains its contiguous journal replay rule, so a mismatch
 keeps the disk read-only and returns ``-EOPNOTSUPP`` before any program.
 Native forward-gap handling requires a separate recovery change with format-
-specific fixtures. A program or map-publication error stops subsequent I/O; a
-fresh loader must determine which complete records reached the medium.
+specific fixtures. A map-publication error stops subsequent I/O; a fresh
+loader must determine which complete records reached the medium.
+
+Program failures
+----------------
+
+A failed data or summary program gives its block up for the session, as
+Cascadia's writer does: nothing more is programmed into it and it is not
+closed. Every logical page the map still places in that block moves to a new
+append block with a fresh sequence, keeping its type and, for relocated user
+data, its user epoch; the failed request follows. A failed page that reads
+back erased consumed nothing, so its sequences are offered again; one that
+reads back exactly as programmed keeps its records and sequences. A torn page
+stops the writer. A further failure gives up the new block too; after eight
+failures in one session the writer stops. The VFL is never changed: a really
+bad block fails again under iOS, which retires it. Without blank blocks the
+request returns ``-ENOSPC`` and the move resumes with the next request.
+Relocation during reclamation still stops on any failure.
 
 The block frontend preserves untouched sectors in partial 4 KiB updates and
 groups up to four logical pages per program. Every acknowledged write has
