@@ -198,6 +198,29 @@
 	status = "okay";
 };
 
+/*
+ * The NCO reference as iBoot reports it in a running J81's ADT
+ * (/arm-io clock-frequencies[10], the NCO's first clock-id 0x10a):
+ * 2.4 GHz / 7. iOS special-cases this rate for its divider precision.
+ */
+&nco_clkref {
+	clock-frequency = <342857142>;
+};
+
+&nco {
+	status = "okay";
+};
+
+&i2s_switch {
+	status = "okay";
+};
+
+/* The speaker link: MCA3 to pad 3 (ADT function-i2s_route aud3 -> pin3) */
+&mca3 {
+	apple,i2s-switch = <&i2s_switch 3 3>;
+	status = "okay";
+};
+
 &serial5 {
 	pinctrl-0 = <&uart5_pins>;
 	pinctrl-names = "default";
