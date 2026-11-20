@@ -94,6 +94,12 @@ properties:
   '#sound-dai-cells':
     const: 0
 
+  port:
+    $ref: audio-graph-port.yaml#
+    unevaluatedProperties: false
+    description:
+      The link to the codecs when an audio-graph-card2 card uses this MCA.
+
   '#clock-cells':
     const: 0
 
