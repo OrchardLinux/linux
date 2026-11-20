@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iio/light/apple,ct709.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple CT709 four-channel ambient light sensor
+
+maintainers:
+  - Linux IIO <linux-iio@vger.kernel.org>
+
+description:
+  The CT709 measures clear, red, green and blue light intensity over I2C.
+  The J120 board uses two independently addressed sensors.
+
+properties:
+  compatible:
+    const: apple,ct709
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
