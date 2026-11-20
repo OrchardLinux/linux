@@ -28,7 +28,8 @@ description: |
   iPad Air to its codec, which provides the bit and frame clocks as on the
   A9; apple,s5l8960x-mca-tdm the playback-only speaker link (TDM) of the
   iPad mini 2, a consumer of the clocks of its amplifiers, to which it
-  supplies MCLK.
+  supplies MCLK. The T8011 speaker link uses wider serial slots while
+  keeping 16-bit PCM.
 
 allOf:
   - $ref: dai-common.yaml#
@@ -40,6 +41,7 @@ allOf:
             - apple,t7001-mca
             - apple,t8010-mca
             - apple,t8010-mca-i2s
+            - apple,t8011-mca
     then:
       properties:
         dmas:
@@ -64,11 +66,12 @@ properties:
       - apple,t7001-mca
       - apple,t8010-mca
       - apple,t8010-mca-i2s
+      - apple,t8011-mca
 
   clocks:
     maxItems: 1
     description:
-      AP NCO channel supplying the bitclock (T7001, T8010). On T7001 the
+      AP NCO channel supplying the bitclock (T7001, T8010 and T8011). On T7001 the
       MCA divides it by two.
 
   clock-names:

@@ -297,6 +297,7 @@ struct s8000_mca {
 	struct device *dev;
 	const struct s8000_mca_hw *hw;
 	const struct s8000_mca_regs *regs;
+	unsigned int slot_width;
 	void __iomem *base;
 	void __iomem *mclk_reg;
 	struct clk_hw mclk_hw;
@@ -518,7 +519,8 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 		substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? &mca->dma_tx :
 								 &mca->dma_rx;
 	unsigned int bits = params_width(params);
-	unsigned int slot = params_physical_width(params);
+	unsigned int pcm_width = params_physical_width(params);
+	unsigned int slot = mca->slot_width ?: pcm_width;
 	unsigned int channels = params_channels(params);
 	unsigned int slots = mca->hw->slots, depth;
 	unsigned int frame_bits = mca->hw->frame_bits ?: slot * slots;
@@ -579,7 +581,7 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 		mca->frame |= MCA_FRAME_MASTER;
 	}
 
-	dma->addr_width = slot == 16 ? DMA_SLAVE_BUSWIDTH_2_BYTES :
+	dma->addr_width = pcm_width == 16 ? DMA_SLAVE_BUSWIDTH_2_BYTES :
 				       DMA_SLAVE_BUSWIDTH_4_BYTES;
 	/* informational: the SmartIO limit comes from the shim record */
 	dma->maxburst = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? depth :
@@ -1198,6 +1200,9 @@ static int s8000_mca_probe(struct platform_device *pdev)
 	if (!mca->hw)
 		return -ENODEV;
 	mca->regs = mca->hw->regs;
+	/* J120 iisConfig spans 256 clocks over eight slots with S16 samples. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8011-mca"))
+		mca->slot_width = 32;
 	spin_lock_init(&mca->hw_lock);
 	mca->irq_mask = MCA_IRQ_ALL;
 	platform_set_drvdata(pdev, mca);
@@ -1535,6 +1540,7 @@ static const struct of_device_id s8000_mca_of_match[] = {
 	{ .compatible = "apple,t7001-mca", .data = &t7001_mca_hw },
 	{ .compatible = "apple,t8010-mca", .data = &t8010_mca_hw },
 	{ .compatible = "apple,t8010-mca-i2s", .data = &t8010_i2s_mca_hw },
+	{ .compatible = "apple,t8011-mca", .data = &t8010_mca_hw },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s8000_mca_of_match);
