@@ -251,6 +251,9 @@ struct s8000_mca_hw {
 	 * drives SCLK while TX is enabled, so TX stays enabled as well.
 	 */
 	bool clocks_at_prepare;
+	bool frame_at_prepare;
+	bool mask_stream_irqs;
+	unsigned int capture_channels;
 	unsigned int dai_format;	/* SND_SOC_DAIFMT_* */
 	u32 v1_ctl;			/* version 1: TX/RX_CTL word */
 	unsigned int channels;
@@ -291,7 +294,6 @@ struct s8000_mca_hw {
 	u32 sio_timeout;
 	u32 sio_fifo;
 	u32 sio_trigger;
-	bool align_sio_tx_depth;
 };
 
 struct s8000_mca {
@@ -523,10 +525,13 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 	unsigned int channels = params_channels(params);
 	unsigned int slots = mca->hw->slots, depth;
 	unsigned int frame_bits = mca->hw->frame_bits ?: slot * slots;
+	unsigned int expected_channels = mca->hw->channels;
 	unsigned int sync_bits = mca->hw->sync_bits ?: frame_bits / 2;
 	u32 width_code;
 
-	if (channels != mca->hw->channels)
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE && mca->hw->capture_channels)
+		expected_channels = mca->hw->capture_channels;
+	if (channels != expected_channels)
 		return -EINVAL;
 	/* Qualify one clock family first; no unverified v5 capture or TDM. */
 	if (mca->hw->clock_provider && params_rate(params) != 48000)
@@ -555,7 +560,7 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 	mca->pad = frame_bits - slot * slots;
 	if (!mca->hw->sync_bits && slots == 2)
 		mca->pad = (mca->pad / 2) << 16 | mca->pad / 2;
-	depth = mca_tx_depth(mca, params_rate(params), channels);
+	depth = mca_tx_depth(mca, params_rate(params), mca->hw->channels);
 	mca->tx_fifo_cfg = depth | (depth - 1) << 16;
 	mca->tx_slots = mca->hw->tx_slots;
 	mca->rx_slots = mca->hw->rx_slots;
@@ -754,14 +759,16 @@ static int mca_prepare(struct snd_pcm_substream *substream,
 
 	spin_lock_irqsave(&mca->hw_lock, flags);
 	mca->prep_mask |= BIT(dir);
-	mca->irq_mask &= ~(tx ? MCA_IRQ_TX_CAUSES | mca->hw->stream_irqs :
-			   MCA_IRQ_RX_CAUSES);
+	if (!mca->hw->mask_stream_irqs)
+		mca->irq_mask &= ~(tx ? MCA_IRQ_TX_CAUSES | mca->hw->stream_irqs :
+				   MCA_IRQ_RX_CAUSES);
 	mca_irq_set_mask(mca, mca->irq_mask);
 	if (first && tx && mca->hw->clocks_at_prepare)
 		mca_write(mca, mca->regs->tx_cfg, mca->tx_cfg | MCA_XX_CFG_EN);
 	if (first)
 		mca_write(mca, mca->regs->frame, mca->frame |
-			  (mca->hw->clocks_at_prepare ? MCA_FRAME_RUN : 0));
+			  (mca->hw->clocks_at_prepare || mca->hw->frame_at_prepare ?
+			   MCA_FRAME_RUN : 0));
 	mca->prep_frame = mca->frame;
 	spin_unlock_irqrestore(&mca->hw_lock, flags);
 
@@ -962,7 +969,6 @@ static int mca_prepare_slave_config(struct snd_pcm_substream *substream,
 	const struct s8000_mca_hw *hw = mca->hw;
 	unsigned int bytes = params_physical_width(params) / 8;
 	unsigned int per_ms;
-	u32 limit;
 	int ret;
 
 	ret = snd_dmaengine_pcm_prepare_slave_config(substream, params, sc);
@@ -978,18 +984,20 @@ static int mca_prepare_slave_config(struct snd_pcm_substream *substream,
 	 */
 	per_ms = round_up(params_rate(params) * params_channels(params) / 1000,
 			  4);
-	limit = bytes * per_ms;
-	if (hw->align_sio_tx_depth && substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		limit = rounddown(min(limit, hw->sio_fifo),
-				  bytes * params_channels(params));
-
 	*cfg = (struct apple_sio_dma_config) {
 		.xfer = bytes == 2 ? hw->sio_xfer16 : hw->sio_xfer32,
 		.timeout = hw->sio_timeout,
 		.fifo = hw->sio_fifo,
 		.trigger = hw->sio_trigger,
-		.limit = limit,
+		.limit = bytes * per_ms,
 	};
+	if (hw->capture_channels) {
+		unsigned int max_depth = substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
+					 hw->sio_fifo : hw->sio_trigger;
+
+		cfg->limit = rounddown(min(max_depth, bytes * per_ms),
+				       bytes * params_channels(params));
+	}
 	sc->peripheral_config = cfg;
 	sc->peripheral_size = sizeof(*cfg);
 	return 0;
@@ -1289,6 +1297,12 @@ static int s8000_mca_probe(struct platform_device *pdev)
 		mca->dai_drv.playback.rates = SNDRV_PCM_RATE_48000;
 	if (!mca->capture)
 		memset(&mca->dai_drv.capture, 0, sizeof(mca->dai_drv.capture));
+	else if (mca->hw->capture_channels) {
+		mca->dai_drv.capture.channels_min = mca->hw->capture_channels;
+		mca->dai_drv.capture.channels_max = mca->hw->capture_channels;
+		mca->dai_drv.capture.formats = mca->hw->formats;
+		mca->dai_drv.capture.rates = SNDRV_PCM_RATE_48000;
+	}
 
 	ret = devm_snd_soc_register_component(dev, &mca_component,
 					      &mca->dai_drv, 1);
@@ -1297,7 +1311,7 @@ static int s8000_mca_probe(struct platform_device *pdev)
 
 	mca->pcm_hw = mca_dma_hw;
 	mca->pcm_hw.channels_min = mca->hw->channels;
-	mca->pcm_hw.channels_max = mca->hw->channels;
+	mca->pcm_hw.channels_max = mca->hw->capture_channels ?: mca->hw->channels;
 	mca->pcm_hw.formats = mca->hw->formats;
 	mca->pcm_config = mca_dma_config;
 	mca->pcm_config.pcm_hardware = &mca->pcm_hw;
@@ -1541,20 +1555,24 @@ static const struct s8000_mca_hw t8011_mca_hw = {
 	.clock_provider = true,
 	.dai_format = SND_SOC_DAIFMT_DSP_A,
 	.channels = 4,
-	.slots = 8,
+	.capture_channels = 8,
+	.rx_slots = 0xff,
 	.frame_bits = 256,
+	.frame_at_prepare = true,
+	.mask_stream_irqs = true,
+	.slots = 8,
 	.tx_slots = 0x0f,
 	.tx_cfg = 0x133,
 	.rx_cfg = 0x137,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE,
 	.sync_bits = 1,
 	.stream_irqs = MCA_IRQ_FRAME_ERROR,
-	.attenuation = 4,
+	.attenuation = 1,
 	.sio_xfer16 = 0x21,
 	.sio_xfer32 = 0x22,
+	.sio_timeout = 0,
 	.sio_fifo = 0xcc,
 	.sio_trigger = 0xac,
-	.align_sio_tx_depth = true,
 };
 
 static const struct of_device_id s8000_mca_of_match[] = {
@@ -1563,9 +1581,9 @@ static const struct of_device_id s8000_mca_of_match[] = {
 	{ .compatible = "apple,s8000-mca", .data = &s8000_mca_hw },
 	{ .compatible = "apple,s8000-mca-tdm", .data = &s8000_tdm_mca_hw },
 	{ .compatible = "apple,t7001-mca", .data = &t7001_mca_hw },
+	{ .compatible = "apple,t8011-mca", .data = &t8011_mca_hw },
 	{ .compatible = "apple,t8010-mca", .data = &t8010_mca_hw },
 	{ .compatible = "apple,t8010-mca-i2s", .data = &t8010_i2s_mca_hw },
-	{ .compatible = "apple,t8011-mca", .data = &t8011_mca_hw },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s8000_mca_of_match);
