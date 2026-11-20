@@ -67,6 +67,7 @@ struct applnco_tables {
 };
 
 struct applnco_hw {
+	u32 stride;
 	u32 enable_mask;
 	u32 control_set;
 	u32 control_clear;
@@ -284,7 +285,7 @@ static int applnco_probe(struct platform_device *pdev)
 	void __iomem *base;
 	struct resource *res;
 	struct applnco_tables *tbl;
-	unsigned int nchannels;
+	unsigned int nchannels, stride;
 	const struct applnco_hw *soc = device_get_match_data(&pdev->dev);
 	int ret, i;
 
@@ -303,10 +304,10 @@ static int applnco_probe(struct platform_device *pdev)
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
+	stride = soc ? soc->stride : NCO_CHANNEL_STRIDE;
 	if (resource_size(res) < NCO_CHANNEL_REGSIZE)
 		return -EINVAL;
-	nchannels = (resource_size(res) - NCO_CHANNEL_REGSIZE)
-			/ NCO_CHANNEL_STRIDE + 1;
+	nchannels = (resource_size(res) - NCO_CHANNEL_REGSIZE) / stride + 1;
 
 	onecell_data = devm_kzalloc(&pdev->dev, struct_size(onecell_data, hws,
 							nchannels), GFP_KERNEL);
@@ -326,7 +327,7 @@ static int applnco_probe(struct platform_device *pdev)
 		if (!chan)
 			return -ENOMEM;
 		chan->soc = soc;
-		chan->base = base + NCO_CHANNEL_STRIDE * i;
+		chan->base = base + stride * i;
 		chan->tbl = tbl;
 		spin_lock_init(&chan->lock);
 
@@ -355,12 +356,26 @@ static int applnco_probe(struct platform_device *pdev)
 
 /* AppleS5L8960XNCO: parent 0, no alternate prescaler, accumulator mode. */
 static const struct applnco_hw t8010_nco_hw = {
+	.stride = NCO_CHANNEL_STRIDE,
+	.enable_mask = BIT(12),
+	.control_set = BIT(31),
+	.control_clear = BIT(24) | BIT(29),
+};
+
+/*
+ * The same block on the A7 to A8X, with its channels 0x1000 apart: iOS's
+ * AppleS5L8960XNCO takes the stride from "pmgr-nco-page-size" and falls back
+ * to 0x1000, which T7001's ADT relies on (reg size 0x5000, five channels).
+ */
+static const struct applnco_hw t7001_nco_hw = {
+	.stride = 0x1000,
 	.enable_mask = BIT(12),
 	.control_set = BIT(31),
 	.control_clear = BIT(24) | BIT(29),
 };
 
 static const struct of_device_id applnco_ids[] = {
+	{ .compatible = "apple,t7001-nco", .data = &t7001_nco_hw },
 	{ .compatible = "apple,t8010-nco", .data = &t8010_nco_hw },
 	{ .compatible = "apple,t8103-nco" },
 	{ .compatible = "apple,nco" },
