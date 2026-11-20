@@ -99,6 +99,8 @@ static int ct709_read_raw(struct iio_dev *indio,
 	}
 	d->deadline = ktime_get_ns() + 5ULL * NSEC_PER_SEC;
 	ret = als_once(&ct709_ops, d, &result);
+	if (ret == -EOPNOTSUPP && !result.changed)
+		goto out;
 	if (ret || !result.valid || !result.restored) {
 		d->faulted = true;
 		if (!ret)

@@ -89,6 +89,14 @@ static int als_once(const struct als_ops *o, void *ctx, struct als_result *r)
 		ret = -EPERM;
 		goto finish;
 	}
+	/* GAIN=2 gives the advertised 16x range only with AUX gain disabled. */
+	ret = als_read(o, ctx, 0x90, &v);
+	if (ret)
+		goto finish;
+	if (v != 0) {
+		ret = -EOPNOTSUPP;
+		goto finish;
+	}
 	/*
 	 * Configure only after exact original admission; any write can be
 	 * ambiguous.
