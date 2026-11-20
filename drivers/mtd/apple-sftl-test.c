@@ -1344,6 +1344,52 @@ static void sftl_test_torn_page_at_load(struct kunit *test)
 	apple_sftl_free(sftl);
 }
 
+/* A native open block can contain older subtype-1 copies on adjacent pages. */
+static void sftl_test_checkpointed_open_copies(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct sftl_test_page *page = kunit_kzalloc(test, sizeof(*page), GFP_KERNEL);
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
+	unsigned int row, chunk;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	f->sequence_bias = 1ULL << 16;
+	for (row = 0; row < 2; row++) {
+		for (chunk = 0; chunk < 4; chunk++) {
+			u8 *meta = page->oob + 16 * chunk;
+			u32 slot = 4 * row + chunk;
+
+			sftl_test_meta(meta, 1, 1, f->sequence_bias + 10 + slot, 2 + slot);
+			put_unaligned_le32(0, meta + 12);
+		}
+		KUNIT_ASSERT_EQ(test, sftl_test_program_page(f, 0, 0, 5, row,
+							    page->data, page->oob), 0);
+	}
+
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.journal_sequence, f->sequence_bias + TEST_OPEN_FIRST + 3);
+	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 2, page->data), 0);
+	sftl_test_expect_fill(test, page->data, 'G');
+	apple_sftl_free(sftl);
+	sftl = NULL;
+
+	page = sftl_test_written(f, 0, 0, 0);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	/* An epoch from the future still invalidates the first page. */
+	put_unaligned_le32(2, page->oob + 12);
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+	KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+
+	/* A newer record still has to pass full journal validation. */
+	sftl_test_meta(page->oob, 1, 1, f->sequence_bias + TEST_OPEN_FIRST + 4, 2);
+	put_unaligned_le32(0, page->oob + 12);
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+	KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+}
+
 /* Only the last programmed page of an open block may be torn. */
 static void sftl_test_torn_page_not_last(struct kunit *test)
 {
@@ -3728,6 +3774,7 @@ static struct kunit_case apple_sftl_cases[] = {
 	KUNIT_CASE(sftl_test_append_interrupted_footer_replays),
 	KUNIT_CASE(sftl_test_append_torn_metadata),
 	KUNIT_CASE(sftl_test_torn_page_at_load),
+	KUNIT_CASE(sftl_test_checkpointed_open_copies),
 	KUNIT_CASE(sftl_test_torn_page_not_last),
 	KUNIT_CASE(sftl_test_append_scans_entire_candidate),
 	KUNIT_CASE(sftl_test_append_reserves_vfl_members),

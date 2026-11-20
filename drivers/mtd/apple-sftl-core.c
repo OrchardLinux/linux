@@ -1350,6 +1350,13 @@ static bool sftl_journal_meta(const struct apple_sftl *sftl, const u8 *meta)
 {
 	u64 sequence = sftl_sequence(meta);
 
+	/* Native subtype-1 data covered by the checkpoint can retain an
+	 * earlier user epoch. It occupies the page but is never replayed.
+	 */
+	if (meta[0] == 1 && meta[1] == 1 && sequence <= sftl->checkpoint_sequence &&
+	    get_unaligned_le32(meta + 8) < sftl->geo->disk_pages)
+		return get_unaligned_le32(meta + 12) <= sequence >> 16;
+
 	return sftl_erased(meta, SFTL_META) ||
 		((meta[0] == 1 || meta[0] == 2) &&
 		 sftl_user_epoch_valid(sftl, meta, sequence) &&
