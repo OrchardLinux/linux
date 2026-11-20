@@ -20,6 +20,16 @@ properties:
   reg:
     maxItems: 1
 
+  apple,als-calibration:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 6696
+    maxItems: 9992
+    description:
+      Factory calibration supplied by the bootloader from the resolved Apple
+      device tree alsCalibration property. On J120 the eight-byte header and
+      two 3344-byte orientation records can be followed by padding. The
+      property on the als0 node contains records for both sensors.
+
 required:
   - compatible
   - reg
