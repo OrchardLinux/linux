@@ -202,6 +202,9 @@ static const struct iio_chan_spec_ext_info apple_aop_accel_ext_info[] = {
 	.ext_info = apple_aop_accel_ext_info,				\
 }
 
+/* Firmware reports always contain all three axes. */
+static const unsigned long apple_aop_accel_scan_masks[] = { GENMASK(2, 0), 0 };
+
 static const struct iio_chan_spec apple_aop_accel_channels[] = {
 	APPLE_AOP_ACCEL_CHANNEL(X, 0),
 	APPLE_AOP_ACCEL_CHANNEL(Y, 1),
@@ -257,6 +260,7 @@ static int apple_aop_accel_probe(struct platform_device *pdev)
 
 	indio_dev->name = "apple-aop-accel";
 	indio_dev->info = &apple_aop_accel_info;
+	indio_dev->available_scan_masks = apple_aop_accel_scan_masks;
 	indio_dev->channels = apple_aop_accel_channels;
 	indio_dev->num_channels = ARRAY_SIZE(apple_aop_accel_channels);
 	indio_dev->modes = INDIO_DIRECT_MODE;
