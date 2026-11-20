@@ -4,14 +4,15 @@
 $id: http://devicetree.org/schemas/sound/apple,t8010-pdm.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8010 PDM microphone controller
+title: Apple T8010 and T8011 PDM microphone controller
 
 maintainers:
   - Henrik Klee <henrik@goat-code.com>
 
 description:
   The PDM microphone controller of the Apple A10 records the built-in
-  PDM microphones. Each microphone has a HiFi decimator that filters its
+  PDM microphones. T8011 uses a different SmartIO FIFO and trigger pair.
+  Each microphone has a HiFi decimator that filters its
   bit stream down to PCM; the controller hands the samples to SmartIO
   DMA. The PDM clock comes from the Always-On Processor's audio service.
 
@@ -20,7 +21,9 @@ allOf:
 
 properties:
   compatible:
-    const: apple,t8010-pdm
+    enum:
+      - apple,t8010-pdm
+      - apple,t8011-pdm
 
   reg:
     minItems: 2
