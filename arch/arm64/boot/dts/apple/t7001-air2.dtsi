@@ -193,6 +193,11 @@
 	status = "okay";
 };
 
+/* SmartIO: the DMA engine of every MCA and of spi1 */
+&sio {
+	status = "okay";
+};
+
 &serial5 {
 	pinctrl-0 = <&uart5_pins>;
 	pinctrl-names = "default";
