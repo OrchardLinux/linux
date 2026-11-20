@@ -194,7 +194,9 @@ static bool tristar_d2355_pack_allows(struct tristar_charger *chg,
 {
 	struct tristar_d2355 *hw = chg->chip_data;
 
-	return pack->temp >= hw->pack_limits[0] && pack->temp <= hw->pack_limits[1] &&
+	/* The gauge's full flag remains valid when the pack supplies power. */
+	return !pack->full &&
+	       pack->temp >= hw->pack_limits[0] && pack->temp <= hw->pack_limits[1] &&
 	       pack->voltage_uv >= hw->pack_limits[2] && pack->voltage_uv <= hw->pack_limits[3] &&
 	       pack->current_ua >= hw->pack_limits[4] && pack->current_ua <= hw->pack_limits[5];
 }

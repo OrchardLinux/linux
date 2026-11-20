@@ -44,6 +44,7 @@ static const enum power_supply_property bq27545_iphone7_plus_cache_props[] = {
 
 /* RemainingCapacity answers, NominalAvailableCapacity does not. */
 static const enum power_supply_property bq27540_j120_cache_props[] = {
+	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,

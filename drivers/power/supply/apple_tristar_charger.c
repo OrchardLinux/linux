@@ -383,9 +383,10 @@ struct tristar_pack {
 	int temp;
 	int voltage_uv;
 	int current_ua;
+	bool full;
 };
 
-static int tristar_read_pack(struct tristar_pack *pack)
+static int tristar_read_pack(struct tristar_charger *chg, struct tristar_pack *pack)
 {
 	struct power_supply *battery = power_supply_get_by_name("battery");
 	union power_supply_propval val;
@@ -414,6 +415,12 @@ static int tristar_read_pack(struct tristar_pack *pack)
 	}
 	if (!ret)
 		pack->current_ua = val.intval;
+	pack->full = false;
+	if (!ret && chg->chip->require_pack_telemetry) {
+		ret = power_supply_get_property(battery, POWER_SUPPLY_PROP_CAPACITY_LEVEL, &val);
+		if (!ret)
+			pack->full = val.intval == POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+	}
 	power_supply_put(battery);
 	return ret;
 }
@@ -1061,7 +1068,7 @@ static void tristar_ramp_step(struct tristar_charger *chg, u64 now)
 	if (tristar_debouncing(chg, now) ||
 	    (chg->step_ns && now - chg->step_ns < chg->step_wait_ns))
 		return;
-	if (tristar_read_pack(&pack)) {
+	if (tristar_read_pack(chg, &pack)) {
 		if (chg->chip->require_pack_telemetry)
 			tristar_withdraw(chg, chg->chip->fallback_code);
 		return;
@@ -1164,7 +1171,7 @@ static void tristar_guard(struct tristar_charger *chg, u64 now)
 	tristar_check_limit(chg);
 	if (chg->phase != TRISTAR_CHARGING)
 		return;
-	if (tristar_read_pack(&pack)) {
+	if (tristar_read_pack(chg, &pack)) {
 		if (chg->chip->require_pack_telemetry)
 			tristar_withdraw(chg, chg->chip->fallback_code);
 		return;
