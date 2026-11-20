@@ -437,7 +437,10 @@
 /*
  * The BCM4350C2's Bluetooth on UART3, from the ADT uart3/bluetooth node:
  * power enable on D2207 GPIO 2, BT_WAKE on GPIO 164. m1n1 adds the device
- * address. 115,200 baud is the speed tested on a J81; the ADT allows 3 Mbit/s.
+ * address. The controller starts at 115,200 baud; the driver then switches
+ * the link to 3 Mbit/s, the ADT's transport-speed. At 115,200 baud, A2DP
+ * audio crackles, and an HFP call's SCO audio (64 kbit/s each way) does not
+ * fit.
  */
 &serial3 {
 	pinctrl-0 = <&uart3_pins>;
@@ -448,6 +451,7 @@
 	bluetooth: bluetooth {
 		compatible = "apple,j81-bcm4350c2-bt";
 		current-speed = <115200>;
+		max-speed = <3000000>;
 		shutdown-gpios = <&pmu_gpio 2 GPIO_ACTIVE_HIGH>;
 		device-wakeup-gpios = <&pinctrl 164 GPIO_ACTIVE_HIGH>;
 	};
