@@ -129,6 +129,23 @@
 		nonposted-mmio;
 		ranges;
 
+		gpu: gpu@201000000 {
+			compatible = "apple,t7000-gpu";
+			reg = <0x2 0x01000000 0x0 0x100000>,
+			      <0x2 0x01e00000 0x0 0x100000>,
+			      <0x2 0x0e000000 0x0 0x40000>,
+			      <0x2 0x01f00000 0x0 0x81000>;
+			reg-names = "rgx", "fender", "pmgr", "bridges";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 134 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 135 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 136 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 137 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 138 IRQ_TYPE_LEVEL_HIGH>;
+			firmware-name = "apple/gfx-t7000.bin";
+			status = "disabled";
+		};
+
 		cpufreq: performance-controller@202220000 {
 			compatible = "apple,t7000-cluster-cpufreq", "apple,s5l8960x-cluster-cpufreq";
 			reg = <0x2 0x02220000 0 0x1000>;

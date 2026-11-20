@@ -51,6 +51,10 @@
 	power-domains = <&ps_disp0 &ps_mipi_dsi>;
 };
 
+&gpu {
+	status = "okay";
+};
+
 &i2c0 {
 	status = "okay";
 
