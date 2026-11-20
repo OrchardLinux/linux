@@ -35,4 +35,11 @@ config SND_SOC_APPLE_T8010_PDM
 	  controller of the Apple A10, which records the built-in
 	  microphones of the iPad 6 and iPad 7.
 
+config SND_SOC_APPLE_J120_SPEAKERS
+	tristate "Apple J120 built-in speaker amplifiers"
+	depends on I2C && GPIOLIB && OF
+	select REGMAP_I2C
+	help
+	  Drive the four MAX98723 speaker amplifiers on the J120 iPad Pro.
+
 endmenu
