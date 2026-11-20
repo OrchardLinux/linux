@@ -183,6 +183,12 @@ enum nvme_quirks {
 	 * Admin queue DMA buffers must be page aligned
 	 */
 	NVME_QUIRK_ADMIN_PAGE_ALIGN		= (1 << 23),
+
+	/* Diagnostic host: expose namespaces read-only and reject media changes. */
+	NVME_QUIRK_READ_ONLY			= (1 << 24),
+
+	/* With READ_ONLY: permit only namespace 1 Write/Flush for bring-up. */
+	NVME_QUIRK_PRIMARY_NS_WRITES		= (1 << 25),
 };
 
 static inline char *nvme_quirk_name(enum nvme_quirks q)
@@ -236,6 +242,10 @@ static inline char *nvme_quirk_name(enum nvme_quirks q)
 		return "dmapool_align_512";
 	case NVME_QUIRK_ADMIN_PAGE_ALIGN:
 		return "admin_page_align";
+	case NVME_QUIRK_READ_ONLY:
+		return "read_only";
+	case NVME_QUIRK_PRIMARY_NS_WRITES:
+		return "primary_ns_writes";
 	}
 
 	return "unknown";

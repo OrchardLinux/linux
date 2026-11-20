@@ -58,6 +58,8 @@ struct apple_ans_nvme_req {
  * @sleep_stop: the controller's port loses power in system sleep: stop the
  *              controller first, as iOS (AppleEmbeddedNVMeController) does,
  *              and bring it up from reset on resume
+ * @read_only: diagnostic host rejects media changes and optional feature setup
+ * @primary_ns_writes: diagnostic exception for namespace 1 Write and Flush
  */
 struct apple_ans_host {
 	u32 l1ss_ctl1;
@@ -65,6 +67,8 @@ struct apple_ans_host {
 	unsigned int rdy_timeout_ms;
 	bool late_bus_master;
 	bool sleep_stop;
+	bool read_only;
+	bool primary_ns_writes;
 };
 
 static const struct apple_ans_host apple_ans_host_s8003 = {
@@ -82,6 +86,16 @@ static const struct apple_ans_host apple_ans_host_s8003 = {
 static const struct apple_ans_host apple_ans_host_t8010 = {
 	.l1ss_ctl1 = APPLE_ANS_L1SS_CTL1_T8010,
 	.sleep_stop = true,
+};
+
+/* J120 uses the same L1SS control, verified against its native port data. */
+static const struct apple_ans_host apple_ans_host_j120 = {
+	.l1ss_ctl1 = APPLE_ANS_L1SS_CTL1_T8010,
+	.sleep_stop = true,
+	/* Namespace writes and their recovery path are not yet qualified. */
+	.read_only = true,
+	/* Isolated write-qualification candidate; never enable auxiliary writes. */
+	.primary_ns_writes = true,
 };
 
 struct apple_ans_nvme {
@@ -105,6 +119,7 @@ static struct apple_ans_nvme *nvme_pci_apple_ans(struct nvme_dev *dev)
 }
 
 static const struct of_device_id nvme_pci_apple_ans_hosts[] = {
+	{ .compatible = "apple,j120-pcie", .data = &apple_ans_host_j120 },
 	{ .compatible = "apple,s8000-pcie", .data = &apple_ans_host_s8003 },
 	{ .compatible = "apple,s8003-pcie", .data = &apple_ans_host_s8003 },
 	{ .compatible = "apple,t8010-pcie", .data = &apple_ans_host_t8010 },
@@ -140,6 +155,18 @@ bool nvme_pci_apple_ans_match(struct pci_dev *pdev)
 {
 	return pdev->vendor == PCI_VENDOR_ID_APPLE &&
 	       nvme_pci_apple_ans_host_match(pdev);
+}
+
+unsigned long nvme_pci_apple_ans_quirks(struct pci_dev *pdev)
+{
+	const struct of_device_id *match = nvme_pci_apple_ans_host_match(pdev);
+	const struct apple_ans_host *host = match ? match->data : NULL;
+
+	/* Avoid automatic power-state programming during read-only bring-up. */
+	if (!host || !host->read_only)
+		return 0;
+	return NVME_QUIRK_READ_ONLY | NVME_QUIRK_NO_APST |
+		(host->primary_ns_writes ? NVME_QUIRK_PRIMARY_NS_WRITES : 0);
 }
 
 static int nvme_pci_apple_ans_init(struct nvme_dev *dev, int node)

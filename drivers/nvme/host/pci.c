@@ -1267,9 +1267,46 @@ static blk_status_t nvme_map_metadata(struct request *req)
 	return nvme_pci_setup_meta_mptr(req);
 }
 
+/*
+ * Fail closed before mapping DMA, including privileged ioctl/io_uring requests.
+ * The only I/O command is Read. Admin commands can inspect the controller and
+ * manage volatile queues/events, but cannot change namespaces or saved state.
+ */
+static bool nvme_readonly_cmd_allowed(u8 opcode, bool admin, u32 feature_id)
+{
+	if (!admin)
+		return opcode == nvme_cmd_read;
+
+	switch (opcode) {
+	case nvme_admin_delete_sq:
+	case nvme_admin_create_sq:
+	case nvme_admin_get_log_page:
+	case nvme_admin_delete_cq:
+	case nvme_admin_create_cq:
+	case nvme_admin_identify:
+	case nvme_admin_abort_cmd:
+	case nvme_admin_get_features:
+	case nvme_admin_async_event:
+		return true;
+	case nvme_admin_set_features:
+		/* No Save bit or reserved bits, and only volatile queue/event setup. */
+		return feature_id == NVME_FEAT_NUM_QUEUES ||
+		       feature_id == NVME_FEAT_ASYNC_EVENT;
+	default:
+		return false;
+	}
+}
+
+static bool nvme_primary_write_allowed(u8 opcode, bool admin, u32 nsid)
+{
+	return !admin && nsid == 1 &&
+	       (opcode == nvme_cmd_write || opcode == nvme_cmd_flush);
+}
+
 static blk_status_t nvme_prep_rq(struct request *req)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
 	blk_status_t ret;
 
 	iod->flags = 0;
@@ -1283,6 +1320,19 @@ static blk_status_t nvme_prep_rq(struct request *req)
 	ret = nvme_setup_cmd(req->q->queuedata, req);
 	if (ret)
 		return ret;
+
+	if (unlikely(nvmeq->dev->ctrl.quirks & NVME_QUIRK_READ_ONLY) &&
+	    !nvme_readonly_cmd_allowed(iod->cmd.common.opcode, !nvmeq->qid,
+				      le32_to_cpu(iod->cmd.features.fid)) &&
+	    !((nvmeq->dev->ctrl.quirks & NVME_QUIRK_PRIMARY_NS_WRITES) &&
+	      nvme_primary_write_allowed(iod->cmd.common.opcode, !nvmeq->qid,
+					le32_to_cpu(iod->cmd.common.nsid)))) {
+		dev_warn_ratelimited(nvmeq->dev->dev,
+			"read-only bring-up: rejected %s opcode %#x\n",
+			nvmeq->qid ? "I/O" : "admin", iod->cmd.common.opcode);
+		ret = BLK_STS_PROTECTION;
+		goto out_free_cmd;
+	}
 
 	if (blk_rq_nr_phys_segments(req)) {
 		ret = nvme_map_data(req);
@@ -3809,6 +3859,7 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 		dev->dma_ops = &nvme_pci_apple_ans_ops;
 		/* One MSI and shared tags, as for 106b:2002 */
 		quirks |= NVME_QUIRK_SINGLE_VECTOR | NVME_QUIRK_SHARED_TAGS;
+		quirks |= nvme_pci_apple_ans_quirks(pdev);
 	}
 	if (dev->dma_ops) {
 		ret = dev->dma_ops->init(dev, node);
