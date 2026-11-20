@@ -185,12 +185,46 @@
 };
 
 /*
- * Speaker amplifiers (two MAX98721, at 0x31 and 0x34 in Apple's device
- * tree). No driver binds them yet; the bus is enabled so they can be
- * identified from user space.
+ * The two speaker amplifiers, fed by MCA3 in TDM slots 0 (0x31) and 1
+ * (0x34); both read revision 0x80 on a J81. Their driver holds them off
+ * until a sound card runs a stream through them. Their interrupts (GPIO 8
+ * and 9) and the 0x31 amplifier's "function-alive" GPIO 101 are not
+ * described yet.
  */
 &i2c1 {
 	status = "okay";
+
+	speaker_amp0: amplifier@31 {
+		compatible = "maxim,max98721";
+		reg = <0x31>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left";
+
+		port {
+			amp0_ep: endpoint {
+				remote-endpoint = <&speaker_amp0_ep>;
+				dai-tdm-slot-num = <8>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <1>;		/* slot 0 */
+			};
+		};
+	};
+
+	speaker_amp1: amplifier@34 {
+		compatible = "maxim,max98721";
+		reg = <0x34>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right";
+
+		port {
+			amp1_ep: endpoint {
+				remote-endpoint = <&speaker_amp1_ep>;
+				dai-tdm-slot-num = <8>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <0 1>;		/* slot 1 */
+			};
+		};
+	};
 };
 
 /* SmartIO: the DMA engine of every MCA and of spi1 */
@@ -219,6 +253,61 @@
 &mca3 {
 	apple,i2s-switch = <&i2s_switch 3 3>;
 	status = "okay";
+
+	mca3_port: port {
+		mca3_ep: endpoint {
+			remote-endpoint = <&speakers_cpu_ep>;
+			format = "dsp_a";
+			bitclock-master;
+			frame-master;
+		};
+	};
+};
+
+/*
+ * The speakers: MCA3 playing to both amplifiers on one TDM link
+ * (audio-graph-card2 "semi-multi", one CPU to two codecs). Channel 0 is
+ * slot 0 (amplifier 0x31, the left speaker in portrait), channel 1 slot 1
+ * (0x34, the right speaker).
+ */
+/ {
+	sound-speakers {
+		compatible = "audio-graph-card2";
+		label = "J81 Speakers";
+		links = <&mca3_port>;
+
+		multi {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ports@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					speakers_cpu_ep: endpoint {
+						remote-endpoint = <&mca3_ep>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					speaker_amp0_ep: endpoint {
+						remote-endpoint = <&amp0_ep>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+					speaker_amp1_ep: endpoint {
+						remote-endpoint = <&amp1_ep>;
+					};
+				};
+			};
+		};
+	};
 };
 
 &serial5 {
