@@ -13,21 +13,26 @@ description:
   The Apple "VXD" block is a multi-standard hardware video decoder, an
   Imagination PowerVR MSVDX core whose MTX (META) microcontroller runs the
   DEVA firmware. Apple has used this IP family since the S5L8940X (A4); the
-  S8000/S8003 (A9) reports vxd-version 7 in the Apple device tree, the T8010
-  (A10) vxd-version 10. The block has no DART; it translates its own memory accesses through a two-level
-  "GART" that the host programs through the MTX MMU registers.
+  S8000/S8003 (A9) reports vxd-version 7 in the Apple device tree, and T8010
+  (A10) and T8011 (A10X) report vxd-version 10. The block has no DART; it
+  translates its own memory accesses through a two-level "GART" that the host
+  programs through the MTX MMU registers.
 
 properties:
   compatible:
-    enum:
-      - apple,s8000-vxd
-      - apple,t8010-vxd
+    oneOf:
+      - enum:
+          - apple,s8000-vxd
+          - apple,t8010-vxd
+      - items:
+          - const: apple,t8011-vxd
+          - const: apple,t8010-vxd
 
   reg:
     minItems: 1
     items:
       - description: decoder core registers
-      - description: second register range of the T8010 block
+      - description: integration registers on T8010 and T8011
 
   interrupts:
     maxItems: 1
