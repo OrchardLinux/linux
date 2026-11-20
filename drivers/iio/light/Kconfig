@@ -76,6 +76,13 @@ config AL3320A
 	  To compile this driver as a module, choose M here: the
 	  module will be called al3320a.
 
+config AMS_CT709
+	tristate "CT709 four-channel light sensor"
+	depends on I2C
+	help
+	  Read the clear, red, green and blue channels of the CT709 light
+	  sensors on the Apple J120. The module is called ams-ct709.
+
 config APDS9160
 	tristate "APDS9160 combined als and proximity sensor"
 	depends on I2C
