@@ -312,6 +312,8 @@ static int tristar_read_pack(struct tristar_pack *pack)
 		ret = -ENODEV;
 	if (!ret)
 		ret = power_supply_get_property(battery, POWER_SUPPLY_PROP_CAPACITY, &val);
+	if (!ret && (val.intval < 0 || val.intval > 100))
+		ret = -ERANGE;
 	if (!ret) {
 		pack->capacity = val.intval;
 		ret = power_supply_get_property(battery, POWER_SUPPLY_PROP_TEMP, &val);
