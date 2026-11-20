@@ -291,13 +291,13 @@ struct s8000_mca_hw {
 	u32 sio_timeout;
 	u32 sio_fifo;
 	u32 sio_trigger;
+	bool align_sio_tx_depth;
 };
 
 struct s8000_mca {
 	struct device *dev;
 	const struct s8000_mca_hw *hw;
 	const struct s8000_mca_regs *regs;
-	unsigned int frame_padding;
 	void __iomem *base;
 	void __iomem *mclk_reg;
 	struct clk_hw mclk_hw;
@@ -522,7 +522,7 @@ static int mca_hw_params(struct snd_pcm_substream *substream,
 	unsigned int slot = params_physical_width(params);
 	unsigned int channels = params_channels(params);
 	unsigned int slots = mca->hw->slots, depth;
-	unsigned int frame_bits = mca->hw->frame_bits ?: slot * slots + mca->frame_padding;
+	unsigned int frame_bits = mca->hw->frame_bits ?: slot * slots;
 	unsigned int sync_bits = mca->hw->sync_bits ?: frame_bits / 2;
 	u32 width_code;
 
@@ -962,6 +962,7 @@ static int mca_prepare_slave_config(struct snd_pcm_substream *substream,
 	const struct s8000_mca_hw *hw = mca->hw;
 	unsigned int bytes = params_physical_width(params) / 8;
 	unsigned int per_ms;
+	u32 limit;
 	int ret;
 
 	ret = snd_dmaengine_pcm_prepare_slave_config(substream, params, sc);
@@ -977,12 +978,17 @@ static int mca_prepare_slave_config(struct snd_pcm_substream *substream,
 	 */
 	per_ms = round_up(params_rate(params) * params_channels(params) / 1000,
 			  4);
+	limit = bytes * per_ms;
+	if (hw->align_sio_tx_depth && substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		limit = rounddown(min(limit, hw->sio_fifo),
+				  bytes * params_channels(params));
+
 	*cfg = (struct apple_sio_dma_config) {
 		.xfer = bytes == 2 ? hw->sio_xfer16 : hw->sio_xfer32,
 		.timeout = hw->sio_timeout,
 		.fifo = hw->sio_fifo,
 		.trigger = hw->sio_trigger,
-		.limit = bytes * per_ms,
+		.limit = limit,
 	};
 	sc->peripheral_config = cfg;
 	sc->peripheral_size = sizeof(*cfg);
@@ -1199,9 +1205,6 @@ static int s8000_mca_probe(struct platform_device *pdev)
 	if (!mca->hw)
 		return -ENODEV;
 	mca->regs = mca->hw->regs;
-	/* J120 iisConfig uses eight 16-bit slots and 128 trailing clocks. */
-	if (of_device_is_compatible(dev->of_node, "apple,t8011-mca"))
-		mca->frame_padding = 128;
 	spin_lock_init(&mca->hw_lock);
 	mca->irq_mask = MCA_IRQ_ALL;
 	platform_set_drvdata(pdev, mca);
@@ -1531,6 +1534,29 @@ static const struct s8000_mca_hw s5l8960x_tdm_mca_hw = {
 	.sio_trigger = 0xac,
 };
 
+/* J120 MCA2 uses eight 16-bit slots followed by 128 padding clocks. */
+static const struct s8000_mca_hw t8011_mca_hw = {
+	.version = 5,
+	.regs = &mca_v4_regs,
+	.clock_provider = true,
+	.dai_format = SND_SOC_DAIFMT_DSP_A,
+	.channels = 4,
+	.slots = 8,
+	.frame_bits = 256,
+	.tx_slots = 0x0f,
+	.tx_cfg = 0x133,
+	.rx_cfg = 0x137,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.sync_bits = 1,
+	.stream_irqs = MCA_IRQ_FRAME_ERROR,
+	.attenuation = 4,
+	.sio_xfer16 = 0x21,
+	.sio_xfer32 = 0x22,
+	.sio_fifo = 0xcc,
+	.sio_trigger = 0xac,
+	.align_sio_tx_depth = true,
+};
+
 static const struct of_device_id s8000_mca_of_match[] = {
 	{ .compatible = "apple,s5l8960x-mca", .data = &s5l8960x_mca_hw },
 	{ .compatible = "apple,s5l8960x-mca-tdm", .data = &s5l8960x_tdm_mca_hw },
@@ -1539,7 +1565,7 @@ static const struct of_device_id s8000_mca_of_match[] = {
 	{ .compatible = "apple,t7001-mca", .data = &t7001_mca_hw },
 	{ .compatible = "apple,t8010-mca", .data = &t8010_mca_hw },
 	{ .compatible = "apple,t8010-mca-i2s", .data = &t8010_i2s_mca_hw },
-	{ .compatible = "apple,t8011-mca", .data = &t8010_mca_hw },
+	{ .compatible = "apple,t8011-mca", .data = &t8011_mca_hw },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s8000_mca_of_match);
