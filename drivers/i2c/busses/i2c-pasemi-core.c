@@ -52,6 +52,7 @@
 #define CTL_CLK_M	GENMASK(7, 0)
 
 #define SMSTA_XFER_CLEAR	(SMSTA_XEN | SMSTA_MTO | SMSTA_MTN | SMSTA_TOM)
+#define SMSTA_XFER_ERROR	(SMSTA_TOM | SMSTA_MTO | SMSTA_MTA | SMSTA_MTN)
 
 /*
  * The hardware (supposedly) has a 25ms timeout for clock stretching, thus
@@ -200,6 +201,15 @@ static int pasemi_smb_waitready(struct pasemi_smbus *smbus)
 			dev_err(smbus->dev, "Timeout, status 0x%08x\n", status);
 			return -ETIME;
 		}
+	}
+
+	/* Apple's engine can report XEN before the final STOP makes it idle. */
+	if (smbus->wait_for_idle && (status & (SMSTA_XEN | SMSTA_XIP)) ==
+	    (SMSTA_XEN | SMSTA_XIP) && !(status & SMSTA_XFER_ERROR)) {
+		/* Preserve the existing bus-stuck error if the busy bit persists. */
+		readx_poll_timeout(ioread32, smbus->ioaddr + REG_SMSTA, status,
+				   !(status & SMSTA_XIP) || (status & SMSTA_XFER_ERROR),
+				   10, USEC_PER_MSEC);
 	}
 
 	/* Controller timeout? */

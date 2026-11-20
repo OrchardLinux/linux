@@ -21,6 +21,7 @@ struct pasemi_smbus {
 	unsigned int		 ctl_flags;
 	int			 hw_rev;
 	int			 use_irq;
+	bool			 wait_for_idle;
 	void			 (*hw_init)(struct pasemi_smbus *smbus);
 	struct completion	 irq_completion;
 };

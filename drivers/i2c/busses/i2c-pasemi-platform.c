@@ -26,6 +26,7 @@
 struct pasemi_platform_i2c_match_data {
 	void (*hw_init)(struct pasemi_smbus *smbus);
 	u32 ctl_flags;
+	bool wait_for_idle;
 };
 
 struct pasemi_platform_i2c_data {
@@ -48,6 +49,7 @@ static void pasemi_platform_i2c_t8010_init(struct pasemi_smbus *smbus)
 static const struct pasemi_platform_i2c_match_data t8010_i2c_data = {
 	.hw_init = pasemi_platform_i2c_t8010_init,
 	.ctl_flags = 0,
+	.wait_for_idle = true,
 };
 
 static int
@@ -94,6 +96,7 @@ static int pasemi_platform_i2c_probe(struct platform_device *pdev)
 	if (match_data) {
 		smbus->hw_init = match_data->hw_init;
 		smbus->ctl_flags = match_data->ctl_flags;
+		smbus->wait_for_idle = match_data->wait_for_idle;
 	}
 
 	smbus->ioaddr = devm_platform_ioremap_resource(pdev, 0);
