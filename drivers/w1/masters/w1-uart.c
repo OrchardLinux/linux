@@ -337,6 +337,18 @@ static void w1_uart_hdq_cancel_receive(struct w1_uart_device *w1dev)
 	spin_unlock_irqrestore(&w1dev->hdq_rx_lock, flags);
 }
 
+static void w1_uart_hdq_stop_on_error(struct w1_uart_device *w1dev,
+				     const char *operation, int ret)
+{
+	if (!ret || !w1dev->hdq_fail_stop)
+		return;
+
+	w1_uart_hdq_cancel_receive(w1dev);
+	w1dev->hdq_faulted = true;
+	dev_err(&w1dev->serdev->dev, "HDQ %s failed (%d), stopping transfers\n",
+		operation, ret);
+}
+
 static int w1_uart_hdq_break(struct w1_uart_device *w1dev)
 {
 	struct serdev_device *serdev = w1dev->serdev;
@@ -473,8 +485,7 @@ static int w1_uart_hdq_xfer(struct w1_uart_device *w1dev, u8 command,
 	if (w1dev->hdq_mux) {
 		ret = mux_state_select(w1dev->hdq_mux);
 		if (ret) {
-			if (w1dev->hdq_fail_stop)
-				w1dev->hdq_faulted = true;
+			w1_uart_hdq_stop_on_error(w1dev, "mux select", ret);
 			return ret;
 		}
 	}
@@ -504,10 +515,7 @@ static int w1_uart_hdq_xfer(struct w1_uart_device *w1dev, u8 command,
 		}
 	}
 
-	if (ret && w1dev->hdq_fail_stop) {
-		w1_uart_hdq_cancel_receive(w1dev);
-		w1dev->hdq_faulted = true;
-	}
+	w1_uart_hdq_stop_on_error(w1dev, "read", ret);
 	return ret;
 }
 
@@ -708,8 +716,7 @@ static u8 w1_uart_hdq_reset_bus(void *data)
 	if (w1dev->hdq_mux) {
 		ret = mux_state_select(w1dev->hdq_mux);
 		if (ret) {
-			if (w1dev->hdq_fail_stop)
-				w1dev->hdq_faulted = true;
+			w1_uart_hdq_stop_on_error(w1dev, "reset mux select", ret);
 			return 1;
 		}
 	}
@@ -718,8 +725,7 @@ static u8 w1_uart_hdq_reset_bus(void *data)
 	if (w1dev->hdq_mux && mux_state_deselect(w1dev->hdq_mux) && !ret)
 		ret = -EIO;
 
-	if (ret && w1dev->hdq_fail_stop)
-		w1dev->hdq_faulted = true;
+	w1_uart_hdq_stop_on_error(w1dev, "reset", ret);
 	return ret ? 1 : 0;
 }
 
