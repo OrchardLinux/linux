@@ -209,8 +209,14 @@ static const u32 t8010_pdm_dec_timing1[] = {
 #define PDM_SIO_FIFO		0x398
 #define PDM_SIO_TRIGGER		0x190
 
+struct t8010_pdm_dma_hw {
+	u32 fifo;
+	u32 trigger;
+};
+
 struct t8010_pdm {
 	struct device *dev;
+	const struct t8010_pdm_dma_hw *dma_hw;
 	void __iomem *base;
 	void __iomem *dec[PDM_MAX_MICS];
 	unsigned int num_mics;
@@ -573,8 +579,8 @@ static int t8010_pdm_prepare_slave_config(struct snd_pcm_substream *substream,
 	 */
 	pdm->sio_cfg = (struct apple_sio_dma_config) {
 		.xfer = PDM_SIO_XFER16,
-		.fifo = PDM_SIO_FIFO,
-		.trigger = PDM_SIO_TRIGGER,
+		.fifo = pdm->dma_hw->fifo,
+		.trigger = pdm->dma_hw->trigger,
 		.limit = 2 * round_up(params_rate(params) *
 				      params_channels(params) / 1000, 4),
 	};
@@ -640,6 +646,9 @@ static int t8010_pdm_probe(struct platform_device *pdev)
 	if (!pdm)
 		return -ENOMEM;
 	pdm->dev = dev;
+	pdm->dma_hw = device_get_match_data(dev);
+	if (!pdm->dma_hw)
+		return -ENODEV;
 	pdm->gain = PDM_GAIN_DEFAULT;
 	spin_lock_init(&pdm->lock);
 	platform_set_drvdata(pdev, pdm);
@@ -699,8 +708,20 @@ static int t8010_pdm_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct t8010_pdm_dma_hw t8010_pdm_dma_hw = {
+	.fifo = PDM_SIO_FIFO,
+	.trigger = PDM_SIO_TRIGGER,
+};
+
+/* J120 PDM 16-bit DMA record, channel 0x5b. */
+static const struct t8010_pdm_dma_hw t8011_pdm_dma_hw = {
+	.fifo = 0x600,
+	.trigger = 0xac,
+};
+
 static const struct of_device_id t8010_pdm_of_match[] = {
-	{ .compatible = "apple,t8010-pdm" },
+	{ .compatible = "apple,t8010-pdm", .data = &t8010_pdm_dma_hw },
+	{ .compatible = "apple,t8011-pdm", .data = &t8011_pdm_dma_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, t8010_pdm_of_match);
