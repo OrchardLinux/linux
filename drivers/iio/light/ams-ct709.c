@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* CT709-family bounded raw IIO candidate; IRQ, IR and lux remain unqualified.
- */
+/* CT709 four-channel ambient light sensor. */
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/iio/iio.h>
@@ -9,10 +8,12 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include "ams-ct709.h"
+#include "ams-ct709-lux.h"
 
 struct ct709_data {
 	struct i2c_client *client;
 	struct mutex lock;
+	struct ct709_lux_cal calibration;
 	u64 deadline;
 	bool stopping;
 	bool faulted;
@@ -90,7 +91,8 @@ static int ct709_read_raw(struct iio_dev *indio,
 		*value2 = 27800;
 		return IIO_VAL_INT_PLUS_MICRO;
 	}
-	if (mask != IIO_CHAN_INFO_RAW || channel->address >= 4)
+	if (mask != IIO_CHAN_INFO_PROCESSED &&
+	    (mask != IIO_CHAN_INFO_RAW || channel->address >= 4))
 		return -EINVAL;
 	mutex_lock(&d->lock);
 	if (d->stopping || d->faulted) {
@@ -108,6 +110,17 @@ static int ct709_read_raw(struct iio_dev *indio,
 		dev_err(&d->client->dev,
 			"capture failed %d, restore %d, verified %u\n", ret,
 			result.restore_error, result.restored);
+		goto out;
+	}
+	if (mask == IIO_CHAN_INFO_PROCESSED) {
+		int millilux;
+
+		ret = ct709_millilux(&d->calibration, result.channels, &millilux);
+		if (ret)
+			goto out;
+		*value = millilux / 1000;
+		*value2 = (millilux % 1000) * 1000;
+		ret = IIO_VAL_INT_PLUS_MICRO;
 		goto out;
 	}
 	*value = result.channels[channel->address];
@@ -131,8 +144,54 @@ static const struct iio_chan_spec ct709_channels[] = {
 	CT709_CHANNEL(RED, 1),
 	CT709_CHANNEL(GREEN, 2),
 	CT709_CHANNEL(BLUE, 3),
+	{ .type = IIO_LIGHT, .info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED) },
 };
 static const struct iio_info ct709_info = {.read_raw = ct709_read_raw};
+/* J120 stores both orientations in the factory record on the als0 node. */
+static bool ct709_read_calibration(struct i2c_client *client,
+				   struct ct709_lux_cal *cal)
+{
+	struct device_node *owner;
+	const u8 *blob, *record;
+	unsigned int orientation, other, i;
+	int len;
+
+	if (!client->dev.of_node || !of_machine_is_compatible("apple,j120"))
+		return false;
+	owner = of_find_node_by_path("als0");
+	if (!owner)
+		return false;
+	if (!of_device_is_compatible(owner, "apple,ct709") ||
+	    owner->parent != client->dev.of_node->parent)
+		goto out;
+	blob = of_get_property(owner, "apple,als-calibration", &len);
+	if (!blob || len < 6696 || memcmp(blob, "\x02\x01\x02\x08", 4) ||
+	    get_unaligned_le16(blob + 4) != 6696)
+		goto out;
+	if (client->addr != 0x29 && client->addr != 0x39)
+		goto out;
+	orientation = client->addr == 0x29 ? 6 : 5;
+	other = orientation == 6 ? 5 : 6;
+	record = NULL;
+	for (i = 0; i < 2; i++) {
+		const u8 *p = blob + 8 + 3344 * i;
+
+		if (p[0] != 2 || p[1] != 1 || p[3] != 1 ||
+		    get_unaligned_le32(p + 4) != 3344 || p[0x68] != 3)
+			goto out;
+		if (p[2] == orientation && !record)
+			record = p;
+		else if (p[2] != other)
+			goto out;
+	}
+	if (record && !ct709_lux_parse(record, 3344, cal)) {
+		of_node_put(owner);
+		return true;
+	}
+out:
+	of_node_put(owner);
+	return false;
+}
 static int ct709_probe(struct i2c_client *client)
 {
 	struct iio_dev *indio;
@@ -163,7 +222,9 @@ static int ct709_probe(struct i2c_client *client)
 	indio->info = &ct709_info;
 	indio->modes = INDIO_DIRECT_MODE;
 	indio->channels = ct709_channels;
-	indio->num_channels = ARRAY_SIZE(ct709_channels);
+	indio->num_channels = ARRAY_SIZE(ct709_channels) - 1;
+	if (ct709_read_calibration(client, &d->calibration))
+		indio->num_channels++;
 	return devm_iio_device_register(&client->dev, indio);
 }
 static void ct709_remove(struct i2c_client *client)
@@ -187,5 +248,4 @@ static struct i2c_driver ct709_driver = {
 };
 module_i2c_driver(ct709_driver);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION(
-	"Bounded raw CT709 IIO candidate with verified per-frame restore");
+MODULE_DESCRIPTION("Apple CT709 ambient light sensor");
