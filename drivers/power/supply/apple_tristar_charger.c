@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Lightning charging for Apple devices with a Tristar (CBTL1610) port
- * controller and a D2365-family PMIC.
+ * controller and a D2365-family PMIC (D2365, or the iPad Air 2's D2207).
  *
  * iBoot leaves the PMIC input-current limit at 100 mA. On every attachment
  * this driver identifies the source and grants what it advertises, up to the
@@ -57,21 +57,60 @@
 
 #include "apple_tristar_accessory.h"
 
-/* PMIC registers, relative to their banks */
-#define TRISTAR_CHG_CONNECTED		0x09	/* status bank */
+/* PMIC connection state: bit 0 is "connected" on every PMIC */
 #define TRISTAR_CHG_CONNECTED_NOW	BIT(0)
-#define TRISTAR_CHG_CONNECTED_NEW	BIT(1)
-#define TRISTAR_CHG_STATUS		0x0a	/* status bank */
-#define TRISTAR_CHG_INPUT_LIMIT		0x03	/* control bank */
-#define TRISTAR_CHG_ADC_SELECT		0x00	/* ADC bank */
-#define TRISTAR_CHG_ADC_RESULT		0x01
+#define TRISTAR_CHG_ADC_START		BIT(7)	/* D2207 ADC control */
+#define TRISTAR_CHG_ADC_LATCH		GENMASK(7, 3)	/* D2207 ADC control + 1 */
+
+/*
+ * Where a PMIC keeps the charger registers, relative to the banks the
+ * device tree gives, and how its ADC is driven. The functions are the same
+ * on both PMICs; the addresses are not.
+ */
+struct tristar_pmic {
+	u8 connected;		/* status bank: connection state */
+	u8 connected_new;	/* the bit that also marks a new connection */
+	u8 status;		/* status bank: battery charger state */
+	u8 input_limit;		/* control bank: input-current limit */
+	u8 adc_start;		/* written to the ADC bank to start a conversion */
+	u8 adc_result;		/* ADC bank: two result bytes */
+	bool adc_rearm;		/* clear the start bit and latch after a read */
+	unsigned int plug_event; /* the event that latches on plug and unplug */
+};
+
+/* D2365 (iPad 5, iPad 6), from iOS 16 AppleD2365PMUPowerSource */
+static const struct tristar_pmic tristar_d2365 = {
+	.connected = 0x09,
+	.connected_new = BIT(1),
+	.status = 0x0a,
+	.input_limit = 0x03,
+	.adc_start = 0x01,
+	.adc_result = 0x01,
+	.plug_event = 72,
+};
+
+/*
+ * D2207 (iPad Air 2), from iOS 15.8 AppleD2207PMU: connection state 0x60,
+ * charger state 0x62, input limit 0x4c0, ADC control 0x500 with the result
+ * at 0x502. A conversion starts with bit 7 and the channel, 6 for the
+ * Tristar's BrickID line; iOS clears the start bit and the latch in 0x501
+ * after each read. The plug event is event 0.
+ */
+static const struct tristar_pmic tristar_d2207 = {
+	.connected = 0x00,
+	.connected_new = BIT(3),
+	.status = 0x02,
+	.input_limit = 0x00,
+	.adc_start = TRISTAR_CHG_ADC_START | 6,
+	.adc_result = 0x02,
+	.adc_rearm = true,
+	.plug_event = 0,
+};
 
 /* Interrupts: the PMU line, ADC completion, then the source-change events. */
 #define TRISTAR_IRQ_LINE		0
 #define TRISTAR_IRQ_ADC			1
 #define TRISTAR_IRQ_SOURCE		2
-/* The D2365 event that latches on every plug and unplug. */
-#define TRISTAR_EVENT_PLUG		72
 #define TRISTAR_IRQS_MAX		16
 
 /* Input-current limit encoding: mA = code * 12.5 + 75 */
@@ -136,8 +175,10 @@ struct tristar_charger {
 	int irqs[TRISTAR_IRQS_MAX];
 	unsigned int nirqs;
 	int plug_irq;			/* wakes the system, 0 without one */
-	u32 status_base;
-	u32 control_base;
+	const struct tristar_pmic *pmic;
+	u32 connected_reg;
+	u32 status_reg;
+	u32 limit_reg;
 	u32 adc_base;
 	unsigned int max_ma;
 
@@ -206,7 +247,7 @@ static unsigned int tristar_ma_code(unsigned int ma)
 
 static int tristar_set_code(struct tristar_charger *chg, unsigned int code)
 {
-	u32 reg = chg->control_base + TRISTAR_CHG_INPUT_LIMIT;
+	u32 reg = chg->limit_reg;
 	unsigned int readback;
 	int ret;
 
@@ -425,7 +466,7 @@ static int tristar_adc_mv(struct tristar_charger *chg, unsigned int epoch,
 
 	reinit_completion(&chg->adc_done);
 	WRITE_ONCE(chg->adc_waiting, true);
-	ret = regmap_write(chg->regmap, chg->adc_base + TRISTAR_CHG_ADC_SELECT, 1);
+	ret = regmap_write(chg->regmap, chg->adc_base, chg->pmic->adc_start);
 	if (ret) {
 		WRITE_ONCE(chg->adc_waiting, false);
 		return ret;
@@ -436,8 +477,15 @@ static int tristar_adc_mv(struct tristar_charger *chg, unsigned int epoch,
 	}
 	if (READ_ONCE(chg->epoch) != epoch)
 		return -ESTALE;
-	ret = regmap_bulk_read(chg->regmap, chg->adc_base + TRISTAR_CHG_ADC_RESULT,
+	ret = regmap_bulk_read(chg->regmap, chg->adc_base + chg->pmic->adc_result,
 			       value, sizeof(value));
+	if (!ret && chg->pmic->adc_rearm) {
+		ret = regmap_update_bits(chg->regmap, chg->adc_base,
+					 TRISTAR_CHG_ADC_START, 0);
+		if (!ret)
+			ret = regmap_update_bits(chg->regmap, chg->adc_base + 1,
+						 TRISTAR_CHG_ADC_LATCH, 0);
+	}
 	if (ret)
 		return ret;
 	if (value[0] & 0x80)
@@ -958,7 +1006,7 @@ static unsigned long tristar_ramp_delay(struct tristar_charger *chg, u64 now)
  */
 static void tristar_check_limit(struct tristar_charger *chg)
 {
-	u32 reg = chg->control_base + TRISTAR_CHG_INPUT_LIMIT;
+	u32 reg = chg->limit_reg;
 	unsigned int hw, code = chg->code;
 
 	if (regmap_read(chg->regmap, reg, &hw) || hw == code)
@@ -1053,7 +1101,8 @@ static void tristar_follow_accessory(struct tristar_charger *chg, u64 now)
 /*
  * Input presence is the D2365's connection state 0x189, as iOS 16 decides it
  * (AppleD2365PMUPowerSource): bit 0 is "connected", and a new connection also
- * needs bit 1. The charger status 0x18a is not presence. Its bits describe
+ * needs bit 1. The D2207's 0x60 has the same meaning, with bit 3 for a new
+ * connection (iOS 15.8 AppleD2207PMU). The charger status 0x18a is not presence. Its bits describe
  * the battery charger: the same method takes bits 1:0 as charging, bit 2 as
  * charge end and bit 4 as charge timeout, for the charging and fully charged
  * state only. It can also read 0 with the input still there: behind the
@@ -1063,21 +1112,20 @@ static void tristar_follow_accessory(struct tristar_charger *chg, u64 now)
  * the PMIC reports input limiting, which the D2365 never does, so a charger
  * that finished, timed out or does not charge keeps the grant.
  *
- * Every board this driver binds has a D2365: the status, control and ADC
- * registers above are the D2365's. An unreadable 0x189 says nothing: keep
- * the last decision.
+ * The D2207's charger state 0x62 has the same bits. An unreadable connection
+ * state says nothing: keep the last decision.
  */
 static bool tristar_input_present(struct tristar_charger *chg)
 {
 	unsigned int connected;
 
-	if (regmap_read(chg->regmap, chg->status_base + TRISTAR_CHG_CONNECTED, &connected)) {
+	if (regmap_read(chg->regmap, chg->connected_reg, &connected)) {
 		dev_err_ratelimited(chg->dev, "PMIC connection state unreadable\n");
 		return chg->online;
 	}
 	if (!(connected & TRISTAR_CHG_CONNECTED_NOW))
 		return false;
-	return chg->present || (connected & TRISTAR_CHG_CONNECTED_NEW);
+	return chg->present || (connected & chg->pmic->connected_new);
 }
 
 static void tristar_poll(struct work_struct *work)
@@ -1096,7 +1144,7 @@ static void tristar_poll(struct work_struct *work)
 	old_online = chg->online;
 	old_present = chg->present;
 	old_usb_on = chg->usb_on;
-	if (regmap_read(chg->regmap, chg->status_base + TRISTAR_CHG_STATUS, &status)) {
+	if (regmap_read(chg->regmap, chg->status_reg, &status)) {
 		tristar_withdraw(chg, TRISTAR_CHG_FALLBACK_CODE);
 		dev_err_ratelimited(chg->dev, "PMIC status unreadable; holding the fallback\n");
 		goto again;
@@ -1186,7 +1234,7 @@ out:
  */
 static bool tristar_event_withdraw(struct tristar_charger *chg)
 {
-	u32 reg = chg->control_base + TRISTAR_CHG_INPUT_LIMIT;
+	u32 reg = chg->limit_reg;
 	unsigned int readback;
 
 	if (READ_ONCE(chg->code) <= TRISTAR_CHG_FALLBACK_CODE)
@@ -1236,7 +1284,7 @@ static bool tristar_event_debounce(struct tristar_charger *chg)
  */
 static void tristar_source_event(struct tristar_charger *chg)
 {
-	u32 reg = chg->control_base + TRISTAR_CHG_INPUT_LIMIT;
+	u32 reg = chg->limit_reg;
 	unsigned int i;
 	u64 now;
 
@@ -1473,7 +1521,7 @@ static int tristar_probe(struct platform_device *pdev)
 	struct tristar_charger *chg;
 	struct device_node *np;
 	unsigned int code, i;
-	u32 max_ua;
+	u32 max_ua, base;
 	int ret;
 
 	chg = devm_kzalloc(dev, sizeof(*chg), GFP_KERNEL);
@@ -1484,12 +1532,20 @@ static int tristar_probe(struct platform_device *pdev)
 	if (!chg->regmap)
 		return dev_err_probe(dev, -ENODEV, "parent regmap unavailable\n");
 
-	ret = tristar_get_bank(dev, "status", TRISTAR_CHG_STATUS + 1, &chg->status_base);
-	if (!ret)
-		ret = tristar_get_bank(dev, "control", TRISTAR_CHG_INPUT_LIMIT + 1,
-				       &chg->control_base);
-	if (!ret)
-		ret = tristar_get_bank(dev, "adc", TRISTAR_CHG_ADC_RESULT + 2, &chg->adc_base);
+	chg->pmic = device_get_match_data(dev);
+	if (!chg->pmic)
+		return -ENODEV;
+	ret = tristar_get_bank(dev, "status",
+			       max(chg->pmic->connected, chg->pmic->status) + 1, &base);
+	if (ret)
+		return ret;
+	chg->connected_reg = base + chg->pmic->connected;
+	chg->status_reg = base + chg->pmic->status;
+	ret = tristar_get_bank(dev, "control", chg->pmic->input_limit + 1, &base);
+	if (ret)
+		return ret;
+	chg->limit_reg = base + chg->pmic->input_limit;
+	ret = tristar_get_bank(dev, "adc", chg->pmic->adc_result + 2, &chg->adc_base);
 	if (ret)
 		return ret;
 
@@ -1524,16 +1580,16 @@ static int tristar_probe(struct platform_device *pdev)
 	ret = platform_irq_count(pdev);
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "failed to count the PMU event interrupts\n");
-	if (ret <= TRISTAR_IRQ_SOURCE || ret > TRISTAR_IRQS_MAX)
+	if (ret < TRISTAR_IRQ_SOURCE || ret > TRISTAR_IRQS_MAX)
 		return dev_err_probe(dev, -EINVAL,
-				     "expected PMU line, ADC and source event interrupts\n");
+				     "expected the PMU line and ADC interrupts\n");
 	chg->nirqs = ret;
 	for (i = 0; i < chg->nirqs; i++) {
 		chg->irqs[i] = platform_get_irq(pdev, i);
 		if (chg->irqs[i] < 0)
 			return chg->irqs[i];
 		if (i >= TRISTAR_IRQ_SOURCE &&
-		    irqd_to_hwirq(irq_get_irq_data(chg->irqs[i])) == TRISTAR_EVENT_PLUG)
+		    irqd_to_hwirq(irq_get_irq_data(chg->irqs[i])) == chg->pmic->plug_event)
 			chg->plug_irq = chg->irqs[i];
 	}
 
@@ -1551,7 +1607,7 @@ static int tristar_probe(struct platform_device *pdev)
 		return ret;
 
 	/* Never adopt a limit we cannot explain; anything higher drops to the fallback. */
-	ret = regmap_read(chg->regmap, chg->control_base + TRISTAR_CHG_INPUT_LIMIT, &code);
+	ret = regmap_read(chg->regmap, chg->limit_reg, &code);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read the input-current limit\n");
 	chg->code = code;
@@ -1713,7 +1769,8 @@ static const struct dev_pm_ops tristar_pm_ops = {
 };
 
 static const struct of_device_id tristar_of_match[] = {
-	{ .compatible = "apple,tristar-charger" },
+	{ .compatible = "apple,d2207-tristar-charger", .data = &tristar_d2207 },
+	{ .compatible = "apple,tristar-charger", .data = &tristar_d2365 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, tristar_of_match);
