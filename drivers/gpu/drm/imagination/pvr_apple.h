@@ -27,6 +27,7 @@ struct pvr_vm_context;
 
 extern const struct pvr_power_sequence_ops pvr_power_sequence_ops_apple;
 extern const struct pvr_apple_chip pvr_apple_chip_s8003;
+extern const struct pvr_apple_chip pvr_apple_chip_t7000;
 extern const struct pvr_apple_chip pvr_apple_chip_t8010;
 
 /*

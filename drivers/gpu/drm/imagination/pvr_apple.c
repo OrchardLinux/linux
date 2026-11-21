@@ -574,11 +574,18 @@ static void pvr_apple_gpu_pages_fini(struct pvr_apple *apple)
 	pvr_apple_gpu_page_fini(apple, &apple->data);
 }
 
+/*
+ * The data buffer holds the terminate-only stream at +0 and the PDS HALT at
+ * +0x1000: two 4 KiB pages, one page of a 16 KiB kernel.
+ */
+#define PVR_APPLE_GPU_DATA_SIZE	max_t(size_t, PVR_DEVICE_PAGE_SIZE, SZ_8K)
+
 static int pvr_apple_gpu_pages_init(struct pvr_apple *apple)
 {
 	int err;
 
-	err = pvr_apple_gpu_page_init(apple, &apple->data, PVR_APPLE_GPU_DATA);
+	err = pvr_apple_gpu_buf_init_vm(apple, apple->pvr_dev->kernel_vm_ctx, &apple->data,
+					PVR_APPLE_GPU_DATA, PVR_APPLE_GPU_DATA_SIZE);
 	if (!err)
 		err = pvr_apple_gpu_page_init(apple, &apple->pds, APPLE_GPU_PDS);
 	if (!err)
@@ -1772,7 +1779,7 @@ int pvr_apple_vm_init(struct pvr_device *pvr_dev, struct pvr_vm_context *vm_ctx)
 	int err;
 
 	err = pvr_vm_map_reserved(vm_ctx, apple->data.obj, PVR_APPLE_GPU_DATA,
-				  PVR_DEVICE_PAGE_SIZE);
+				  PVR_APPLE_GPU_DATA_SIZE);
 	if (!err)
 		err = pvr_vm_map_reserved(vm_ctx, apple->zero_obj, 0, PVR_DEVICE_PAGE_SIZE);
 	if (!err && apple->chip->vm_init)

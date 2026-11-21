@@ -1537,6 +1537,12 @@ static const struct pvr_device_data pvr_device_data_apple_s8003 = {
 	.apple_fw = true,
 	.apple_chip = &pvr_apple_chip_s8003,
 };
+
+static const struct pvr_device_data pvr_device_data_apple_t7000 = {
+	.pwr_ops = &pvr_power_sequence_ops_apple,
+	.apple_fw = true,
+	.apple_chip = &pvr_apple_chip_t7000,
+};
 #endif
 
 static const struct of_device_id dt_match[] = {
@@ -1548,6 +1554,10 @@ static const struct of_device_id dt_match[] = {
 	{
 		.compatible = "apple,t8010-gpu",
 		.data = &pvr_device_data_apple,
+	},
+	{
+		.compatible = "apple,t7000-gpu",
+		.data = &pvr_device_data_apple_t7000,
 	},
 #endif
 	{

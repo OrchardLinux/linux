@@ -53,10 +53,12 @@
 
 #include <clocksource/arm_arch_timer.h>
 #include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <linux/bitfield.h>
 #include <linux/bitmap.h>
 #include <linux/cleanup.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/of.h>
@@ -264,6 +266,7 @@ struct s8003_variant {
 	void (*idle)(struct pvr_apple *apple);
 	int (*doorbell)(struct pvr_apple *apple, u32 dm);
 	int (*first_command)(struct pvr_apple *apple);
+	void (*no_alive)(struct pvr_apple *apple);	/* instead of the stop after a boot without alive */
 	int (*vm_map)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
 	void (*vm_put)(struct pvr_apple *apple, struct s8003_vm *vm);
 	void (*vm_unmap)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
@@ -391,6 +394,14 @@ struct pvr_apple_s8003 {
 	struct s8003_mem zero;		/* at GPU address 0 */
 	struct pvr_gem_object *spare;
 	bool pio_mapped;
+
+	/* The A8's (T7000_*) */
+	void __iomem *pmgr;		/* the power manager: GPU power state, PLL5 */
+	void __iomem *bridges;		/* the GPU's two bus bridges */
+	u8 *border;			/* BorderColorTable's contents (firmware file) */
+	struct s8003_mem hwobj[4];	/* the hardware objects at 0x8_00000000 */
+	bool t7000_pio_mapped;
+	bool stuck;			/* Fender stayed busy: the GPU is left alone */
 
 	struct s8003_idle idle;
 };
@@ -801,6 +812,9 @@ static void pvr_apple_s8003_fini(struct pvr_apple *apple)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
 
+	/* A firmware left running keeps its memory (t7000_stuck()) */
+	if (s->stuck)
+		return;
 	s->v->unmap(apple);
 	if (s->park_vm) {
 		pvr_vm_context_put(s->park_vm);
@@ -1099,6 +1113,7 @@ static void s8003_drain_work(struct work_struct *work)
 
 static int s8003_wait_alive(struct pvr_apple *apple)
 {
+	struct pvr_apple_s8003 *s = apple->chip_data;
 	bool alive = false;
 	int err, drained = 0;
 
@@ -1106,7 +1121,9 @@ static int s8003_wait_alive(struct pvr_apple *apple)
 				S8003_ALIVE_TIMEOUT_US, false, apple, &alive);
 	if (!err)
 		err = drained;
-	if (err)
+	if (err && s->v->no_alive)	/* no Rogue or Fender access after a failed boot */
+		dev_err(apple_dev(apple), "GFX firmware did not come up: %d\n", err);
+	else if (err)
 		dev_err(apple_dev(apple), "GFX firmware did not come up: %d (Fender state %#x)\n",
 			err, readl(apple->fender + FENDER_POWER_STATE));
 	return err;
@@ -3040,8 +3057,13 @@ static int pvr_apple_s8003_start(struct pvr_apple *apple)
 	s8003_jobs_reset(s);
 
 	err = v->release(apple, q);
-	if (!err)
+	if (!err) {
 		err = s8003_wait_alive(apple);
+		if (err && v->no_alive) {
+			v->no_alive(apple);
+			return err;
+		}
+	}
 	if (!err) {
 		dev_dbg(apple_dev(apple), "GFX firmware is up (power state %u)\n", q);
 		if (v->first_command)
@@ -3122,6 +3144,1062 @@ static int pvr_apple_s8003_prepare_job(struct pvr_apple *apple, struct pvr_job *
 	return s->v->prepare_job(apple, job);
 }
 
+/*
+ * The A8 (T7000): the GX6450 (Apple's G4P) runs the same family of firmware
+ * on its META (AGXFirmwareKextG4P, "METAFW_G4P g4p_b0"), booted the same way.
+ * What differs is ported from the standalone bring-up module that boots it
+ * on the iPod touch 6, stage by stage (an out-of-tree module that is not
+ * part of this series): power-on and ID, firmware boot to the alive event, slot
+ * load, compute, and the first TA + 3D render. Addresses in the comments
+ * are Apple's iOS 12.4 (16G77) iPod7,1 kernelcache (AGXG4P, unslid) and the
+ * firmware's; "P4"/"P5" are the live iOS objects dumped on that device.
+ */
+
+/* The core this driver boots: CORE_REVISION major 3, minor 10 (readChipInfo 0x8479d14) */
+#define T7000_CORE_REVISION		0x00030a00
+
+/* The power manager's registers, from its base (ApplePMGR) */
+#define T7000_PMGR_PLL5			0x5004	/* the GPU's PLL: bit 30 locked */
+#define T7000_PLL_LOCKED		BIT(30)
+#define T7000_PMGR_GPU_TABLE		0x1c000	/* GPU performance records 1-3 at +0x10 each */
+#define T7000_GPU_TABLE_VALID		BIT(21)
+#define T7000_PMGR_VM_CTL		0x23000	/* the voltage manager: on with [11:8] clear */
+#define T7000_PMGR_PS_GFX		0x20320	/* the GPU's power state */
+#define T7000_PMGR_SOC_TVM		0x2d000	/* SoC voltage manager enable (0x849d340) */
+#define T7000_PMGR_MISC_ACG		0x32000	/* clock gating enable (0x849d1bc) */
+#define T7000_PS_TARGET			GENMASK(3, 0)
+#define T7000_PS_ACTUAL			GENMASK(7, 4)
+#define T7000_PS_HIST			GENMASK(9, 8)
+#define T7000_PS_DEV_DISABLE		BIT(10)
+#define T7000_PS_MIN			GENMASK(19, 16)
+#define T7000_PS_AUTO_PM		BIT(28)
+#define T7000_PS_BIT30			BIT(30)
+#define T7000_PS_ON			0xf
+#define T7000_PS_POLL_US		200000
+
+#define T7000_FENDER_POLL_US		100000
+/*
+ * The bring-up module paused this long before each group of new accesses
+ * (its log crumbs): before the GPU's power state goes on (after SOC_TVM),
+ * before Fender's wake, before the first Rogue register read, before Fender
+ * state 0 after it, before the boot stream and before the release. Every
+ * run had these pauses, so the driver keeps them.
+ */
+#define T7000_SETTLE_MS			100
+#define T7000_FENDER_SNOOP		0x0014	/* FENDER_WAKE: bit 1 snoop armed */
+#define T7000_FENDER_CTRL_SNOOP		BIT(29)
+
+/* Rogue registers of the boot stream that powervr has no name for */
+#define T7000_CR_SLC_3808		0x3808
+
+/*
+ * The unpacked image as 0x84727c8 lays it out with iOS's 4 KiB pages: the
+ * bootloader's segment (2) first, then code, data and one more data range;
+ * no core memory. The handover is at the end of segment 2.
+ */
+#define T7000_IMAGE_SIZE		0x24000
+#define T7000_IMAGE_HANDOVER		0xff8
+#define T7000_SEGMMU_ALLTHRS_WRITEABLE	0xf02	/* 0x8471b0c: BASE | 0xf02 */
+#define T7000_SEGMMU_OUTA1_BIFDM	(7u << 8) /* (PLATFORM +0x4bc = 7) << 8 */
+
+/* The firmware's register windows (PLATFORM +0x190, P4): Fender, AIC + 0x1000, AIC + 0x4000 */
+#define T7000_PIO_FENDER		0x0000
+#define T7000_PIO_FENDER_SIZE		0x5000
+#define T7000_PIO_AIC_TIME		0x8000
+#define T7000_PIO_AIC_SET		0xc000
+#define T7000_PIO_AIC_SIZE		0x1000
+
+/*
+ * Root memory: the objects, then the channels and the PM sets' control
+ * blocks, all in META's uncached window as Apple's (P5: channel 0x43318200,
+ * PM control 0x4331c000). Shared memory: the objects, then the PM sets'
+ * lists in the cached window as Apple's (P5b: 0xc0284000).
+ */
+#define T7000_ROOT_OBJECTS_END		0x18000
+#define T7000_CU_CHANNEL		0x18000	/* 0x1000 */
+#define T7000_TA_CHANNEL		0x20000	/* 0x3000 each */
+#define T7000_3D_CHANNEL		0x24000
+#define T7000_PM_CONTROL		0x28000	/* 0x2000 per set */
+#define T7000_SHARED_OBJECTS_END	0x60000
+#define T7000_PM_LIST			0x60000	/* 0x2000 per set */
+#define T7000_PM_SETS			7	/* one per user slot */
+#define T7000_PM_SET_SIZE		0x2000
+#define T7000_ROOT_SIZE			(T7000_PM_CONTROL + T7000_PM_SETS * T7000_PM_SET_SIZE)
+#define T7000_SHARED_SIZE		(T7000_PM_LIST + T7000_PM_SETS * T7000_PM_SET_SIZE)
+
+/* Slots: 8, the host's from 1, one per VM (vt+0x888/0x890/0x898) */
+#define T7000_SLOTS			8
+#define T7000_SLOT_FIRST		1
+
+/*
+ * The hardware-specific objects Apple's kext maps at firmware init
+ * (0x847950c) at 0x8_00000000 and names to the firmware (PLATFORM +0x30,
+ * +0x188, +0x4a8; object 0x4c +0/+8): the YUV CSC buffer, BRN44455Object
+ * (0x8475964), BorderColorTable (0x847586c: 0x800 bytes of the kext's data)
+ * and FenceBuffer (0x8475a40). Each GART reserves 0x8_00000000 + 4 MiB
+ * (0x8463138), so every VM sees them at these addresses: the firmware loads
+ * the FenceBuffer into MCU_FENCE and the MCU writes it through the running
+ * job's context. Plain flags: with PM/META protect the firmware never
+ * posts its alive event.
+ */
+#define T7000_HWOBJ_VA			0x800000000ull
+#define T7000_HWOBJ_SIZE		0x4000
+#define T7000_HWOBJ_WINDOW		SZ_4M
+#define T7000_BORDER_SIZE		0x800
+#define T7000_BORDER_FW			"apple/gfx-t7000-border.bin"
+enum { T7000_HW_YUV, T7000_HW_BRN44455, T7000_HW_BORDER, T7000_HW_FENCE, T7000_HW_OBJS };
+static const u32 t7000_hwobj_offset[T7000_HW_OBJS] = { 0x0, 0x4000, 0x8000, 0x10000 };
+
+/* GPU memory of the firmware's: past the device cache, PM/firmware protected */
+#define T7000_FW_FLAGS			(DRM_PVR_BO_BYPASS_DEVICE_CACHE | DRM_PVR_BO_PM_FW_PROTECT)
+/* What a VM's jobs reach: past the device cache, nothing else */
+#define T7000_VM_FLAGS			DRM_PVR_BO_BYPASS_DEVICE_CACHE
+
+/*
+ * Objects, as the A8's kext sizes them (allocateSharedRingGroups 0x84653e8,
+ * packed-group table 0x712fa38..fab0) and packs them, checked against
+ * every live P4 object. A ring lane's indices take 0x30 bytes (A9 0x20).
+ */
+#define T7000_RING_CTL_SIZE		0x30
+
+static const struct s8003_object_size s8003_objects_a8[] = {
+	{ S8003_INIT, false, 0x1118 },
+	{ S8003_CHANNEL, false, 0x990 },
+	{ S8003_CHANNEL + 1, false, 0x8e0 },
+	{ S8003_CHANNEL + 2, false, 0x8c0 },
+	{ S8003_POLICY, false, 0x1058 },
+	{ 0x4b, false, 0x28 },
+	{ 0x4c, false, 0x10 },
+	{ S8003_PLATFORM, false, 0x4dc },
+	{ 0x4e, false, 0x84 },
+	{ S8003_TAG_SEEN, false, 0x20 },
+	{ S8003_CONTROL, true, 0x1528 },
+	{ S8003_EVENT_CTL, true, T7000_RING_CTL_SIZE },
+	{ S8003_LOG_CTL, true, 4 * T7000_RING_CTL_SIZE },
+	{ S8003_STATS_CTL, true, T7000_RING_CTL_SIZE },
+	{ S8003_TRACE_CTL, true, T7000_RING_CTL_SIZE },
+	{ S8003_EVENTS, true, 0x2c00 },
+	{ S8003_LOGS, true, 0xb000 },
+	{ 0x4f, true, 0x36000 },
+	{ S8003_STATS, true, 0x2c00 },
+	{ S8003_TRACE, true, 0x2400 },
+	{ S8003_WORK_CTL, true, T7000_RING_CTL_SIZE },
+	{ S8003_WORK_CTL + 4, true, T7000_RING_CTL_SIZE },
+	{ S8003_WORK_CTL + 8, true, T7000_RING_CTL_SIZE },
+	{ S8003_DC_CTL, true, T7000_RING_CTL_SIZE },
+	{ S8003_WORK_RING, true, 0x1400 },
+	{ S8003_WORK_RING + 4, true, 0x1400 },
+	{ S8003_WORK_RING + 8, true, 0x1400 },
+	{ S8003_DC_RING, true, 0x1400 },
+	{ S8003_TAG_HOST, true, 0x20 },
+	{ S8003_MMU_ROOT, true, 0x40 },
+};
+
+/* The image's segments: META address (bit 31 clear), size, offset in the image */
+static const struct {
+	u32 base, size, offset;
+} t7000_segments[4] = {
+	{ 0x10000000, 0x1e000, 0x01000 },
+	{ 0x20000000, 0x03000, 0x1f000 },
+	{ 0x40000000, 0x01000, 0x00000 },	/* the bootloader's: not configured (0x8471b0c) */
+	{ 0x60000000, 0x02000, 0x22000 },
+};
+
+/* Where a section of the LDR image goes, as 0x8472a00 reads it */
+static int t7000_ldr_mem(void *data, u32 addr, u32 size, bool zero, void **write_addr)
+{
+	struct pvr_apple_s8003 *s = data;
+	u32 seg = (addr >> 29) & 3, a = addr & 0x7fffffff;
+
+	/* core memory (0x80000080..): the A8's image has none */
+	if ((u32)(addr + 0x7fffff80) >> 7 < 0x17f || !((addr >> 27) & 0xf))
+		return -EINVAL;
+	if (a < t7000_segments[seg].base || size > t7000_segments[seg].size ||
+	    a - t7000_segments[seg].base > t7000_segments[seg].size - size)
+		return -EINVAL;
+	*write_addr = s->image + t7000_segments[seg].offset + a - t7000_segments[seg].base;
+	return 0;
+}
+
+/* Thread 1's stack pointer and entry (0x8472a00 case 3), from entries {thread, sp, pc, catch} */
+static int t7000_ldr_start_threads(void *data, const u32 *words, u32 count)
+{
+	struct pvr_apple_s8003 *s = data;
+	u32 i;
+
+	for (i = 0; i + 4 <= count; i += 4) {
+		if (words[i] != 1)
+			continue;
+		if (s->thread_pc)
+			return -EINVAL;
+		s->thread_sp = words[i + 1];
+		s->thread_pc = words[i + 2];
+	}
+	return 0;
+}
+
+static const struct pvr_meta_ldr_target t7000_ldr_target = {
+	.mem = t7000_ldr_mem,
+	.config = s8003_ldr_config,
+	.start_threads = t7000_ldr_start_threads,
+};
+
+/*
+ * The bootloader's configuration (0x84724c4 + 0x8471b0c): segments 0, 1 and
+ * 3 with the BIF data master in OUTA1, the image's 27 writes, a zero u64 and
+ * the META address of the handover, which holds INIT's and CONTROL's.
+ */
+static void t7000_image_configure(struct pvr_apple_s8003 *s)
+{
+	u8 *conf = s->image + S8003_IMAGE_CONF;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t7000_segments); i++) {
+		u64 out = S8003_IMAGE_VA + t7000_segments[i].offset;
+		u32 limit = max(t7000_segments[i].size - 1, 0xfffu);
+
+		if (i == 2)
+			continue;
+		put32(conf, META_CR_MMCU_SEGMENT_N_BASE(i));
+		put32(conf + 4, t7000_segments[i].base | T7000_SEGMMU_ALLTHRS_WRITEABLE);
+		put32(conf + 8, META_CR_MMCU_SEGMENT_N_LIMIT(i));
+		put32(conf + 12, limit);
+		put32(conf + 16, META_CR_MMCU_SEGMENT_N_OUTA0(i));
+		put32(conf + 20, lower_32_bits(out));
+		put32(conf + 24, META_CR_MMCU_SEGMENT_N_OUTA1(i));
+		put32(conf + 28, T7000_SEGMMU_OUTA1_BIFDM | upper_32_bits(out));
+		conf += 32;
+	}
+	for (i = 0; i < s->conf_count; i++, conf += 8) {
+		put32(conf, s->conf[i][0]);
+		put32(conf + 4, s->conf[i][1]);
+	}
+	put64(conf, 0);
+	put32(conf + 8, s8003_meta_addr(S8003_IMAGE_VA + T7000_IMAGE_HANDOVER));
+	put32(s->image + T7000_IMAGE_HANDOVER, s8003_object_addr(&s->layout, S8003_INIT));
+	put32(s->image + T7000_IMAGE_HANDOVER + 4, s8003_object_addr(&s->layout, S8003_CONTROL));
+}
+
+/* The registers' windows and the hardware objects in the kernel VM */
+static void t7000_unmap(struct pvr_apple *apple)
+{
+	struct pvr_vm_context *vm_ctx = apple->pvr_dev->kernel_vm_ctx;
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	unsigned int i;
+
+	if (s->t7000_pio_mapped) {
+		pvr_vm_unmap_io(vm_ctx, S8003_PIO_VA + T7000_PIO_FENDER, T7000_PIO_FENDER_SIZE);
+		pvr_vm_unmap_io(vm_ctx, S8003_PIO_VA + T7000_PIO_AIC_TIME, T7000_PIO_AIC_SIZE);
+		pvr_vm_unmap_io(vm_ctx, S8003_PIO_VA + T7000_PIO_AIC_SET, T7000_PIO_AIC_SIZE);
+		s->t7000_pio_mapped = false;
+	}
+	for (i = 0; i < T7000_HW_OBJS; i++)
+		s8003_mem_fini(apple, &s->hwobj[i]);
+}
+
+/*
+ * The firmware's memory and registers in the kernel VM, as the bring-up
+ * module maps them: the image, root and shared memory and a zeroed page at
+ * address 0 for the firmware only and past the device cache (the CPU writes
+ * them uncached), the register windows as pvr_vm_map_io() maps registers,
+ * and the hardware objects.
+ */
+static int t7000_map(struct pvr_apple *apple)
+{
+	struct pvr_vm_context *vm_ctx = apple->pvr_dev->kernel_vm_ctx;
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	unsigned int i;
+	int err;
+
+	err = s8003_mem_init(apple, &s->fw, S8003_IMAGE_VA, T7000_IMAGE_SIZE, T7000_FW_FLAGS);
+	if (!err)
+		err = s8003_mem_init(apple, &s->root, S8003_ROOT_VA, T7000_ROOT_SIZE, T7000_FW_FLAGS);
+	if (!err)
+		err = s8003_mem_init(apple, &s->shared, S8003_SHARED_VA, T7000_SHARED_SIZE,
+				     T7000_FW_FLAGS);
+	if (!err)
+		err = s8003_mem_init(apple, &s->zero, 0, PVR_DEVICE_PAGE_SIZE, T7000_FW_FLAGS);
+	for (i = 0; !err && i < T7000_HW_OBJS; i++)
+		err = s8003_mem_init(apple, &s->hwobj[i], T7000_HWOBJ_VA + t7000_hwobj_offset[i],
+				     T7000_HWOBJ_SIZE, T7000_VM_FLAGS);
+	if (!err) {
+		err = pvr_vm_map_io(vm_ctx, s->fender_phys, S8003_PIO_VA + T7000_PIO_FENDER,
+				    T7000_PIO_FENDER_SIZE);
+		if (!err) {
+			err = pvr_vm_map_io(vm_ctx, s->aic_phys + 0x1000,
+					    S8003_PIO_VA + T7000_PIO_AIC_TIME, T7000_PIO_AIC_SIZE);
+			if (err)
+				pvr_vm_unmap_io(vm_ctx, S8003_PIO_VA + T7000_PIO_FENDER,
+						T7000_PIO_FENDER_SIZE);
+		}
+		if (!err) {
+			err = pvr_vm_map_io(vm_ctx, s->aic_phys + AIC_SW_SET,
+					    S8003_PIO_VA + T7000_PIO_AIC_SET, T7000_PIO_AIC_SIZE);
+			if (err) {
+				pvr_vm_unmap_io(vm_ctx, S8003_PIO_VA + T7000_PIO_FENDER,
+						T7000_PIO_FENDER_SIZE);
+				pvr_vm_unmap_io(vm_ctx, S8003_PIO_VA + T7000_PIO_AIC_TIME,
+						T7000_PIO_AIC_SIZE);
+			}
+		}
+		if (!err)
+			s->t7000_pio_mapped = true;
+	}
+	if (err)
+		pvr_apple_s8003_fini(apple);
+	return err;
+}
+
+/* PLATFORM +0x38..+0xaf: the first of the two 0xa8-byte blocks 0x8466578 copies from acc+0x1798 (P4) */
+static const u32 t7000_platform_38[] = {
+	0x00000000, 0x00002000, 0x00002000, 0x00000000, 0x20000000, 0x00000000,
+	0x00002543, 0xe4233312, 0xf3772543, 0x10f2e5fd, 0x408d2543, 0xdd650000,
+	0x00002543, 0xe0fd395e, 0xf92d2543, 0x099ceef2, 0x43962543, 0xdbe10000,
+	0x00002000, 0xe9912cdd, 0xf4fd2000, 0x10eee926, 0x38b42000, 0xe3a60000,
+	0x00002000, 0xe73b3189, 0xfa022000, 0x0a7df105, 0x3b5e2000, 0xe2510000,
+};
+
+/* POLICY +0x40: the 0x160 bytes 0x8467770 copies from fwctl +0x3f0 (P4: the nonzero words) */
+static const u32 t7000_policy_40[][2] = {
+	{ 0x40, 0x4294fc36 }, { 0x44, 0x40041a37 }, { 0x48, 0x4219ba44 }, { 0xe0, 0x42849d8b },
+	{ 0x164, 0x3f800000 }, { 0x168, 0x3faab021 }, { 0x16c, 0x3fc820c5 }, { 0x170, 0x3fe9d495 },
+};
+
+/*
+ * The governor's words 0x8467770 computes from fwctl +0x598..+0x63c (P4), with
+ * the result it stores; where iOS's firmware changed a word later (+0x678,
+ * +0x67c, +0x774, +0x78c), Apple's initial value.
+ */
+static const u32 t7000_policy_gov[][2] = {
+	{ 0x634, 0x271 }, { 0x640, 0x3f7f2e9f }, { 0x648, 0x3b516154 }, { 0x650, 0x3ca59586 },
+	{ 0x65c, 0x452ba000 }, { 0x660, 0x40a90fdb }, { 0x668, 0xbddfbe5e }, { 0x66c, 0xfffffefc },
+	{ 0x674, 0x12c }, { 0x67c, 0xaba }, { 0x694, 0x12c }, { 0x72c, 0x5f }, { 0x730, 0x6 },
+	{ 0x734, 0x1 }, { 0x73c, 0x3f4ccccd }, { 0x744, 0x3e4ccccd }, { 0x740, 0x3f7ae148 },
+	{ 0x748, 0x3ca3d70a }, { 0x74c, 0x40fca970 }, { 0x750, 0x3e4a2121 }, { 0x758, 0x42be0000 },
+	{ 0x75c, 0x416b53d1 }, { 0x760, 0x40db53d0 }, { 0x764, 0x4006bca2 }, { 0x76c, 0xc8 },
+	{ 0x770, 0x64 }, { 0x778, 0x5f }, { 0x790, 0x64 }, { 0x7a8, 0x42c80000 }, { 0x7ac, 300 },
+	{ 0x7b4, 0x3f4ccccd }, { 0x7b8, 0x3e4ccccd }, { 0x904, 300 },
+};
+
+/* MHz and mV per row (kext arrays acc+0x19d4, P4): states 1-3 are 365, 450 and 500 MHz */
+static const u32 t7000_mhz[7] = { 0, 365, 450, 500, 182, 225, 250 };
+static const u32 t7000_mv[7] = { 600, 871, 896, 912, 871, 896, 912 };
+
+/*
+ * The root and shared memory as the A8's firmware finds it when it starts
+ * (0x8466578, 0x8467770; values from P4): where its objects are, the heaps'
+ * bases, the registers it may use, the interrupt it raises, its thread, the
+ * performance states and the hardware objects. @q is the power state the
+ * core starts in, to which the power interface's two clock targets are
+ * pinned (Apple: state 1, 0x846eb10). CONTROL +0xcd0..+0xcd8, the
+ * performance controller's inputs, stay zero as in Apple's live CONTROL.
+ */
+static void t7000_init_build(struct pvr_apple *apple, u32 q)
+{
+	static const u8 rings[] = {
+		S8003_WORK_CTL, S8003_WORK_RING, S8003_WORK_CTL + 4, S8003_WORK_RING + 4,
+		S8003_WORK_CTL + 8, S8003_WORK_RING + 8, S8003_DC_CTL, S8003_DC_RING,
+		S8003_EVENT_CTL, S8003_EVENTS, S8003_LOG_CTL, S8003_LOGS,
+		S8003_STATS_CTL, S8003_STATS, S8003_TRACE_CTL, S8003_TRACE,
+	};
+	static const u8 objects[] = {
+		S8003_CHANNEL, S8003_CHANNEL + 1, S8003_CHANNEL + 2, S8003_POLICY, 0x4b,
+	};
+	static const u8 tail[] = { 0x4e, 0x4c, S8003_PLATFORM, S8003_TAG_SEEN, 0x4f };
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	const struct s8003_layout *layout = &s->layout;
+	const struct {
+		u64 phys;
+		u32 addr;
+		u32 size;
+	} pio[] = {
+		{ s->fender_phys, s8003_meta_addr(S8003_PIO_VA + T7000_PIO_FENDER),
+		  T7000_PIO_FENDER_SIZE },
+		{ s->aic_phys + 0x1000, s8003_meta_addr(S8003_PIO_VA + T7000_PIO_AIC_TIME),
+		  T7000_PIO_AIC_SIZE },
+		{ s->aic_phys + AIC_SW_SET, s8003_meta_addr(S8003_PIO_VA + T7000_PIO_AIC_SET),
+		  T7000_PIO_AIC_SIZE },
+		{ s->rgx_phys, 0, 0x20000 },
+	};
+	u8 *init, *platform, *policy, *control, *o4c;
+	unsigned int i;
+
+	memset(s->root.map, 0, T7000_ROOT_SIZE);
+	memset(s->shared.map, 0, T7000_SHARED_SIZE);
+	init = s8003_object(s, S8003_INIT);
+	platform = s8003_object(s, S8003_PLATFORM);
+	policy = s8003_object(s, S8003_POLICY);
+	control = s8003_object(s, S8003_CONTROL);
+	o4c = s8003_object(s, 0x4c);
+
+	for (i = 0; i < ARRAY_SIZE(rings); i++)
+		put32(init + 4 * i, s8003_object_addr(layout, rings[i]));
+	for (i = 0; i < ARRAY_SIZE(objects); i++)
+		put32(init + 0x88 + 4 * i, s8003_object_addr(layout, objects[i]));
+	for (i = 0; i < ARRAY_SIZE(tail); i++)
+		put32(init + 0x470 + 4 * i, s8003_object_addr(layout, tail[i]));
+	/* No core memory: the image's end, size 0 (0x84724c4; P4 0x40024000, 0xe1c0024000, 0) */
+	put32(init + 0x4a4, (lower_32_bits(S8003_IMAGE_VA + T7000_IMAGE_SIZE) + 0x40000000) |
+			    0x40000000);
+	put64(init + 0x4a8, S8003_IMAGE_VA + T7000_IMAGE_SIZE);
+	/* Channel headers {0, self, 0, self + 8}; no channel 1 +0x778 on the A8 */
+	for (i = 0; i < 3; i++) {
+		u8 *channel = s8003_object(s, S8003_CHANNEL + i);
+		u32 addr = s8003_object_addr(layout, S8003_CHANNEL + i);
+
+		put32(channel + 4, addr);
+		put32(channel + 12, addr + 8);
+	}
+
+	/* The heaps' bases (DAT 0x712f910): +0x20/+0x28 is the PDS and USC execution base */
+	put64(platform + 0x00, 0x500000000ull);
+	put64(platform + 0x08, 0x600000000ull);
+	put64(platform + 0x10, 0x100000000ull);
+	put64(platform + 0x18, 0x100000000ull);
+	put64(platform + 0x20, 0x300000000ull);
+	put64(platform + 0x28, 0x300000000ull);
+	for (i = 0; i < ARRAY_SIZE(t7000_platform_38); i++)
+		put32(platform + 0x38 + 4 * i, t7000_platform_38[i]);
+	for (i = 0; i < ARRAY_SIZE(pio); i++) {
+		u8 *entry = platform + 0x190 + 16 * i;
+
+		put64(entry, pio[i].phys);
+		put32(entry + 8, pio[i].addr);
+		put32(entry + 12, pio[i].size);
+	}
+	put32(platform + 0x250, 1);	/* Fender boot */
+	put32(platform + 0x254, 1);	/* gpu_lockup_detection */
+	put32(platform + 0x258, 1);	/* PIO supported */
+	put32(platform + 0x274, 1);	/* agf_timeslice */
+	put32(platform + 0x278, 1);
+	put32(platform + 0x27c, 1);	/* agf_timer */
+	put32(platform + 0x280, 1000 * 0x18);	/* agf_timer_period, 24 MHz ticks */
+	put32(platform + 0x284, 0x10);
+	put32(platform + 0x290, 1);	/* agf_dwb */
+	put32(platform + 0x294, 1);	/* agf_itr_cache */
+	put32(platform + 0x29c, 1);	/* agf_deferred_opaque */
+	put32(platform + 0x2b4, 0x1f);	/* agf_max_tiles_per_pipe */
+	put32(platform + 0x2dc, 1);	/* agf_frg_vce_inval */
+	put32(platform + 0x300, 2);	/* chip info {2, 4, 0, 4} */
+	put32(platform + 0x304, 4);
+	put32(platform + 0x308, 4);
+	put32(platform + 0x30c, 3);	/* the highest performance state */
+	put32(platform + 0x310, 16);
+	for (i = 0; i < ARRAY_SIZE(t7000_mhz); i++) {
+		put32(platform + 0x314 + 4 * i, t7000_mhz[i]);
+		put32(platform + 0x354 + 4 * i, t7000_mv[i]);
+	}
+	/* The interrupt to the host: its word and bit among the AIC's software sets (P4 0x10, 0x400) */
+	put32(platform + 0x494, 4 * (s->irq / 32));
+	put32(platform + 0x498, BIT(s->irq % 32));
+	put32(platform + 0x49c, AIC_TIME & 0xfff);	/* in the time window */
+	put32(platform + 0x4a0, s->thread_pc);
+	put32(platform + 0x4a4, s->thread_sp);
+	put64(platform + 0x4b0, S8003_IMAGE_VA);
+	put64(platform + 0x4b8, 0x700000000ull);	/* DAT 0x712fab8 */
+	put32(platform + 0x4c8, 0xffff);	/* agf_gtp_ks */
+	put32(platform + 0x4cc, 7);		/* agf_frg_ks */
+	put32(platform + 0x4d0, 7);		/* agf_compute_ks */
+
+	put32(policy + 0x04, 0x10);
+	put64(policy + 0x10, 0x3f800000);
+	put64(policy + 0x28, 0x100000001ull);
+	put32(policy + 0x3c, 100);
+	for (i = 0; i < ARRAY_SIZE(t7000_policy_40); i++)
+		put32(policy + t7000_policy_40[i][0], t7000_policy_40[i][1]);
+	for (i = 0; i < ARRAY_SIZE(t7000_policy_gov); i++)
+		put32(policy + t7000_policy_gov[i][0], t7000_policy_gov[i][1]);
+	put64(policy + 0x1008, arch_timer_read_counter());	/* the governor's last sample */
+
+	put32(control + 0x28, 1);
+	put32(control + 0x34, 0x78);		/* gpu_temperature_limit */
+	put32(control + 0x4a, 1);
+	put32(control + 0xc66, 1867);		/* power target */
+	put32(control + 0xc6a, 100 * q);	/* the power interface's clock targets */
+	put32(control + 0xc6e, 100 * q);
+	put32(control + 0xd0e, s8003_object_addr(layout, S8003_TAG_HOST));
+	put32(control + 0xd12, s8003_object_addr(layout, S8003_MMU_ROOT));
+	put32(control + 0xd16, 1);
+	/* GPU context 0 runs on the kernel VM, whose catalogue the boot stream gives the BIF */
+	put64(s8003_object(s, S8003_MMU_ROOT),
+	      pvr_vm_get_page_table_root_addr(apple->pvr_dev->kernel_vm_ctx));
+
+	/* The hardware objects, fresh, and their names */
+	for (i = 0; i < T7000_HW_OBJS; i++)
+		memset(s->hwobj[i].map, 0, T7000_HWOBJ_SIZE);
+	memcpy(s->hwobj[T7000_HW_BORDER].map, s->border, T7000_BORDER_SIZE);
+	put64(platform + 0x30, T7000_HWOBJ_VA + t7000_hwobj_offset[T7000_HW_YUV]);
+	put64(platform + 0x188, T7000_HWOBJ_VA + t7000_hwobj_offset[T7000_HW_BORDER]);
+	put64(platform + 0x4a8, T7000_HWOBJ_VA + t7000_hwobj_offset[T7000_HW_FENCE]);
+	put64(o4c, T7000_HWOBJ_VA + t7000_hwobj_offset[T7000_HW_BRN44455]);
+	put64(o4c + 8, T7000_HWOBJ_VA + t7000_hwobj_offset[T7000_HW_FENCE]);
+}
+
+/*
+ * A channel page. The compute channel has the A9's layout (s8003_channel_init()),
+ * which the A8's firmware takes. The TA and 3D channels have Apple's header
+ * and ring control (P5b chfw_ta/chfw_3d, chring: five watermarks 0x10 apart,
+ * 0x144 entries, the ring right behind at +0x60); their dependency objects,
+ * stamps and records are where the A9's layout has them.
+ */
+#define T7000_RCH_CMD			0x300	/* the 3D job's barrier command */
+#define T7000_RCH_W			0x400
+#define T7000_RCH_TA_USEQ		0xa00
+#define T7000_RCH_3D_USEQ		0xd00
+#define T7000_RCH_TIMES			0x2800	/* the 3D record's times, 16 bytes */
+#define T7000_RCH_SIZE			0x3000
+#define T7000_RCH_CTL			0x2000	/* Apple's ring control: 0x60 + 0x144 entries */
+#define T7000_RCH_RING			(T7000_RCH_CTL + 0x60)
+#define T7000_RCH_ENTRIES		0x144
+#define T7000_CU_SIZE			0x1000
+
+static void t7000_channel_init(u8 *p, u32 size, u32 addr, u32 tq, u32 dep)
+{
+	memset(p, 0, size);
+	s8003_channel_init(p, addr, tq, dep);
+}
+
+/* Apple's TA/3D channel header: @control_knob is CONTROL + 0xc, @object the engine's channel object */
+static void t7000_render_channel_init(u8 *p, u32 addr, u32 control_knob, u32 object)
+{
+	t7000_channel_init(p, T7000_RCH_SIZE, addr, S8003_CH_TQ, S8003_CH_DEP);
+	memset(p, 0, 0x80);
+	put32(p + 0x00, addr + T7000_RCH_CTL);
+	put32(p + 0x04, addr + T7000_RCH_RING);
+	put32(p + 0x08, control_knob);
+	put32(p + 0x0c, 2);
+	put32(p + 0x10, 0xff000000);
+	put32(p + 0x18, 0xffffffff);
+	put32(p + 0x2c, object);
+	put32(p + 0x34, object + 8);
+	put32(p + 0x4c, 0x21);
+	put32(p + 0x54, 0x640);
+	memset(p + S8003_CH_CTL, 0, 0x60);
+	put32(p + T7000_RCH_CTL + S8003_CH_CTL_ENTRIES, T7000_RCH_ENTRIES);
+}
+
+static void t7000_channels_init(struct pvr_apple_s8003 *s)
+{
+	u32 knob = s8003_object_addr(&s->layout, S8003_CONTROL) + 0xc;
+
+	t7000_channel_init(s8003_channel(s, APPLE_ENGINE_COMPUTE), T7000_CU_SIZE,
+			   s8003_channel_addr(s, APPLE_ENGINE_COMPUTE), S8003_CU_TQ, S8003_CU_DEP);
+	t7000_render_channel_init(s8003_channel(s, APPLE_ENGINE_GEOM),
+				  s8003_channel_addr(s, APPLE_ENGINE_GEOM), knob,
+				  s8003_object_addr(&s->layout, S8003_CHANNEL));
+	t7000_render_channel_init(s8003_channel(s, APPLE_ENGINE_FRAG),
+				  s8003_channel_addr(s, APPLE_ENGINE_FRAG), knob,
+				  s8003_object_addr(&s->layout, S8003_CHANNEL + 1));
+}
+
+static u32 pmgr_read(struct pvr_apple_s8003 *s, u32 reg)
+{
+	return readl(s->pmgr + reg);
+}
+
+/*
+ * Every access to the Rogue registers waits for this: Fender in state 1, no
+ * request in flight, the GPU's PLL locked, all read right before. An access
+ * with the PLL unlocked hung the whole SoC in bring-up.
+ */
+static bool t7000_r0_gate(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u32 state = readl(apple->fender + FENDER_POWER_STATE);
+	u32 pll = pmgr_read(s, T7000_PMGR_PLL5);
+
+	if ((state & FENDER_POWER_STATE_MASK) == 1 && (pll & T7000_PLL_LOCKED))
+		return true;
+	dev_err_ratelimited(apple_dev(apple),
+			    "GPU registers not accessed: Fender state %#x, PLL5 %#x\n", state, pll);
+	return false;
+}
+
+/*
+ * Where Apple panics (a GPC state transition stuck, no alive event): leave
+ * the GPU as it is, as the bring-up module does. No Fender, PMGR or Rogue
+ * register is touched again, and the firmware's memory and page tables are
+ * kept until a reboot (pvr_apple_s8003_fini()): the META may still run in
+ * them.
+ */
+static void t7000_stuck(struct pvr_apple *apple, const char *why)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	if (s->stuck)
+		return;
+	s->stuck = true;
+	if (apple->pvr_dev->kernel_vm_ctx)
+		pvr_vm_context_get(apple->pvr_dev->kernel_vm_ctx);
+	dev_err(apple_dev(apple), "%s: the GPU is left as it is, with its memory, until a reboot\n",
+		why);
+}
+
+/* Ask Fender for power state @state and wait until no request is in flight */
+static int t7000_fender_state(struct pvr_apple *apple, u32 state)
+{
+	u32 val;
+	int err;
+
+	writel(FENDER_POWER_REQUEST | state, apple->fender + FENDER_POWER_STATE);
+	err = readl_poll_timeout(apple->fender + FENDER_POWER_STATE, val,
+				 !(val & FENDER_POWER_REQUEST), 5, T7000_FENDER_POLL_US);
+	if (err) {
+		dev_err(apple_dev(apple), "Fender stayed busy going to state %u (%#x)\n", state, val);
+		return err;
+	}
+	apple->perf_state = state;
+	return 0;
+}
+
+/* Apple's GPU power state writer (0x8497520): on (auto power management) or off */
+static int t7000_ps_set(struct pvr_apple *apple, u32 target)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	void __iomem *ps = s->pmgr + T7000_PMGR_PS_GFX;
+	u32 r = readl(ps), val;
+	int err;
+
+	if (FIELD_GET(T7000_PS_TARGET, r) == target && !(r & (T7000_PS_BIT30 | T7000_PS_DEV_DISABLE)) &&
+	    !!(r & T7000_PS_AUTO_PM) == (target == T7000_PS_ON))
+		return 0;
+	if (r & T7000_PS_AUTO_PM) {
+		r &= 0xeffffcff;
+		writel(r, ps);
+	} else {
+		r &= 0xfffffcff;
+	}
+	r = (r & 0xfffffcf0) | target;
+	if (target < T7000_PS_ON)
+		r |= T7000_PS_HIST;
+	writel(r, ps);
+	err = readl_poll_timeout(ps, val, FIELD_GET(T7000_PS_ACTUAL, val) == target, 5,
+				 T7000_PS_POLL_US);
+	if (err) {
+		dev_err(apple_dev(apple), "GPU power state %#x not reached: %#x\n", target, val);
+		return err;
+	}
+	if (target != T7000_PS_ON)
+		return 0;
+	r = (r & ~T7000_PS_HIST) | T7000_PS_AUTO_PM;
+	writel(r, ps);
+	if (r & T7000_PS_BIT30) {
+		r &= ~T7000_PS_BIT30;
+		writel(r, ps);
+	}
+	if (r & T7000_PS_DEV_DISABLE)
+		writel(r & ~T7000_PS_DEV_DISABLE, ps);
+	return 0;
+}
+
+static bool t7000_ps_on(struct pvr_apple_s8003 *s)
+{
+	return FIELD_GET(T7000_PS_ACTUAL, pmgr_read(s, T7000_PMGR_PS_GFX)) == T7000_PS_ON;
+}
+
+/*
+ * Apple's bridge settings for the GPU (0x84a0098, from the ADT): one store to
+ * bridge 10, 32 to bridge 11, after the GPU powers on.
+ */
+static const u32 t7000_bridge11[32] = {
+	0x007c7c01, 0x007c7c01, 0x007c7c01, 0x007c7901, 0x007c7901, 0x007c7c01, 0x007c7c01,
+	0x007c7c01, 0x007c7c01, 0x007c7c01, 0x007c7c01, 0x007c7c01, 0x006c6901, 0x007c7901,
+	0x007c7c01, 0x007c7c01, 0x00747201, 0x00747201, 0x00747201, 0x00747201, 0x007c7c01,
+	0x007c7c01, 0x007c7c01, 0x006c6901, 0x007c7c01, 0x00797901, 0x00797901, 0x007c7c01,
+	0x006c6901, 0x00797901, 0x00797901, 0x00797901,
+};
+
+static void t7000_bridges(struct pvr_apple_s8003 *s)
+{
+	unsigned int i;
+
+	writel(0x80010004, s->bridges + 0x18);
+	for (i = 0; i < ARRAY_SIZE(t7000_bridge11); i++)
+		writel(t7000_bridge11[i], s->bridges + 0x80000 + 4 * i);
+}
+
+/*
+ * Power the GPU on as the bring-up module does, in Apple's order: the
+ * power manager's clock gating (0x849d1bc) and SoC voltage manager
+ * (0x849d340) enables, then the GPU's power state with automatic power
+ * management (K3-K5), the bridge settings (K6), and Fender's wake into
+ * state 1 with the META held back by an empty boot stream (K7). The core's
+ * ID can be read then. A GPU already on (a restart without power-off) is
+ * only woken.
+ */
+static int t7000_boot(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	void __iomem *ps = s->pmgr + T7000_PMGR_PS_GFX;
+	unsigned int n;
+	u32 val;
+	int err;
+
+	if (s->stuck)
+		return -EIO;
+	/*
+	 * Every stop powers the GPU off (t7000_core_off()): one that is on was
+	 * left on by something else. The module refuses such a GPU, and so
+	 * does this.
+	 */
+	if (FIELD_GET(T7000_PS_ACTUAL, pmgr_read(s, T7000_PMGR_PS_GFX))) {
+		dev_err(apple_dev(apple), "the GPU is powered already: not touched\n");
+		return -EBUSY;
+	}
+	for (n = 1; n <= 3; n++) {
+		if (!(pmgr_read(s, T7000_PMGR_GPU_TABLE + 0x10 * n) & T7000_GPU_TABLE_VALID)) {
+			dev_err(apple_dev(apple), "GPU performance record %u not valid\n", n);
+			return -EIO;
+		}
+	}
+	val = pmgr_read(s, T7000_PMGR_MISC_ACG);
+	if (!(val & 1))
+		writel(val | 1, s->pmgr + T7000_PMGR_MISC_ACG);
+	if (pmgr_read(s, T7000_PMGR_VM_CTL) & 0xf00) {
+		dev_err(apple_dev(apple), "the voltage manager is off: GPU not powered\n");
+		return -EIO;
+	}
+	val = pmgr_read(s, T7000_PMGR_SOC_TVM);
+	if (!(val & 1)) {
+		writel(val | 1, s->pmgr + T7000_PMGR_SOC_TVM);
+		udelay(100);
+	}
+	msleep(T7000_SETTLE_MS);	/* the SRAM rail SOC_TVM raises, before the GPU powers */
+	/* K3 (0x84973ac): minimum state 0, history cleared */
+	val = readl(ps);
+	writel((val & 0xfff00000) | (val & 0xfcff), ps);
+	err = t7000_ps_set(apple, T7000_PS_ON);
+	if (err)
+		goto ps_off;
+	t7000_bridges(s);
+
+	msleep(T7000_SETTLE_MS);
+	writel(FENDER_STREAM_END, apple->fender + FENDER_STREAM);
+	writel(FENDER_CTRL_BOOT, apple->fender + FENDER_CTRL);
+	mutex_lock(&apple->perf_lock);
+	err = t7000_fender_state(apple, 1);
+	mutex_unlock(&apple->perf_lock);
+	if (!err) {
+		usleep_range(10, 20);
+		msleep(T7000_SETTLE_MS);
+		return 0;
+	}
+	if (t7000_fender_state(apple, 0)) {
+		/* Apple panics here ("GPC state transition is stuck") */
+		t7000_stuck(apple, "Fender stuck at the wake");
+		return err;
+	}
+ps_off:
+	t7000_ps_set(apple, 0);
+	return err;
+}
+
+static int t7000_core_off(struct pvr_apple *apple);
+
+/* The core's ID, as the bring-up module reads it: two gated 32-bit reads */
+static int pvr_apple_t7000_read_gpu_id(struct pvr_apple *apple, struct pvr_gpu_id *gpu_id)
+{
+	struct pvr_device *pvr_dev = apple->pvr_dev;
+	u32 rev = 0, id = 0;
+	int err = -EIO;
+
+	if (t7000_r0_gate(apple)) {
+		rev = pvr_cr_read32(pvr_dev, ROGUE_CR_CORE_REVISION);
+		if (t7000_r0_gate(apple)) {
+			id = pvr_cr_read32(pvr_dev, ROGUE_CR_CORE_ID);
+			err = 0;
+		}
+	}
+	/*
+	 * As the module: the core goes back to Fender state 0 at once, and
+	 * the GPU off if the ID was not read. The release starts from state 0.
+	 */
+	if (err) {
+		t7000_core_off(apple);
+		return err;
+	}
+	msleep(T7000_SETTLE_MS);
+	mutex_lock(&apple->perf_lock);
+	err = t7000_fender_state(apple, 0);
+	mutex_unlock(&apple->perf_lock);
+	if (err) {
+		t7000_stuck(apple, "Fender stuck after the ID read");
+		return err;
+	}
+	if (rev != T7000_CORE_REVISION) {
+		dev_err(apple_dev(apple), "CORE_REVISION %#x is not the A8's\n", rev);
+		return -ENODEV;
+	}
+	gpu_id->b = FIELD_GET(GENMASK(23, 16), rev);
+	gpu_id->v = FIELD_GET(GENMASK(15, 8), rev);
+	gpu_id->n = FIELD_GET(GENMASK(15, 8), id);
+	gpu_id->c = FIELD_GET(GENMASK(7, 0), id);
+	return 0;
+}
+
+/*
+ * One 32- or 64-bit write of the boot stream, as Apple's Fender writers
+ * (0x847a858, 0x847a8b4) store them: no read-back.
+ */
+static void t7000_stream_word(struct s8003_stream *stream, u32 word)
+{
+	if (stream->offset >= FENDER_STREAM_SIZE) {
+		stream->err = -ENOSPC;
+		return;
+	}
+	writel(word, stream->apple->fender + FENDER_STREAM + stream->offset);
+	stream->offset += 4;
+}
+
+static void t7000_stream_write32(struct s8003_stream *stream, u32 reg, u32 value)
+{
+	t7000_stream_word(stream, reg | 0xff << 16);
+	t7000_stream_word(stream, value);
+}
+
+static void t7000_stream_write64(struct s8003_stream *stream, u32 reg, u64 value)
+{
+	t7000_stream_word(stream, reg + 4);
+	t7000_stream_word(stream, upper_32_bits(value));
+	t7000_stream_word(stream, reg | 0xff << 16);
+	t7000_stream_word(stream, lower_32_bits(value));
+}
+
+/*
+ * Apple's stop (0x846ebf8): Fender's core word 0, then state 0, waiting for
+ * each; then the stored boot stream is cut back to its end marker, so that
+ * no later power-up replays it, and the GPU's power state goes off: every
+ * boot starts from a GPU that is off, in the full power-on order. A Fender that stays busy (Apple panics) is
+ * left alone, and so is everything after it.
+ */
+static int t7000_core_off(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u32 val;
+	int err;
+
+	if (s->stuck || !t7000_ps_on(s))
+		return s->stuck ? -EIO : 0;
+	writel(0, apple->fender + FENDER_CORE);
+	err = readl_poll_timeout(apple->fender + FENDER_POWER_STATE, val,
+				 !(val & FENDER_POWER_REQUEST), 5, T7000_FENDER_POLL_US);
+	if (!err) {
+		mutex_lock(&apple->perf_lock);
+		err = t7000_fender_state(apple, 0);
+		mutex_unlock(&apple->perf_lock);
+	}
+	if (err) {
+		t7000_stuck(apple, "Fender stuck at the stop");
+		return err;
+	}
+	writel(FENDER_STREAM_END, apple->fender + FENDER_STREAM);
+	/* and the GPU's power state off, as the module ends every run */
+	return t7000_ps_set(apple, 0);
+}
+
+/*
+ * Boot the META (Apple's prepareBoot 0x846f044 and start 0x846eb10): with
+ * the core in state 0, store the boot stream (reset, boot mode, the page
+ * catalogue of GPU context 0 in BIF_CAT_BASE0 as configureMMUForBoot
+ * 0x8477e8c does, the SLC setup of populateInitSequence 0x8477eb0; no spare
+ * page), then release the core word and power the core up in state @q.
+ * Fender replays the stream, whose last write releases the reset.
+ */
+static int t7000_release(struct pvr_apple *apple, u32 q)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	struct s8003_stream stream = { .apple = apple };
+	u32 val;
+	int err;
+
+	if (s->stuck)
+		return -EIO;
+	mutex_lock(&apple->perf_lock);
+	err = t7000_fender_state(apple, 0);
+	mutex_unlock(&apple->perf_lock);
+	if (err) {
+		t7000_stuck(apple, "Fender stuck before the boot");
+		return err;
+	}
+	msleep(T7000_SETTLE_MS);
+	(void)readl(apple->fender + FENDER_STREAM_STATE);
+	writel(0, apple->fender + FENDER_STREAM_STATE);
+	(void)readl(apple->fender + FENDER_STREAM_STATE);
+	writel(FENDER_CTRL_BOOT, apple->fender + FENDER_CTRL);
+	t7000_stream_write64(&stream, ROGUE_CR_SOFT_RESET, S8003_SOFT_RESET_ALL);
+	t7000_stream_write64(&stream, ROGUE_CR_SOFT_RESET, S8003_SOFT_RESET_CORE);
+	t7000_stream_write64(&stream, ROGUE_CR_SOFT_RESET, ROGUE_CR_SOFT_RESET_GARTEN_EN);
+	t7000_stream_write32(&stream, ROGUE_CR_META_BOOT, ROGUE_CR_META_BOOT_MODE_EN);
+	t7000_stream_write64(&stream, ROGUE_CR_BIF_CAT_BASE0,
+			     pvr_vm_get_page_table_root_addr(apple->pvr_dev->kernel_vm_ctx));
+	t7000_stream_write64(&stream, ROGUE_CR_SLC_CTRL_MISC, 0x200001);
+	t7000_stream_write64(&stream, T7000_CR_SLC_3808, 1);
+	t7000_stream_write64(&stream, ROGUE_CR_SOFT_RESET, 0);
+	t7000_stream_word(&stream, FENDER_STREAM_END);
+	if (stream.err) {
+		dev_err(apple_dev(apple), "Fender did not take the boot stream: %d\n", stream.err);
+		return stream.err;
+	}
+	wmb();	/* the image and init data are in memory before the META runs */
+
+	msleep(T7000_SETTLE_MS);
+	writel(0, apple->fender + FENDER_CORE);
+	err = readl_poll_timeout(apple->fender + FENDER_POWER_STATE, val,
+				 !(val & FENDER_POWER_REQUEST), 5, T7000_FENDER_POLL_US);
+	if (err) {
+		t7000_stuck(apple, "Fender busy before the release");
+		return err;
+	}
+	/* As Apple's start: the request, then the alive event is waited for in memory */
+	mutex_lock(&apple->perf_lock);
+	writel(FENDER_POWER_REQUEST | q, apple->fender + FENDER_POWER_STATE);
+	apple->perf_state = q;
+	mutex_unlock(&apple->perf_lock);
+	return 0;
+}
+
+/* Apple panics in every caller of its alive wait (0x8471040, 0x846dc1c, 0x846f9a0) */
+static void t7000_no_alive(struct pvr_apple *apple)
+{
+	t7000_stuck(apple, "no alive event from the firmware");
+}
+
+/* After the stop, for runtime suspend: the GPU's power state goes off */
+static void t7000_idle(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	if (!s->stuck && t7000_ps_on(s))
+		t7000_ps_set(apple, 0);
+}
+
+/*
+ * Apple's kick, the same in all five of its MTS_SCHEDULE writers (TA
+ * 0x846f220, 3D 0x846f408, CL 0x846f5f0, device control 0x846f9a0; COUNTED
+ * and the data master): Fender's wake, the power state read, then the META's
+ * scheduler register. In state 0 (the firmware idled the core) Apple rings
+ * as long as Fender is set up and the snoop is armed; with that write Fender
+ * wakes the core (on the iPod: state 1 and the PLL locked within 1 ms).
+ * Apple restarts the firmware when Fender's control is 0 and warns when the
+ * snoop is not armed; this driver refuses both. In state 1 the PLL must be
+ * locked, as for every access to the Rogue registers.
+ */
+static int t7000_doorbell(struct pvr_apple *apple, u32 dm)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u32 state, pll, ctrl, snoop;
+
+		return -EIO;
+	mb();	/* what the firmware is rung for is in memory */
+	writel(FENDER_WAKE_ALL, apple->fender + FENDER_WAKE);
+	state = readl(apple->fender + FENDER_POWER_STATE);
+	pll = pmgr_read(s, T7000_PMGR_PLL5);
+	if (!(state & 0xf)) {
+		ctrl = readl(apple->fender + FENDER_CTRL);
+		snoop = readl(apple->fender + T7000_FENDER_SNOOP);
+		if (!ctrl || (!(ctrl & T7000_FENDER_CTRL_SNOOP) && !(snoop & BIT(1)))) {
+			dev_err_ratelimited(apple_dev(apple),
+					    "doorbell not rung: Fender state %#x, control %#x, snoop %#x\n",
+					    state, ctrl, snoop);
+			return -EIO;
+		}
+	} else if (!(pll & T7000_PLL_LOCKED)) {
+		dev_err_ratelimited(apple_dev(apple),
+				    "doorbell not rung: Fender state %#x, PLL5 %#x\n", state, pll);
+		return -EIO;
+	}
+	pvr_cr_write32(apple->pvr_dev, ROGUE_CR_MTS_SCHEDULE, ROGUE_CR_MTS_SCHEDULE_TASK_COUNTED | dm);
+	return 0;
+}
+
+/* The hardware objects at their addresses in a VM */
+static int t7000_vm_map(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	unsigned int i;
+	int err = 0;
+
+	for (i = 0; !err && i < T7000_HW_OBJS; i++) {
+		if (!s->hwobj[i].obj)
+			return -ENODEV;
+		err = pvr_vm_map_reserved(vm_ctx, s->hwobj[i].obj,
+					  T7000_HWOBJ_VA + t7000_hwobj_offset[i], T7000_HWOBJ_SIZE);
+	}
+	return err;
+}
+
+static void t7000_vm_unmap(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	unsigned int i;
+
+	for (i = 0; i < T7000_HW_OBJS; i++)
+		if (s->hwobj[i].obj)
+			pvr_vm_unmap_obj(vm_ctx, s->hwobj[i].obj,
+					 T7000_HWOBJ_VA + t7000_hwobj_offset[i], T7000_HWOBJ_SIZE);
+}
+
+static void t7000_vm_put(struct pvr_apple *apple, struct s8003_vm *vm)
+{
+}
+
+static void t7000_iounmap(void *addr)
+{
+	iounmap((void __iomem *)addr);
+}
+
+/*
+ * Registers another driver owns as well (the power manager's): mapped, not
+ * requested, and non-posted as every Apple device's.
+ */
+static void __iomem *t7000_ioremap(struct device *dev, const char *name)
+{
+	struct resource *res = platform_get_resource_byname(to_platform_device(dev),
+							    IORESOURCE_MEM, name);
+	void __iomem *addr;
+
+	if (!res)
+		return NULL;
+	addr = ioremap_np(res->start, resource_size(res));
+	if (!addr || devm_add_action_or_reset(dev, t7000_iounmap, (void __force *)addr))
+		return NULL;
+	return addr;
+}
+
+/*
+ * The power manager's and the bridges' registers, and BorderColorTable's
+ * contents: 0x800 bytes of the kext's data (0xfffffff0088f1460), shipped
+ * beside the firmware. Without them the GPU is not started: the firmware
+ * runs only as the bring-up module ran it.
+ */
+static int t7000_init(struct pvr_apple *apple)
+{
+	struct device *dev = apple_dev(apple);
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	const struct firmware *border;
+	int err;
+
+	s->pmgr = t7000_ioremap(dev, "pmgr");
+	s->bridges = t7000_ioremap(dev, "bridges");
+	if (!s->pmgr || !s->bridges)
+		return dev_err_probe(dev, -EINVAL, "no power manager or bridge registers\n");
+
+	err = request_firmware(&border, T7000_BORDER_FW, dev);
+	if (err)
+		return dev_err_probe(dev, err, "no %s\n", T7000_BORDER_FW);
+	if (border->size != T7000_BORDER_SIZE) {
+		dev_err(dev, "%s has %zu bytes, not %u\n", T7000_BORDER_FW, border->size,
+			T7000_BORDER_SIZE);
+		err = -EINVAL;
+	} else {
+		s->border = devm_kmemdup(dev, border->data, T7000_BORDER_SIZE, GFP_KERNEL);
+		if (!s->border)
+			err = -ENOMEM;
+	}
+	release_firmware(border);
+	return err;
+}
+
 static const struct pvr_meta_ldr_target s8003_ldr_target = {
 	.mem = s8003_ldr_mem,
 	.config = s8003_ldr_config,
@@ -3167,9 +4245,45 @@ static const struct s8003_variant s8003_variant_a9 = {
 	.report_hang = s8003_report_hang,
 };
 
+/* The A8: its own sizes and boot; its jobs as the A9's where the firmware takes them the same way */
+static const struct s8003_variant s8003_variant_a8 = {
+	.name = "A8",
+	.page_size = SZ_4K,
+	.image_size = T7000_IMAGE_SIZE,
+	.root_size = T7000_ROOT_SIZE,
+	.shared_size = T7000_SHARED_SIZE,
+	.root_objects_end = T7000_ROOT_OBJECTS_END,
+	.shared_objects_end = T7000_SHARED_OBJECTS_END,
+	.objects = s8003_objects_a8,
+	.nr_objects = ARRAY_SIZE(s8003_objects_a8),
+	.ring_ctl_size = T7000_RING_CTL_SIZE,
+	.slots = T7000_SLOTS,
+	.slot_first = T7000_SLOT_FIRST,
+	.vm_slots = 1,
+	.channel = { T7000_TA_CHANNEL, T7000_3D_CHANNEL, T7000_CU_CHANNEL },
+	.channels_root = true,
+	.ldr_conf_count = S8003_LDR_CONF_MAX,
+	.ldr = &t7000_ldr_target,
+	.init = t7000_init,
+	.image_configure = t7000_image_configure,
+	.map = t7000_map,
+	.unmap = t7000_unmap,
+	.init_build = t7000_init_build,
+	.channels_init = t7000_channels_init,
+	.boot = t7000_boot,
+	.release = t7000_release,
+	.core_off = t7000_core_off,
+	.idle = t7000_idle,
+	.doorbell = t7000_doorbell,
+	.no_alive = t7000_no_alive,
+	.vm_map = t7000_vm_map,
+	.vm_put = t7000_vm_put,
+	.vm_unmap = t7000_vm_unmap,
+};
+
 static const struct s8003_variant *s8003_variant_of(const struct pvr_apple_chip *chip)
 {
-	return &s8003_variant_a9;
+	return chip == &pvr_apple_chip_t7000 ? &s8003_variant_a8 : &s8003_variant_a9;
 }
 
 const struct pvr_apple_chip pvr_apple_chip_s8003 = {
@@ -3204,6 +4318,77 @@ const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.vm_fini = pvr_apple_s8003_vm_fini,
 	.vm_scenes = pvr_apple_s8003_vm_scenes,
 	.vm_evictable = pvr_apple_s8003_vm_evictable,
+	.mmu_flush = pvr_apple_s8003_mmu_flush,
+	.irq_ack = pvr_apple_s8003_irq_ack,
+};
+
+/*
+ * The A8's heaps, as its firmware lays out a VM (heap setup 0x847efb8; the
+ * bases PLATFORM tells the firmware): the general heap at 0x1_00000000, the
+ * PDS heap at the PDS and USC execution base 0x3_00000000, USC code behind
+ * it at 0x3_80000000, then region headers, visibility test and transfer
+ * fragments. The general heap ends at 0x1_f0000000: the 256 MiB behind it
+ * hold the driver's PM tables in every VM (T7000_PM_*_VA). The hardware
+ * objects' 4 MiB at 0x8_00000000, reserved in every GART by Apple's kext,
+ * are outside every heap, so userspace cannot map there.
+ */
+static const struct drm_pvr_heap t7000_heaps[] = {
+	[DRM_PVR_HEAP_GENERAL] = {
+		.base = 0x100000000ull,
+		.size = 0xf0000000ull,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_PDS_CODE_DATA] = {
+		.base = 0x300000000ull,
+		.size = 0x10000000ull,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_USC_CODE] = {
+		.base = 0x380000000ull,
+		.size = 0x10000000ull,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_RGNHDR] = {
+		.base = 0x500000000ull,
+		.size = 0x10000000ull,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_VIS_TEST] = {
+		.base = 0x580000000ull,
+		.size = 0x10000000ull,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_TRANSFER_FRAG] = {
+		.base = 0x600000000ull,
+		.size = 0x10000000ull,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+};
+
+/*
+ * The A8 (T7000). Its firmware is booted and runs as the A9's is, with the
+ * variant above. It starts in power state 1, Apple's start state and the
+ * only one whose PLL lock is proven on Linux; the firmware is told all three
+ * of its states, and the host pins it there (PLATFORM, CONTROL).
+ */
+const struct pvr_apple_chip pvr_apple_chip_t7000 = {
+	.fw_name = "apple/gfx-t7000.bin",
+	.perf_state_max = 1,
+	.own_pm_pages = true,
+	.gate_off_ms = 10,
+	.irq_poll_us = 1000,
+	.heaps = t7000_heaps,
+	.read_gpu_id = pvr_apple_t7000_read_gpu_id,
+	.init = pvr_apple_s8003_init,
+	.boot = pvr_apple_s8003_boot,
+	.start = pvr_apple_s8003_start,
+	.stop = pvr_apple_s8003_stop,
+	.idle = pvr_apple_s8003_idle,
+	.fini = pvr_apple_s8003_fini,
+	.restore_image = pvr_apple_s8003_restore_image,
+	.events = pvr_apple_s8003_events,
+	.vm_init = pvr_apple_s8003_vm_init,
+	.vm_fini = pvr_apple_s8003_vm_fini,
 	.mmu_flush = pvr_apple_s8003_mmu_flush,
 	.irq_ack = pvr_apple_s8003_irq_ack,
 };
