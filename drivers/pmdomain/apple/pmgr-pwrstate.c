@@ -190,10 +190,29 @@ static const struct clk_ops apple_pmgr_clk_ops = {
 	.is_enabled = apple_pmgr_clk_is_enabled,
 };
 
+/*
+ * Confirm both the bus-disable and reset bits. Callers that retain DMA
+ * buffers until reset succeeds need a hardware readback, not just a
+ * successful software write.
+ */
+static int apple_pmgr_reset_verify(struct apple_pmgr_ps *ps, bool asserted)
+{
+	u32 mask = APPLE_PMGR_DEV_DISABLE | APPLE_PMGR_RESET;
+	u32 val;
+	int ret;
+
+	ret = regmap_read(ps->regmap, ps->offset, &val);
+	if (ret)
+		return ret;
+
+	return (val & mask) == (asserted ? mask : 0) ? 0 : -EIO;
+}
+
 static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
+	int ret;
 
 	spin_lock_irqsave(&ps->lock, flags);
 
@@ -202,33 +221,44 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 
 	dev_dbg(ps->dev, "PS 0x%x: assert reset\n", ps->offset);
 	/* Quiesce device before asserting reset */
-	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE,
-			   APPLE_PMGR_DEV_DISABLE);
-	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET,
-			   APPLE_PMGR_RESET);
+	ret = regmap_update_bits(ps->regmap, ps->offset,
+				 APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE,
+				 APPLE_PMGR_DEV_DISABLE);
+	if (!ret)
+		ret = regmap_update_bits(ps->regmap, ps->offset,
+					 APPLE_PMGR_FLAGS | APPLE_PMGR_RESET,
+					 APPLE_PMGR_RESET);
+	if (!ret)
+		ret = apple_pmgr_reset_verify(ps, true);
 
 	spin_unlock_irqrestore(&ps->lock, flags);
 
-	return 0;
+	return ret;
 }
 
 static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
 	unsigned long flags;
+	int ret;
 
 	spin_lock_irqsave(&ps->lock, flags);
 
 	dev_dbg(ps->dev, "PS 0x%x: deassert reset\n", ps->offset);
-	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_RESET, 0);
-	regmap_update_bits(ps->regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE, 0);
+	ret = regmap_update_bits(ps->regmap, ps->offset,
+				 APPLE_PMGR_FLAGS | APPLE_PMGR_RESET, 0);
+	if (!ret)
+		ret = regmap_update_bits(ps->regmap, ps->offset,
+					 APPLE_PMGR_FLAGS | APPLE_PMGR_DEV_DISABLE, 0);
+	if (!ret)
+		ret = apple_pmgr_reset_verify(ps, false);
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
 		dev_err(ps->dev, "PS 0x%x: RESET was deasserted while powered down\n", ps->offset);
 
 	spin_unlock_irqrestore(&ps->lock, flags);
 
-	return 0;
+	return ret;
 }
 
 static int apple_pmgr_reset_reset(struct reset_controller_dev *rcdev, unsigned long id)
@@ -247,9 +277,12 @@ static int apple_pmgr_reset_reset(struct reset_controller_dev *rcdev, unsigned l
 static int apple_pmgr_reset_status(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
-	u32 reg = 0;
+	u32 reg;
+	int ret;
 
-	regmap_read(ps->regmap, ps->offset, &reg);
+	ret = regmap_read(ps->regmap, ps->offset, &reg);
+	if (ret)
+		return ret;
 
 	return !!(reg & APPLE_PMGR_RESET);
 }
