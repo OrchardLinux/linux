@@ -171,6 +171,10 @@
 	power-domains = <&ps_disp0 &ps_dp>;
 };
 
+&gpu {
+	status = "okay";
+};
+
 &typhoon_opp06 {
 	status = "okay";
 };
