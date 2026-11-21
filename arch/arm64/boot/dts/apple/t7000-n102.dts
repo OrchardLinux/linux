@@ -16,6 +16,11 @@
 	model = "Apple iPod touch 6";
 	chassis-type = "handset";
 
+	aliases {
+		spi2 = &spi2;
+		touchscreen0 = &touchscreen;
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -72,14 +77,54 @@
 	status = "okay";
 };
 
+&spi2 {
+	cs-gpios = <&pinctrl 185 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,n102-touchscreen";
+		reg = <0>;
+		/* The N1 driver requests an 83 ns SPI bit period. */
+		spi-max-frequency = <12048192>;
+		interrupts-extended = <&pinctrl 3 IRQ_TYPE_EDGE_FALLING>;
+		attn-gpios = <&pinctrl 3 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&pinctrl 2 GPIO_ACTIVE_LOW>;
+		ana-supply = <&touch_ana>;
+		core-supply = <&touch_core>;
+		clocks = <&touchclk>;
+		firmware-name = "apple/n102-fwstart.z2fw";
+		touchscreen-size-x = <640>;
+		touchscreen-size-y = <1136>;
+		touchscreen-inverted-y;
+	};
+};
+
+&touchclk {
+	status = "okay";
+};
 &i2c0 {
 	status = "okay";
+
+	display-pmu@27 {
+		compatible = "apple,chestnut-pmic";
+		reg = <0x27>;
+
+		touch_ana: regulator-touch-hv {
+			compatible = "apple,chestnut-touch-hv-regulator";
+			regulator-name = "touch-analog";
+		};
+	};
 
 	pmic@74 {
 		compatible = "apple,adi-pmic", "apple,i2c-pmic";
 		reg = <0x74>;
 		#address-cells = <1>;
 		#size-cells = <1>;
+
+		touch_core: regulator-touch-core {
+			compatible = "apple,d2186-touch-core-regulator";
+			regulator-name = "touch-core";
+		};
 
 		rtc@5c0 {
 			compatible = "apple,adi-pmic-rtc", "apple,amber-pmic-rtc";
