@@ -189,6 +189,18 @@
 			status = "disabled";
 		};
 
+		serial1: serial@20a0c4000 {
+			compatible = "apple,t7000-uart", "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0c4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 159 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart1>;
+			status = "disabled";
+		};
+
 		serial5: serial@20a0d4000 {
 			compatible = "apple,t7000-uart", "apple,t8010-uart", "apple,s5l-uart";
 			reg = <0x2 0x0a0d4000 0x0 0x4000>;
@@ -426,6 +438,13 @@
 			i2c3_pins: i2c3-pins {
 				pinmux = <APPLE_PINMUX(87, 1)>,
 					 <APPLE_PINMUX(86, 1)>;
+			};
+
+			uart1_pins: uart1-pins {
+				pinmux = <APPLE_PINMUX(173, 1)>,
+					 <APPLE_PINMUX(174, 1)>,
+					 <APPLE_PINMUX(175, 1)>,
+					 <APPLE_PINMUX(176, 1)>;
 			};
 
 			uart5_pins: uart5-pins {
