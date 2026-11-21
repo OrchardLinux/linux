@@ -2469,6 +2469,15 @@ static void apple_z2_platform_power_off(struct apple_z2 *z2)
 			z2->clk_enabled = false;
 		}
 		apple_z2_set_gpio(z2->power_ldo_gpio, 0);
+		if (z2->core_enabled) {
+			error = regulator_disable(z2->core_supply);
+			if (error)
+				dev_warn(&z2->spidev->dev,
+					 "failed to disable core supply: %d\n",
+					 error);
+			else
+				z2->core_enabled = false;
+		}
 		if (z2->ana_enabled) {
 			error = regulator_disable(z2->ana_supply);
 			if (error)
@@ -2623,6 +2632,12 @@ static int apple_z2_j71t_power_on(struct apple_z2 *z2)
 	if (error)
 		return error;
 	z2->ana_enabled = true;
+	if (z2->core_supply && !z2->core_enabled) {
+		error = regulator_enable(z2->core_supply);
+		if (error)
+			goto err_power_off;
+		z2->core_enabled = true;
+	}
 	apple_z2_set_gpio(z2->power_ldo_gpio, 1);
 	usleep_range(5000, 6000);
 
@@ -4777,6 +4792,39 @@ static const struct apple_z2_chip_info apple_z2_j72_info = {
 	.n1 = &apple_z2_j72_n1,
 };
 
+/* iPod touch 6 (N102), AppleMultitouchN1SPI personality C1F58,1. */
+static const struct apple_z2_hbpp_reg apple_z2_n102_calib_regs[] = {
+	{ 0x10003060, 6099 },	/* fll-mval */
+	{ 0x1000305c, 2 },	/* ref-clk-div */
+	{ 0x10003058, 6 },
+	{ APPLE_Z2_N1_CONST_CAL_REG, 3 },
+	{ 0x10003518, 1 },	/* clk32-clock-enable */
+};
+
+static const struct apple_z2_n1_info apple_z2_n102_n1 = {
+	.calib_regs = apple_z2_n102_calib_regs,
+	.num_calib_regs = ARRAY_SIZE(apple_z2_n102_calib_regs),
+	.execute_addr = 0x10003400,
+	.execute_arg = 0x100,
+	.cal_size = 0x400,
+	.cal_chunk_size = 0x3f0,
+	.control_delay_us = 25,
+	.get_delay_us = 2000,
+	.wake_holdoff_ms = 100,
+	.get_attempts = 5,
+	.device_info_attempts = 4,
+	.device_info_retry_us = 3000,
+	.interface = 1,
+};
+
+static const struct apple_z2_chip_info apple_z2_n102_info = {
+	.name = "iPod7,1 Touchscreen",
+	.variant = APPLE_Z2_VARIANT_J71T,
+	.cs_setup_us = 10,
+	.cs_hold_us = 10,
+	.n1 = &apple_z2_n102_n1,
+};
+
 static const struct apple_z2_chip_info apple_z2_j172_info = {
 	.name = "iPad 7 Touchscreen",
 	.variant = APPLE_Z2_VARIANT_J172,
@@ -4891,6 +4939,14 @@ static int apple_z2_probe(struct spi_device *spi)
 		if (IS_ERR(z2->ana_supply))
 			return dev_err_probe(dev, PTR_ERR(z2->ana_supply),
 					     "unable to get analog supply\n");
+
+		if (!apple_z2_is_j72(z2) &&
+		    device_property_present(dev, "core-supply")) {
+			z2->core_supply = devm_regulator_get(dev, "core");
+			if (IS_ERR(z2->core_supply))
+				return dev_err_probe(dev, PTR_ERR(z2->core_supply),
+						     "unable to get core supply\n");
+		}
 
 		z2->sync_pinctrl = devm_pinctrl_get(dev);
 		if (IS_ERR(z2->sync_pinctrl)) {
@@ -5194,6 +5250,7 @@ static const struct of_device_id apple_z2_of_match[] = {
 	{ .compatible = "apple,d11-touchscreen", .data = &apple_z2_d11_info },
 	{ .compatible = "apple,d111-touchscreen", .data = &apple_z2_d111_info },
 	{ .compatible = "apple,n61-touchscreen", .data = &apple_z2_n61_info },
+	{ .compatible = "apple,n102-touchscreen", .data = &apple_z2_n102_info },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_z2_of_match);
@@ -5211,6 +5268,7 @@ static struct spi_device_id apple_z2_of_id[] = {
 	{ .name = "d11-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_d11_info },
 	{ .name = "d111-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_d111_info },
 	{ .name = "n61-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n61_info },
+	{ .name = "n102-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n102_info },
 	{}
 };
 MODULE_DEVICE_TABLE(spi, apple_z2_of_id);
