@@ -11,7 +11,9 @@ maintainers:
 
 description: |
   Charging on Apple devices whose Lightning port uses a Tristar (NXP CBTL1610)
-  port controller and a D2365-family PMIC, such as the iPad 5 and iPad 6. The
+  port controller and a D2365-family PMIC, such as the iPad 5 and iPad 6 (D2365)
+  and the iPad Air 2 (D2207). The PMICs have the same charger functions at
+  different register addresses, so the compatible names the PMIC. The
   node is a child of the PMIC. It identifies the attached source through the
   Tristar and the PMIC ADC and sets the PMIC input-current limit, which iBoot
   leaves at 100 mA. PMU events come from the PMIC's event interrupt
@@ -27,11 +29,15 @@ allOf:
 
 properties:
   compatible:
-    items:
-      - enum:
-          - apple,j71b-tristar-charger
-          - apple,j71t-tristar-charger
-      - const: apple,tristar-charger
+    oneOf:
+      - items:
+          - enum:
+              - apple,j71b-tristar-charger
+              - apple,j71t-tristar-charger
+          - const: apple,tristar-charger
+      - items:
+          - const: apple,j81-tristar-charger
+          - const: apple,d2207-tristar-charger
 
   reg:
     items:
@@ -46,7 +52,7 @@ properties:
       - const: adc
 
   interrupts:
-    minItems: 3
+    minItems: 2
     maxItems: 16
     description: |
       From the PMIC's event interrupt controller. The first is the PMU event
@@ -54,7 +60,8 @@ properties:
       withdraws a grant there, before it knows which event it was. The
       second is ADC conversion complete. Every further entry is an event
       that can signal a change of the attached source (attach, detach,
-      charger state); any of them starts a new identification.
+      charger state); any of them starts a new identification. Without
+      them, the charger's poll of the connection state notices a change.
 
   apple,tristar:
     $ref: /schemas/types.yaml#/definitions/phandle
