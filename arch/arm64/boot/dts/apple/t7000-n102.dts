@@ -69,6 +69,10 @@
 	apple,always-on;
 };
 
+&dwi_bl {
+	apple,led-driver = <&backlight_driver>;
+};
+
 &framebuffer0 {
 	power-domains = <&ps_disp0 &ps_mipi_dsi>;
 };
@@ -104,6 +108,12 @@
 };
 &i2c0 {
 	status = "okay";
+
+
+	backlight_driver: led-controller@63 {
+		compatible = "ti,lm3534";
+		reg = <0x63>;
+	};
 
 	display-pmu@27 {
 		compatible = "apple,chestnut-pmic";
