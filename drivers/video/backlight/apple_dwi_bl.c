@@ -32,8 +32,7 @@
 #define DWI_BL_CTL_SEND			(DWI_BL_CTL_SEND1 | \
 					 DWI_BL_CTL_SEND2 | \
 					 DWI_BL_CTL_SEND3 | \
-					 DWI_BL_CTL_LE_DATA | \
-					 DWI_BL_CTL_SEND4)
+					 DWI_BL_CTL_LE_DATA)
 
 #define DWI_BL_MAX_BRIGHTNESS		2047
 
@@ -53,6 +52,7 @@
 
 struct apple_dwi_bl {
 	void __iomem *base;
+	u32 send_flags;
 	struct i2c_client *led;	/* the LED driver's own enable, if separate */
 	bool led_usable;
 	bool led_on;
@@ -112,7 +112,7 @@ static int dwi_bl_update_status(struct backlight_device *bl)
 	}
 
 	writel(cmd, dwi_bl->base + DWI_BL_CMD);
-	writel(DWI_BL_CTL_SEND, dwi_bl->base + DWI_BL_CTL);
+	writel(dwi_bl->send_flags, dwi_bl->base + DWI_BL_CTL);
 
 	if (!brightness)
 		return dwi_bl_led_enable(bl, false);
@@ -207,6 +207,11 @@ static int dwi_bl_probe(struct platform_device *dev)
 	dwi_bl->base = devm_platform_get_and_ioremap_resource(dev, 0, &res);
 	if (IS_ERR(dwi_bl->base))
 		return PTR_ERR(dwi_bl->base);
+
+	/* T7000's DWI transfers use only bits 0, 4, 5 and 6. */
+	dwi_bl->send_flags = DWI_BL_CTL_SEND;
+	if (!of_device_is_compatible(dev->dev.of_node, "apple,t7000-dwi-bl"))
+		dwi_bl->send_flags |= DWI_BL_CTL_SEND4;
 
 	ret = dwi_bl_get_led(dev, dwi_bl);
 	if (ret)
