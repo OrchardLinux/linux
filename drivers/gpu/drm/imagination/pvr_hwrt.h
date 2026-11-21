@@ -110,6 +110,24 @@ struct pvr_hwrt_dataset {
 	 * @vm_ctx while this data set exists.
 	 */
 	struct pvr_vm_pin pins[ROGUE_FWIF_NUM_RTDATAS + ROGUE_FWIF_NUM_RTDATA_FREELISTS];
+
+	/**
+	 * @apple_rgn: Region-header ring of this target on a firmware that
+	 * gives each frame its own slice of it (Apple A8), like the cursor in
+	 * Apple's per-render-target RTM structure. It lives as long as the
+	 * data set, so a queued job always finds it. Zero until the first
+	 * geometry job on the data set is prepared; under the chip's lock.
+	 */
+	struct {
+		/** @apple_rgn.ring: Size of the mirrored ring in bytes; 0: not prepared. */
+		u64 ring;
+
+		/** @apple_rgn.cursor: Offset of the next frame's slice, unmasked. */
+		u64 cursor;
+
+		/** @apple_rgn.slice: Bytes of one frame's region headers. */
+		u32 slice;
+	} apple_rgn;
 };
 
 struct drm_gem_object *pvr_hwrt_data_resv_obj(struct pvr_hwrt_data *hwrt_data);

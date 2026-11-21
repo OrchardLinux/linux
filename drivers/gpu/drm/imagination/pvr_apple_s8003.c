@@ -323,6 +323,8 @@ struct s8003_pm {
 	bool clean;			/* both of its jobs were handed to the firmware */
 };
 
+
+
 struct s8003_vm {
 	struct pvr_vm_context *vm_ctx;
 	/* Only ioctl preparers take this lock; the job worker never waits on it. */
@@ -332,6 +334,22 @@ struct s8003_vm {
 	struct s8003_pm pm[2];
 	u32 fb_blocks;			/* pool size the firmware's feedback asked for */
 	ktime_t fb_at;			/* when that feedback was last taken */
+
+	/* The A8's: its PM set (submit_lock), its scene (rings: &pvr_hwrt_dataset.apple_rgn) */
+	struct {
+		struct pvr_gem_object *aux, *stack, *pool;
+		u8 *aux_map, *stack_map, *pool_map;
+		u32 blocks;			/* the pool's 128 KiB blocks (32 pages each) */
+		u32 want;			/* blocks the feedback or a stall asked for */
+		struct pvr_gem_object *next_pool;	/* @want blocks, taken at a geometry job */
+		u8 *next_pool_map;
+		u32 next_blocks;
+		u32 built;			/* the firmware start the set was built for */
+		bool open;			/* a geometry job waits for its fragment job */
+		const struct pvr_hwrt_data *hwrt;
+		u32 ta_seq;
+		u64 rgn_addr;			/* the scene's region-header slice */
+	} t7000;
 };
 
 struct pvr_apple_s8003 {
@@ -402,8 +420,13 @@ struct pvr_apple_s8003 {
 	struct s8003_mem hwobj[4];	/* the hardware objects at 0x8_00000000 */
 	bool t7000_pio_mapped;
 	bool stuck;			/* Fender stayed busy: the GPU is left alone */
+	u32 t7000_trace;		/* the records' trace ID, one per job */
 
 	struct s8003_idle idle;
+	/* The A8: the smallest PM pool a stall taught; the VM of the last geometry job */
+	u32 t7000_pm_floor;
+	struct s8003_vm *t7000_geom_vm;
+
 };
 
 static void put32(u8 *p, u32 value)
@@ -1774,6 +1797,8 @@ static void pvr_apple_s8003_vm_fini(struct pvr_apple *apple, struct pvr_vm_conte
 	}
 	if (s->pm_last == vm)
 		s->pm_last = NULL;
+	if (s->t7000_geom_vm == vm)
+		s->t7000_geom_vm = NULL;
 	if (s->pm_prev == vm)
 		s->pm_prev = NULL;
 	s8003_wb_sets_update(s);
@@ -4139,10 +4164,6 @@ static void t7000_vm_unmap(struct pvr_apple *apple, struct pvr_vm_context *vm_ct
 					 T7000_HWOBJ_VA + t7000_hwobj_offset[i], T7000_HWOBJ_SIZE);
 }
 
-static void t7000_vm_put(struct pvr_apple *apple, struct s8003_vm *vm)
-{
-}
-
 /*
  * The last job of @engine that is done: its finish stamp at its number or
  * past it. The finish stamp is the last word a job's microsequence writes
@@ -4286,15 +4307,754 @@ static int t7000_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, st
 	return seq;
 }
 
-/* Render jobs come with the A8's parameter manager */
-static int t7000_submit_render(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job)
+/*
+ * Render jobs. The A8's parameter manager keeps one set per VM: a control
+ * block with 36 state records "S" of 0xc0 bytes behind its first 0x80 (root
+ * memory), a list of the pool's pages in slices of 32 with a link to the
+ * previous slice (shared memory), and in the VM the PM's own tables (36
+ * macrotile arrays, 36 MLists, the vheap) and the free-list page stack: a
+ * u32 page number array the host fills on the CPU, which the firmware loads
+ * into the PM at every TA start (0x1001a418 -> 0x10025a28). Without the
+ * stack the TA faulted at VA 0x180 in the PM's context. P5b shows Apple's
+ * fresh queue built this way (kext 0x847f58c, 0x8480a28, 0x847fef0); its
+ * first frame uses S[1] for the TA and the 3D job. The pool's pages are
+ * never mapped: the PM writes their numbers to the hardware.
+ */
+#define T7000_PM_S_COUNT		36
+#define T7000_PM_S_SIZE			0xc0
+#define T7000_PM_SLICE			0x84
+#define T7000_PM_SLICE_PAGES		32
+/*
+ * The pool, in 128 KiB blocks (a slice of 32 pages each). Apple's fresh
+ * queue starts at 2 and its steady PMs held 8 (0x100 pages), as dumped:
+ * iOS grows the pool, from the firmware's feedback between scenes and with
+ * tag-5 grow records ("Synchronous PB Grow" in the kext's firmware
+ * state dump), and this driver has no grow inside a scene and no partial
+ * render. So it starts larger (a8_pm_blocks; on the iPod, 2 blocks held a
+ * 256x256 mesh of 8192 small triangles but not 16384, some 20-32 bytes a
+ * triangle, so 32 blocks hold about 128k), grows from the feedback
+ * between scenes as the A9 does, and doubles after a stall for
+ * pages. The most is what one set's list page holds: 61 slices of 0x84
+ * after its 0x80 header (Apple sizes its list for 0x300 blocks).
+ */
+#define T7000_PM_BLOCKS_MAX		((T7000_PM_SET_SIZE - 0x80) / T7000_PM_SLICE)
+#define T7000_PM_FEEDBACK		0x40	/* list: high-water pages, margin, -, request */
+#define T7000_PM_FEEDBACK_TAKEN		0x60	/* list: 1 once the host took them */
+static unsigned int a8_pm_blocks = 32;
+module_param(a8_pm_blocks, uint, 0644);
+MODULE_PARM_DESC(a8_pm_blocks, "A8: a new VM's PM pool in 128 KiB blocks (2..61, default 32 = 4 MiB)");
+/*
+ * Growing a live VM's pool rebuilds its set under the same PM id while the
+ * firmware may hold that id loaded; whether a TA start reloads the stack
+ * then is not read yet (10007eec, 10007fd8), and the A8's usage words are
+ * the A9's by analogy. Until a test shows both, the feedback is only
+ * logged, and a stall raises the pool of later VMs only.
+ */
+static bool a8_pm_grow;
+module_param(a8_pm_grow, bool, 0644);
+MODULE_PARM_DESC(a8_pm_grow, "A8: grow a live VM's PM pool from the firmware's feedback (default 0: log the feedback only)");
+#define T7000_PM_MACROTILE		0x80
+#define T7000_PM_MLIST			0x10000
+#define T7000_PM_VHEAP			0x600
+#define T7000_PM_AUX_SIZE		ALIGN(T7000_PM_S_COUNT * T7000_PM_MACROTILE + \
+					      T7000_PM_S_COUNT * T7000_PM_MLIST + T7000_PM_VHEAP, SZ_4K)
+#define T7000_PM_STACK_SIZE		0x18000	/* 0x300 blocks x 32 pages (PM object +0x28) */
+#define T7000_PM_SCENE_S		1
+/* In every VM, behind the general heap (t7000_heaps) */
+#define T7000_PM_AUX_VA			0x1f0000000ull
+#define T7000_PM_STACK_VA		0x1f0400000ull
+
+static u64 t7000_pm_mlist(unsigned int i)
 {
-	return -EOPNOTSUPP;
+	return T7000_PM_AUX_VA + T7000_PM_S_COUNT * T7000_PM_MACROTILE + (u64)i * T7000_PM_MLIST;
 }
 
+/* The VM's set at its slot's place in the root and shared memory */
+static u32 t7000_pm_control_va(const struct s8003_vm *vm)
+{
+	return T7000_PM_CONTROL + (vm->slot[0] - T7000_SLOT_FIRST) * T7000_PM_SET_SIZE;
+}
+
+static u32 t7000_pm_list_va(const struct s8003_vm *vm)
+{
+	return T7000_PM_LIST + (vm->slot[0] - T7000_SLOT_FIRST) * T7000_PM_SET_SIZE;
+}
+
+static u32 t7000_pm_s(const struct s8003_vm *vm)
+{
+	return s8003_meta_addr(S8003_ROOT_VA + t7000_pm_control_va(vm)) + 0x80 +
+	       T7000_PM_SCENE_S * T7000_PM_S_SIZE;
+}
+
+/*
+ * Build the VM's PM set for this start of the firmware (a8_pm_fill(): P5b's
+ * fresh queue, its control fields, the slices, S records with the VM's
+ * tables, the stack from index 0, slice 0 first). The usage word's flag
+ * (list +0x60) is 1: the host took the firmware's feedback.
+ */
+static int t7000_pm_build(struct pvr_apple *apple, struct s8003_vm *vm)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u8 *control = s->root.map + t7000_pm_control_va(vm);
+	u8 *list = s->shared.map + t7000_pm_list_va(vm);
+	u32 list_meta = s8003_meta_addr(S8003_SHARED_VA + t7000_pm_list_va(vm));
+	u32 blocks = vm->t7000.blocks, pages = blocks * T7000_PM_SLICE_PAGES;
+	u8 *stack = vm->t7000.stack_map;
+	unsigned int i, j, k;
+	int err;
+
+	if (!blocks || blocks > T7000_PM_BLOCKS_MAX)
+		return -EINVAL;
+	vm->t7000.built = 0;
+	memset(stack, 0, T7000_PM_STACK_SIZE);
+	/* The stack first: the pool's page numbers from index 0 (0x847fef0) */
+	for (i = 0; i < pages; i++) {
+		dma_addr_t page;
+
+		err = pvr_gem_get_dma_addr(vm->t7000.pool, i * SZ_4K, &page);
+		if (err)
+			return err;
+		put32(stack + 4 * i, page >> 12);
+	}
+	memset(vm->t7000.pool_map, 0, (size_t)pages * SZ_4K);
+	memset(vm->t7000.aux_map, 0, T7000_PM_AUX_SIZE);
+	memset(control, 0, T7000_PM_SET_SIZE);
+	memset(list, 0, T7000_PM_SET_SIZE);
+	for (j = 0; j < blocks; j++) {
+		u8 *slice = list + 0x80 + j * T7000_PM_SLICE;
+
+		put32(slice, j ? list_meta + 0x80 + (j - 1) * T7000_PM_SLICE : 0);
+		for (k = 0; k < T7000_PM_SLICE_PAGES; k++)
+			put32(slice + 4 + 4 * k, get32(stack + 4 * (j * T7000_PM_SLICE_PAGES + k)));
+	}
+	put32(control + 0xc, 0x7f);
+	put32(control + 0x14, list_meta + 0x80 + (blocks - 1) * T7000_PM_SLICE);
+	put64(control + 0x18, T7000_PM_STACK_VA);
+	put32(control + 0x20, T7000_PM_STACK_SIZE);
+	put32(list + T7000_PM_FEEDBACK_TAKEN, 1);
+	put32(control + 0x24, pages);
+	put32(control + 0x28, pages - 1);
+	put32(control + 0x38, SZ_4K);
+	put32(control + 0x44, list_meta);
+	put32(control + 0x58, 1);
+	put32(control + 0x5c, 0x6000);
+	put32(control + 0x60, 0x2000);
+	for (i = 0; i < T7000_PM_S_COUNT; i++) {
+		u8 *rec = control + 0x80 + i * T7000_PM_S_SIZE;
+
+		put64(rec + 0xa0, t7000_pm_mlist(i));
+		put64(rec + 0xa8, T7000_PM_AUX_VA + i * T7000_PM_MACROTILE);
+		put64(rec + 0xb0, t7000_pm_mlist(T7000_PM_S_COUNT));
+		put32(rec + 0xb8, list_meta + 0x40);
+	}
+	wmb();
+	vm->t7000.built = s->gen;
+	return 0;
+}
+
+static void t7000_pm_obj_put(struct pvr_apple *apple, struct pvr_gem_object **obj, u8 **map)
+{
+	if (!*obj)
+		return;
+	if (*map)
+		pvr_gem_object_vunmap(*obj);
+	pvr_gem_object_put(*obj);
+	*obj = NULL;
+	*map = NULL;
+}
+
+/* A VM's PM objects go with it; their VM mappings with the VM */
+static void t7000_vm_put(struct pvr_apple *apple, struct s8003_vm *vm)
+{
+	t7000_pm_obj_put(apple, &vm->t7000.aux, &vm->t7000.aux_map);
+	t7000_pm_obj_put(apple, &vm->t7000.stack, &vm->t7000.stack_map);
+	t7000_pm_obj_put(apple, &vm->t7000.pool, &vm->t7000.pool_map);
+	t7000_pm_obj_put(apple, &vm->t7000.next_pool, &vm->t7000.next_pool_map);
+}
+
+static int t7000_pm_obj(struct pvr_apple *apple, size_t size, struct pvr_gem_object **obj, u8 **map)
+{
+	*obj = pvr_gem_object_create(apple->pvr_dev, size, T7000_VM_FLAGS);
+	if (IS_ERR(*obj)) {
+		int err = PTR_ERR(*obj);
+
+		*obj = NULL;
+		return err;
+	}
+	*map = pvr_gem_object_vmap(*obj);
+	if (IS_ERR(*map)) {
+		int err = PTR_ERR(*map);
+
+		*map = NULL;
+		t7000_pm_obj_put(apple, obj, map);
+		return err;
+	}
+	return 0;
+}
+
+/*
+ * Region headers as a mirrored ring (Apple's resource with flag 0x200000,
+ * mapped page by page at VA and VA + its length, 0x847d738): a buffer of
+ * R bytes mapped twice back to back, of 16 slices of the target's region
+ * headers rounded up to 4 KiB at least. Each frame takes the next slice;
+ * slices are never cleared. A dataset's ring: where it starts, R, the
+ * slice, and the dataset's cursor (Apple's RTM +0x19c), kept in the data set
+ * itself (&pvr_hwrt_dataset.apple_rgn) for as long as it exists.
+ */
+
+static int t7000_rgn_ring(struct pvr_vm_context *vm_ctx, u64 base, u32 slice, u64 *size)
+{
+	struct pvr_gem_object *obj, *mirror;
+	u64 offset, range, mirror_offset, mirror_range;
+	int err = -EINVAL;
+
+	obj = pvr_vm_find_gem_object(vm_ctx, base, &offset, &range);
+	if (!obj)
+		return -EINVAL;
+	mirror = pvr_vm_find_gem_object(vm_ctx, base + range, &mirror_offset, &mirror_range);
+	if (mirror == obj && !offset && !mirror_offset && mirror_range == range &&
+	    range == pvr_gem_object_size(obj) && is_power_of_2(range) &&
+	    range >= roundup_pow_of_two(16 * slice)) {
+		*size = range;
+		err = 0;
+	}
+	if (mirror)
+		pvr_gem_object_put(mirror);
+	pvr_gem_object_put(obj);
+	return err;
+}
+
+/*
+ * Before a geometry job, in the submitting process: the target (one sample
+ * so far), its region-header ring, and the VM's PM objects, mapped in the VM
+ * once (the stack, the PM's tables) or kept unmapped (the pool).
+ */
 static int t7000_prepare_job(struct pvr_apple *apple, struct pvr_job *job)
 {
-	return job->type == DRM_PVR_JOB_TYPE_COMPUTE ? 0 : -EOPNOTSUPP;
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	struct s8003_vm *vm;
+	struct pvr_hwrt_dataset *dataset;
+	struct s8003_rt rt;
+	u64 ring;
+	u32 slice, blocks;
+	int err;
+
+	if (job->type != DRM_PVR_JOB_TYPE_GEOMETRY)
+		return 0;
+	vm = xa_load(&s->vms, (unsigned long)job->ctx->vm_ctx);
+	if (!vm)
+		return -EINVAL;
+	dataset = job->hwrt->hwrt_dataset;
+	err = s8003_rt_derive(dataset, &rt);
+	if (err) {
+		return err;
+	}
+	if (dataset->samples != 1)
+		return -EOPNOTSUPP;
+	slice = ALIGN(rt.header, SZ_4K);
+	err = t7000_rgn_ring(vm->vm_ctx, job->hwrt->data.rgn_header_dev_addr, slice, &ring);
+	if (err) {
+		dev_warn_ratelimited(apple_dev(apple),
+				     "geometry job refused: region headers at %#llx are not a mirrored ring of 16 slices of %#x\n",
+				     job->hwrt->data.rgn_header_dev_addr, slice);
+		return err;
+	}
+
+	mutex_lock(&vm->prepare_lock);
+	if (!vm->t7000.stack) {
+		struct pvr_gem_object *aux = NULL, *stack = NULL, *pool = NULL;
+		u8 *aux_map = NULL, *stack_map = NULL, *pool_map = NULL;
+
+		err = t7000_pm_obj(apple, T7000_PM_AUX_SIZE, &aux, &aux_map);
+		if (!err)
+			err = t7000_pm_obj(apple, T7000_PM_STACK_SIZE, &stack, &stack_map);
+		blocks = clamp(max(READ_ONCE(a8_pm_blocks), READ_ONCE(s->t7000_pm_floor)), 2u,
+			       (u32)T7000_PM_BLOCKS_MAX);
+		if (!err)
+			err = t7000_pm_obj(apple, (size_t)blocks * T7000_PM_SLICE_PAGES * SZ_4K,
+					   &pool, &pool_map);
+		if (!err)
+			err = pvr_vm_map_reserved(vm->vm_ctx, aux, T7000_PM_AUX_VA, T7000_PM_AUX_SIZE);
+		if (!err) {
+			err = pvr_vm_map_reserved(vm->vm_ctx, stack, T7000_PM_STACK_VA,
+						  T7000_PM_STACK_SIZE);
+			if (err)
+				pvr_vm_unmap_obj(vm->vm_ctx, aux, T7000_PM_AUX_VA, T7000_PM_AUX_SIZE);
+		}
+		if (err) {
+			t7000_pm_obj_put(apple, &aux, &aux_map);
+			t7000_pm_obj_put(apple, &stack, &stack_map);
+			t7000_pm_obj_put(apple, &pool, &pool_map);
+			goto out;
+		}
+		mutex_lock(&apple->submit_lock);
+		vm->t7000.aux = aux;
+		vm->t7000.aux_map = aux_map;
+		vm->t7000.stack = stack;
+		vm->t7000.stack_map = stack_map;
+		vm->t7000.pool = pool;
+		vm->t7000.pool_map = pool_map;
+		vm->t7000.blocks = blocks;
+		vm->t7000.want = blocks;
+		mutex_unlock(&apple->submit_lock);
+	}
+	/*
+	 * A larger pool the feedback or a stall asked for: allocated here, in
+	 * the submitting process, and taken by a geometry job once the scenes
+	 * on the old one are done (t7000_submit_geom()).
+	 */
+	mutex_lock(&apple->submit_lock);
+	blocks = max(vm->t7000.want, READ_ONCE(s->t7000_pm_floor));
+	blocks = !READ_ONCE(a8_pm_grow) || vm->t7000.next_pool || blocks <= vm->t7000.blocks ? 0 :
+		 min_t(u32, blocks, T7000_PM_BLOCKS_MAX);
+	mutex_unlock(&apple->submit_lock);
+	if (blocks) {
+		struct pvr_gem_object *pool = NULL;
+		u8 *pool_map = NULL;
+
+		if (!t7000_pm_obj(apple, (size_t)blocks * T7000_PM_SLICE_PAGES * SZ_4K, &pool,
+				  &pool_map)) {
+			mutex_lock(&apple->submit_lock);
+			if (!vm->t7000.next_pool) {
+				vm->t7000.next_pool = pool;
+				vm->t7000.next_pool_map = pool_map;
+				vm->t7000.next_blocks = blocks;
+				pool = NULL;
+			}
+			mutex_unlock(&apple->submit_lock);
+			t7000_pm_obj_put(apple, &pool, &pool_map);
+		}
+	}
+	/*
+	 * The ring lives with the data set, which this job holds until it is
+	 * freed: no other target's job can take it before this one is
+	 * submitted. Its cursor starts at 0 with the data set.
+	 */
+	mutex_lock(&apple->submit_lock);
+	dataset->apple_rgn.ring = ring;
+	dataset->apple_rgn.slice = slice;
+	mutex_unlock(&apple->submit_lock);
+out:
+	mutex_unlock(&vm->prepare_lock);
+	return err;
+}
+
+/* The A8's records */
+#define T7000_TA_W_SIZE			0x568
+#define T7000_3D_W_SIZE			0x8b0
+#define T7000_TA_USEQ_SIZE		0xc0
+#define T7000_3D_USEQ_SIZE		0x140
+
+/*
+ * A geometry job's record: the A9's fill moved to the A8's offsets (+8 from
+ * 0x20 and from 0x3a4), with Apple's A8 values where they differ from the
+ * A9's (the TA scratch base, the resume and TA PDS words and three scratch
+ * pointers are zero, +0x3c8 is 0x22000, +0x530 is 0), and the region
+ * headers' slice of this frame. The values are those of the record the
+ * first triangle drew with (Mesa's twiddled-triangle job, recorded on
+ * the iPod touch 6).
+ */
+static void t7000_fill_ta(u8 *w, const struct pvr_apple_g5p_cmd_geom *cmd,
+			  const struct pvr_hwrt_data *hwrt, const struct s8003_rt *rt, u64 rgn)
+{
+	const struct pvr_apple_g5p_geom_regs *g = &cmd->g5p;
+	u64 tpc = hwrt->data.tail_ptrs_dev_addr;
+	unsigned int i;
+
+	memset(w, 0, T7000_TA_W_SIZE);
+	put32(w + 0x28, 0x1e3ce508);
+	put32(w + 0x2c, 0x1e3ce508);
+	put64(w + 0x30, rgn);
+	put64(w + 0x38, tpc);
+	put64(w + 0x40, rt->ta_state);
+	put64(w + 0x48, g->sample_positions ?: rt->positions);
+	put64(w + 0x50, g->scratch_ptr[4]);
+	put64(w + 0x58, g->scratch_ptr[5]);
+	for (i = 0; i < 6; i++) {
+		put32(w + 0x60 + i * 4, g->context_pds[0][i]);
+		put32(w + 0x78 + i * 4, g->context_pds[1][i]);
+	}
+	put64(w + 0x90, g->ta_program);
+	put64(w + 0xa0, cmd->cmd.regs.vdm_ctrl_stream_base & ~3ull);
+	put32(w + 0x3ac, 0x00000088);
+	put32(w + 0x3b0, 0x00000002);
+	put64(w + 0x3b4, rt->ta_tiling[0]);
+	put64(w + 0x3bc, rt->ta_tiling[1]);
+	put32(w + 0x3c4, rt->ta_tiling_word);
+	put32(w + 0x3c8, 0x00022000);
+	put64(w + 0x44c, tpc);
+	put32(w + 0x454, rt->tpc);
+	put64(w + 0x470, g->scratch_ptr[0]);
+	put64(w + 0x490, g->scratch_ptr[4]);
+}
+
+/*
+ * A fragment job's record, the same way: the A9's fill at the A8's offsets,
+ * without the scale words (zero in Apple's records), Apple's ISP and output
+ * words for one sample and an output width of 2 (+0x3c8..+0x3d4), and the
+ * render targets' PBE register words from the Rogue command (set A at
+ * +0x118 and +0x4c0, set B at +0x540, two qwords per target, as Apple's
+ * fillers 0x8475dbc and 0x844aeb0 write them).
+ */
+static int t7000_fill_3d(u8 *w, const struct pvr_apple_g5p_cmd_frag *cmd, const struct s8003_rt *rt,
+			 u64 rgn)
+{
+	/* The register block's ZLS images and their copies further on (as recorded from the first triangle) */
+	static const u16 zls[5][2] = {
+		{ 0x80, 0x618 }, { 0x88, 0x628 }, { 0x90, 0x630 }, { 0x98, 0x648 }, { 0xa0, 0x650 },
+	};
+	const struct rogue_fwif_frag_regs *regs = &cmd->cmd.regs;
+	const struct pvr_apple_g5p_frag_regs *g = &cmd->g5p;
+	u64 positions = g->sample_positions ?: rt->positions;
+	unsigned int i;
+
+	if ((g->pixel_output_width && g->pixel_output_width != 2) || g->flags)
+		return -EINVAL;
+
+	memset(w, 0, T7000_3D_W_SIZE);
+	put64(w + 0x20, rgn);
+	put64(w + 0x28, rt->positions);
+	put32(w + 0x30, rt->state);
+	put32(w + 0x34, rt->padded);
+	put32(w + 0x38, rt->region);
+	put64(w + 0x60, positions);
+	put64(w + 0x68, regs->isp_scissor_base & ~3ull);
+	put64(w + 0x70, regs->isp_dbias_base & ~3ull);
+	put64(w + 0x78, regs->isp_oclqry_base);
+	for (i = 0; i < ARRAY_SIZE(zls); i++) {
+		put64(w + zls[i][0], g->zls[i]);
+		put64(w + zls[i][1], g->zls[i]);
+	}
+	put32(w + 0xa8, rt->region >> 2);
+	put32(w + 0xb0, g->background[0]);
+	put32(w + 0xb4, g->background[1]);
+	put64(w + 0xb8, g->background_texture);
+	for (i = 4; i < 8; i++)
+		put32(w + 0xc0 + (i - 4) * 4, g->background[i]);
+	for (i = 0; i < 8; i++) {
+		put64(w + 0x118 + i * 16, regs->pbe_word[i][0]);
+		put64(w + 0x120 + i * 16, regs->pbe_word[i][1]);
+		put64(w + 0x4c0 + i * 16, regs->pbe_word[i][0]);
+		put64(w + 0x4c8 + i * 16, regs->pbe_word[i][1]);
+		put64(w + 0x540 + i * 16, regs->pbe_word[i][0]);
+		put64(w + 0x548 + i * 16, regs->pbe_word[i][1]);
+	}
+	put32(w + 0x3a8, rt->padded);
+	put32(w + 0x3ac, regs->isp_bgobjdepth);
+	put32(w + 0x3b0, regs->isp_bgobjvals);
+	put32(w + 0x3b8, 0x0000001f);
+	/* The kext's upload has the halves of the first end-of-tile pair swapped */
+	put32(w + 0x3bc, g->eot[1]);
+	put32(w + 0x3c0, g->eot[0]);
+	put32(w + 0x3c4, g->eot[2]);
+	put32(w + 0x3c8, 0x0001700f | BIT(17));	/* ISP_CTL; +PROCESS_EMPTY_TILES, as the A9 (0x0023000f) */
+	put32(w + 0x3cc, 0x000001fc);
+	put32(w + 0x3d4, 0x00001200);
+	put64(w + 0x498, regs->isp_dbias_base);
+	put64(w + 0x4a8, regs->isp_scissor_base);
+	for (i = 0; i < 8; i++)
+		put32(w + 0x5c0 + i * 4, g->background[i]);
+	put64(w + 0x5e0, g->background_texture);
+	put32(w + 0x608, g->restore[0]);
+	put32(w + 0x60c, g->restore[1]);
+	for (i = 0; i < 3; i++) {
+		put32(w + 0x670 + i * 4, g->eot[i]);
+		put32(w + 0x684 + i * 4, g->eot_resume[i]);
+	}
+	put32(w + 0x698, regs->isp_bgobjdepth);
+	put32(w + 0x69c, regs->isp_bgobjvals);
+	put32(w + 0x6a0, 2);
+	put32(w + 0x858, 1);
+	return 0;
+}
+
+/* What the 3D engine is waited for between a fragment job's start and finish (P5 ms_3d) */
+static const u32 t7000_3d_wait[24] = {
+	0x201, 0x138204, 0x10, 0xf, 0 /* the channel object + 0x724 */, 0x14, 0x109f, 0x104000a,
+	0x1f, 0x1f, 0xf48008, 0x10000015, 4, 0, 0x14, 0x109f, 0x13000a, 0x4000, 0x4000, 0x138204,
+	0x4000, 0x104000a, 8, 8,
+};
+
+/*
+ * The kernel's part of a render job (a8_ta_write()/a8_3d_write(), Apple's
+ * P5 form): the record's links (tag, slot, dependency object, PM set and
+ * state record, microsequence, stamps, the trace ID Metal passes per job)
+ * and the microsequence: start (TA 0x23, 3D 0x25 with 23 arguments), the
+ * timestamps around the wait, finish (0x24, 0x26). @k is the stamp's value
+ * before this job; the job's finish writes k + 1.
+ */
+struct t7000_rjob {
+	u32 ch, w, useq, object, slot, pm_id, control, s, dep, seq, k, trace, times;
+	u32 pr_ch, pr_index;
+};
+
+static void t7000_ta_write(u8 *work, u8 *useq, const struct t7000_rjob *j)
+{
+	const u32 w = j->w, g = j->object + 0x724;
+	const u32 mirror = j->ch + S8003_CH_STAMP, finish = mirror + 4;
+	const u32 words[] = {
+		0x23, w + 0x3ac, w + 0x28, j->s, g, j->ch, j->slot, j->k, j->pm_id, 0, j->k, 0,
+		w + 0x46c, 0, 0, 0, j->seq,
+		0x80000018, w + 0x558, w + 0x560, w + 0x560, j->seq,
+		0x801,
+		0x18, w + 0x558, w + 0x560, w + 0x564, j->seq,
+		0x24, j->s, j->control, g, j->ch, j->slot, 0, w + 0x46c, 0, 0, j->seq, finish,
+		j->k + 1, (u32)-0x70,
+		0x40000017,
+	};
+
+	BUILD_BUG_ON(sizeof(words) > T7000_TA_USEQ_SIZE);
+	put32(work + 0x4, j->slot);
+	put32(work + 0xc, j->dep);
+	put32(work + 0x10, j->pm_id);
+	put32(work + 0x14, j->control);
+	put32(work + 0x18, j->s);
+	put32(work + 0x45c, j->useq);
+	put32(work + 0x460, T7000_TA_USEQ_SIZE);
+	put32(work + 0x464, j->pr_ch);
+	put32(work + 0x468, j->pr_index);
+	put32(work + 0x51c, j->trace);
+	put32(work + 0x534, mirror);
+	put32(work + 0x538, finish);
+	put32(work + 0x53c, j->k + 1);
+	put32(work + 0x54c, j->seq);
+	put32(work + 0x550, j->k);
+	memset(useq, 0, T7000_TA_USEQ_SIZE);
+	useq_put(useq, words, ARRAY_SIZE(words));
+}
+
+static void t7000_3d_write(u8 *work, u8 *useq, const struct t7000_rjob *j)
+{
+	const u32 w = j->w, g = j->object + 0x724;
+	const u32 mirror = j->ch + S8003_CH_STAMP, finish = mirror + 4;
+	const u32 start[] = {
+		0x25, w + 0x3a8, w + 0x60, j->s, g, w + 0x7d8, w + 0x7dc, w + 0x860, j->ch, w, j->slot,
+		j->k, j->pm_id, 0, j->k, 0, w + 0x6c0, w + 0x894, 0, 0, 0, 0, 0, j->seq,
+		0x80000018, w + 0x8a0, w + 0x8a8, w + 0x8a8, j->seq,
+	};
+	const u32 finish_words[] = {
+		0x18, w + 0x8a0, w + 0x8a8, w + 0x8ac, j->seq,
+		0x26, j->seq, finish, j->k + 1, j->s, j->control, 1, g, w + 0x860, w + 0x7d8, j->ch, w,
+		j->slot, w + 0x6c0, 0, 0, 0, (u32)-0xe8,
+		0x40000017,
+	};
+	u32 wait[ARRAY_SIZE(t7000_3d_wait)];
+	unsigned int i;
+	u8 *out;
+
+	BUILD_BUG_ON(sizeof(start) + sizeof(wait) + sizeof(finish_words) > T7000_3D_USEQ_SIZE);
+	for (i = 0; i < ARRAY_SIZE(wait); i++)
+		wait[i] = i == 4 ? g : t7000_3d_wait[i];
+	put32(work + 0x0, 1);
+	put32(work + 0x4, j->slot);
+	put32(work + 0xc, j->useq);
+	put32(work + 0x10, T7000_3D_USEQ_SIZE);
+	put32(work + 0x14, j->dep);
+	put32(work + 0x18, j->control);
+	put32(work + 0x1c, j->s);
+	put32(work + 0x850, j->trace);
+	put32(work + 0x870, mirror);
+	put32(work + 0x874, finish);
+	put32(work + 0x878, j->k + 1);
+	put32(work + 0x888, j->seq);
+	put32(work + 0x88c, j->k);
+	put32(work + 0x8ac, j->times);
+	memset(useq, 0, T7000_3D_USEQ_SIZE);
+	out = useq_put(useq, start, ARRAY_SIZE(start));
+	out = useq_put(out, wait, ARRAY_SIZE(wait));
+	useq_put(out, finish_words, ARRAY_SIZE(finish_words));
+}
+
+/*
+ * A geometry job: one record at a time on the TA channel (one pointer-ring
+ * entry, its record; no PM command on the A8), on the VM's PM set, built
+ * for this start of the firmware or again after a scene whose fragment
+ * job never came, and S[1] for its scene as Apple's first frame. Its
+ * partial-render index names the 3D ring entry of the frame's fragment
+ * record.
+ */
+/*
+ * The firmware's usage report at list +0x40 after a scene (high-water
+ * pages, margin, -, request in blocks; +0x60 is 1 once taken, and the
+ * firmware clears both when it starts a scene, 10008150), read as the A9
+ * does (s8003_pm_feedback(): Apple's growPoolFromFirmwareFeedback): the
+ * pool should hold three times the high-water mark or the margin plus a
+ * block, else grow by the request. Memory only; submit_lock held.
+ */
+static void t7000_pm_feedback(struct pvr_apple *apple, struct s8003_vm *vm)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u8 *list = s->shared.map + t7000_pm_list_va(vm);
+	u32 high, margin, request, target, blocks = vm->t7000.blocks;
+
+	lockdep_assert_held(&apple->submit_lock);
+	if (get32(list + T7000_PM_FEEDBACK_TAKEN) == 1)
+		return;
+	rmb();	/* the flag before the words it covers */
+	high = get32(list + T7000_PM_FEEDBACK);
+	margin = get32(list + T7000_PM_FEEDBACK + 4);
+	request = min(get32(list + T7000_PM_FEEDBACK + 12), (u32)S8003_PM_GROW_MAX);
+	if (!READ_ONCE(a8_pm_grow)) {
+		/* read only, at most once a second a VM: what the A8 reports */
+		if (!vm->fb_at || ktime_ms_delta(ktime_get(), vm->fb_at) >= 1000) {
+			vm->fb_at = ktime_get();
+			dev_info(apple_dev(apple),
+				 "A8 PM usage (pool %u blocks): %u %u %u %u\n", blocks, high,
+				 margin, get32(list + T7000_PM_FEEDBACK + 8),
+				 get32(list + T7000_PM_FEEDBACK + 12));
+		}
+		return;
+	}
+	/* as the A9: at most every S8003_PM_FEEDBACK_MS */
+	if (vm->fb_at && ktime_ms_delta(ktime_get(), vm->fb_at) < S8003_PM_FEEDBACK_MS)
+		return;
+	vm->fb_at = ktime_get();
+	put32(list + T7000_PM_FEEDBACK_TAKEN, 1);
+	wmb();
+	/* Not from this pool: ignored */
+	if (high > blocks * T7000_PM_SLICE_PAGES ||
+	    margin > T7000_PM_BLOCKS_MAX * T7000_PM_SLICE_PAGES)
+		return;
+	target = DIV_ROUND_UP(max(3 * high, T7000_PM_SLICE_PAGES + margin), T7000_PM_SLICE_PAGES);
+	if (target <= blocks && request)
+		target = blocks + request;
+	target = min_t(u32, target, T7000_PM_BLOCKS_MAX);
+	if (target > vm->t7000.want) {
+		dev_dbg(apple_dev(apple),
+			"A8 PM pool feedback: high-water %u pages, margin %u, request %u: %u -> %u blocks\n",
+			high, margin, request, blocks, target);
+		vm->t7000.want = target;
+	}
+}
+
+static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job)
+{
+	struct pvr_hwrt_dataset *dataset = job->hwrt->hwrt_dataset;
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u32 addr = s8003_channel_addr(s, APPLE_ENGINE_GEOM);
+	u8 *p = s8003_channel(s, APPLE_ENGINE_GEOM);
+	struct t7000_rjob j;
+	struct s8003_rt rt;
+	u64 slice_addr;
+	u32 seq;
+	int err;
+
+		return s8003_submit_error(apple, vm, "geometry", -EINVAL, "not prepared");
+	if (!dataset->apple_rgn.ring || !vm->t7000.stack)
+	err = s8003_rt_derive(dataset, &rt);
+	if (err)
+		return s8003_submit_error(apple, vm, "geometry", err, "rt derive");
+	/*
+	 * Every earlier scene is done here (a geometry job waits for the last
+	 * fragment job, pvr_apple_job_add_deps()): the pool is the firmware's
+	 * no more. Take the last scene's feedback, then a larger pool if one
+	 * is ready; the set is built anew on it.
+	 */
+	if (vm->t7000.built == s->gen && !vm->t7000.open)
+		t7000_pm_feedback(apple, vm);
+	if (vm->t7000.next_pool && !vm->t7000.open) {
+		dev_info(apple_dev(apple), "A8 PM pool: %u -> %u blocks (%u KiB)\n", vm->t7000.blocks,
+			 vm->t7000.next_blocks, vm->t7000.next_blocks * 128);
+		t7000_pm_obj_put(apple, &vm->t7000.pool, &vm->t7000.pool_map);
+		vm->t7000.pool = vm->t7000.next_pool;
+		vm->t7000.pool_map = vm->t7000.next_pool_map;
+		vm->t7000.blocks = vm->t7000.next_blocks;
+		vm->t7000.next_pool = NULL;
+		vm->t7000.next_pool_map = NULL;
+		vm->t7000.built = 0;
+	}
+	s->t7000_geom_vm = vm;
+	if (vm->t7000.built != s->gen || vm->t7000.open) {
+		err = t7000_pm_build(apple, vm);
+		if (err)
+			return s8003_submit_error(apple, vm, "geometry", err, "PM set build");
+	}
+	err = s8003_wait_done(apple, APPLE_ENGINE_GEOM, apple->ta_seq);
+	if (err)
+		return s8003_submit_error(apple, vm, "geometry", err, "record slot wait");
+
+	seq = apple->ta_seq + 1;
+	slice_addr = job->hwrt->data.rgn_header_dev_addr +
+		     (dataset->apple_rgn.cursor & (dataset->apple_rgn.ring - 1));
+	t7000_fill_ta(p + T7000_RCH_W, job->cmd, job->hwrt, &rt, slice_addr);
+	j = (struct t7000_rjob) {
+		.ch = addr, .w = addr + T7000_RCH_W, .useq = addr + T7000_RCH_TA_USEQ,
+		.object = s8003_object_addr(&s->layout, S8003_CHANNEL), .slot = vm->slot[0],
+		.pm_id = 0, .control = s8003_meta_addr(S8003_ROOT_VA + t7000_pm_control_va(vm)),
+		.s = t7000_pm_s(vm), .dep = addr + S8003_CH_DEP, .seq = seq, .k = seq - 1,
+		.trace = ++s->t7000_trace, .pr_ch = s8003_channel_addr(s, APPLE_ENGINE_FRAG),
+		.pr_index = (2 * (apple->frag_seq + 1) - 1) % T7000_RCH_ENTRIES,
+	};
+	t7000_ta_write(p + T7000_RCH_W, p + T7000_RCH_TA_USEQ, &j);
+	put32(p + T7000_RCH_RING + ((seq - 1) % T7000_RCH_ENTRIES) * 4, j.w);
+
+	dataset->apple_rgn.cursor += dataset->apple_rgn.slice;
+	vm->t7000.open = true;
+	vm->t7000.hwrt = job->hwrt;
+	vm->t7000.ta_seq = seq;
+	vm->t7000.rgn_addr = slice_addr;
+	apple->ta_seq = seq;
+	err = t7000_publish(apple, APPLE_ENGINE_GEOM, seq % T7000_RCH_ENTRIES);
+	if (err)
+		return s8003_submit_error(apple, vm, "geometry", err, "publish");
+	return seq;
+}
+
+/*
+ * A fragment job: its scene's geometry job was submitted before it. Two
+ * pointer-ring entries, the barrier command {4, the TA's finish stamp, the
+ * value it reaches, this job's number} and the record (P5b), the scene's
+ * region-header slice, S[1] of the set.
+ */
+static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u32 addr = s8003_channel_addr(s, APPLE_ENGINE_FRAG);
+	u32 ta_addr = s8003_channel_addr(s, APPLE_ENGINE_GEOM);
+	u8 *p = s8003_channel(s, APPLE_ENGINE_FRAG), *cmd = p + T7000_RCH_CMD;
+	struct t7000_rjob j;
+	struct s8003_rt rt;
+	u32 seq, ring;
+	int err;
+
+	if (!vm->t7000.open || vm->t7000.hwrt != job->hwrt || vm->t7000.built != s->gen)
+		return s8003_submit_error(apple, vm, "fragment", -ECANCELED,
+					   "its geometry job failed or was not submitted");
+	err = s8003_rt_derive(job->hwrt->hwrt_dataset, &rt);
+	if (err)
+		return s8003_submit_error(apple, vm, "fragment", err, "rt derive");
+	err = s8003_wait_done(apple, APPLE_ENGINE_FRAG, apple->frag_seq);
+	if (err)
+		return s8003_submit_error(apple, vm, "fragment", err, "record slot wait");
+
+	seq = apple->frag_seq + 1;
+	err = t7000_fill_3d(p + T7000_RCH_W, job->cmd, &rt, vm->t7000.rgn_addr);
+	if (err)
+		return s8003_submit_error(apple, vm, "fragment", err, "3D record fill");
+	memset(p + T7000_RCH_TIMES, 0, 16);
+	j = (struct t7000_rjob) {
+		.ch = addr, .w = addr + T7000_RCH_W, .useq = addr + T7000_RCH_3D_USEQ,
+		.object = s8003_object_addr(&s->layout, S8003_CHANNEL + 1), .slot = vm->slot[0],
+		.pm_id = 0, .control = s8003_meta_addr(S8003_ROOT_VA + t7000_pm_control_va(vm)),
+		.s = t7000_pm_s(vm), .dep = ta_addr + S8003_CH_DEP, .seq = seq, .k = seq - 1,
+		.trace = ++s->t7000_trace, .times = addr + T7000_RCH_TIMES,
+	};
+	t7000_3d_write(p + T7000_RCH_W, p + T7000_RCH_3D_USEQ, &j);
+	memset(cmd, 0, S8003_CMD_SIZE);
+	put32(cmd, S8003_CMD_WAIT);
+	put32(cmd + 4, ta_addr + S8003_CH_STAMP + 4);
+	put32(cmd + 8, vm->t7000.ta_seq);
+	put32(cmd + 12, seq);
+	ring = (2 * (seq - 1)) % T7000_RCH_ENTRIES;
+	put32(p + T7000_RCH_RING + ring * 4, addr + T7000_RCH_CMD);
+	put32(p + T7000_RCH_RING + ((ring + 1) % T7000_RCH_ENTRIES) * 4, j.w);
+
+	vm->t7000.open = false;
+	apple->frag_seq = seq;
+	err = t7000_publish(apple, APPLE_ENGINE_FRAG, (2 * seq) % T7000_RCH_ENTRIES);
+	if (err)
+		return s8003_submit_error(apple, vm, "fragment", err, "publish");
+	return seq;
 }
 
 static void t7000_report_hang(struct pvr_apple *apple)
@@ -4310,6 +5070,7 @@ static void t7000_report_hang(struct pvr_apple *apple)
 		s->failed ? "rings unreadable" : READ_ONCE(apple->fault) ? "posted a fault" :
 		"posted no fault");
 }
+
 
 static void t7000_iounmap(void *addr)
 {
@@ -4449,8 +5210,8 @@ static const struct s8003_variant s8003_variant_a8 = {
 	.vm_unmap = t7000_vm_unmap,
 	.engine_done = t7000_engine_done,
 	.prepare_job = t7000_prepare_job,
-	.submit_geom = t7000_submit_render,
-	.submit_frag = t7000_submit_render,
+	.submit_geom = t7000_submit_geom,
+	.submit_frag = t7000_submit_frag,
 	.submit_compute = t7000_submit_compute,
 	.report_hang = t7000_report_hang,
 };
