@@ -247,6 +247,10 @@ struct pvr_apple {
  *	gives up says so, from memory only. A client that closes, or a VM
  *	that goes, then waits at most that one timeout under submit_lock. A
  *	job refused before the chip's own submit path says why.
+ * @irq_thread: The completion check runs in the firmware interrupt's thread
+ *	(and the poll work as the backup), not only in a work item the
+ *	interrupt queues; an interrupt that finds its job not yet in memory
+ *	checks again within the fast period.
  * @fault_skips_done: A firmware fault resets through the oldest job its
  *	engine has not finished, not one finished but not yet retired.
  * @submit: Hand @job to the firmware. Takes &pvr_apple.submit_lock itself.
@@ -257,6 +261,10 @@ struct pvr_apple {
  * @max_power_state: Highest state licensed for fault capture; optional.
  * @report_fault: Capture the MMU fault state after a firmware fault, in place
  *	of the licence-checked bank read (pvr_apple_report_mmu_fault()); optional.
+ * @poll_us: The backup check period with the interrupt taken, in place of
+ *	@irq_poll_us (a tunable); optional.
+ * @recheck_us: After an interrupt whose check found nothing, the delay of
+ *	the first re-check, in place of the fast period; optional.
  * @events: Read what the firmware posted. Before @engine_done wherever a job
  *	is waited for; may sleep.
  * @vm_init: A userspace VM was created: map what the firmware needs in it.
@@ -291,6 +299,7 @@ struct pvr_apple_chip {
 	unsigned int gate_off_ms;
 	bool wait_deadline;
 	bool fault_skips_done;
+	bool irq_thread;
 	/* With the firmware's interrupt taken: microseconds between checks while jobs are pending */
 	unsigned int irq_poll_us;
 	const struct drm_pvr_heap *heaps;
@@ -311,6 +320,8 @@ struct pvr_apple_chip {
 	void (*write_frag)(struct pvr_apple *apple, u32 seq, const void *hw);
 	void (*report_hang)(struct pvr_apple *apple);
 	void (*report_fault)(struct pvr_apple *apple);
+	unsigned int (*poll_us)(struct pvr_apple *apple);
+	unsigned int (*recheck_us)(struct pvr_apple *apple);
 
 	int (*prepare_job)(struct pvr_apple *apple, struct pvr_job *job);
 	int (*submit)(struct pvr_apple *apple, struct pvr_job *job);

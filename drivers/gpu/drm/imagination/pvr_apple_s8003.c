@@ -4115,39 +4115,63 @@ static void t7000_idle(struct pvr_apple *apple)
 /*
  * Apple's kick, the same in all five of its MTS_SCHEDULE writers (TA
  * 0x846f220, 3D 0x846f408, CL 0x846f5f0, device control 0x846f9a0; COUNTED
- * and the data master): Fender's wake, the power state read, then the META's
- * scheduler register. In state 0 (the firmware idled the core) Apple rings
- * as long as Fender is set up and the snoop is armed; with that write Fender
- * wakes the core (on the iPod: state 1 and the PLL locked within 1 ms).
- * Apple restarts the firmware when Fender's control is 0 and warns when the
- * snoop is not armed; this driver refuses both. In state 1 the PLL must be
- * locked, as for every access to the Rogue registers.
+ * and the data master): Fender's wake (+0x14 = 7, 0x847a640), the power
+ * state read (+0x1000 & 0xf, 0x8477020), then the META's scheduler
+ * register, written in every case. Only in state 0 (the firmware idled the
+ * core) does Apple look further: with Fender's control 0 it restarts the
+ * firmware (0x846dc1c), with the snoop not armed it warns; with the wake
+ * write Fender wakes the core (on the iPod: state 1 and the PLL locked
+ * within 1 ms). In state 1 Apple reads no PLL: the firmware's own power
+ * and clock changes (its idle gating, DVFS) can leave PLL5 relocking while
+ * the state reads 1 (iOS shows that in 30 of 200 draw rounds), and Apple
+ * rings then too, and so does this driver. It
+ * still does not write the register with Fender's control 0 or the snoop
+ * not armed in state 0 (never seen here; Apple's restart is not
+ * implemented): the job is then in the ring and its wait ends in the reset.
+ *
+ * Nothing here fails: a job's publish checks first (t7000_publish_check()).
  */
-static int t7000_doorbell(struct pvr_apple *apple, u32 dm)
+static void t7000_ring(struct pvr_apple *apple, u32 dm)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
 	u32 state, pll, ctrl, snoop;
 
-		return -EIO;
+	if (s->stuck) {
+		dev_err_ratelimited(apple_dev(apple),
+				    "doorbell not rung: the GPU is stuck; the job waits for the reset\n");
+		return;
+	}
 	mb();	/* what the firmware is rung for is in memory */
 	writel(FENDER_WAKE_ALL, apple->fender + FENDER_WAKE);
 	state = readl(apple->fender + FENDER_POWER_STATE);
-	pll = pmgr_read(s, T7000_PMGR_PLL5);
 	if (!(state & 0xf)) {
 		ctrl = readl(apple->fender + FENDER_CTRL);
 		snoop = readl(apple->fender + T7000_FENDER_SNOOP);
 		if (!ctrl || (!(ctrl & T7000_FENDER_CTRL_SNOOP) && !(snoop & BIT(1)))) {
 			dev_err_ratelimited(apple_dev(apple),
-					    "doorbell not rung: Fender state %#x, control %#x, snoop %#x\n",
+					    "doorbell not rung: Fender state %#x, control %#x, snoop %#x; the job waits for the reset\n",
 					    state, ctrl, snoop);
-			return -EIO;
+			return;
 		}
-	} else if (!(pll & T7000_PLL_LOCKED)) {
-		dev_err_ratelimited(apple_dev(apple),
-				    "doorbell not rung: Fender state %#x, PLL5 %#x\n", state, pll);
-		return -EIO;
+	} else {
+		/* logged only: Apple reads no PLL here */
+		pll = pmgr_read(s, T7000_PMGR_PLL5);
+		if (!(pll & T7000_PLL_LOCKED))
+			dev_info_ratelimited(apple_dev(apple),
+					     "doorbell rung with PLL5 relocking, as Apple's kext rings: Fender state %#x, PLL5 %#x\n",
+					     state, pll);
 	}
 	pvr_cr_write32(apple->pvr_dev, ROGUE_CR_MTS_SCHEDULE, ROGUE_CR_MTS_SCHEDULE_TASK_COUNTED | dm);
+}
+
+/* The variant's doorbell, for device-control commands */
+static int t7000_doorbell(struct pvr_apple *apple, u32 dm)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	if (s->stuck)
+		return -EIO;
+	t7000_ring(apple, dm);
 	return 0;
 }
 
@@ -4198,13 +4222,41 @@ static u32 t7000_engine_done(struct pvr_apple *apple, enum pvr_apple_engine engi
 }
 
 /*
+ * Everything that can refuse a job's publish, checked before the job's
+ * record, numbers or VM state move: a refused job leaves nothing the
+ * firmware could run. Once, a publish refused after the producer index was
+ * written (the doorbell's PLL check) left the 3D job in the work ring; the
+ * firmware took it un-rung while its fence had already failed, and the 3D
+ * engine faulted in the job's context. The work ring's slot is free once
+ * the firmware took the previous entry (it takes one at once); submit_lock
+ * keeps it so until t7000_publish().
+ */
+static int t7000_publish_check(struct pvr_apple *apple, enum pvr_apple_engine engine)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u8 *ctl = s8003_object(s, S8003_WORK_CTL + 4 * s8003_engine(engine));
+	u32 start = ring_read(ctl, S8003_RING_PRODUCER), consumer;
+
+	lockdep_assert_held(&apple->submit_lock);
+	if (s->stuck)
+		return -EIO;
+	if (start >= APPLE_RING_ENTRIES)
+		return -EPROTO;
+	return read_poll_timeout(s8003_ring_consumer, consumer, consumer == start, 20,
+				 S8003_RING_TIMEOUT_US, false, apple, ctl);
+}
+
+/*
  * Tell the firmware that @engine's pointer ring is filled up to @end: an
  * entry of the engine's work ring {engine, channel, end}, with Apple's 1 in
  * its fourth word on a render channel (P5b), the host's watermark, the work
  * ring's producer index, and Apple's kick with the engine's data master (TA
- * DM0, 3D DM1, CL DM2: 0x846f220, 0x846f408, 0x846f5f0).
+ * DM0, 3D DM1, CL DM2: 0x846f220, 0x846f408, 0x846f5f0). After
+ * t7000_publish_check() under the same hold of submit_lock; it does not
+ * fail: once the producer index is written the job is the firmware's, and
+ * its fence follows the firmware's progress, a fault or the reset.
  */
-static int t7000_publish(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 end)
+static void t7000_publish(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 end)
 {
 	static const u32 dm[] = {
 		ROGUE_CR_MTS_SCHEDULE_DM_DM0, ROGUE_CR_MTS_SCHEDULE_DM_DM1, ROGUE_CR_MTS_SCHEDULE_DM_DM2,
@@ -4214,17 +4266,9 @@ static int t7000_publish(struct pvr_apple *apple, enum pvr_apple_engine engine, 
 	u8 *ctl = s8003_object(s, S8003_WORK_CTL + 4 * fw_engine);
 	u8 *ring = s8003_object(s, S8003_WORK_RING + 4 * fw_engine);
 	u32 host = engine == APPLE_ENGINE_COMPUTE ? S8003_CH_CTL : T7000_RCH_CTL;
-	u32 start = ring_read(ctl, S8003_RING_PRODUCER), consumer;
+	u32 start = ring_read(ctl, S8003_RING_PRODUCER);
 	u8 *p = s8003_channel(s, engine), *entry;
-	int err;
 
-	if (start >= APPLE_RING_ENTRIES)
-		return -EPROTO;
-	/* The firmware takes a work-ring entry at once; the ring never holds two */
-	err = read_poll_timeout(s8003_ring_consumer, consumer, consumer == start, 20,
-				S8003_RING_TIMEOUT_US, false, apple, ctl);
-	if (err)
-		return err;
 	entry = ring + start * S8003_DC_SIZE;
 	memset(entry, 0, S8003_DC_SIZE);
 	put32(entry, fw_engine);
@@ -4237,7 +4281,7 @@ static int t7000_publish(struct pvr_apple *apple, enum pvr_apple_engine engine, 
 	wmb();
 	WRITE_ONCE(*(__le32 *)(ctl + S8003_RING_PRODUCER),
 		   cpu_to_le32((start + 1) % APPLE_RING_ENTRIES));
-	return t7000_doorbell(apple, dm[fw_engine]);
+	t7000_ring(apple, dm[fw_engine]);
 }
 
 /* The A8's compute record: the A9's with every offset from 0x10 on 8 further */
@@ -4269,6 +4313,9 @@ static int t7000_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, st
 	err = s8003_wait_done(apple, APPLE_ENGINE_COMPUTE, apple->last_seq);
 	if (err)
 		return s8003_submit_error(apple, vm, "compute", err, "record slot wait");
+	err = t7000_publish_check(apple, APPLE_ENGINE_COMPUTE);
+	if (err)
+		return s8003_submit_error(apple, vm, "compute", err, "publish");
 	seq = apple->last_seq + 1;
 	k = seq - 1;
 	{
@@ -4315,9 +4362,7 @@ static int t7000_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, st
 	put32(work + 0x27c, k);
 	put32(p + S8003_CH_RING + ((seq - 1) % S8003_CH_ENTRIES) * 4, w);
 	apple->last_seq = seq;
-	err = t7000_publish(apple, APPLE_ENGINE_COMPUTE, seq % S8003_CH_ENTRIES);
-	if (err)
-		return s8003_submit_error(apple, vm, "compute", err, "publish");
+	t7000_publish(apple, APPLE_ENGINE_COMPUTE, seq % S8003_CH_ENTRIES);
 	return seq;
 }
 
@@ -4993,6 +5038,9 @@ static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	err = s8003_wait_done(apple, APPLE_ENGINE_GEOM, apple->ta_seq);
 	if (err)
 		return s8003_submit_error(apple, vm, "geometry", err, "record slot wait");
+	err = t7000_publish_check(apple, APPLE_ENGINE_GEOM);
+	if (err)
+		return s8003_submit_error(apple, vm, "geometry", err, "publish");
 
 	seq = apple->ta_seq + 1;
 	slice_addr = job->hwrt->data.rgn_header_dev_addr +
@@ -5015,9 +5063,7 @@ static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	vm->t7000.ta_seq = seq;
 	vm->t7000.rgn_addr = slice_addr;
 	apple->ta_seq = seq;
-	err = t7000_publish(apple, APPLE_ENGINE_GEOM, seq % T7000_RCH_ENTRIES);
-	if (err)
-		return s8003_submit_error(apple, vm, "geometry", err, "publish");
+	t7000_publish(apple, APPLE_ENGINE_GEOM, seq % T7000_RCH_ENTRIES);
 	return seq;
 }
 
@@ -5047,6 +5093,9 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	err = s8003_wait_done(apple, APPLE_ENGINE_FRAG, apple->frag_seq);
 	if (err)
 		return s8003_submit_error(apple, vm, "fragment", err, "record slot wait");
+	err = t7000_publish_check(apple, APPLE_ENGINE_FRAG);
+	if (err)
+		return s8003_submit_error(apple, vm, "fragment", err, "publish");
 
 	seq = apple->frag_seq + 1;
 	err = t7000_fill_3d(p + T7000_RCH_W, job->cmd, &rt, vm->t7000.rgn_addr);
@@ -5072,9 +5121,7 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 
 	vm->t7000.open = false;
 	apple->frag_seq = seq;
-	err = t7000_publish(apple, APPLE_ENGINE_FRAG, (2 * seq) % T7000_RCH_ENTRIES);
-	if (err)
-		return s8003_submit_error(apple, vm, "fragment", err, "publish");
+	t7000_publish(apple, APPLE_ENGINE_FRAG, (2 * seq) % T7000_RCH_ENTRIES);
 	return seq;
 }
 
@@ -5306,6 +5353,36 @@ static void t7000_report_hang(struct pvr_apple *apple)
 		return;
 	}
 	t7000_report_bif(apple, "hang");
+}
+
+/*
+ * The backup completion check's period while jobs are pending (with the
+ * interrupt taken): the firmware raises its interrupt some time after it
+ * writes a job's stamp, and in one measurement the 250 us check found 71% of
+ * the jobs first. A tunable, to measure the trade against CPU wake-ups.
+ */
+static unsigned int a8_poll_us = 250;
+module_param(a8_poll_us, uint, 0644);
+MODULE_PARM_DESC(a8_poll_us, "A8: backup completion check period in us while jobs are pending (20..1000, default 250)");
+
+static unsigned int t7000_poll_us(struct pvr_apple *apple)
+{
+	return clamp(READ_ONCE(a8_poll_us), 20u, 1000u);
+}
+
+/*
+ * An interrupt whose check finds its job not done in memory yet: measurements show
+ * that is most of them (interrupts that found nothing ~5200 against ~1950
+ * that found their job), and the 100 us fast period then found the job.
+ * The first re-check comes sooner; the fast period follows.
+ */
+static unsigned int a8_recheck_us = 20;
+module_param(a8_recheck_us, uint, 0644);
+MODULE_PARM_DESC(a8_recheck_us, "A8: first re-check after an interrupt that found nothing, in us (5..250, default 20)");
+
+static unsigned int t7000_recheck_us(struct pvr_apple *apple)
+{
+	return clamp(READ_ONCE(a8_recheck_us), 5u, 250u);
 }
 
 static void t7000_iounmap(void *addr)
@@ -5558,10 +5635,18 @@ const struct pvr_apple_chip pvr_apple_chip_t7000 = {
 	.gate_off_ms = 10,
 	.wait_deadline = true,
 	.fault_skips_done = true,
-	.irq_poll_us = 1000,
+	.irq_thread = true,
+	/*
+	 * Between the firmware's interrupts the completion check runs every
+	 * 250 us while jobs are pending: the A9's 1 ms was a sixth of an A8
+	 * compute job's wall clock. Memory only: the stamps and the rings.
+	 */
+	.irq_poll_us = 250,
 	.heaps = t7000_heaps,
 	.read_gpu_id = pvr_apple_t7000_read_gpu_id,
 	.report_fault = t7000_report_fault,
+	.poll_us = t7000_poll_us,
+	.recheck_us = t7000_recheck_us,
 	.init = pvr_apple_s8003_init,
 	.boot = pvr_apple_s8003_boot,
 	.start = pvr_apple_s8003_start,

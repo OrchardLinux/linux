@@ -148,6 +148,7 @@ int pvr_apple_fender_power_on(struct pvr_apple *apple)
 }
 
 static void pvr_apple_poll_work(struct work_struct *work);
+static void pvr_apple_check(struct pvr_apple *apple, bool from_irq);
 static enum hrtimer_restart pvr_apple_poll_timer(struct hrtimer *timer);
 static u32 pvr_apple_frag_retired(struct pvr_apple *apple);
 
@@ -1209,7 +1210,20 @@ static irqreturn_t pvr_apple_firmware_irq(int irq, void *data)
 
 	/* At its source first, as Apple's kext does before it reads the rings */
 	apple->chip->irq_ack(apple);
+	if (apple->chip->irq_thread)
+		return READ_ONCE(apple->stopping) ? IRQ_HANDLED : IRQ_WAKE_THREAD;
 	pvr_apple_firmware_event(apple);
+	return IRQ_HANDLED;
+}
+
+/*
+ * &pvr_apple_chip.irq_thread: the completion check runs in the interrupt's
+ * thread, as Apple's kext drains its rings in its interrupt event source's
+ * work loop, not in a work item behind it.
+ */
+static irqreturn_t pvr_apple_firmware_irq_thread(int irq, void *data)
+{
+	pvr_apple_check(data, true);
 	return IRQ_HANDLED;
 }
 
@@ -1230,8 +1244,13 @@ int pvr_apple_firmware_irq_init(struct pvr_apple *apple, int irq)
 
 	if (!apple->chip->irq_ack || !apple->chip->irq_poll_us)
 		return -EINVAL;
-	err = devm_request_irq(dev, irq, pvr_apple_firmware_irq, IRQF_NO_AUTOEN,
-			       "apple-gfx-fw", apple);
+	if (apple->chip->irq_thread)
+		err = devm_request_threaded_irq(dev, irq, pvr_apple_firmware_irq,
+						pvr_apple_firmware_irq_thread,
+						IRQF_NO_AUTOEN | IRQF_ONESHOT, "apple-gfx-fw", apple);
+	else
+		err = devm_request_irq(dev, irq, pvr_apple_firmware_irq, IRQF_NO_AUTOEN,
+				       "apple-gfx-fw", apple);
 	if (err)
 		return err;
 	apple->fw_irq = irq;
@@ -1254,7 +1273,17 @@ static void pvr_apple_fw_irq_set_locked(struct pvr_apple *apple, bool on)
 /* Signal the fences of retired jobs; check again while any are pending. */
 static void pvr_apple_poll_work(struct work_struct *work)
 {
-	struct pvr_apple *apple = container_of(work, struct pvr_apple, poll_work.work);
+	pvr_apple_check(container_of(work, struct pvr_apple, poll_work.work), false);
+}
+
+/*
+ * The completion check: from the poll work, or on a chip with
+ * &pvr_apple_chip.irq_thread from the firmware interrupt's thread
+ * (@from_irq). Both may run at once: the fences are retired under
+ * fence_lock, the rings drained under the chip's own lock.
+ */
+static void pvr_apple_check(struct pvr_apple *apple, bool from_irq)
+{
 	struct pvr_apple_fence *fence, *tmp;
 	unsigned int retired = 0, us;
 	bool pending = false, irq_on;
@@ -1309,6 +1338,20 @@ static void pvr_apple_poll_work(struct work_struct *work)
 	if (!pending || READ_ONCE(apple->stopping))
 		return;
 	/*
+	 * An interrupt that found its job not yet done in memory: the
+	 * firmware is ahead of its stamp. Check again soon, not only at the
+	 * backup period.
+	 */
+	if (from_irq && !retired) {
+		pvr_apple_firmware_progress(apple);
+		/* a chip's own, shorter first re-check */
+		if (apple->chip->recheck_us) {
+			us = apple->chip->recheck_us(apple);
+			hrtimer_start(&apple->poll_timer, us_to_ktime(max(us, 5U)), HRTIMER_MODE_REL);
+			return;
+		}
+	}
+	/*
 	 * Without the firmware's interrupt (the A10's firmware sends no
 	 * completion message in this setup) poll. With it, check again
 	 * soon only after an announced completion; otherwise the slower
@@ -1316,7 +1359,7 @@ static void pvr_apple_poll_work(struct work_struct *work)
 	 */
 	us = READ_ONCE(pvr_apple_poll_us);
 	if (irq_on && !ktime_before(ktime_get(), READ_ONCE(apple->fast_until)))
-		us = apple->chip->irq_poll_us;
+		us = apple->chip->poll_us ? apple->chip->poll_us(apple) : apple->chip->irq_poll_us;
 	hrtimer_start(&apple->poll_timer, us_to_ktime(max(us, 10U)), HRTIMER_MODE_REL);
 }
 
@@ -2154,6 +2197,12 @@ void pvr_apple_fw_fini(struct pvr_device *pvr_dev)
 	cancel_delayed_work_sync(&apple->poll_work);
 	pvr_apple_forget_scenes(apple);
 	pvr_apple_cancel_fences(apple, -ENODEV);
+	/* the interrupt is off now; a check its thread runs reads the rings */
+	if (apple->chip->irq_thread && apple->fw_irq) {
+		synchronize_irq(apple->fw_irq);
+		hrtimer_cancel(&apple->poll_timer);
+		cancel_delayed_work_sync(&apple->poll_work);
+	}
 	pvr_apple_gpu_pages_fini(apple);
 	if (apple->pm_pages) {
 		/* free lists still holding the pages keep their own references */
