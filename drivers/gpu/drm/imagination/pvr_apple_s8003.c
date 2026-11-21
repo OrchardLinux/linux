@@ -4143,6 +4143,174 @@ static void t7000_vm_put(struct pvr_apple *apple, struct s8003_vm *vm)
 {
 }
 
+/*
+ * The last job of @engine that is done: its finish stamp at its number or
+ * past it. The finish stamp is the last word a job's microsequence writes
+ * (TA 0x24, 3D 0x26, CU 0x33), and what the bring-up module waits for; the
+ * mirror stamp and the stamp event follow it.
+ */
+static u32 t7000_engine_done(struct pvr_apple *apple, enum pvr_apple_engine engine)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u32 latest = s8003_submitted(apple, engine);
+	u32 stamp = engine == APPLE_ENGINE_COMPUTE ? S8003_CU_STAMP : S8003_CH_STAMP;
+	s32 behind;
+
+	if (!READ_ONCE(apple->booted) || !s->root.map)
+		return latest;
+	behind = get32(s8003_channel(s, engine) + stamp + 4) - latest;
+	return latest + min(behind, 0);
+}
+
+/*
+ * Tell the firmware that @engine's pointer ring is filled up to @end: an
+ * entry of the engine's work ring {engine, channel, end}, with Apple's 1 in
+ * its fourth word on a render channel (P5b), the host's watermark, the work
+ * ring's producer index, and Apple's kick with the engine's data master (TA
+ * DM0, 3D DM1, CL DM2: 0x846f220, 0x846f408, 0x846f5f0).
+ */
+static int t7000_publish(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 end)
+{
+	static const u32 dm[] = {
+		ROGUE_CR_MTS_SCHEDULE_DM_DM0, ROGUE_CR_MTS_SCHEDULE_DM_DM1, ROGUE_CR_MTS_SCHEDULE_DM_DM2,
+	};
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u32 fw_engine = s8003_engine(engine);
+	u8 *ctl = s8003_object(s, S8003_WORK_CTL + 4 * fw_engine);
+	u8 *ring = s8003_object(s, S8003_WORK_RING + 4 * fw_engine);
+	u32 host = engine == APPLE_ENGINE_COMPUTE ? S8003_CH_CTL : T7000_RCH_CTL;
+	u32 start = ring_read(ctl, S8003_RING_PRODUCER), consumer;
+	u8 *p = s8003_channel(s, engine), *entry;
+	int err;
+
+	if (start >= APPLE_RING_ENTRIES)
+		return -EPROTO;
+	/* The firmware takes a work-ring entry at once; the ring never holds two */
+	err = read_poll_timeout(s8003_ring_consumer, consumer, consumer == start, 20,
+				S8003_RING_TIMEOUT_US, false, apple, ctl);
+	if (err)
+		return err;
+	entry = ring + start * S8003_DC_SIZE;
+	memset(entry, 0, S8003_DC_SIZE);
+	put32(entry, fw_engine);
+	put32(entry + 4, s8003_channel_addr(s, engine));
+	put32(entry + 8, end);
+	if (engine != APPLE_ENGINE_COMPUTE)
+		put32(entry + 12, 1);
+	wmb();
+	put32(p + host + S8003_CH_CTL_HOST, end);
+	wmb();
+	WRITE_ONCE(*(__le32 *)(ctl + S8003_RING_PRODUCER),
+		   cpu_to_le32((start + 1) % APPLE_RING_ENTRIES));
+	return t7000_doorbell(apple, dm[fw_engine]);
+}
+
+/* The A8's compute record: the A9's with every offset from 0x10 on 8 further */
+#define T7000_CU_W_SIZE			0x298
+#define T7000_CU_TERMINATE1		0x00900004	/* the terminate program's descriptor (A9 0x00a00004) */
+
+/*
+ * A compute job on its VM's slot, one at a time: the record and the
+ * microsequence word for word as Apple's in P5's CL slots (start 0x32 with
+ * the stamp's previous value k twice, the timestamps around the wait for
+ * the engine's finished event, finish 0x33), userspace's registers placed
+ * as the bring-up module ran Mesa's records: the context store, resume
+ * and terminate programs and their descriptors, the configuration word,
+ * the context state and the control stream with its terminate word.
+ */
+static int t7000_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job)
+{
+	const struct pvr_apple_g5p_cmd_compute *cmd = job->cmd;
+	const struct pvr_apple_g5p_compute_regs *g = &cmd->g5p;
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u32 addr = s8003_channel_addr(s, APPLE_ENGINE_COMPUTE);
+	u32 global = s8003_object_addr(&s->layout, S8003_CHANNEL + 2);
+	u32 w = addr + S8003_CH_W, stamp = addr + S8003_CU_STAMP, slot = vm->slot[0], seq, k;
+	u8 *p = s8003_channel(s, APPLE_ENGINE_COMPUTE);
+	u8 *work = p + S8003_CH_W;
+	unsigned int i;
+	int err;
+
+	err = s8003_wait_done(apple, APPLE_ENGINE_COMPUTE, apple->last_seq);
+	if (err)
+		return s8003_submit_error(apple, vm, "compute", err, "record slot wait");
+	seq = apple->last_seq + 1;
+	k = seq - 1;
+	{
+		const u32 useq[] = {
+			0x32, w + 0x18, w + 0x68, global + 0x720, addr, slot, k, k, 0, w + 0x1f0,
+			1, 0, seq,
+			0x80000018, w + 0x280, w + 0x288, w + 0x288, seq,
+			0x101, 0x004a000a, 1, 1,
+			0x18, w + 0x280, w + 0x288, w + 0x28c, seq,
+			0x33, global + 0x720, addr, slot, w + 0x1f0, 1, 0, seq,
+			stamp + 4, seq, (u32)-0x6c,
+			0x40000017,
+		};
+
+		BUILD_BUG_ON(sizeof(useq) > S8003_CU_USEQ_SIZE);
+		memset(p + S8003_CU_USEQ, 0, S8003_CU_USEQ_SIZE);
+		useq_put(p + S8003_CU_USEQ, useq, ARRAY_SIZE(useq));
+	}
+	memset(work, 0, T7000_CU_W_SIZE);
+	put32(work, 3);
+	put32(work + 8, slot);
+	put32(work + 0xc, addr + S8003_CU_DEP);
+	put32(work + 0x18, g->config[0]);
+	put32(work + 0x1c, g->config[1]);
+	put64(work + 0x68, g->tail);
+	put64(work + 0x70, g->pds_resume);
+	put64(work + 0x78, cmd->cmd.regs.cdm_ctrl_stream_base);
+	put32(work + 0x1e8, addr + S8003_CU_USEQ);
+	put32(work + 0x1ec, S8003_CU_USEQ_SIZE);
+	for (i = 0; i < 4; i++)
+		put64(work + 0x1f4 + i * 8, g->state[i]);
+	put64(work + 0x214, g->tail);
+	put64(work + 0x21c, g->terminate);
+	put64(work + 0x224, g->pds_store);
+	put32(work + 0x22c, g->pds_store1);
+	put64(work + 0x234, g->pds_resume);
+	put32(work + 0x23c, g->pds_resume1);
+	put64(work + 0x244, g->pds_terminate);
+	put32(work + 0x24c, T7000_CU_TERMINATE1);
+	put32(work + 0x260, stamp);
+	put32(work + 0x264, stamp + 4);
+	put32(work + 0x268, seq);
+	put32(work + 0x278, seq);
+	put32(work + 0x27c, k);
+	put32(p + S8003_CH_RING + ((seq - 1) % S8003_CH_ENTRIES) * 4, w);
+	apple->last_seq = seq;
+	err = t7000_publish(apple, APPLE_ENGINE_COMPUTE, seq % S8003_CH_ENTRIES);
+	if (err)
+		return s8003_submit_error(apple, vm, "compute", err, "publish");
+	return seq;
+}
+
+/* Render jobs come with the A8's parameter manager */
+static int t7000_submit_render(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job)
+{
+	return -EOPNOTSUPP;
+}
+
+static int t7000_prepare_job(struct pvr_apple *apple, struct pvr_job *job)
+{
+	return job->type == DRM_PVR_JOB_TYPE_COMPUTE ? 0 : -EOPNOTSUPP;
+}
+
+static void t7000_report_hang(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	const u8 *p = s8003_channel(s, APPLE_ENGINE_COMPUTE);
+	const u8 *ctl = s8003_object(s, S8003_WORK_CTL + 8);
+
+	dev_err(apple_dev(apple),
+		"hang: compute: submitted %u, stamps %u %u, work ring %u/%u; firmware %s\n",
+		apple->last_seq, get32(p + S8003_CU_STAMP), get32(p + S8003_CU_STAMP + 4),
+		get32(ctl + S8003_RING_CONSUMER), get32(ctl + S8003_RING_PRODUCER),
+		s->failed ? "rings unreadable" : READ_ONCE(apple->fault) ? "posted a fault" :
+		"posted no fault");
+}
+
 static void t7000_iounmap(void *addr)
 {
 	iounmap((void __iomem *)addr);
@@ -4279,6 +4447,12 @@ static const struct s8003_variant s8003_variant_a8 = {
 	.vm_map = t7000_vm_map,
 	.vm_put = t7000_vm_put,
 	.vm_unmap = t7000_vm_unmap,
+	.engine_done = t7000_engine_done,
+	.prepare_job = t7000_prepare_job,
+	.submit_geom = t7000_submit_render,
+	.submit_frag = t7000_submit_render,
+	.submit_compute = t7000_submit_compute,
+	.report_hang = t7000_report_hang,
 };
 
 static const struct s8003_variant *s8003_variant_of(const struct pvr_apple_chip *chip)
@@ -4369,11 +4543,19 @@ static const struct drm_pvr_heap t7000_heaps[] = {
  * The A8 (T7000). Its firmware is booted and runs as the A9's is, with the
  * variant above. It starts in power state 1, Apple's start state and the
  * only one whose PLL lock is proven on Linux; the firmware is told all three
- * of its states, and the host pins it there (PLATFORM, CONTROL).
+ * of its states, and the host pins it there (PLATFORM, CONTROL). Jobs take
+ * the A9's command streams: the A8's records hold the same registers.
  */
 const struct pvr_apple_chip pvr_apple_chip_t7000 = {
 	.fw_name = "apple/gfx-t7000.bin",
 	.perf_state_max = 1,
+	.geom_stream = &pvr_apple_g5p_cmd_geom_stream,
+	.frag_stream = &pvr_apple_g5p_cmd_frag_stream,
+	.geom_ext_type = PVR_STREAM_EXTHDR_TYPE_GEOM_G5P,
+	.geom_ext_mask = PVR_STREAM_EXTHDR_GEOM_G5P_REGS,
+	.frag_ext_type = PVR_STREAM_EXTHDR_TYPE_FRAG_G5P,
+	.frag_ext_mask = PVR_STREAM_EXTHDR_FRAG_G5P_REGS,
+	.compute_stream = &pvr_apple_g5p_cmd_compute_stream,
 	.own_pm_pages = true,
 	.gate_off_ms = 10,
 	.irq_poll_us = 1000,
@@ -4386,6 +4568,10 @@ const struct pvr_apple_chip pvr_apple_chip_t7000 = {
 	.idle = pvr_apple_s8003_idle,
 	.fini = pvr_apple_s8003_fini,
 	.restore_image = pvr_apple_s8003_restore_image,
+	.report_hang = pvr_apple_s8003_report_hang,
+	.prepare_job = pvr_apple_s8003_prepare_job,
+	.submit = pvr_apple_s8003_submit,
+	.engine_done = pvr_apple_s8003_engine_done,
 	.events = pvr_apple_s8003_events,
 	.vm_init = pvr_apple_s8003_vm_init,
 	.vm_fini = pvr_apple_s8003_vm_fini,
