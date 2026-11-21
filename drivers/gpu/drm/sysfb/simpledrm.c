@@ -2,6 +2,7 @@
 
 #include <linux/aperture.h>
 #include <linux/clk.h>
+#include <linux/iopoll.h>
 #include <linux/minmax.h>
 #include <linux/of_address.h>
 #include <linux/of_clk.h>
@@ -227,6 +228,9 @@ static int simplefb_get_panel_height_mm_of(struct drm_device *dev,
 
 struct simpledrm_device {
 	struct drm_sysfb_device sysfb;
+	void __iomem *h9g;
+	struct drm_display_mode h9g_fast_mode;
+	u16 h9g_boot_subframes;
 
 	/* clocks */
 #if defined CONFIG_OF && defined CONFIG_COMMON_CLK
@@ -570,6 +574,126 @@ static int simpledrm_device_attach_genpd(struct simpledrm_device *sdev)
  * Modesetting
  */
 
+#define H9G_M3_CONTROL			0x8008
+#define H9G_MODE			0x15808
+#define H9G_IRQ_ENABLE			0x15824
+#define H9G_OUTPUT_ENABLE		0x18060
+#define H9G_EXTRA_SUBFRAMES		0x18050
+#define H9G_SUBFRAME_LINES		0x18708
+#define H9G_ACTIVE_SUBFRAMES		0x1870c
+#define H9G_EXTRA_SUBFRAMES_WRITE	0x98050
+
+static bool simpledrm_h9g_write(struct simpledrm_device *sdev, u16 subframes)
+{
+	u32 value;
+
+	writel(subframes, sdev->h9g + H9G_EXTRA_SUBFRAMES_WRITE);
+	return !readl_poll_timeout(sdev->h9g + H9G_EXTRA_SUBFRAMES, value,
+				   (u16)value == subframes, 10, 1000);
+}
+
+static void simpledrm_h9g_restore(void *data)
+{
+	struct simpledrm_device *sdev = data;
+
+	if (!simpledrm_h9g_write(sdev, sdev->h9g_boot_subframes))
+		drm_err(&sdev->sysfb.dev, "failed to restore H9G boot cadence\n");
+}
+
+static void simpledrm_h9g_init(struct simpledrm_device *sdev)
+{
+	struct drm_sysfb_device *sysfb = &sdev->sysfb;
+	struct device *dev = sysfb->dev.dev;
+	struct device_node *display;
+	struct resource res;
+	void __iomem *regs;
+	u16 subframes;
+	int ret = -ENODEV;
+
+	if (!of_machine_is_compatible("apple,j120") ||
+	    sysfb->fb_mode.hdisplay != 2048 || sysfb->fb_mode.vdisplay != 2732)
+		return;
+	display = of_parse_phandle(dev->of_node, "display", 0);
+	if (!display)
+		return;
+	if (of_device_is_compatible(display, "apple,t8011-h9g-display"))
+		ret = of_address_to_resource(display, 0, &res);
+	of_node_put(display);
+	if (ret || resource_size(&res) < H9G_EXTRA_SUBFRAMES_WRITE + sizeof(u32))
+		return;
+	regs = devm_ioremap_resource(dev, &res);
+	if (IS_ERR(regs))
+		return;
+	subframes = readl(regs + H9G_EXTRA_SUBFRAMES);
+	/* Adopt only the boot scanout with the firmware processor stopped. */
+	if (readl(regs + H9G_M3_CONTROL) != 3 || readl(regs + H9G_MODE) != 1 ||
+	    readl(regs + H9G_IRQ_ENABLE) || readl(regs + H9G_OUTPUT_ENABLE) ||
+	    readl(regs + H9G_SUBFRAME_LINES) != 1497 ||
+	    readl(regs + H9G_ACTIVE_SUBFRAMES) != 0x200 ||
+	    subframes != 2)
+		return;
+
+	sdev->h9g = regs;
+	sdev->h9g_boot_subframes = subframes;
+	if (devm_add_action_or_reset(dev, simpledrm_h9g_restore, sdev)) {
+		sdev->h9g = NULL;
+		return;
+	}
+
+	/* The boot link runs at the same pixel clock for both cadences. */
+	sysfb->fb_mode.clock = 750001;
+	sysfb->fb_mode.htotal = 2088;
+	sysfb->fb_mode.vtotal = 5988;
+	sdev->h9g_fast_mode = sysfb->fb_mode;
+	sdev->h9g_fast_mode.vtotal = 2994;
+}
+
+static enum drm_mode_status simpledrm_mode_valid(struct drm_crtc *crtc,
+					       const struct drm_display_mode *mode)
+{
+	struct drm_sysfb_device *sysfb = to_drm_sysfb_device(crtc->dev);
+	struct simpledrm_device *sdev = container_of(sysfb, struct simpledrm_device, sysfb);
+
+	if (!sdev->h9g)
+		return drm_sysfb_crtc_helper_mode_valid(crtc, mode);
+	if (drm_mode_equal(mode, &sysfb->fb_mode) || drm_mode_equal(mode, &sdev->h9g_fast_mode))
+		return MODE_OK;
+	return MODE_BAD;
+}
+
+static void simpledrm_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
+{
+	struct drm_sysfb_device *sysfb = to_drm_sysfb_device(crtc->dev);
+	struct simpledrm_device *sdev = container_of(sysfb, struct simpledrm_device, sysfb);
+	const struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
+	u16 subframes;
+
+	if (!sdev->h9g)
+		return;
+	subframes = drm_mode_equal(&new_state->mode, &sdev->h9g_fast_mode) ?
+		    0 : sdev->h9g_boot_subframes;
+	if (!simpledrm_h9g_write(sdev, subframes))
+		drm_err(crtc->dev, "failed to set H9G extra subframes to %u\n", subframes);
+}
+
+static int simpledrm_get_modes(struct drm_connector *connector)
+{
+	struct drm_sysfb_device *sysfb = to_drm_sysfb_device(connector->dev);
+	struct simpledrm_device *sdev = container_of(sysfb, struct simpledrm_device, sysfb);
+	struct drm_display_mode *fast;
+	int count = drm_sysfb_connector_helper_get_modes(connector);
+
+	if (!sdev->h9g)
+		return count;
+	fast = drm_mode_duplicate(connector->dev, &sdev->h9g_fast_mode);
+	if (!fast)
+		return count;
+	fast->type = DRM_MODE_TYPE_DRIVER;
+	drm_mode_set_name(fast);
+	drm_mode_probed_add(connector, fast);
+	return count + 1;
+}
+
 static const u64 simpledrm_primary_plane_format_modifiers[] = {
 	DRM_SYSFB_PLANE_FORMAT_MODIFIERS,
 };
@@ -584,7 +708,9 @@ static const struct drm_plane_funcs simpledrm_primary_plane_funcs = {
 };
 
 static const struct drm_crtc_helper_funcs simpledrm_crtc_helper_funcs = {
-	DRM_SYSFB_CRTC_HELPER_FUNCS,
+	.mode_valid = simpledrm_mode_valid,
+	.atomic_check = drm_sysfb_crtc_helper_atomic_check,
+	.atomic_enable = simpledrm_atomic_enable,
 };
 
 static const struct drm_crtc_funcs simpledrm_crtc_funcs = {
@@ -597,7 +723,7 @@ static const struct drm_encoder_funcs simpledrm_encoder_funcs = {
 };
 
 static const struct drm_connector_helper_funcs simpledrm_connector_helper_funcs = {
-	DRM_SYSFB_CONNECTOR_HELPER_FUNCS,
+	.get_modes = simpledrm_get_modes,
 };
 
 static const struct drm_connector_funcs simpledrm_connector_funcs = {
@@ -735,6 +861,7 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	sysfb->fb_mode = drm_sysfb_mode(width, height, width_mm, height_mm);
 	sysfb->fb_format = format;
 	sysfb->fb_pitch = stride;
+	simpledrm_h9g_init(sdev);
 
 	drm_dbg(dev, "display mode={" DRM_MODE_FMT "}\n", DRM_MODE_ARG(&sysfb->fb_mode));
 	drm_dbg(dev, "framebuffer format=%p4cc, size=%dx%d, stride=%d byte\n",
