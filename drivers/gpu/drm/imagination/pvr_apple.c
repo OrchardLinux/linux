@@ -1801,7 +1801,9 @@ struct dma_fence *pvr_apple_submit_job(struct pvr_job *job)
  * &pvr_apple_chip.vm_scenes): a geometry job then waits for the fragment job
  * before the last one if the last one is its own VM's, and a fragment job
  * for its geometry job to be submitted rather than finished
- * (pvr_apple_job_armed()).
+ * (pvr_apple_job_armed()). A chip with one scene whose firmware orders the
+ * pair (&pvr_apple_chip.joint) keeps the geometry job's wait for the last
+ * fragment job and lets the fragment job follow its geometry job's submit.
  *
  * Return: 0 or a negative error.
  */
@@ -1837,7 +1839,7 @@ int pvr_apple_job_add_deps(struct pvr_job *job)
 void pvr_apple_job_armed(struct pvr_job *job, struct dma_fence *finished)
 {
 	struct pvr_apple *apple = to_apple(job->pvr_dev);
-	bool joint = apple->chip->scenes > 1;
+	bool joint = apple->chip->scenes > 1 || (apple->chip->joint && apple->chip->joint(apple));
 	struct dma_fence **last, *old;
 
 	if (job->type == DRM_PVR_JOB_TYPE_GEOMETRY)

@@ -429,6 +429,8 @@ struct pvr_apple_s8003 {
 	u32 t7000_pm_floor;
 	struct s8003_vm *t7000_geom_vm;
 	bool t7000_mmu_arm;		/* a lockup event came from the MMU-fault arm */
+	/* The 3D record the last fragment job was written to (T7000_RCH_W or T7000_RCH1_W) */
+	u32 t7000_frag_w;
 
 	bool bif_read;			/* t7000_report_fault() read the fault registers */
 };
@@ -3687,6 +3689,16 @@ static void t7000_init_build(struct pvr_apple *apple, u32 q)
 #define T7000_RCH_3D_USEQ		0xd00
 #define T7000_RCH_TIMES			0x2800	/* the 3D record's times, 16 bytes */
 #define T7000_RCH_SIZE			0x3000
+/*
+ * The 3D channel's second record (a8_joint): its barrier command, record,
+ * microsequence and times behind the first's, in the 0x1000 the 3D channel
+ * has before the PM control blocks (T7000_PM_CONTROL).
+ */
+#define T7000_RCH_SLOT1			0x3000
+#define T7000_RCH1_CMD			(T7000_RCH_SLOT1 + 0x000)
+#define T7000_RCH1_W			(T7000_RCH_SLOT1 + 0x100)
+#define T7000_RCH1_3D_USEQ		(T7000_RCH_SLOT1 + 0xa00)
+#define T7000_RCH1_TIMES		(T7000_RCH_SLOT1 + 0xc00)
 #define T7000_RCH_CTL			0x2000	/* Apple's ring control: 0x60 + 0x144 entries */
 #define T7000_RCH_RING			(T7000_RCH_CTL + 0x60)
 #define T7000_RCH_ENTRIES		0x144
@@ -4993,6 +5005,47 @@ static void t7000_pm_feedback(struct pvr_apple *apple, struct s8003_vm *vm)
 	}
 }
 
+/*
+ * A fragment job is submitted once its geometry job is (pvr_apple_job_armed()),
+ * not once it finished: the firmware holds the 3D itself. Each 3D record
+ * goes behind the barrier command {4, the TA's finish stamp, the value it
+ * reaches, the job's number} (t7000_submit_frag()), Apple's form, so
+ * the 3D starts when its TA is done without the host's interrupt, check,
+ * signal and the fragment job's run_job in between. That barrier is what
+ * Apple's A8 kext puts in front of each 3D record (seen in an iOS capture), so iOS
+ * needs no host wait there; the A9's kext kicks a command buffer's TA and 3D
+ * back to back (submitTAWorkAndKickMTS 0xfffffff006ca00a0 and its 3D twin
+ * 0xfffffff006ca01f8), as the A9 here does (pvr_apple_chip_s8003.scenes).
+ * A partial render then finds the 3D record its TA names (pr_index) in the
+ * ring, as on iOS. 0 waits for the geometry job's fence as before.
+ */
+static bool a8_joint;
+module_param(a8_joint, bool, 0644);
+MODULE_PARM_DESC(a8_joint, "A8: submit a fragment job right after its geometry job, the firmware holds the 3D until the TA is done; change it only with the GPU idle (default 0)");
+
+static bool t7000_joint(struct pvr_apple *apple)
+{
+	return READ_ONCE(a8_joint);
+}
+
+/*
+ * The 3D record of fragment job @seq: with a8_joint the two alternate. A
+ * fragment job is then written as soon as its geometry job is submitted,
+ * some tens of microseconds after the job before it was seen done, while
+ * the firmware may still retire that job: its interrupt came 80 us after
+ * its stamp was visible on average, when measured, and the firmware reads the
+ * record for the retirement (the mirror stamp's address and value at
+ * W+0x870..0x878) and runs its microsequence to the end op (0x40000017).
+ * Apple's kext writes each command buffer's records apart and reclaims
+ * them on the firmware's completion event; the A9 here alternates two
+ * (s8003_slot_of()). Without a8_joint the next fragment job came a geometry
+ * job later (over 600 us), and the one record is kept as it was.
+ */
+static bool t7000_frag_slot1(struct pvr_apple_s8003 *s)
+{
+	return READ_ONCE(a8_joint) && s->t7000_frag_w != T7000_RCH1_W;
+}
+
 static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job)
 {
 	struct pvr_hwrt_dataset *dataset = job->hwrt->hwrt_dataset;
@@ -5056,6 +5109,16 @@ static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	};
 	t7000_ta_write(p + T7000_RCH_W, p + T7000_RCH_TA_USEQ, &j);
 	put32(p + T7000_RCH_RING + ((seq - 1) % T7000_RCH_ENTRIES) * 4, j.w);
+	/*
+	 * The 3D ring entry this TA names for a partial render (pr_index) is
+	 * written by its fragment job, which with a8_joint is written while
+	 * this TA runs. Until then it names the last fragment job's record,
+	 * complete and not rewritten (t7000_frag_slot1()), as it did before
+	 * a8_joint; never a record being written.
+	 */
+	if (READ_ONCE(a8_joint) && s->t7000_frag_w)
+		put32(s8003_channel(s, APPLE_ENGINE_FRAG) + T7000_RCH_RING + j.pr_index * 4,
+		      j.pr_ch + s->t7000_frag_w);
 
 	dataset->apple_rgn.cursor += dataset->apple_rgn.slice;
 	vm->t7000.open = true;
@@ -5078,11 +5141,17 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	struct pvr_apple_s8003 *s = apple->chip_data;
 	u32 addr = s8003_channel_addr(s, APPLE_ENGINE_FRAG);
 	u32 ta_addr = s8003_channel_addr(s, APPLE_ENGINE_GEOM);
-	u8 *p = s8003_channel(s, APPLE_ENGINE_FRAG), *cmd = p + T7000_RCH_CMD;
+	u8 *p = s8003_channel(s, APPLE_ENGINE_FRAG), *cmd;
+	u32 cmd_off, w_off, useq_off, times_off;
 	struct t7000_rjob j;
 	struct s8003_rt rt;
 	u32 seq, ring;
 	int err;
+
+	BUILD_BUG_ON(T7000_RCH1_W - T7000_RCH1_CMD < S8003_CMD_SIZE);
+	BUILD_BUG_ON(T7000_RCH1_3D_USEQ - T7000_RCH1_W < T7000_3D_W_SIZE);
+	BUILD_BUG_ON(T7000_RCH1_TIMES - T7000_RCH1_3D_USEQ < T7000_3D_USEQ_SIZE);
+	BUILD_BUG_ON(T7000_3D_CHANNEL + T7000_RCH1_TIMES + 16 > T7000_PM_CONTROL);
 
 	if (!vm->t7000.open || vm->t7000.hwrt != job->hwrt || vm->t7000.built != s->gen)
 		return s8003_submit_error(apple, vm, "fragment", -ECANCELED,
@@ -5098,26 +5167,46 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		return s8003_submit_error(apple, vm, "fragment", err, "publish");
 
 	seq = apple->frag_seq + 1;
-	err = t7000_fill_3d(p + T7000_RCH_W, job->cmd, &rt, vm->t7000.rgn_addr);
+	/*
+	 * Which record (t7000_frag_slot1()): with a8_joint the two alternate, so
+	 * this job never rewrites the record of the job before it, which the
+	 * firmware may still be retiring.
+	 */
+	if (t7000_frag_slot1(s)) {
+		cmd_off = T7000_RCH1_CMD;
+		w_off = T7000_RCH1_W;
+		useq_off = T7000_RCH1_3D_USEQ;
+		times_off = T7000_RCH1_TIMES;
+	} else {
+		cmd_off = T7000_RCH_CMD;
+		w_off = T7000_RCH_W;
+		useq_off = T7000_RCH_3D_USEQ;
+		times_off = T7000_RCH_TIMES;
+	}
+	cmd = p + cmd_off;
+	err = t7000_fill_3d(p + w_off, job->cmd, &rt, vm->t7000.rgn_addr);
 	if (err)
 		return s8003_submit_error(apple, vm, "fragment", err, "3D record fill");
-	memset(p + T7000_RCH_TIMES, 0, 16);
+	memset(p + times_off, 0, 16);
 	j = (struct t7000_rjob) {
-		.ch = addr, .w = addr + T7000_RCH_W, .useq = addr + T7000_RCH_3D_USEQ,
+		.ch = addr, .w = addr + w_off, .useq = addr + useq_off,
 		.object = s8003_object_addr(&s->layout, S8003_CHANNEL + 1), .slot = vm->slot[0],
 		.pm_id = 0, .control = s8003_meta_addr(S8003_ROOT_VA + t7000_pm_control_va(vm)),
 		.s = t7000_pm_s(vm), .dep = ta_addr + S8003_CH_DEP, .seq = seq, .k = seq - 1,
-		.trace = ++s->t7000_trace, .times = addr + T7000_RCH_TIMES,
+		.trace = ++s->t7000_trace, .times = addr + times_off,
 	};
-	t7000_3d_write(p + T7000_RCH_W, p + T7000_RCH_3D_USEQ, &j);
+	t7000_3d_write(p + w_off, p + useq_off, &j);
 	memset(cmd, 0, S8003_CMD_SIZE);
 	put32(cmd, S8003_CMD_WAIT);
 	put32(cmd + 4, ta_addr + S8003_CH_STAMP + 4);
 	put32(cmd + 8, vm->t7000.ta_seq);
 	put32(cmd + 12, seq);
+	/* the whole record before the ring entries that name it (a partial render reads them) */
+	wmb();
 	ring = (2 * (seq - 1)) % T7000_RCH_ENTRIES;
-	put32(p + T7000_RCH_RING + ring * 4, addr + T7000_RCH_CMD);
+	put32(p + T7000_RCH_RING + ring * 4, addr + cmd_off);
 	put32(p + T7000_RCH_RING + ((ring + 1) % T7000_RCH_ENTRIES) * 4, j.w);
+	s->t7000_frag_w = w_off;
 
 	vm->t7000.open = false;
 	apple->frag_seq = seq;
@@ -5647,6 +5736,7 @@ const struct pvr_apple_chip pvr_apple_chip_t7000 = {
 	.report_fault = t7000_report_fault,
 	.poll_us = t7000_poll_us,
 	.recheck_us = t7000_recheck_us,
+	.joint = t7000_joint,
 	.init = pvr_apple_s8003_init,
 	.boot = pvr_apple_s8003_boot,
 	.start = pvr_apple_s8003_start,

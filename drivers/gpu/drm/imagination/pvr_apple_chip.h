@@ -332,6 +332,12 @@ struct pvr_apple_chip {
 	void (*vm_fini)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
 	bool (*vm_evictable)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
 	unsigned int (*vm_scenes)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
+	/*
+	 * Whether the firmware orders a fragment job after its geometry job
+	 * itself, so that the fragment job need wait only for its geometry job
+	 * to be submitted, as with two scenes (&scenes > 1); asked per job.
+	 */
+	bool (*joint)(struct pvr_apple *apple);
 	void (*mmu_flush)(struct pvr_apple *apple);
 	/* Acknowledge the firmware's interrupt at its source; hard IRQ context */
 	void (*irq_ack)(struct pvr_apple *apple);
