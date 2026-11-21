@@ -336,6 +336,39 @@ static bool asp_is_write(struct asp_cmd_hdr *cmd)
 	};
 }
 
+/*
+ * The only commands that may reach the controller: identify, the user
+ * area's read, write and flush, the write unlock, and reads of the
+ * auxiliary namespaces. The write unlock opens the whole controller, not
+ * one namespace, so this is what keeps writes to the auxiliary namespaces
+ * (0x40-0x48: LLB, firmware, defect maps, control bits, effaceable
+ * storage, NVRAM, SysCfg, panic log) and the format commands from ever
+ * being sent, whatever the request path above builds. SysCfg holds the
+ * factory calibration, which no restore brings back.
+ */
+static bool asp_cmd_allowed(const struct asp_cmd_hdr *cmd)
+{
+	switch (cmd->op) {
+	case ASP_CMD_IDENTIFY:
+	case ASP_CMD_READ_USERAREA:
+	case ASP_CMD_WRITE_USERAREA:
+	case ASP_CMD_FLUSH:
+	case ASP_CMD_WRITE_UNLOCK:
+	case ASP_CMD_OP_READ_LLB:
+	case ASP_CMD_OP_READ_FW:
+	case ASP_CMD_OP_READ_UTILDM:
+	case ASP_CMD_OP_READ_DM:
+	case ASP_CMD_OP_READ_CTRLBITS:
+	case ASP_CMD_OP_READ_EFFACE:
+	case ASP_CMD_OP_READ_NVRAM:
+	case ASP_CMD_OP_READ_SYSCFG:
+	case ASP_CMD_OP_READ_PANICLOG:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static enum req_op asp_req_op(struct asp_cmd_hdr *cmd)
 {
 	return asp_is_write(cmd) ? REQ_OP_DRV_OUT : REQ_OP_DRV_IN;
@@ -526,6 +559,10 @@ static blk_status_t apple_asp_submit_cmd(struct apple_asp *asp,
 {
 	int ret;
 
+	/* every command comes through apple_asp_queue_rq(); checked again */
+	if (WARN_ON_ONCE(!asp_cmd_allowed(cmd)))
+		return BLK_STS_NOTSUPP;
+
 	memcpy(asp_q_cmd_hdr(asp, cmd), cmd, ASP_CMD_HDR_SIZE);
 
 	dma_wmb();
@@ -618,6 +655,19 @@ static blk_status_t apple_asp_queue_rq(struct blk_mq_hw_ctx *hctx,
 	ret = asp_setup_cmd(qd, req);
 	if (ret)
 		return ret;
+
+	if (!asp_cmd_allowed(&iod->cmd)) {
+		dev_err_ratelimited(asp->dev, "refusing command 0x%02x\n",
+				    iod->cmd.op);
+		if (req_op(req) == REQ_OP_READ || req_op(req) == REQ_OP_WRITE) {
+			/* asp_setup_rw() mapped it; nothing was sent */
+			dma_unmap_sg(asp->dev, iod->sg, iod->nents,
+				     rq_dma_dir(req));
+			mempool_free(iod->sg, asp->iod_mempool);
+			iod->sg = NULL;
+		}
+		return BLK_STS_NOTSUPP;
+	}
 
 	if (iod->sg)
 		asp_setup_hw_sgl(asp, iod);
