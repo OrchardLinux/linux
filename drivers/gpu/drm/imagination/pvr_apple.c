@@ -759,12 +759,50 @@ static int pvr_apple_wait_engine(struct pvr_apple *apple, enum pvr_apple_engine 
 	return !err && (s32)(done - seq) < 0 ? -EIO : err;
 }
 
+/*
+ * pvr_apple_wait_idle() for a chip with &pvr_apple_chip.wait_deadline: one
+ * deadline for all engines, so a closing client or a VM that goes waits at
+ * most @timeout_us under submit_lock, not one timeout per engine. A wait
+ * that gives up names the engine, from memory only: the driver's counts
+ * and the stamps the firmware wrote. No Fender, PMGR or Rogue register is
+ * read, as after every job.
+ */
+static int pvr_apple_wait_idle_deadline(struct pvr_apple *apple, unsigned int timeout_us)
+{
+	static const char *const names[APPLE_ENGINES] = {
+		[APPLE_ENGINE_GEOM] = "geometry",
+		[APPLE_ENGINE_FRAG] = "fragment",
+		[APPLE_ENGINE_COMPUTE] = "compute",
+	};
+	ktime_t deadline = ktime_add_us(ktime_get(), timeout_us);
+	int engine, err = 0;
+
+	for (engine = 0; engine < APPLE_ENGINES; engine++) {
+		s64 left = ktime_us_delta(deadline, ktime_get());
+
+		/* Never 0: read_poll_timeout() takes 0 as no timeout at all */
+		err = pvr_apple_wait_engine(apple, engine, pvr_apple_engine_last(apple, engine),
+					    max_t(s64, min_t(s64, left, timeout_us), 1));
+		if (err)
+			break;
+	}
+	if (err)
+		dev_err_ratelimited(apple_dev(apple),
+				    "GPU not idle within %u us: %s submitted %u done %u%s (%d)\n",
+				    timeout_us, names[engine], pvr_apple_engine_last(apple, engine),
+				    pvr_apple_engine_done(apple, engine),
+				    READ_ONCE(apple->fault) ? ", firmware fault" : "", err);
+	return err;
+}
+
 /* Wait until every engine retired its submitted jobs; submit_lock held */
 int pvr_apple_wait_idle(struct pvr_apple *apple, unsigned int timeout_us)
 {
 	int engine, err = 0;
 
 	lockdep_assert_held(&apple->submit_lock);
+	if (apple->chip->wait_deadline)
+		return pvr_apple_wait_idle_deadline(apple, timeout_us);
 	for (engine = 0; engine < APPLE_ENGINES && !err; engine++)
 		err = pvr_apple_wait_engine(apple, engine, pvr_apple_engine_last(apple, engine),
 					    timeout_us);
@@ -961,6 +999,10 @@ void pvr_apple_report_mmu_fault(struct pvr_apple *apple)
 
 	if (xchg(&apple->fault_reported, true))
 		return;
+	if (apple->chip->report_fault) {
+		apple->chip->report_fault(apple);
+		return;
+	}
 	if (!apple->chip->max_power_state) {
 		dev_warn(apple_dev(apple), "GPU MMU fault licence refused: no licence for this chip\n");
 		return;
@@ -1029,6 +1071,20 @@ static void pvr_apple_fault_pending(struct pvr_apple *apple)
 	for (engine = 0; engine < APPLE_ENGINES; engine++) {
 		fence = list_first_entry_or_null(&apple->pending[engine],
 					 struct pvr_apple_fence, node);
+		/*
+		 * A job its engine finished but the poll has not retired yet
+		 * is not the one the firmware faulted on: faulting its
+		 * scheduler found no job left, and the faulted one waited for
+		 * its timeout (a texture test: geometry done, fragment
+		 * hung 5 s). Take each engine's first unfinished job.
+		 */
+		if (apple->chip->fault_skips_done) {
+			u32 done = pvr_apple_engine_done(apple, engine);
+
+			while (fence && (s32)(done - (u32)fence->base.seqno) >= 0)
+				fence = list_is_last(&fence->node, &apple->pending[engine]) ? NULL :
+					list_next_entry(fence, node);
+		}
 		if (!fence || !fence->sched)
 			continue;
 		if (!oldest || ktime_before(fence->submitted, oldest->submitted)) {

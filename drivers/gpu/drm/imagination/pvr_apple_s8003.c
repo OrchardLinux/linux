@@ -276,6 +276,8 @@ struct s8003_variant {
 	int (*submit_frag)(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job);
 	int (*submit_compute)(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job);
 	void (*report_hang)(struct pvr_apple *apple);
+	/* A fault event @e (S8003_EVENT_SIZE bytes) was posted: say what it is; optional */
+	void (*event_fault)(struct pvr_apple *apple, const u8 *e);
 };
 
 struct s8003_mem {
@@ -426,7 +428,9 @@ struct pvr_apple_s8003 {
 	/* The A8: the smallest PM pool a stall taught; the VM of the last geometry job */
 	u32 t7000_pm_floor;
 	struct s8003_vm *t7000_geom_vm;
+	bool t7000_mmu_arm;		/* a lockup event came from the MMU-fault arm */
 
+	bool bif_read;			/* t7000_report_fault() read the fault registers */
 };
 
 static void put32(u8 *p, u32 value)
@@ -1103,6 +1107,8 @@ static int s8003_drain(struct pvr_apple *apple, bool *alive)
 			dev_warn_ratelimited(apple_dev(apple), "firmware fault event type=%u slot=%u: %*ph\n",
 					     type, get_unaligned_le32(e + 0x0c),
 					     S8003_EVENT_SIZE - 4, e + 4);
+			if (s->v->event_fault)
+				s->v->event_fault(apple, e);
 			pvr_apple_firmware_fault(apple);
 		}
 		consumer = (consumer + 1) % APPLE_RING_ENTRIES;
@@ -2805,8 +2811,16 @@ static int pvr_apple_s8003_submit(struct pvr_apple *apple, struct pvr_job *job)
 		err = -ENODEV;
 	else
 		err = s8003_vm_attach(apple, vm);
-	if (err)
+	if (err) {
+		/* the chip's own refusals say why below; these said nothing */
+		if (apple->chip->wait_deadline)
+			dev_warn_ratelimited(apple_dev(apple), "job not submitted: %s (%d)\n",
+					     !apple->booted ? "the firmware is not running" :
+					     !vm ? "its VM is not known to the chip" :
+					     err == -EBUSY ? "every VM slot is taken" :
+					     "its VM did not attach", err);
 		goto out_unlock;
+	}
 	if (job->type == DRM_PVR_JOB_TYPE_GEOMETRY)
 		err = s->v->submit_geom(apple, vm, job);
 	else if (job->type == DRM_PVR_JOB_TYPE_FRAGMENT)
@@ -4560,7 +4574,14 @@ static int t7000_prepare_job(struct pvr_apple *apple, struct pvr_job *job)
 		return err;
 	}
 
-	mutex_lock(&vm->prepare_lock);
+	/*
+	 * The submitting client's own context: a holder may wait on the GPU
+	 * (up to the job timeout under submit_lock), so a killed client
+	 * leaves instead of sleeping uninterruptibly behind it.
+	 */
+	err = mutex_lock_killable(&vm->prepare_lock);
+	if (err)
+		return err;
 	if (!vm->t7000.stack) {
 		struct pvr_gem_object *aux = NULL, *stack = NULL, *pool = NULL;
 		u8 *aux_map = NULL, *stack_map = NULL, *pool_map = NULL;
@@ -5057,20 +5078,235 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	return seq;
 }
 
-static void t7000_report_hang(struct pvr_apple *apple)
+/*
+ * A fault in a job's context can leave the A8's firmware silent with
+ * EVENT_STATUS bit 9 (MMU page fault) latched: no event and no watchdog. So
+ * after the firmware's state, read EVENT_STATUS once, gated as every access
+ * to the Rogue registers, and only with bit 9 set the BIF's two fault banks
+ * once each: the faulting address, read or write, the requester's tag and
+ * sideband, and the context (CAT_BASE: 0 the firmware's, a slot's, or a
+ * PM's). The firmware's fault arm reads the same banks (0x10022c98). Never
+ * in a loop: a tight poll of these registers during a job froze the whole
+ * SoC. @why prefixes the lines.
+ *
+ * Return: whether EVENT_STATUS was read (the gate let it).
+ */
+static bool t7000_report_bif(struct pvr_apple *apple, const char *why)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
-	const u8 *p = s8003_channel(s, APPLE_ENGINE_COMPUTE);
-	const u8 *ctl = s8003_object(s, S8003_WORK_CTL + 8);
+	struct pvr_device *pvr_dev = apple->pvr_dev;
+	u32 status, bank;
+	bool fw_fault;
 
-	dev_err(apple_dev(apple),
-		"hang: compute: submitted %u, stamps %u %u, work ring %u/%u; firmware %s\n",
-		apple->last_seq, get32(p + S8003_CU_STAMP), get32(p + S8003_CU_STAMP + 4),
-		get32(ctl + S8003_RING_CONSUMER), get32(ctl + S8003_RING_PRODUCER),
-		s->failed ? "rings unreadable" : READ_ONCE(apple->fault) ? "posted a fault" :
-		"posted no fault");
+	if (s->stuck || !t7000_r0_gate(apple))
+		return false;
+	status = pvr_cr_read32(pvr_dev, ROGUE_CR_EVENT_STATUS);
+	/*
+	 * A lockup event from the firmware's MMU-fault arm (+8 = 0): the
+	 * firmware took bit 9 off already (10005138), so the banks are read
+	 * on its word, once, as the bit would have had them read.
+	 */
+	fw_fault = xchg(&s->t7000_mmu_arm, false);
+	dev_err(apple_dev(apple), "%s: EVENT_STATUS %#x%s\n", why, status,
+		status & ROGUE_CR_EVENT_STATUS_MMU_PAGE_FAULT_EN ? " (MMU page fault)" :
+		fw_fault ? " (bit 9 taken by the firmware's MMU-fault arm)" :
+		" (no MMU page fault: BIF banks not read)");
+	if (!(status & ROGUE_CR_EVENT_STATUS_MMU_PAGE_FAULT_EN || fw_fault) ||
+	    !t7000_r0_gate(apple))
+		return true;
+	for (bank = 0; bank < 2; bank++) {
+		u32 reg = bank ? ROGUE_CR_BIF_FAULT_BANK1_MMU_STATUS : ROGUE_CR_BIF_FAULT_BANK0_MMU_STATUS;
+		u32 req_reg = bank ? ROGUE_CR_BIF_FAULT_BANK1_REQ_STATUS :
+				     ROGUE_CR_BIF_FAULT_BANK0_REQ_STATUS;
+		u64 mmu = pvr_cr_read32(pvr_dev, reg) | (u64)pvr_cr_read32(pvr_dev, reg + 4) << 32;
+		u64 req = pvr_cr_read32(pvr_dev, req_reg) |
+			  (u64)pvr_cr_read32(pvr_dev, req_reg + 4) << 32;
+
+		dev_err(apple_dev(apple),
+			"GPU MMU fault bank %u: %s, context %llu, VA %#llx %s, tag %llu, sideband %#llx (mmu %#llx req %#llx)\n",
+			bank, mmu & ROGUE_CR_BIF_FAULT_BANK0_MMU_STATUS_FAULT_EN ? "fault" : "no fault",
+			(mmu >> ROGUE_CR_BIF_FAULT_BANK0_MMU_STATUS_CAT_BASE_SHIFT) & 0xf,
+			req & ~ROGUE_CR_BIF_FAULT_BANK0_REQ_STATUS_ADDRESS_CLRMSK,
+			req & ROGUE_CR_BIF_FAULT_BANK0_REQ_STATUS_RNW_EN ? "read" : "write",
+			(req >> ROGUE_CR_BIF_FAULT_BANK0_REQ_STATUS_TAG_ID_SHIFT) & 0xf,
+			(req >> ROGUE_CR_BIF_FAULT_BANK0_REQ_STATUS_TAG_SB_SHIFT) & 0x3f, mmu, req);
+	}
+	return true;
 }
 
+/*
+ * The firmware stopped on a fault (a fault event, or a job's stamp that will
+ * not come): the gated registers once, at the event, as iOS reads the banks
+ * before it resets the firmware. The A10's licence check (the epoch's power
+ * states) has no A8 counterpart; Fender state 1 and the PLL lock are the
+ * A8's gate. pvr_apple_report_mmu_fault() calls this once per firmware start.
+ */
+static void t7000_report_fault(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	WRITE_ONCE(s->bif_read, t7000_report_bif(apple, "fault"));
+}
+
+/*
+ * A type-4 event: the firmware's lockup recovery. The lockup checker
+ * 1000f538 recovers once every active engine has its lockup flag; 100290a4
+ * builds the event on its stack with 1000f800:
+ * +0 type 4, +0xc and +0x18 from 10002ed0, +0x10 and +0x14 zero, +0x1c the
+ * checker's argument, and +0x20/+0x24 from 10017c54. +0x28 is not written by
+ * the builder: what the stack held (0x1001b5a8 and 0x1001afd8 were seen;
+ * neither follows a call, the first is mid-instruction). +8 (written by
+ * the undecoded 1000f820) is 0 when the lockup state was set to 2 by the
+ * DM handler's MMU-fault arm (10005138: the firmware's status word had bit
+ * 0x200, EVENT_STATUS bit 9, which it clears after reading the BIF banks
+ * itself, 10022c98) and 1 from the watchdog count in 1000f538 (TA +0x830
+ * flags); these are the only two writers of state 2. So arm 0 is an MMU
+ * page fault the firmware took, not a stall for pages: a stall has no event.
+ *
+ * 10017c54 fills +0x24 one byte per group of the object at [GbP+260], each
+ * byte the same four fields: bit 0 the group's +0, bit 1 its +4, bit 2 its
+ * +0xc non-zero, bits 3-7 its +0x10 (groups at +0x318, +0x30, +0x600 and
+ * +0x8e8 for bytes 0-3). The byte with bit 2 set moved with the locked
+ * engine: 05 81 81 81 for a TA lockup (one run), 81 05 81 81 for a 3D one
+ * (another), so bytes 0-2 are named TA, 3D and CL here [inferred from those
+ * two]. The lockup state the firmware keeps in host memory, object 0x4b
+ * (INIT +0x98: +0 state 0/1/2, +8/+0xc/+0x10 per-engine lockup counts, +0x14
+ * the total, +0x18 the first locked engine; not yet seen on Linux), is
+ * printed raw beside it, and each engine whose submitted and done counts
+ * differ. Memory only: no register is read here.
+ */
+static void t7000_event_fault(struct pvr_apple *apple, const u8 *e)
+{
+	static const char *const groups[4] = { "TA", "3D", "CL", "group3" };
+	static const char *const names[APPLE_ENGINES] = {
+		[APPLE_ENGINE_GEOM] = "geometry",
+		[APPLE_ENGINE_FRAG] = "fragment",
+		[APPLE_ENGINE_COMPUTE] = "compute",
+	};
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u32 arm = get_unaligned_le32(e + 8), w = get_unaligned_le32(e + 0x24);
+	const u8 *lk = s8003_object(s, 0x4b);
+	char locked[32] = "";
+	int i, engine;
+
+	if (get_unaligned_le32(e) != 4)
+		return;
+	/* the fault registers read next (t7000_report_fault()) take the banks */
+	if (arm == 0)
+		WRITE_ONCE(s->t7000_mmu_arm, true);
+	for (i = 0; i < 4; i++) {
+		u8 b = w >> (8 * i);
+
+		if (b & BIT(2)) {
+			strlcat(locked, groups[i], sizeof(locked));
+			strlcat(locked, " ", sizeof(locked));
+		}
+	}
+	dev_err(apple_dev(apple),
+		"firmware lockup recovery: arm %u (%s), locked %s(+0x24 %#x: %s %u/%u/%u/%u %s %u/%u/%u/%u %s %u/%u/%u/%u %s %u/%u/%u/%u as +0/+4/+0xc set/+0x10), +0x1c %#x +0x20 %#x\n",
+		arm, arm == 0 ? "the DM handler's MMU-fault arm" : arm == 1 ? "the TA/3D watchdog" : "?",
+		locked[0] ? locked : "none ", w,
+		groups[0], w & 1, (w >> 1) & 1, (w >> 2) & 1, (w >> 3) & 0x1f,
+		groups[1], (w >> 8) & 1, (w >> 9) & 1, (w >> 10) & 1, (w >> 11) & 0x1f,
+		groups[2], (w >> 16) & 1, (w >> 17) & 1, (w >> 18) & 1, (w >> 19) & 0x1f,
+		groups[3], (w >> 24) & 1, (w >> 25) & 1, (w >> 26) & 1, (w >> 27) & 0x1f,
+		get_unaligned_le32(e + 0x1c), get_unaligned_le32(e + 0x20));
+	dev_err(apple_dev(apple),
+		"firmware lockup recovery: object 0x4b %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+		get32(lk), get32(lk + 4), get32(lk + 8), get32(lk + 0xc), get32(lk + 0x10),
+		get32(lk + 0x14), get32(lk + 0x18), get32(lk + 0x1c), get32(lk + 0x20),
+		get32(lk + 0x24));
+	for (engine = 0; engine < APPLE_ENGINES; engine++) {
+		u32 submitted = s8003_submitted(apple, engine);
+		u32 done = t7000_engine_done(apple, engine);
+
+		if (submitted != done)
+			dev_err(apple_dev(apple), "firmware lockup recovery: %s submitted %u done %u\n",
+				names[engine], submitted, done);
+	}
+}
+
+/*
+ * At a hang: the parameter manager's state, for a TA that ran out of pages:
+ * the TA object (INIT +0x88; +0x728 1 while the TA is active, +0x72c 2 after the out-of-memory handler 10012b24, the
+ * watchdog's words +0x828..+0x840), the last geometry VM's PM control
+ * (+0x24 pages, +0x28 top index, +0x3c/+0x40 the saved hardware words),
+ * its list's usage report (+0x40..+0x4c, taken flag +0x60) and the stack
+ * at the top index; all memory. Then R0+0x348, the PM's live top index,
+ * read once through the gate. A stall for pages doubles the pool of the
+ * next VM (t7000_pm_floor) and of this one, if it lives on.
+ */
+static void t7000_report_pm(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	const u8 *ta = s8003_object(s, S8003_CHANNEL);
+	struct s8003_vm *vm = s->t7000_geom_vm;
+	u32 oom = get32(ta + 0x72c);
+
+	dev_err(apple_dev(apple),
+		"hang: TA object +0x728 %#x +0x72c %#x%s; watchdog +0x828.. %08x %08x %08x %08x %08x %08x %08x\n",
+		get32(ta + 0x728), oom, oom == 2 ? " (out of parameter memory)" : "",
+		get32(ta + 0x828), get32(ta + 0x82c), get32(ta + 0x830), get32(ta + 0x834),
+		get32(ta + 0x838), get32(ta + 0x83c), get32(ta + 0x840));
+	if (vm && vm->slot[0] && vm->t7000.stack_map) {
+		const u8 *control = s->root.map + t7000_pm_control_va(vm);
+		const u8 *list = s->shared.map + t7000_pm_list_va(vm);
+		u32 top = get32(control + 0x28);
+
+		dev_err(apple_dev(apple),
+			"hang: PM pool %u blocks: control pages %u top %u saved %#x %#x; usage %u %u %u %u taken %u; stack[top] %#x\n",
+			vm->t7000.blocks, get32(control + 0x24), top, get32(control + 0x3c),
+			get32(control + 0x40), get32(list + T7000_PM_FEEDBACK),
+			get32(list + T7000_PM_FEEDBACK + 4), get32(list + T7000_PM_FEEDBACK + 8),
+			get32(list + T7000_PM_FEEDBACK + 12), get32(list + T7000_PM_FEEDBACK_TAKEN),
+			top < T7000_PM_STACK_SIZE / 4 ? get32(vm->t7000.stack_map + 4 * top) : 0);
+		if (oom == 2) {
+			u32 blocks = min_t(u32, 2 * vm->t7000.blocks, T7000_PM_BLOCKS_MAX);
+
+			WRITE_ONCE(s->t7000_pm_floor, max(s->t7000_pm_floor, blocks));
+			if (READ_ONCE(a8_pm_grow))
+				vm->t7000.want = max(vm->t7000.want, blocks);
+			dev_err(apple_dev(apple), "hang: new VMs' PM pools from now on at least %u blocks\n",
+				s->t7000_pm_floor);
+		}
+	}
+	if (s->stuck || !t7000_r0_gate(apple))
+		return;
+	dev_err(apple_dev(apple), "hang: R0+0x348 (PM top index) %#x\n",
+		pvr_cr_read32(apple->pvr_dev, 0x348));
+}
+
+/*
+ * A job timed out: the firmware's state from memory, then the fault
+ * registers (t7000_report_bif()) unless the fault event read them already.
+ */
+static void t7000_report_hang(struct pvr_apple *apple)
+{
+	static const char *const names[] = { "compute", "geometry", "fragment" };
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	int engine;
+
+	for (engine = 0; engine < APPLE_ENGINES; engine++) {
+		const u8 *p = s8003_channel(s, engine);
+		const u8 *ctl = s8003_object(s, S8003_WORK_CTL + 4 * s8003_engine(engine));
+		u32 stamp = engine == APPLE_ENGINE_COMPUTE ? S8003_CU_STAMP : S8003_CH_STAMP;
+
+		dev_err(apple_dev(apple), "hang: %s: submitted %u, stamps %u %u, work ring %u/%u\n",
+			names[engine], s8003_submitted(apple, engine), get32(p + stamp),
+			get32(p + stamp + 4), get32(ctl + S8003_RING_CONSUMER),
+			get32(ctl + S8003_RING_PRODUCER));
+	}
+	dev_err(apple_dev(apple), "hang: firmware %s, Fender state %#x\n",
+		s->failed ? "rings unreadable" : READ_ONCE(apple->fault) ? "posted a fault" :
+		"posted no fault", s->stuck ? 0 : readl(apple->fender + FENDER_POWER_STATE));
+	t7000_report_pm(apple);
+	/* once: the fault event's read, if the gate let it, else here */
+	if (READ_ONCE(apple->fault_reported) && xchg(&s->bif_read, false)) {
+		dev_err(apple_dev(apple), "hang: fault registers were read at the fault (above)\n");
+		return;
+	}
+	t7000_report_bif(apple, "hang");
+}
 
 static void t7000_iounmap(void *addr)
 {
@@ -5214,6 +5450,7 @@ static const struct s8003_variant s8003_variant_a8 = {
 	.submit_frag = t7000_submit_frag,
 	.submit_compute = t7000_submit_compute,
 	.report_hang = t7000_report_hang,
+	.event_fault = t7000_event_fault,
 };
 
 static const struct s8003_variant *s8003_variant_of(const struct pvr_apple_chip *chip)
@@ -5319,9 +5556,12 @@ const struct pvr_apple_chip pvr_apple_chip_t7000 = {
 	.compute_stream = &pvr_apple_g5p_cmd_compute_stream,
 	.own_pm_pages = true,
 	.gate_off_ms = 10,
+	.wait_deadline = true,
+	.fault_skips_done = true,
 	.irq_poll_us = 1000,
 	.heaps = t7000_heaps,
 	.read_gpu_id = pvr_apple_t7000_read_gpu_id,
+	.report_fault = t7000_report_fault,
 	.init = pvr_apple_s8003_init,
 	.boot = pvr_apple_s8003_boot,
 	.start = pvr_apple_s8003_start,
