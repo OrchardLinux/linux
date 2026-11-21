@@ -55,6 +55,7 @@ obj-$(CONFIG_BATTERY_BQ27XXX_HDQ) += bq27xxx_battery_hdq.o
 obj-$(CONFIG_CHARGER_APPLE_SN2400) += apple_sn2400_charger.o
 obj-$(CONFIG_APPLE_BELLATRIX_POWER) += apple_bellatrix_power.o
 obj-$(CONFIG_APPLE_D2365_CHARGER) += apple_d2365_charger.o
+obj-$(CONFIG_BATTERY_APPLE_D2186) += apple_d2186_battery.o
 obj-$(CONFIG_APPLE_TRISTAR_CHARGER) += apple-tristar-charger.o
 apple-tristar-charger-y		:= apple_tristar_charger.o
 apple-tristar-charger-$(CONFIG_APPLE_TRISTAR_ACCESSORY) += apple_tristar_accessory.o \

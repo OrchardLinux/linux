@@ -379,6 +379,22 @@ config APPLE_D2365_CHARGER
 	  This driver can also be built as a module. If so, the module will be
 	  called apple_d2365_charger.
 
+config BATTERY_APPLE_D2186
+	tristate "Apple D2186 PMIC battery and charger status"
+	depends on MFD_SIMPLE_MFD_I2C && IIO
+	help
+	  Say Y or M here to enable read-only battery and USB charger status
+	  reporting for Apple devices with a Dialog D2186 PMIC and no
+	  standalone fuel-gauge IC, such as the iPod touch 6 (N102).
+
+	  Battery voltage, charge current, thermistor temperature and USB
+	  input telemetry are read through the D2186 PMIC ADC IIO driver,
+	  and charging status is read from the PMIC status registers. This
+	  driver never writes to charger current limits or charging control.
+
+	  This driver can also be built as a module. If so, the module will
+	  be called apple_d2186_battery.
+
 config APPLE_TRISTAR_CHARGER
 	tristate "Apple Tristar Lightning charging"
 	depends on MFD_SIMPLE_MFD_I2C && I2C
