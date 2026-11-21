@@ -40,37 +40,54 @@
 #define DWI_BL_SEND_TIMEOUT_US		1000
 
 /*
- * TI LP8559 command register: the LED outputs are on while bits 0 and 3
- * are set. A brightness of 0 sent over DWI leaves them lit at the lowest
- * current; iOS (AppleARMBacklight, "bklE") turns the backlight off by
- * clearing both bits and on by setting them, then waits 600 us before the
- * first level.
+ * The LED driver keeps a separate enable bit on I2C. AppleLMBacklight
+ * ("bklE") waits 600 us after enabling either chip before the first level.
  */
-#define LP8559_COMMAND			0x00
-#define LP8559_COMMAND_ON		(BIT(0) | BIT(3))
-#define LP8559_ON_DELAY_US		600
+#define DWI_BL_LED_ON_DELAY_US		600
+
+struct dwi_bl_led_enable {
+	u8 reg;
+	u8 mask;
+};
+
+static const struct dwi_bl_led_enable lp8559_enable = {
+	.reg = 0x00,
+	.mask = BIT(0) | BIT(3),
+};
+
+static const struct dwi_bl_led_enable lm3534_enable = {
+	.reg = 0x10,
+	.mask = BIT(0),
+};
+
+static const struct of_device_id dwi_bl_led_matches[] = {
+	{ .compatible = "ti,lp8559", .data = &lp8559_enable },
+	{ .compatible = "ti,lm3534", .data = &lm3534_enable },
+	{}
+};
 
 struct apple_dwi_bl {
 	void __iomem *base;
 	u32 send_flags;
 	struct i2c_client *led;	/* the LED driver's own enable, if separate */
-	bool led_usable;
+	const struct dwi_bl_led_enable *led_enable;
 	bool led_on;
 };
 
 static int dwi_bl_led_enable(struct backlight_device *bl, bool on)
 {
 	struct apple_dwi_bl *dwi_bl = bl_get_data(bl);
+	const struct dwi_bl_led_enable *enable = dwi_bl->led_enable;
 	int ret;
 
-	if (!dwi_bl->led_usable || dwi_bl->led_on == on)
+	if (!enable || dwi_bl->led_on == on)
 		return 0;
 
-	ret = i2c_smbus_read_byte_data(dwi_bl->led, LP8559_COMMAND);
+	ret = i2c_smbus_read_byte_data(dwi_bl->led, enable->reg);
 	if (ret >= 0)
-		ret = i2c_smbus_write_byte_data(dwi_bl->led, LP8559_COMMAND,
-						on ? ret | LP8559_COMMAND_ON :
-						ret & ~LP8559_COMMAND_ON);
+		ret = i2c_smbus_write_byte_data(dwi_bl->led, enable->reg,
+					       on ? ret | enable->mask :
+					       ret & ~enable->mask);
 	if (ret < 0) {
 		dev_err(&bl->dev, "cannot turn the LED driver %s: %d\n",
 			on ? "on" : "off", ret);
@@ -78,7 +95,7 @@ static int dwi_bl_led_enable(struct backlight_device *bl, bool on)
 	}
 	dwi_bl->led_on = on;
 	if (on)
-		fsleep(LP8559_ON_DELAY_US);
+		fsleep(DWI_BL_LED_ON_DELAY_US);
 	return 0;
 }
 
@@ -148,12 +165,13 @@ static void dwi_bl_unlink_led(void *data)
 
 /*
  * The LED driver the DWI commands reach can have an enable of its own on
- * I2C. Only a TI LP8559 is driven here. Sleep must suspend this device
- * before that bus, and resume it after.
+ * I2C. Sleep must suspend this device before that bus, and resume it after.
  */
 static int dwi_bl_get_led(struct platform_device *pdev, struct apple_dwi_bl *dwi_bl)
 {
 	struct device *dev = &pdev->dev;
+	const struct of_device_id *match;
+	const struct dwi_bl_led_enable *enable;
 	struct device_node *np;
 	struct device_link *link;
 	int ret;
@@ -161,8 +179,8 @@ static int dwi_bl_get_led(struct platform_device *pdev, struct apple_dwi_bl *dwi
 	np = of_parse_phandle(dev->of_node, "apple,led-driver", 0);
 	if (!np)
 		return 0;
-	/* Only the LP8559's command register is known; leave others alone. */
-	if (!of_device_is_compatible(np, "ti,lp8559")) {
+	match = of_match_node(dwi_bl_led_matches, np);
+	if (!match) {
 		of_node_put(np);
 		return 0;
 	}
@@ -182,13 +200,14 @@ static int dwi_bl_get_led(struct platform_device *pdev, struct apple_dwi_bl *dwi
 		return ret;
 
 	/* Without its enable, the backlight still works; level 0 stays lit. */
-	ret = i2c_smbus_read_byte_data(dwi_bl->led, LP8559_COMMAND);
+	enable = match->data;
+	ret = i2c_smbus_read_byte_data(dwi_bl->led, enable->reg);
 	if (ret < 0) {
 		dev_warn(dev, "LED driver does not answer (%d); it stays on\n", ret);
 		return 0;
 	}
-	dwi_bl->led_usable = true;
-	dwi_bl->led_on = (ret & LP8559_COMMAND_ON) == LP8559_COMMAND_ON;
+	dwi_bl->led_enable = enable;
+	dwi_bl->led_on = (ret & enable->mask) == enable->mask;
 	return 0;
 }
 
