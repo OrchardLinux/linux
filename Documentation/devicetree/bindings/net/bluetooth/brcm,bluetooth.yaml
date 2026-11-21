@@ -32,6 +32,7 @@ properties:
           - const: brcm,bcm4329-bt
       - enum:
           - apple,j81-bcm4350c2-bt
+          - apple,n102-bcm4345b1-bt
           - brcm,bcm20702a1
           - brcm,bcm4329-bt
           - brcm,bcm4330-bt
