@@ -17,8 +17,20 @@
 	chassis-type = "handset";
 
 	aliases {
+		bluetooth0 = &bluetooth;
+		serial1 = &serial1;
+		wifi0 = &wifi0;
 		spi2 = &spi2;
 		touchscreen0 = &touchscreen;
+	};
+
+	/* Wi-Fi REG_ON is D2186 GPIO 10 (ADT uart4/wlan function-reg_on). */
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&pmu_gpio 10 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <100000>;
 	};
 
 	gpio-keys {
@@ -71,6 +83,62 @@
 
 &dwi_bl {
 	apple,led-driver = <&backlight_driver>;
+};
+
+&pcie_dart1 {
+	status = "okay";
+};
+
+/*
+ * The BCM4345 on root port 1 (ADT apcie/pci-bridge1): PERST# GPIO 77,
+ * DEVICE_WAKE GPIO 200, Gen1. Port 0 has nothing attached. CLKREQ#
+ * (GPIO 41) is not described, as on the T7001 and mini 4.
+ */
+&pcie {
+	/* ADT dart-apcie1 vm-offset and vm-size; SID 0 */
+	iommu-map = <0x100 &pcie_dart1 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	status = "okay";
+
+	pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		reset-gpios = <&pinctrl 77 GPIO_ACTIVE_LOW>;
+		max-link-speed = <1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,43ab";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl 200 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+			brcm,board-type = "apple,bacchus";
+			brcm,ccode-map-trivial;
+		};
+	};
+};
+
+/*
+ * The BCM4345B1's Bluetooth on UART1, from the ADT uart1/bluetooth node:
+ * power enable on D2186 GPIO 8, BT_WAKE on GPIO 50. m1n1 adds the device
+ * address. Starts at 115,200 baud; the ADT allows 3 Mbit/s.
+ */
+&serial1 {
+	pinctrl-0 = <&uart1_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "apple,n102-bcm4345b1-bt";
+		current-speed = <115200>;
+		shutdown-gpios = <&pmu_gpio 8 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl 50 GPIO_ACTIVE_HIGH>;
+		apple,wlan = <&wifi0>;
+	};
 };
 
 &framebuffer0 {
@@ -130,6 +198,14 @@
 		reg = <0x74>;
 		#address-cells = <1>;
 		#size-cells = <1>;
+
+		pmu_gpio: gpio {
+			compatible = "apple,d2186-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			/* Only Bluetooth (8) and Wi-Fi (10) REG_ON are used; the others stay as iBoot left them. */
+			gpio-reserved-ranges = <0 8>, <9 1>, <11 10>;
+		};
 
 		touch_core: regulator-touch-core {
 			compatible = "apple,d2186-touch-core-regulator";
