@@ -67,6 +67,9 @@ patternProperties:
   "^backlight(@[0-9a-f]+)?$":
     $ref: /schemas/leds/backlight/apple,pmic-bl.yaml
 
+  "^adc(@[0-9a-f]+)?$":
+    $ref: /schemas/iio/adc/apple,d2186-adc.yaml
+
   "^rtc(@[0-9a-f]+)?$":
     $ref: /schemas/rtc/apple,pmic-rtc.yaml
 
