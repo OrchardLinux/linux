@@ -45,5 +45,4 @@
 &ans {
 	memory-region = <&ans_firmware>;
 	memory-region-names = "firmware";
-	status = "okay";
 };

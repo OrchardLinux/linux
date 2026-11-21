@@ -47,6 +47,23 @@
 	};
 };
 
+/*
+ * Internal NAND through the ANS1 storage processor. The
+ * boot loader started its firmware and iOS never shuts it down
+ * (no-shutdown in the ADT), so keep its power domain on, as on the A7.
+ */
+&ans {
+	status = "okay";
+};
+
+&ans_mbox {
+	status = "okay";
+};
+
+&ps_ans {
+	apple,always-on;
+};
+
 &framebuffer0 {
 	power-domains = <&ps_disp0 &ps_mipi_dsi>;
 };

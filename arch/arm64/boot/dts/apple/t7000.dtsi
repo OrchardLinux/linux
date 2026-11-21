@@ -173,6 +173,7 @@
 				"recv-empty", "recv-not-empty";
 			#mbox-cells = <0>;
 			power-domains = <&ps_ans>;
+			status = "disabled";
 		};
 
 		serial0: serial@20a0c0000 {
