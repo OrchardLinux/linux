@@ -65,9 +65,8 @@
 
 	/*
 	 * Design capacity (1080 mAh) and shutdown voltage (3400 mV) come from
-	 * the board's firmware device tree. The OCV curve is an approximate
-	 * 4.35 V Li-ion profile anchored at 3400 mV = 0% until measured on
-	 * hardware.
+	 * the board's firmware device tree (battery-family 6). The OCV curve
+	 * comes from AppleARMPMUCharger battery-data["0006-default"].
 	 */
 	n102_battery: battery {
 		compatible = "simple-battery";
@@ -75,18 +74,20 @@
 		charge-full-design-microamp-hours = <1080000>;
 		voltage-min-design-microvolt = <3400000>;
 		voltage-max-design-microvolt = <4350000>;
+		factory-internal-resistance-micro-ohms = <200000>;
 		ocv-capacity-celsius = <20>;
-		ocv-capacity-table-0 = <4350000 100>,
-				       <4220000 90>,
-				       <4100000 80>,
-				       <3990000 70>,
-				       <3900000 60>,
-				       <3840000 50>,
-				       <3800000 40>,
-				       <3770000 30>,
-				       <3740000 20>,
-				       <3680000 10>,
-				       <3580000 5>,
+		ocv-capacity-table-0 = <4275000 99>,
+				       <4176000 90>,
+				       <4075000 80>,
+				       <3970000 70>,
+				       <3897000 60>,
+				       <3835000 50>,
+				       <3797000 40>,
+				       <3771000 30>,
+				       <3741000 20>,
+				       <3689000 10>,
+				       <3669000 5>,
+				       <3460000 1>,
 				       <3400000 0>;
 	};
 };
