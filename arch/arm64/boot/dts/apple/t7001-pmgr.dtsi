@@ -101,6 +101,12 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dwi";
+		/*
+		 * Carries the voltage requests to the PMIC: with it off, the GPU
+		 * rail never comes up. The boot chain leaves it on; nothing on
+		 * T7001 holds it, unlike the T7000 handhelds' backlight.
+		 */
+		apple,always-on;
 	};
 
 	ps_gpio: power-controller@20128 {
