@@ -617,6 +617,22 @@ config ADI_AXI_ADC
 	  To compile this driver as a module, choose M here: the
 	  module will be called adi-axi-adc.
 
+config APPLE_D2186_ADC
+	tristate "Apple D2186 PMIC ADC driver"
+	depends on MFD_SIMPLE_MFD_I2C
+	help
+	  Say Y or M here to build support for the 12-bit housekeeping ADC
+	  in the Dialog D2186 PMIC used in Apple A8 devices such as the
+	  iPod touch 6 (N102).
+
+	  The driver accesses the ADC through the parent Apple I2C PMIC
+	  regmap using serialized polled conversions and exposes battery
+	  voltage, system voltage, USB bus voltage, charge current, USB
+	  input current and battery thermistor temperature channels.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called apple-d2186-adc.
+
 config APPLE_ORION_VBUS
 	tristate "Apple Orion Bellatrix Lightning VBUS ADC"
 	depends on I2C && OF
