@@ -605,7 +605,13 @@ pvr_load_gpu_id(struct pvr_device *pvr_dev)
 	struct pvr_gpu_id *gpu_id = &pvr_dev->gpu_id;
 
 	if (!pvr_gpuid_override || !pvr_gpuid_override[0]) {
-		pvr_gpuid_decode_reg(pvr_dev, gpu_id);
+		/* An Apple chip may read its ID its own way */
+		int err = pvr_apple_read_gpu_id(pvr_dev, gpu_id);
+
+		if (err == -ENOENT)
+			pvr_gpuid_decode_reg(pvr_dev, gpu_id);
+		else if (err)
+			return err;
 	} else {
 		drm_warn(from_pvr_device(pvr_dev),
 			 "Using custom GPU ID (BVNC) provided by the user!");

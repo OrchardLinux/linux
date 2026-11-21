@@ -1250,7 +1250,13 @@ static_assert(ARRAY_SIZE(pvr_apple_heaps) == ARRAY_SIZE(pvr_heaps));
 
 static const struct drm_pvr_heap *pvr_device_heaps(const struct pvr_device *pvr_dev)
 {
-	return pvr_device_is_apple(pvr_dev) ? pvr_apple_heaps : pvr_heaps;
+	const struct drm_pvr_heap *heaps;
+
+	if (!pvr_device_is_apple(pvr_dev))
+		return pvr_heaps;
+	/* A chip may lay its heaps out as its firmware does */
+	heaps = pvr_apple_chip_heaps(pvr_dev);
+	return heaps ?: pvr_apple_heaps;
 }
 
 int

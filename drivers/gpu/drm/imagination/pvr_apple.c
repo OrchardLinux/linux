@@ -2126,6 +2126,34 @@ void pvr_apple_device_info_init(struct pvr_device *pvr_dev)
 }
 
 /**
+ * pvr_apple_read_gpu_id() - Read the GPU ID the chip's own way
+ * @pvr_dev: Target device, powered.
+ * @gpu_id: Where the ID goes.
+ *
+ * Return: 0, -%ENOENT for a chip whose ID is read from the Rogue registers
+ * as on any Rogue core, or another negative error.
+ */
+int pvr_apple_read_gpu_id(struct pvr_device *pvr_dev, struct pvr_gpu_id *gpu_id)
+{
+	const struct pvr_apple_chip *chip = pvr_dev->device_data->apple_chip;
+
+	if (!pvr_device_is_apple(pvr_dev) || !chip->read_gpu_id)
+		return -ENOENT;
+	return chip->read_gpu_id(to_apple(pvr_dev), gpu_id);
+}
+
+/**
+ * pvr_apple_chip_heaps() - The chip's own userspace heaps
+ * @pvr_dev: Target device.
+ *
+ * Return: the chip's heap table, or %NULL for powervr's Apple heaps.
+ */
+const struct drm_pvr_heap *pvr_apple_chip_heaps(const struct pvr_device *pvr_dev)
+{
+	return pvr_dev->device_data->apple_chip->heaps;
+}
+
+/**
  * pvr_apple_takes_jobs() - Whether the chip's firmware is given jobs
  * @pvr_dev: Target device.
  *

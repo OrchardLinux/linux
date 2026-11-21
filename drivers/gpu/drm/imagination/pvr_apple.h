@@ -14,7 +14,9 @@
 
 struct dentry;
 struct dma_fence;
+struct drm_pvr_heap;
 struct pvr_apple_chip;
+struct pvr_gpu_id;
 struct pvr_context;
 struct pvr_device;
 struct pvr_job;
@@ -168,6 +170,8 @@ int pvr_apple_reset(struct pvr_device *pvr_dev);
 int pvr_apple_suspend(struct pvr_device *pvr_dev);
 int pvr_apple_resume(struct pvr_device *pvr_dev);
 void pvr_apple_device_info_init(struct pvr_device *pvr_dev);
+int pvr_apple_read_gpu_id(struct pvr_device *pvr_dev, struct pvr_gpu_id *gpu_id);
+const struct drm_pvr_heap *pvr_apple_chip_heaps(const struct pvr_device *pvr_dev);
 bool pvr_apple_takes_jobs(struct pvr_device *pvr_dev);
 bool pvr_apple_free_list_has_pages(struct pvr_device *pvr_dev);
 u32 pvr_apple_stream_musthave(struct pvr_device *pvr_dev, enum pvr_stream_type type,
@@ -208,6 +212,14 @@ static inline int pvr_apple_reset(struct pvr_device *pvr_dev) { return -ENODEV; 
 static inline int pvr_apple_suspend(struct pvr_device *pvr_dev) { return 0; }
 static inline int pvr_apple_resume(struct pvr_device *pvr_dev) { return 0; }
 static inline void pvr_apple_device_info_init(struct pvr_device *pvr_dev) {}
+static inline int pvr_apple_read_gpu_id(struct pvr_device *pvr_dev, struct pvr_gpu_id *gpu_id)
+{
+	return -ENOENT;
+}
+static inline const struct drm_pvr_heap *pvr_apple_chip_heaps(const struct pvr_device *pvr_dev)
+{
+	return NULL;
+}
 static inline bool pvr_apple_takes_jobs(struct pvr_device *pvr_dev) { return false; }
 static inline bool pvr_apple_free_list_has_pages(struct pvr_device *pvr_dev) { return true; }
 static inline u32 pvr_apple_stream_musthave(struct pvr_device *pvr_dev,

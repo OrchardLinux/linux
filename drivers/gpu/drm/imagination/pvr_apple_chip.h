@@ -220,6 +220,11 @@ struct pvr_apple {
  * @write_geom: Write geometry job @seq and its work-ring entry.
  * @write_frag: Write fragment job @seq and its work-ring entry.
  * @report_hang: Log what else the firmware recorded about a job that timed out.
+ * @heaps: The userspace heaps (DRM_PVR_HEAP_*), if not powervr's Apple heaps
+ *	below 2^38. Optional.
+ * @read_gpu_id: Read the GPU's ID (BVNC) the chip's own way, with the core
+ *	powered by @boot. Optional: the Rogue registers are read as on any
+ *	Rogue core.
  *
  * The functions from @kick to @write_frag are for a firmware that takes one
  * command per engine at a time from a fixed place, named by the work ring's
@@ -277,6 +282,8 @@ struct pvr_apple_chip {
 	unsigned int gate_off_ms;
 	/* With the firmware's interrupt taken: microseconds between checks while jobs are pending */
 	unsigned int irq_poll_us;
+	const struct drm_pvr_heap *heaps;
+	int (*read_gpu_id)(struct pvr_apple *apple, struct pvr_gpu_id *gpu_id);
 
 	int (*init)(struct pvr_apple *apple);
 	int (*boot)(struct pvr_apple *apple);
