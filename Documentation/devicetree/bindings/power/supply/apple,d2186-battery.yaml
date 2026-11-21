@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/apple,d2186-battery.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple D2186 PMIC battery and charger monitor
+
+maintainers:
+  - Berkay Kösebay <brkosebay@users.noreply.github.com>
+
+description: |
+  Devices such as the Apple iPod touch 6 (N102) have no dedicated fuel-gauge
+  IC. Battery telemetry is sampled through the Dialog D2186 PMIC housekeeping
+  ADC and charging state is read from the PMIC status registers (0x60..0x6d)
+  through the parent Apple I2C PMIC regmap.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  compatible:
+    const: apple,d2186-battery
+
+  io-channels:
+    minItems: 1
+    maxItems: 5
+
+  io-channel-names:
+    minItems: 1
+    maxItems: 5
+    items:
+      enum:
+        - vbat
+        - ich
+        - tbat
+        - vbus
+        - ibus
+
+  monitored-battery: true
+
+required:
+  - compatible
+  - io-channels
+  - io-channel-names
+
+additionalProperties: false
+
+examples:
+  - |
+    bat: battery {
+        compatible = "simple-battery";
+        device-chemistry = "lithium-ion";
+        charge-full-design-microamp-hours = <1080000>;
+        voltage-min-design-microvolt = <3400000>;
+        voltage-max-design-microvolt = <4350000>;
+        ocv-capacity-celsius = <20>;
+        ocv-capacity-table-0 = <4350000 100>, <3840000 50>, <3400000 0>;
+    };
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        pmic@74 {
+            compatible = "apple,adi-pmic", "apple,i2c-pmic";
+            reg = <0x74>;
+            #address-cells = <1>;
+            #size-cells = <1>;
+
+            pmu_adc: adc@500 {
+                compatible = "apple,d2186-adc";
+                reg = <0x500 0x24>;
+                #io-channel-cells = <1>;
+            };
+
+            battery {
+                compatible = "apple,d2186-battery";
+                monitored-battery = <&bat>;
+                io-channels = <&pmu_adc 4>,
+                              <&pmu_adc 1>,
+                              <&pmu_adc 2>,
+                              <&pmu_adc 15>,
+                              <&pmu_adc 9>;
+                io-channel-names = "vbat", "ich", "tbat", "vbus", "ibus";
+            };
+        };
+    };

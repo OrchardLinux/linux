@@ -88,6 +88,9 @@ patternProperties:
   "^adc(@[0-9a-f]+)?$":
     $ref: /schemas/iio/adc/apple,d2186-adc.yaml
 
+  "^battery(@[0-9a-f]+)?$":
+    $ref: /schemas/power/supply/apple,d2186-battery.yaml
+
   "^rtc(@[0-9a-f]+)?$":
     $ref: /schemas/rtc/apple,pmic-rtc.yaml
 
