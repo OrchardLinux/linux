@@ -218,6 +218,63 @@ struct s8003_layout {
 	u8 shared[S8003_OBJECTS];	/* in the shared memory, not the root */
 };
 
+/* An object of the root or shared memory and its size, in the order Apple's kext packs them */
+struct s8003_object_size {
+	u8 object;
+	bool shared;
+	u32 size;
+};
+
+struct pvr_apple_s8003;
+struct s8003_vm;
+
+/*
+ * What differs between the chips that run this firmware: sizes, counts, and
+ * the steps whose structure differs. The A9's values are the constants above;
+ * a chip's start, jobs and VMs go through the same functions otherwise.
+ */
+struct s8003_variant {
+	const char *name;
+	u32 page_size;			/* the GPU page size the firmware's tables have */
+	u32 image_size;			/* the unpacked firmware image */
+	u32 root_size, shared_size;	/* the root and shared memory as mapped */
+	u32 root_objects_end;		/* where the root's objects must end */
+	u32 shared_objects_end;		/* where the shared memory's objects must end */
+	const struct s8003_object_size *objects;
+	unsigned int nr_objects;
+	u32 ring_ctl_size;		/* one lane's ring indices */
+	u32 slots;			/* the firmware's slots for VMs */
+	u32 slot_first;			/* the first slot the host may use */
+	unsigned int vm_slots;		/* a VM's slots: 2 (geometry and compute, fragment) or 1 */
+	u32 channel[3];			/* the engines' channels: TA, 3D, CU offsets */
+	bool channels_root;		/* the channels are in the root memory, not the shared */
+	u32 ldr_conf_count;		/* the image's register writes, if a fixed number */
+	bool touch;			/* the firmware needs s8003_touch() */
+	const struct pvr_meta_ldr_target *ldr;
+
+	int (*init)(struct pvr_apple *apple);
+	void (*image_configure)(struct pvr_apple_s8003 *s);
+	int (*map)(struct pvr_apple *apple);
+	void (*unmap)(struct pvr_apple *apple);
+	void (*init_build)(struct pvr_apple *apple, u32 q);
+	void (*channels_init)(struct pvr_apple_s8003 *s);
+	int (*boot)(struct pvr_apple *apple);
+	int (*release)(struct pvr_apple *apple, u32 q);
+	int (*core_off)(struct pvr_apple *apple);
+	void (*idle)(struct pvr_apple *apple);
+	int (*doorbell)(struct pvr_apple *apple, u32 dm);
+	int (*first_command)(struct pvr_apple *apple);
+	int (*vm_map)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
+	void (*vm_put)(struct pvr_apple *apple, struct s8003_vm *vm);
+	void (*vm_unmap)(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx);
+	u32 (*engine_done)(struct pvr_apple *apple, enum pvr_apple_engine engine);
+	int (*prepare_job)(struct pvr_apple *apple, struct pvr_job *job);
+	int (*submit_geom)(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job);
+	int (*submit_frag)(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job);
+	int (*submit_compute)(struct pvr_apple *apple, struct s8003_vm *vm, struct pvr_job *job);
+	void (*report_hang)(struct pvr_apple *apple);
+};
+
 struct s8003_mem {
 	struct pvr_gem_object *obj;
 	u8 *map;
@@ -276,6 +333,7 @@ struct s8003_vm {
 
 struct pvr_apple_s8003 {
 	struct pvr_apple *apple;
+	const struct s8003_variant *v;
 	struct delayed_work drain_work;	/* reads the rings while the firmware runs */
 	struct mutex event_lock;	/* the rings the firmware posts to */
 	ktime_t touched;		/* s8003_touch() */
@@ -358,57 +416,56 @@ static u32 s8003_meta_addr(u64 va)
 	return (lower_32_bits(va) + 0x40000000) | range;
 }
 
-/* Apple's kext packs each group in this order, every object on 64 bytes. */
-static int s8003_layout_plan(struct s8003_layout *layout)
+/* The A9's objects, as Apple's kext packs them */
+static const struct s8003_object_size s8003_objects_a9[] = {
+	{ S8003_INIT, false, 0x1490 },
+	{ S8003_CHANNEL, false, 0x990 },
+	{ S8003_CHANNEL + 1, false, 0x8e0 },
+	{ S8003_CHANNEL + 2, false, 0x8c0 },
+	{ S8003_POLICY, false, 0x938 },
+	{ 0x4b, false, 0x28 },
+	{ 0x4c, false, 8 },
+	{ S8003_PLATFORM, false, 0x78c },
+	{ 0x4e, false, 0x84 },
+	{ S8003_CONTROL, true, 0x2058 },
+	{ S8003_EVENT_CTL, true, S8003_RING_CTL_SIZE },
+	{ S8003_LOG_CTL, true, 4 * S8003_RING_CTL_SIZE },
+	{ S8003_STATS_CTL, true, S8003_RING_CTL_SIZE },
+	{ S8003_TRACE_CTL, true, S8003_RING_CTL_SIZE },
+	{ S8003_EVENTS, true, 0x2c00 },
+	{ S8003_LOGS, true, 0xb000 },
+	{ 0x4f, true, 0x36000 },
+	{ S8003_STATS, true, 0x2c00 },
+	{ S8003_TRACE, true, 0x2400 },
+	{ S8003_DC_CTL, true, S8003_RING_CTL_SIZE },
+	{ S8003_DC_RING, true, 0x1400 },
+	{ S8003_WORK_CTL, true, S8003_RING_CTL_SIZE },
+	{ S8003_WORK_CTL + 4, true, S8003_RING_CTL_SIZE },
+	{ S8003_WORK_CTL + 8, true, S8003_RING_CTL_SIZE },
+	{ S8003_WORK_RING, true, 0x1400 },
+	{ S8003_WORK_RING + 4, true, 0x1400 },
+	{ S8003_WORK_RING + 8, true, 0x1400 },
+	{ 0x5c, true, 8 },
+	{ 0x85, true, 0x400 },
+	{ 0x84, true, 0x400 },
+	{ S8003_MMU_ROOT, true, 0x800 },
+};
+
+/* Apple's kext packs each group in the variant's order, every object on 64 bytes. */
+static int s8003_layout_plan(const struct s8003_variant *v, struct s8003_layout *layout)
 {
-	static const struct {
-		u8 object;
-		bool shared;
-		u32 size;
-	} objects[] = {
-		{ S8003_INIT, false, 0x1490 },
-		{ S8003_CHANNEL, false, 0x990 },
-		{ S8003_CHANNEL + 1, false, 0x8e0 },
-		{ S8003_CHANNEL + 2, false, 0x8c0 },
-		{ S8003_POLICY, false, 0x938 },
-		{ 0x4b, false, 0x28 },
-		{ 0x4c, false, 8 },
-		{ S8003_PLATFORM, false, 0x78c },
-		{ 0x4e, false, 0x84 },
-		{ S8003_CONTROL, true, 0x2058 },
-		{ S8003_EVENT_CTL, true, S8003_RING_CTL_SIZE },
-		{ S8003_LOG_CTL, true, 4 * S8003_RING_CTL_SIZE },
-		{ S8003_STATS_CTL, true, S8003_RING_CTL_SIZE },
-		{ S8003_TRACE_CTL, true, S8003_RING_CTL_SIZE },
-		{ S8003_EVENTS, true, 0x2c00 },
-		{ S8003_LOGS, true, 0xb000 },
-		{ 0x4f, true, 0x36000 },
-		{ S8003_STATS, true, 0x2c00 },
-		{ S8003_TRACE, true, 0x2400 },
-		{ S8003_DC_CTL, true, S8003_RING_CTL_SIZE },
-		{ S8003_DC_RING, true, 0x1400 },
-		{ S8003_WORK_CTL, true, S8003_RING_CTL_SIZE },
-		{ S8003_WORK_CTL + 4, true, S8003_RING_CTL_SIZE },
-		{ S8003_WORK_CTL + 8, true, S8003_RING_CTL_SIZE },
-		{ S8003_WORK_RING, true, 0x1400 },
-		{ S8003_WORK_RING + 4, true, 0x1400 },
-		{ S8003_WORK_RING + 8, true, 0x1400 },
-		{ 0x5c, true, 8 },
-		{ 0x85, true, 0x400 },
-		{ 0x84, true, 0x400 },
-		{ S8003_MMU_ROOT, true, 0x800 },
-	};
+	const struct s8003_object_size *objects = v->objects;
 	u32 used[2] = {};
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(objects); i++) {
+	for (i = 0; i < v->nr_objects; i++) {
 		u32 offset = ALIGN(used[objects[i].shared], 64);
 
 		layout->offset[objects[i].object] = offset;
 		layout->shared[objects[i].object] = objects[i].shared;
 		used[objects[i].shared] = offset + objects[i].size;
 	}
-	return used[0] <= S8003_ROOT_SIZE && used[1] <= S8003_TA_CHANNEL ? 0 : -EINVAL;
+	return used[0] <= v->root_objects_end && used[1] <= v->shared_objects_end ? 0 : -EINVAL;
 }
 
 static u64 s8003_object_va(const struct s8003_layout *layout, u32 object)
@@ -482,12 +539,6 @@ static int s8003_ldr_start_threads(void *data, const u32 *words, u32 count)
 	s->thread_pc = words[2];
 	return 0;
 }
-
-static const struct pvr_meta_ldr_target s8003_ldr_target = {
-	.mem = s8003_ldr_mem,
-	.config = s8003_ldr_config,
-	.start_threads = s8003_ldr_start_threads,
-};
 
 /*
  * The bootloader's configuration: the segment MMU's view of the image (code,
@@ -733,7 +784,8 @@ err_fini:
 	return err;
 }
 
-static void pvr_apple_s8003_fini(struct pvr_apple *apple)
+/* The registers' windows in the kernel VM */
+static void s8003_unmap(struct pvr_apple *apple)
 {
 	struct pvr_vm_context *vm_ctx = apple->pvr_dev->kernel_vm_ctx;
 	struct pvr_apple_s8003 *s = apple->chip_data;
@@ -743,6 +795,13 @@ static void pvr_apple_s8003_fini(struct pvr_apple *apple)
 		pvr_vm_unmap_io(vm_ctx, S8003_PIO_VA + S8003_PIO_AIC, S8003_PIO_SIZE);
 		s->pio_mapped = false;
 	}
+}
+
+static void pvr_apple_s8003_fini(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	s->v->unmap(apple);
 	if (s->park_vm) {
 		pvr_vm_context_put(s->park_vm);
 		s->park_vm = NULL;
@@ -986,7 +1045,7 @@ static int s8003_drain(struct pvr_apple *apple, bool *alive)
 	guard(mutex)(&s->event_lock);
 	for (lane = 0; lane < 4 && !err; lane++)
 		err = s8003_ring_discard(s8003_object(s, S8003_LOG_CTL) +
-					 lane * S8003_RING_CTL_SIZE);
+					 lane * s->v->ring_ctl_size);
 	if (err)
 		return err;
 
@@ -1151,21 +1210,20 @@ static u32 s8003_engine(enum pvr_apple_engine engine)
 	return engine == APPLE_ENGINE_GEOM ? 0 : engine == APPLE_ENGINE_FRAG ? 1 : 2;
 }
 
-static u32 s8003_channel_offset(enum pvr_apple_engine engine)
+static u32 s8003_channel_offset(const struct pvr_apple_s8003 *s, enum pvr_apple_engine engine)
 {
-	static const u32 offset[] = { S8003_TA_CHANNEL, S8003_3D_CHANNEL, S8003_CU_CHANNEL };
-
-	return offset[s8003_engine(engine)];
+	return s->v->channel[s8003_engine(engine)];
 }
 
 static u8 *s8003_channel(struct pvr_apple_s8003 *s, enum pvr_apple_engine engine)
 {
-	return s->shared.map + s8003_channel_offset(engine);
+	return (s->v->channels_root ? s->root.map : s->shared.map) + s8003_channel_offset(s, engine);
 }
 
-static u32 s8003_channel_addr(enum pvr_apple_engine engine)
+static u32 s8003_channel_addr(const struct pvr_apple_s8003 *s, enum pvr_apple_engine engine)
 {
-	return s8003_meta_addr(S8003_SHARED_VA + s8003_channel_offset(engine));
+	return s8003_meta_addr((s->v->channels_root ? S8003_ROOT_VA : S8003_SHARED_VA) +
+			       s8003_channel_offset(s, engine));
 }
 
 /* A channel before its first job: where its parts are, an empty ring */
@@ -1190,11 +1248,11 @@ static void s8003_channel_init(u8 *p, u32 addr, u32 tq, u32 dep)
 static void s8003_channels_init(struct pvr_apple_s8003 *s)
 {
 	s8003_channel_init(s8003_channel(s, APPLE_ENGINE_GEOM),
-			   s8003_channel_addr(APPLE_ENGINE_GEOM), S8003_CH_TQ, S8003_CH_DEP);
+			   s8003_channel_addr(s, APPLE_ENGINE_GEOM), S8003_CH_TQ, S8003_CH_DEP);
 	s8003_channel_init(s8003_channel(s, APPLE_ENGINE_FRAG),
-			   s8003_channel_addr(APPLE_ENGINE_FRAG), S8003_CH_TQ, S8003_CH_DEP);
+			   s8003_channel_addr(s, APPLE_ENGINE_FRAG), S8003_CH_TQ, S8003_CH_DEP);
 	s8003_channel_init(s8003_channel(s, APPLE_ENGINE_COMPUTE),
-			   s8003_channel_addr(APPLE_ENGINE_COMPUTE), S8003_CU_TQ, S8003_CU_DEP);
+			   s8003_channel_addr(s, APPLE_ENGINE_COMPUTE), S8003_CU_TQ, S8003_CU_DEP);
 }
 
 /* How often s8003_touch() runs while the firmware works for the host */
@@ -1275,7 +1333,8 @@ static void pvr_apple_s8003_events(struct pvr_apple *apple)
 	if (!READ_ONCE(apple->booted) || !s->shared.map)
 		return;
 	/* An eighth early, so that a check every S8003_TOUCH_US always touches */
-	if (ktime_us_delta(now, READ_ONCE(s->touched)) + S8003_TOUCH_US / 8 >= S8003_TOUCH_US) {
+	if (s->v->touch &&
+	    ktime_us_delta(now, READ_ONCE(s->touched)) + S8003_TOUCH_US / 8 >= S8003_TOUCH_US) {
 		WRITE_ONCE(s->touched, now);
 		s8003_touch(s);
 	}
@@ -1300,7 +1359,7 @@ static u32 s8003_submitted(struct pvr_apple *apple, enum pvr_apple_engine engine
  * end of the pointer ring and that of the last job submitted. With the
  * firmware off nothing is in flight.
  */
-static u32 pvr_apple_s8003_engine_done(struct pvr_apple *apple, enum pvr_apple_engine engine)
+static u32 s8003_engine_done(struct pvr_apple *apple, enum pvr_apple_engine engine)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
 	u32 latest = s8003_submitted(apple, engine);
@@ -1325,6 +1384,13 @@ static u32 pvr_apple_s8003_engine_done(struct pvr_apple *apple, enum pvr_apple_e
 			return done - 1;
 	}
 	return done;
+}
+
+static u32 pvr_apple_s8003_engine_done(struct pvr_apple *apple, enum pvr_apple_engine engine)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	return s->v->engine_done(apple, engine);
 }
 
 static u32 s8003_done_poll(struct pvr_apple *apple, enum pvr_apple_engine engine)
@@ -1401,7 +1467,7 @@ static int s8003_device_control(struct pvr_apple *apple, const u32 (*cmd)[2], un
 	WRITE_ONCE(*(__le32 *)(ctl + S8003_RING_PRODUCER), cpu_to_le32(target));
 	mb();	/* the index is in memory before the firmware is told */
 
-	err = s8003_doorbell(apple, ROGUE_CR_MTS_SCHEDULE_DM_DM0);
+	err = s->v->doorbell(apple, ROGUE_CR_MTS_SCHEDULE_DM_DM0);
 	if (err)
 		return err;
 	return read_poll_timeout(s8003_ring_consumer, consumer, consumer == target, 100,
@@ -1423,18 +1489,18 @@ static u64 s8003_slot_tag_bump(struct pvr_apple_s8003 *s, u32 slot)
 	return (u32)(next - (tag + S8003_TAG_CATALOGUE)) / S8003_TAG_CATALOGUE;
 }
 
-/* Point a pair of slots at a page-table root (0: at none) under @tag */
+/* Point a VM's slots (a pair, or one) at a page-table root (0: at none) under @tag */
 static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, u32 tag)
 {
-	const u32 cmd[2][2] = { { S8003_DC_SLOT, slot[1] }, { S8003_DC_SLOT, slot[0] } };
 	struct pvr_apple_s8003 *s = apple->chip_data;
+	unsigned int e, n = s->v->vm_slots;
+	const u32 cmd[2][2] = { { S8003_DC_SLOT, slot[n - 1] }, { S8003_DC_SLOT, slot[0] } };
 	unsigned long flags;
 	u64 steps = 0, total;
-	unsigned int e;
 	int err;
 
 	spin_lock_irqsave(&s->tag_lock, flags);
-	for (e = 0; e < 2; e++) {
+	for (e = 0; e < n; e++) {
 		__set_bit(slot[e], s->loading);
 		put64(s8003_object(s, S8003_MMU_ROOT) + 8 * slot[e], root);
 		put32(s8003_object(s, S8003_TAG_HOST) + 4 * slot[e], tag);
@@ -1442,11 +1508,11 @@ static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, 
 	}
 	spin_unlock_irqrestore(&s->tag_lock, flags);
 
-	err = s8003_device_control(apple, cmd, 2);
+	err = s8003_device_control(apple, cmd, n);
 	if (err)
 		dev_err(apple_dev(apple), "GFX firmware slot load failed: %d\n", err);
 	/* The firmware must copy the tag we held stable while loading the root. */
-	for (e = 0; e < 2 && !err; e++) {
+	for (e = 0; e < n && !err; e++) {
 		u32 seen = get32(s8003_object(s, S8003_TAG_SEEN) + 4 * slot[e]);
 
 		if (seen != tag) {
@@ -1458,7 +1524,7 @@ static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, 
 	}
 	/* The attach holds submit_lock: deferred flushes precede the VM's job. */
 	spin_lock_irqsave(&s->tag_lock, flags);
-	for (e = 0; e < 2; e++) {
+	for (e = 0; e < n; e++) {
 		__clear_bit(slot[e], s->loading);
 		if (test_bit(slot[e], s->bump_pending)) {
 			steps += s8003_slot_tag_bump(s, slot[e]);
@@ -1476,7 +1542,7 @@ static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, 
 }
 
 /*
- * The slot pair of a VM for this start of the firmware. Slots are handed out
+ * The slots of a VM for this start of the firmware. Slots are handed out
  * in turn, so that one a VM gave back is used again as late as possible; if
  * it was left on the park tables (pvr_apple_s8003_vm_fini()) it is emptied
  * first, as Apple's kext does when an address space goes.
@@ -1484,33 +1550,37 @@ static int s8003_slots_load(struct pvr_apple *apple, const u32 *slot, u64 root, 
 static int s8003_vm_attach(struct pvr_apple *apple, struct s8003_vm *vm)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
+	const struct s8003_variant *v = s->v;
+	bool parked = false;
 	unsigned int e;
 	int err = 0;
 
 	lockdep_assert_held(&apple->submit_lock);
 	if (vm->attached == s->gen)
 		return 0;
-	for (e = 2; e-- > 0 && !vm->slot[e];) {
-		u32 slot = find_next_zero_bit(s->slots, S8003_SLOTS, s->next_slot);
+	for (e = v->vm_slots; e-- > 0 && !vm->slot[e];) {
+		u32 slot = find_next_zero_bit(s->slots, v->slots, s->next_slot);
 
-		if (slot >= S8003_SLOTS)
-			slot = find_next_zero_bit(s->slots, S8003_SLOTS, S8003_SLOT_FIRST);
-		if (slot >= S8003_SLOTS) {
+		if (slot >= v->slots)
+			slot = find_next_zero_bit(s->slots, v->slots, v->slot_first);
+		if (slot >= v->slots) {
 			if (vm->slot[1])
 				__clear_bit(vm->slot[1], s->slots);
 			vm->slot[1] = 0;
 			return -EBUSY;
 		}
 		__set_bit(slot, s->slots);
-		s->next_slot = slot + 1 < S8003_SLOTS ? slot + 1 : S8003_SLOT_FIRST;
+		s->next_slot = slot + 1 < v->slots ? slot + 1 : v->slot_first;
 		vm->slot[e] = slot;
 	}
 	/* No job runs while a slot changes */
 	err = pvr_apple_wait_idle(apple, S8003_JOB_TIMEOUT_US);
-	if (!err && (test_bit(vm->slot[0], s->parked) || test_bit(vm->slot[1], s->parked))) {
+	for (e = 0; e < v->vm_slots; e++)
+		parked |= test_bit(vm->slot[e], s->parked);
+	if (!err && parked) {
 		err = s8003_slots_load(apple, vm->slot, 0, 0);
-		__clear_bit(vm->slot[0], s->parked);
-		__clear_bit(vm->slot[1], s->parked);
+		for (e = 0; e < v->vm_slots; e++)
+			__clear_bit(vm->slot[e], s->parked);
 	}
 	if (!err)
 		err = s8003_slots_load(apple, vm->slot,
@@ -1535,7 +1605,7 @@ static void pvr_apple_s8003_mmu_flush(struct pvr_apple *apple)
 	if (!s->shared.map)
 		return;
 	spin_lock_irqsave(&s->tag_lock, flags);
-	for (slot = S8003_SLOT_FIRST; slot < S8003_SLOTS; slot++) {
+	for (slot = s->v->slot_first; slot < s->v->slots; slot++) {
 		if (test_bit(slot, s->loading))
 			__set_bit(slot, s->bump_pending);
 		else
@@ -1550,14 +1620,22 @@ static void pvr_apple_s8003_mmu_flush(struct pvr_apple *apple)
 				    "MMU tag steps-past=%llu total=%llu\n", steps, total);
 }
 
+/* The PM reaches its sets through the job's slot, at the firmware's addresses */
+static int s8003_vm_map(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	if (!s->pmsets.obj)
+		return -ENODEV;
+	return pvr_vm_map_reserved(vm_ctx, s->pmsets.obj, S8003_PM_SETS_VA, s->pmsets.size);
+}
+
 static int pvr_apple_s8003_vm_init(struct pvr_apple *apple, struct pvr_vm_context *vm_ctx)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
 	struct s8003_vm *vm;
 	int err;
 
-	if (!s->pmsets.obj)
-		return -ENODEV;
 	vm = kzalloc(sizeof(*vm), GFP_KERNEL);
 	if (!vm)
 		return -ENOMEM;
@@ -1565,8 +1643,7 @@ static int pvr_apple_s8003_vm_init(struct pvr_apple *apple, struct pvr_vm_contex
 	mutex_init(&vm->prepare_lock);
 	vm->pm[0].set = -1;
 	vm->pm[1].set = -1;
-	/* The PM reaches its sets through the job's slot, at the firmware's addresses */
-	err = pvr_vm_map_reserved(vm_ctx, s->pmsets.obj, S8003_PM_SETS_VA, s->pmsets.size);
+	err = s->v->vm_map(apple, vm_ctx);
 	if (!err)
 		err = xa_err(xa_store(&s->vms, (unsigned long)vm_ctx, vm, GFP_KERNEL));
 	if (err)
@@ -1675,8 +1752,8 @@ static void pvr_apple_s8003_vm_fini(struct pvr_apple *apple, struct pvr_vm_conte
 	    !pvr_apple_wait_idle(apple, S8003_JOB_TIMEOUT_US) &&
 	    !s8003_slots_load(apple, vm->slot, pvr_vm_get_page_table_root_addr(s->park_vm),
 			      S8003_TAG_PARK)) {
-		__set_bit(vm->slot[0], s->parked);
-		__set_bit(vm->slot[1], s->parked);
+		for (e = 0; e < s->v->vm_slots; e++)
+			__set_bit(vm->slot[e], s->parked);
 	}
 	if (s->pm_last == vm)
 		s->pm_last = NULL;
@@ -1686,10 +1763,21 @@ static void pvr_apple_s8003_vm_fini(struct pvr_apple *apple, struct pvr_vm_conte
 	for (e = 0; e < 2; e++) {
 		if (vm->slot[e])
 			__clear_bit(vm->slot[e], s->slots);
-		s8003_pm_put(s, &vm->pm[e]);
 	}
+	s->v->vm_put(apple, vm);
 	mutex_unlock(&apple->submit_lock);
+	if (s->v->vm_unmap)
+		s->v->vm_unmap(apple, vm_ctx);
 	kfree(vm);
+}
+
+/* A VM's PM sets go with it */
+static void s8003_vm_put(struct pvr_apple *apple, struct s8003_vm *vm)
+{
+	unsigned int e;
+
+	for (e = 0; e < 2; e++)
+		s8003_pm_put(apple->chip_data, &vm->pm[e]);
 }
 
 static u64 s8003_pm_set_va(const struct s8003_pm *pm, u32 page)
@@ -2224,7 +2312,7 @@ static int s8003_publish(struct pvr_apple *apple, enum pvr_apple_engine engine, 
 	entry = ring + start * S8003_DC_SIZE;
 	memset(entry, 0, S8003_DC_SIZE);
 	put32(entry, fw_engine);
-	put32(entry + 4, s8003_channel_addr(engine));
+	put32(entry + 4, s8003_channel_addr(s, engine));
 	put32(entry + 8, end);
 	wmb();
 	put32(p + S8003_CH_CTL + S8003_CH_CTL_HOST, end);
@@ -2524,10 +2612,10 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 			pm_record = true;
 	}
 	s8003_fill_ta(p + s8003_slot_of(seq, false).w, job->cmd, job->hwrt, &rt);
-	s8003_job_write(p, s8003_channel_addr(APPLE_ENGINE_GEOM),
+	s8003_job_write(p, s8003_channel_addr(s, APPLE_ENGINE_GEOM),
 			s8003_object_addr(&s->layout, S8003_CHANNEL),
 			s8003_meta_addr(s8003_pm_set_va(pm, 0)), pm->set + 1, vm->slot[0], false,
-			seq, s8003_channel_addr(APPLE_ENGINE_GEOM) + S8003_CH_STAMP + 4,
+			seq, s8003_channel_addr(s, APPLE_ENGINE_GEOM) + S8003_CH_STAMP + 4,
 			pm_record ? 0 : pm->rec_seq, pm_record);
 	if (pm_record)
 		pm->rec_seq = seq;
@@ -2578,10 +2666,10 @@ static int s8003_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	err = s8003_fill_3d(p + s8003_slot_of(seq, true).w, job->cmd, job->hwrt, &rt);
 	if (err)
 		return s8003_submit_error(apple, vm, "fragment", err, "3D record fill");
-	s8003_job_write(p, s8003_channel_addr(APPLE_ENGINE_FRAG),
+	s8003_job_write(p, s8003_channel_addr(s, APPLE_ENGINE_FRAG),
 			s8003_object_addr(&s->layout, S8003_CHANNEL + 1),
 			s8003_meta_addr(s8003_pm_set_va(pm, 0)), pm->set + 1, vm->slot[1], true, seq,
-			s8003_channel_addr(APPLE_ENGINE_GEOM) + S8003_CH_STAMP + 4, pm->ta_seq, true);
+			s8003_channel_addr(s, APPLE_ENGINE_GEOM) + S8003_CH_STAMP + 4, pm->ta_seq, true);
 	pm->td_seq = seq;
 	WRITE_ONCE(s->set_frag[pm->set], seq);
 	apple->frag_seq = seq;
@@ -2602,7 +2690,7 @@ static int s8003_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, st
 	const struct pvr_apple_g5p_cmd_compute *cmd = job->cmd;
 	const struct pvr_apple_g5p_compute_regs *g = &cmd->g5p;
 	struct pvr_apple_s8003 *s = apple->chip_data;
-	u32 addr = s8003_channel_addr(APPLE_ENGINE_COMPUTE);
+	u32 addr = s8003_channel_addr(s, APPLE_ENGINE_COMPUTE);
 	u32 global = s8003_object_addr(&s->layout, S8003_CHANNEL + 2);
 	u32 w = addr + S8003_CH_W, slot = vm->slot[0], seq;
 	u8 *p = s8003_channel(s, APPLE_ENGINE_COMPUTE);
@@ -2678,17 +2766,17 @@ static int pvr_apple_s8003_submit(struct pvr_apple *apple, struct pvr_job *job)
 	if (err)
 		goto out_unlock;
 	if (job->type == DRM_PVR_JOB_TYPE_GEOMETRY)
-		err = s8003_submit_geom(apple, vm, job);
+		err = s->v->submit_geom(apple, vm, job);
 	else if (job->type == DRM_PVR_JOB_TYPE_FRAGMENT)
-		err = s8003_submit_frag(apple, vm, job);
+		err = s->v->submit_frag(apple, vm, job);
 	else
-		err = s8003_submit_compute(apple, vm, job);
+		err = s->v->submit_compute(apple, vm, job);
 out_unlock:
 	mutex_unlock(&apple->submit_lock);
 	return err;
 }
 
-static void pvr_apple_s8003_report_hang(struct pvr_apple *apple)
+static void s8003_report_hang(struct pvr_apple *apple)
 {
 	static const char *const names[] = { "compute", "geometry", "fragment" };
 	struct pvr_apple_s8003 *s = apple->chip_data;
@@ -2754,8 +2842,9 @@ static void s8003_jobs_reset(struct pvr_apple_s8003 *s)
 	WRITE_ONCE(s->apple->fault, false);
 	memset(s->set_geom, 0, sizeof(s->set_geom));
 	memset(s->set_frag, 0, sizeof(s->set_frag));
-	memset(s->pmsets.map, 0, s->pmsets.size);
-	s8003_channels_init(s);
+	if (s->pmsets.map)
+		memset(s->pmsets.map, 0, s->pmsets.size);
+	s->v->channels_init(s);
 }
 
 /*
@@ -2834,28 +2923,33 @@ static void s8003_irq_init(struct pvr_apple *apple)
 		dev_warn(dev, "firmware interrupt not taken (%d): jobs are polled for\n", err);
 }
 
+static const struct s8003_variant *s8003_variant_of(const struct pvr_apple_chip *chip);
+
 static int pvr_apple_s8003_init(struct pvr_apple *apple)
 {
+	const struct s8003_variant *v = s8003_variant_of(apple->chip);
 	struct device *dev = apple_dev(apple);
 	struct pvr_apple_layout *layout = &apple->layout;
 	struct pvr_apple_s8003 *s;
 	unsigned int i;
 	int err;
 
-	/* The firmware's page tables have 16 KiB pages, as the kernel's must */
-	if (PVR_DEVICE_PAGE_SIZE != SZ_16K)
-		return dev_err_probe(dev, -ENODEV, "the A9 GPU needs a 16 KiB page kernel\n");
+	/* The firmware's page tables have the chip's page size, as the kernel's must */
+	if (PVR_DEVICE_PAGE_SIZE != v->page_size)
+		return dev_err_probe(dev, -ENODEV, "the %s GPU needs a %u KiB page kernel\n",
+				     v->name, v->page_size / SZ_1K);
 
 	s = devm_kzalloc(dev, sizeof(*s), GFP_KERNEL);
 	if (!s)
 		return -ENOMEM;
 	apple->chip_data = s;
 	s->apple = apple;
+	s->v = v;
 	INIT_DELAYED_WORK(&s->drain_work, s8003_drain_work);
 	spin_lock_init(&s->tag_lock);
 	spin_lock_init(&s->set_lock);
 	xa_init(&s->vms);
-	s->next_slot = S8003_SLOT_FIRST;
+	s->next_slot = v->slot_first;
 	err = devm_mutex_init(dev, &s->event_lock);
 	if (err)
 		return err;
@@ -2863,12 +2957,17 @@ static int pvr_apple_s8003_init(struct pvr_apple *apple)
 	err = s8003_parse_dt(apple);
 	if (err)
 		return err;
+	if (v->init) {
+		err = v->init(apple);
+		if (err)
+			return err;
+	}
 	s8003_irq_init(apple);
-	err = s8003_layout_plan(&s->layout);
+	err = s8003_layout_plan(v, &s->layout);
 	if (err)
 		return err;
 
-	s->image = kvzalloc(S8003_IMAGE_SIZE, GFP_KERNEL);
+	s->image = kvzalloc(v->image_size, GFP_KERNEL);
 	if (!s->image)
 		return -ENOMEM;
 	err = devm_add_action_or_reset(dev, s8003_free_image, s->image);
@@ -2878,12 +2977,12 @@ static int pvr_apple_s8003_init(struct pvr_apple *apple)
 	if (err)
 		return err;
 	err = pvr_meta_ldr_process(from_pvr_device(apple->pvr_dev), apple->fw_image,
-				   apple->fw_size, &s8003_ldr_target, s, NULL);
-	if (!err && !s->thread_pc)
+				   apple->fw_size, v->ldr, s, NULL);
+	if (!err && (!s->thread_pc || (v->ldr_conf_count && s->conf_count != v->ldr_conf_count)))
 		err = -EINVAL;
 	if (err)
-		return dev_err_probe(dev, err, "not the A9's GFX firmware image\n");
-	s8003_image_configure(s);
+		return dev_err_probe(dev, err, "not the %s's GFX firmware image\n", v->name);
+	v->image_configure(s);
 
 	apple->heap = &s->idle;
 	for (i = 0; i < APPLE_ENGINES; i++) {
@@ -2903,7 +3002,7 @@ static int pvr_apple_s8003_init(struct pvr_apple *apple)
  * Wake Fender and power the core in state 1, the META held in reset: the
  * Rogue registers answer (the core's ID is read next), no firmware runs.
  */
-static int pvr_apple_s8003_boot(struct pvr_apple *apple)
+static int s8003_boot(struct pvr_apple *apple)
 {
 	int err;
 
@@ -2916,32 +3015,41 @@ static int pvr_apple_s8003_boot(struct pvr_apple *apple)
 	return 0;
 }
 
+static int pvr_apple_s8003_boot(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	return s->v->boot(apple);
+}
+
 static int pvr_apple_s8003_start(struct pvr_apple *apple)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
+	const struct s8003_variant *v = s->v;
 	u32 q = pvr_apple_start_power_state(apple);
 	int err;
 
 	if (!s->shared.obj) {
-		err = s8003_map(apple);
+		err = v->map(apple);
 		if (err)
 			return err;
 	}
 	/* The firmware writes into its image while it runs: start from the copy */
-	memcpy(s->fw.map, s->image, S8003_IMAGE_SIZE);
-	s8003_init_build(apple, q);
+	memcpy(s->fw.map, s->image, v->image_size);
+	v->init_build(apple, q);
 	s8003_jobs_reset(s);
 
-	err = s8003_release(apple, q);
+	err = v->release(apple, q);
 	if (!err)
 		err = s8003_wait_alive(apple);
 	if (!err) {
 		dev_dbg(apple_dev(apple), "GFX firmware is up (power state %u)\n", q);
-		err = s8003_first_command(apple);
+		if (v->first_command)
+			err = v->first_command(apple);
 	}
 	if (err) {
 		/* It must not run on once the kernel VM, its page tables, may go */
-		s8003_core_off(apple);
+		v->core_off(apple);
 		return err;
 	}
 	dev_dbg(apple_dev(apple), "GFX firmware takes commands\n");
@@ -2973,12 +3081,19 @@ static void pvr_apple_s8003_stop(struct pvr_apple *apple, bool recover)
 		cancel_delayed_work_sync(&s->drain_work);
 	if (pm_runtime_status_suspended(apple_dev(apple)))
 		return;
-	s8003_core_off(apple);
+	s->v->core_off(apple);
+}
+
+static void s8003_idle(struct pvr_apple *apple)
+{
+	/* nothing of the firmware's keeps the GPU's power domain on */
 }
 
 static void pvr_apple_s8003_idle(struct pvr_apple *apple)
 {
-	/* nothing of the firmware's keeps the GPU's power domain on */
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	s->v->idle(apple);
 }
 
 static void pvr_apple_s8003_restore_image(struct pvr_apple *apple)
@@ -2991,6 +3106,70 @@ static u32 pvr_apple_s8003_max_power_state(struct pvr_apple *apple)
 	struct pvr_apple_s8003 *s = apple->chip_data;
 
 	return get32(s8003_object(s, S8003_PLATFORM) + 0x710);
+}
+
+static void pvr_apple_s8003_report_hang(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	s->v->report_hang(apple);
+}
+
+static int pvr_apple_s8003_prepare_job(struct pvr_apple *apple, struct pvr_job *job)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	return s->v->prepare_job(apple, job);
+}
+
+static const struct pvr_meta_ldr_target s8003_ldr_target = {
+	.mem = s8003_ldr_mem,
+	.config = s8003_ldr_config,
+	.start_threads = s8003_ldr_start_threads,
+};
+
+/* The A9: its values are the S8003_* constants, its steps the s8003_* functions */
+static const struct s8003_variant s8003_variant_a9 = {
+	.name = "A9",
+	.page_size = SZ_16K,
+	.image_size = S8003_IMAGE_SIZE,
+	.root_size = S8003_ROOT_SIZE,
+	.shared_size = S8003_SHARED_SIZE,
+	.root_objects_end = S8003_ROOT_SIZE,
+	.shared_objects_end = S8003_TA_CHANNEL,
+	.objects = s8003_objects_a9,
+	.nr_objects = ARRAY_SIZE(s8003_objects_a9),
+	.ring_ctl_size = S8003_RING_CTL_SIZE,
+	.slots = S8003_SLOTS,
+	.slot_first = S8003_SLOT_FIRST,
+	.vm_slots = 2,
+	.channel = { S8003_TA_CHANNEL, S8003_3D_CHANNEL, S8003_CU_CHANNEL },
+	.touch = true,
+	.ldr = &s8003_ldr_target,
+	.image_configure = s8003_image_configure,
+	.map = s8003_map,
+	.unmap = s8003_unmap,
+	.init_build = s8003_init_build,
+	.channels_init = s8003_channels_init,
+	.boot = s8003_boot,
+	.release = s8003_release,
+	.core_off = s8003_core_off,
+	.idle = s8003_idle,
+	.doorbell = s8003_doorbell,
+	.first_command = s8003_first_command,
+	.vm_map = s8003_vm_map,
+	.vm_put = s8003_vm_put,
+	.engine_done = s8003_engine_done,
+	.prepare_job = s8003_prepare_job,
+	.submit_geom = s8003_submit_geom,
+	.submit_frag = s8003_submit_frag,
+	.submit_compute = s8003_submit_compute,
+	.report_hang = s8003_report_hang,
+};
+
+static const struct s8003_variant *s8003_variant_of(const struct pvr_apple_chip *chip)
+{
+	return &s8003_variant_a9;
 }
 
 const struct pvr_apple_chip pvr_apple_chip_s8003 = {
@@ -3016,7 +3195,7 @@ const struct pvr_apple_chip pvr_apple_chip_s8003 = {
 	.fini = pvr_apple_s8003_fini,
 	.restore_image = pvr_apple_s8003_restore_image,
 	.report_hang = pvr_apple_s8003_report_hang,
-	.prepare_job = s8003_prepare_job,
+	.prepare_job = pvr_apple_s8003_prepare_job,
 	.submit = pvr_apple_s8003_submit,
 	.engine_done = pvr_apple_s8003_engine_done,
 	.max_power_state = pvr_apple_s8003_max_power_state,
