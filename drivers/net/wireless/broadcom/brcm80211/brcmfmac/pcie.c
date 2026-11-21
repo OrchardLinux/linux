@@ -51,6 +51,7 @@ enum brcmf_pcie_state {
 };
 
 BRCMF_FW_DEF(43602, "brcmfmac43602-pcie");
+BRCMF_FW_CLM_DEF(4345, "brcmfmac4345-pcie");
 BRCMF_FW_DEF(4350, "brcmfmac4350-pcie");
 BRCMF_FW_DEF(4350C, "brcmfmac4350c2-pcie");
 BRCMF_FW_CLM_DEF(4355, "brcmfmac4355-pcie");
@@ -85,6 +86,7 @@ MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.txcap_blob");
 
 static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+	BRCMF_FW_ENTRY(BRCM_CC_4345_CHIP_ID, 0xFFFFFFFF, 4345),
 	BRCMF_FW_ENTRY(BRCM_CC_43465_CHIP_ID, 0xFFFFFFF0, 4366C),
 	BRCMF_FW_ENTRY(BRCM_CC_4350_CHIP_ID, 0x000000FF, 4350C),
 	BRCMF_FW_ENTRY(BRCM_CC_4350_CHIP_ID, 0xFFFFFF00, 4350),
@@ -2091,6 +2093,18 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
 	int ret;
 
 	switch (devinfo->ci->chip) {
+	case BRCM_CC_4345_CHIP_ID:
+		/*
+		 * Apple BCM4345 OTP is shadowed in ChipCommon from 0x800 with
+		 * Apple's records starting at 0x8c0 for 0x172 bytes (0xb9
+		 * 16-bit words). Keep the record optional so a missing Apple
+		 * tuple falls back to the board-type firmware names.
+		 */
+		coreid = BCMA_CORE_CHIPCOMMON;
+		base = 0x8c0;
+		words = 0xb9;
+		optional = true;
+		break;
 	case BRCM_CC_4350_CHIP_ID:
 		/*
 		 * The 40 nm OTP holds (CC_CAP_OTPSIZE + 1) Kbit and is
@@ -2809,6 +2823,7 @@ static const struct dev_pm_ops brcmf_pciedrvr_pm = {
 	}
 
 static const struct pci_device_id brcmf_pcie_devid_table[] = {
+	BRCMF_PCIE_DEVICE(BRCM_PCIE_4345_DEVICE_ID, WCC),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4350_DEVICE_ID, WCC),
 	BRCMF_PCIE_DEVICE_SUB(0x4355, BRCM_PCIE_VENDOR_ID_BROADCOM, 0x4355, WCC),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4354_RAW_DEVICE_ID, WCC),
