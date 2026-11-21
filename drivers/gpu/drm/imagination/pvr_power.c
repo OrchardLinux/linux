@@ -643,8 +643,12 @@ int pvr_power_domains_init(struct pvr_device *pvr_dev)
 
 	domain_count = of_count_phandle_with_args(dev->of_node, "power-domains",
 						  "#power-domain-cells");
+	/* No power-domains property: no domains (the A8 powers itself up) */
+	if (domain_count == -ENOENT)
+		domain_count = 0;
 	if (domain_count < 0) {
 		err = domain_count;
+		drm_err(drm_dev, "cannot count the power domains (%d)\n", err);
 		goto out;
 	}
 

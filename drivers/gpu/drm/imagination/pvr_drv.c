@@ -1431,15 +1431,17 @@ pvr_probe(struct platform_device *plat_dev)
 
 	err = pvr_power_domains_init(pvr_dev);
 	if (err)
-		return err;
+		return dev_err_probe(&plat_dev->dev, err, "power domains\n");
 
 	init_rwsem(&pvr_dev->reset_sem);
 
 	pvr_context_device_init(pvr_dev);
 
 	err = pvr_queue_device_init(pvr_dev);
-	if (err)
+	if (err) {
+		dev_err_probe(&plat_dev->dev, err, "queue init\n");
 		goto err_context_fini;
+	}
 
 	devm_pm_runtime_enable(&plat_dev->dev);
 	pm_runtime_mark_last_busy(&plat_dev->dev);
@@ -1449,12 +1451,16 @@ pvr_probe(struct platform_device *plat_dev)
 	pvr_watchdog_init(pvr_dev);
 
 	err = pvr_device_init(pvr_dev);
-	if (err)
+	if (err) {
+		dev_err_probe(&plat_dev->dev, err, "device init\n");
 		goto err_watchdog_fini;
+	}
 
 	err = drm_dev_register(drm_dev, 0);
-	if (err)
+	if (err) {
+		dev_err_probe(&plat_dev->dev, err, "DRM device registration\n");
 		goto err_device_fini;
+	}
 
 	xa_init_flags(&pvr_dev->free_list_ids, XA_FLAGS_ALLOC1);
 	xa_init_flags(&pvr_dev->job_ids, XA_FLAGS_ALLOC1);
