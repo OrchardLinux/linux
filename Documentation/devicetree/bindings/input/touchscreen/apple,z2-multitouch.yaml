@@ -27,6 +27,7 @@ properties:
       - apple,d11-touchscreen
       - apple,d111-touchscreen
       - apple,n61-touchscreen
+      - apple,n102-touchscreen
 
   interrupts:
     maxItems: 1
@@ -185,6 +186,7 @@ allOf:
             - apple,j71t-touchscreen
             - apple,j81-touchscreen
             - apple,j96-touchscreen
+            - apple,n102-touchscreen
     then:
       properties:
         pinctrl-names:
@@ -195,7 +197,6 @@ allOf:
         display-sync-gpios: false
         display-sync1-gpios: false
         hv-supply: false
-        core-supply: false
         spi-cpha: false
         spi-cpol: false
         apple,z2-bpw16-min-len: false
@@ -203,7 +204,20 @@ allOf:
       required:
         - clocks
         - ana-supply
-        - power-ldo-gpios
+      if:
+        properties:
+          compatible:
+            const: apple,n102-touchscreen
+      then:
+        properties:
+          power-ldo-gpios: false
+        required:
+          - core-supply
+      else:
+        properties:
+          core-supply: false
+        required:
+          - power-ldo-gpios
   - if:
       properties:
         compatible:
@@ -268,6 +282,7 @@ allOf:
             - apple,j85-touchscreen
             - apple,j96-touchscreen
             - apple,n61-touchscreen
+            - apple,n102-touchscreen
     then:
       properties:
         ana-supply: true
@@ -283,6 +298,7 @@ allOf:
             - apple,j81-touchscreen
             - apple,j85-touchscreen
             - apple,j96-touchscreen
+            - apple,n102-touchscreen
     then:
       properties:
         attn-gpios: true
