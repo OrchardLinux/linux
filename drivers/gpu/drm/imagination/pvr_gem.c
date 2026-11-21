@@ -31,6 +31,8 @@ static void pvr_gem_object_free(struct drm_gem_object *obj)
 	struct pvr_gem_object *bo = gem_to_pvr_gem(obj);
 
 	drm_gem_lru_remove(obj);
+	atomic_dec(&to_pvr_device(obj->dev)->live.gem_objs);
+	atomic64_sub(obj->size, &to_pvr_device(obj->dev)->live.gem_bytes);
 	if (bo->pages_evicted)
 		atomic64_sub(obj->size, &to_pvr_device(obj->dev)->gem_reclaim.evicted_bytes);
 	shmem_obj->pages_mark_dirty_on_put = true;
@@ -425,6 +427,9 @@ struct drm_gem_object *pvr_gem_create_object(struct drm_device *drm_dev, size_t 
 
 	gem_obj = gem_from_pvr_gem(pvr_obj);
 	gem_obj->funcs = &pvr_gem_object_funcs;
+	/* Counted here and in pvr_gem_object_free(): created and imported alike */
+	atomic_inc(&to_pvr_device(drm_dev)->live.gem_objs);
+	atomic64_add(size, &to_pvr_device(drm_dev)->live.gem_bytes);
 
 	return gem_obj;
 }

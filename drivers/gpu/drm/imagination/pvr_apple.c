@@ -87,6 +87,12 @@ static struct pvr_apple *to_apple(struct pvr_device *pvr_dev)
 	return pvr_dev->apple;
 }
 
+static void pvr_apple_stat_show(struct seq_file *s, const char *name, const struct pvr_apple_stat *st)
+{
+	seq_printf(s, "%s last %llu max %llu avg %llu n %llu\n", name, st->last, st->max,
+		   st->n ? div64_u64(st->sum, st->n) : 0, st->n);
+}
+
 /* Ask Fender for power state @state and wait until it reports it */
 int pvr_apple_request_power_state(struct pvr_apple *apple, u32 state)
 {
@@ -447,12 +453,20 @@ static int pvr_apple_power_on(struct pvr_device *pvr_dev)
 int pvr_apple_prepare_job(struct pvr_device *pvr_dev)
 {
 	struct pvr_apple *apple = to_apple(pvr_dev);
+	ktime_t start = 0;
 	int err;
 
 	mutex_lock(&apple->submit_lock);
+	if (!READ_ONCE(apple->stopping) && !apple->booted)
+		start = ktime_get();
 	err = READ_ONCE(apple->stopping) ? -ENODEV :
 		apple->booted ? 0 : pvr_apple_fw_restart(apple);
 	mutex_unlock(&apple->submit_lock);
+	if (start) {
+		spin_lock_irq(&apple->fence_lock);
+		pvr_apple_stat_add(&apple->boot_us, ktime_us_delta(ktime_get(), start));
+		spin_unlock_irq(&apple->fence_lock);
+	}
 	if (err)
 		dev_err(apple_dev(apple), "GPU did not start: %d\n", err);
 	else if (READ_ONCE(apple->devfreq_suspended))
@@ -685,6 +699,24 @@ static int pvr_apple_jobs_show(struct seq_file *s, void *unused)
 	unsigned int pending[APPLE_ENGINES] = {};
 	struct pvr_apple_fence *fence;
 	u64 retired_total, busy_ns;
+	u64 job_last[APPLE_ENGINES], job_max[APPLE_ENGINES], job_sum[APPLE_ENGINES], job_n[APPLE_ENGINES];
+	struct pvr_apple_stat wait_us[APPLE_ENGINES], run_us[APPLE_ENGINES], irq_us;
+	struct pvr_apple_stat irq_to_signal_us, geom_to_frag_us, boot_us, prepare_us;
+	struct pvr_apple_stat ioctl_us[APPLE_IOCTLS];
+	u64 retired_after_irq, retired_by_poll, irq_empty, retired_after_irq_recheck;
+	struct pvr_apple_stat irq_to_check_us, irq_recheck_to_signal_us;
+	static const char *const ioctl_names[APPLE_IOCTLS] = {
+		[APPLE_IOCTL_CREATE_BO] = "ioctl CREATE_BO us",
+		[APPLE_IOCTL_VM_MAP] = "ioctl VM_MAP us",
+		[APPLE_IOCTL_CREATE_VM_CONTEXT] = "ioctl CREATE_VM_CONTEXT us",
+		[APPLE_IOCTL_CREATE_CONTEXT] = "ioctl CREATE_CONTEXT us",
+		[APPLE_IOCTL_CREATE_FREE_LIST] = "ioctl CREATE_FREE_LIST us",
+		[APPLE_IOCTL_CREATE_HWRT_DATASET] = "ioctl CREATE_HWRT_DATASET us",
+		[APPLE_IOCTL_SUBMIT_JOBS] = "ioctl SUBMIT_JOBS us",
+	};
+	struct pvr_device *pvr_dev = apple->pvr_dev;
+	unsigned long jobs = 0, id;
+	struct pvr_job *job;
 	bool irq_on;
 	unsigned long flags;
 	bool booted, fault = false;
@@ -704,6 +736,26 @@ static int pvr_apple_jobs_show(struct seq_file *s, void *unused)
 			pending[engine]++;
 	retired_total = apple->retired_total;
 	busy_ns = apple->busy_ns;
+	for (engine = 0; engine < APPLE_ENGINES; engine++) {
+		job_last[engine] = apple->job_us_last[engine];
+		job_max[engine] = apple->job_us_max[engine];
+		job_sum[engine] = apple->job_us_sum[engine];
+		job_n[engine] = apple->job_us_n[engine];
+	}
+	memcpy(wait_us, apple->wait_us, sizeof(wait_us));
+	memcpy(run_us, apple->run_us, sizeof(run_us));
+	irq_us = apple->irq_us;
+	irq_to_signal_us = apple->irq_to_signal_us;
+	retired_after_irq = apple->retired_after_irq;
+	retired_by_poll = apple->retired_by_poll;
+	irq_empty = apple->irq_empty;
+	retired_after_irq_recheck = apple->retired_after_irq_recheck;
+	irq_recheck_to_signal_us = apple->irq_recheck_to_signal_us;
+	irq_to_check_us = apple->irq_to_check_us;
+	geom_to_frag_us = apple->geom_to_frag_us;
+	boot_us = apple->boot_us;
+	prepare_us = apple->prepare_us;
+	memcpy(ioctl_us, apple->ioctl_us, sizeof(ioctl_us));
 	irq_on = apple->fw_irq_on;
 	spin_unlock_irqrestore(&apple->fence_lock, flags);
 	mutex_unlock(&apple->submit_lock);
@@ -726,19 +778,106 @@ static int pvr_apple_jobs_show(struct seq_file *s, void *unused)
 	for (engine = 0; engine < APPLE_ENGINES; engine++)
 		seq_printf(s, "%s submitted %u done %u pending %u\n", names[engine],
 			   submitted[engine], done[engine], pending[engine]);
+	for (engine = 0; engine < APPLE_ENGINES; engine++)
+		seq_printf(s, "%s job_us last %llu max %llu avg %llu n %llu\n", names[engine],
+			   job_last[engine], job_max[engine],
+			   job_n[engine] ? div64_u64(job_sum[engine], job_n[engine]) : 0, job_n[engine]);
 	seq_printf(s, "retired_total %llu\nbusy_ns %llu\n", retired_total, busy_ns);
 	seq_printf(s, "fault %u\n", fault);
 	seq_printf(s, "runtime_pm_status %s\n", runtime_status);
 	seq_printf(s, "fw_irq %s\n", !apple->fw_irq ? "none" : irq_on ? "on" : "off");
 
+	/* Where a job's time goes, in us; statistics only */
+	for (engine = 0; engine < APPLE_ENGINES; engine++) {
+		char name[32];
+
+		snprintf(name, sizeof(name), "%s wait_us", names[engine]);
+		pvr_apple_stat_show(s, name, &wait_us[engine]);
+		snprintf(name, sizeof(name), "%s run_us", names[engine]);
+		pvr_apple_stat_show(s, name, &run_us[engine]);
+	}
+	pvr_apple_stat_show(s, "kick_to_irq_us", &irq_us);
+	pvr_apple_stat_show(s, "irq_to_signal_us", &irq_to_signal_us);
+	pvr_apple_stat_show(s, "geometry_signal_to_fragment_run_us", &geom_to_frag_us);
+	pvr_apple_stat_show(s, "firmware_start_us", &boot_us);
+	pvr_apple_stat_show(s, "chip_prepare_us", &prepare_us);
+	for (engine = 0; engine < APPLE_IOCTLS; engine++)
+		pvr_apple_stat_show(s, ioctl_names[engine], &ioctl_us[engine]);
+	seq_printf(s, "irqs %lld\npolls %lld\n", (long long)atomic64_read(&apple->irqs),
+		   (long long)atomic64_read(&apple->polls));
+	seq_printf(s, "retired after_irq %llu after_irq_recheck %llu by_poll %llu; interrupts that found nothing %llu\n",
+		   retired_after_irq, retired_after_irq_recheck, retired_by_poll, irq_empty);
+	pvr_apple_stat_show(s, "irq_recheck_to_signal_us", &irq_recheck_to_signal_us);
+	pvr_apple_stat_show(s, "irq_to_check_us", &irq_to_check_us);
+
+	/* What is alive now, for leak checks */
+	xa_for_each(&pvr_dev->job_ids, id, job)
+		jobs++;
+	/* vm_ctxs includes the driver's own: the kernel VM, and a chip's (the A8's park VM) */
+	seq_printf(s, "live jobs %lu vm_ctxs %d (driver's included) gem_objs %d gem_bytes %lld mmu_pages %d\n",
+		   jobs, atomic_read(&pvr_dev->live.vm_ctxs),
+		   atomic_read(&pvr_dev->live.gem_objs),
+		   (long long)atomic64_read(&pvr_dev->live.gem_bytes),
+		   atomic_read(&pvr_dev->live.mmu_pages));
+	if (apple->chip->debugfs_show)
+		apple->chip->debugfs_show(apple, s);
+
 	return 0;
 }
-DEFINE_SHOW_ATTRIBUTE(pvr_apple_jobs);
+static int pvr_apple_jobs_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, pvr_apple_jobs_show, inode->i_private);
+}
+
+/* Any write zeroes the statistics (not the counts of what is alive) */
+static ssize_t pvr_apple_jobs_write(struct file *file, const char __user *buf, size_t len,
+				    loff_t *ppos)
+{
+	struct pvr_apple *apple = ((struct seq_file *)file->private_data)->private;
+	int engine;
+
+	spin_lock_irq(&apple->fence_lock);
+	for (engine = 0; engine < APPLE_ENGINES; engine++) {
+		apple->job_us_last[engine] = 0;
+		apple->job_us_max[engine] = 0;
+		apple->job_us_sum[engine] = 0;
+		apple->job_us_n[engine] = 0;
+	}
+	memset(apple->wait_us, 0, sizeof(apple->wait_us));
+	memset(apple->run_us, 0, sizeof(apple->run_us));
+	memset(&apple->irq_us, 0, sizeof(apple->irq_us));
+	memset(&apple->irq_to_signal_us, 0, sizeof(apple->irq_to_signal_us));
+	memset(&apple->geom_to_frag_us, 0, sizeof(apple->geom_to_frag_us));
+	memset(&apple->boot_us, 0, sizeof(apple->boot_us));
+	memset(&apple->prepare_us, 0, sizeof(apple->prepare_us));
+	memset(apple->ioctl_us, 0, sizeof(apple->ioctl_us));
+	apple->retired_after_irq = 0;
+	apple->retired_by_poll = 0;
+	apple->irq_empty = 0;
+	apple->retired_after_irq_recheck = 0;
+	memset(&apple->irq_to_check_us, 0, sizeof(apple->irq_to_check_us));
+	memset(&apple->irq_recheck_to_signal_us, 0, sizeof(apple->irq_recheck_to_signal_us));
+	if (apple->chip->debugfs_reset)
+		apple->chip->debugfs_reset(apple);
+	atomic64_set(&apple->irqs, 0);
+	atomic64_set(&apple->polls, 0);
+	spin_unlock_irq(&apple->fence_lock);
+	return len;
+}
+
+static const struct file_operations pvr_apple_jobs_fops = {
+	.owner = THIS_MODULE,
+	.open = pvr_apple_jobs_open,
+	.read = seq_read,
+	.write = pvr_apple_jobs_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
 
 void pvr_apple_debugfs_init(struct pvr_device *pvr_dev, struct dentry *root)
 {
 	if (pvr_dev->apple)
-		debugfs_create_file("apple_jobs", 0400, root, pvr_dev->apple,
+		debugfs_create_file("apple_jobs", 0600, root, pvr_dev->apple,
 				    &pvr_apple_jobs_fops);
 }
 
@@ -865,6 +1004,38 @@ static const struct dma_fence_ops pvr_apple_fence_ops = {
 	.get_timeline_name = pvr_apple_fence_timeline_name,
 };
 
+static enum pvr_apple_engine pvr_apple_job_engine(const struct pvr_job *job)
+{
+	return job->type == DRM_PVR_JOB_TYPE_GEOMETRY ? APPLE_ENGINE_GEOM :
+	       job->type == DRM_PVR_JOB_TYPE_FRAGMENT ? APPLE_ENGINE_FRAG : APPLE_ENGINE_COMPUTE;
+}
+
+/**
+ * pvr_apple_job_ran() - Account a job's run_job (statistics only)
+ * @job: The job.
+ * @start: When its run_job began.
+ *
+ * Its wait from arming to run_job, and the time run_job took.
+ */
+void pvr_apple_job_ran(struct pvr_job *job, ktime_t start)
+{
+	struct pvr_apple *apple = to_apple(job->pvr_dev);
+	enum pvr_apple_engine engine = pvr_apple_job_engine(job);
+	ktime_t now = ktime_get();
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple->fence_lock, flags);
+	if (job->apple_armed)
+		pvr_apple_stat_add(&apple->wait_us[engine], ktime_us_delta(start, job->apple_armed));
+	pvr_apple_stat_add(&apple->run_us[engine], ktime_us_delta(now, start));
+	if (engine == APPLE_ENGINE_FRAG && apple->geom_signalled) {
+		pvr_apple_stat_add(&apple->geom_to_frag_us,
+				   ktime_us_delta(start, apple->geom_signalled));
+		apple->geom_signalled = 0;
+	}
+	spin_unlock_irqrestore(&apple->fence_lock, flags);
+}
+
 bool pvr_apple_fence_faulted(struct dma_fence *base)
 {
 	struct pvr_apple_fence *fence;
@@ -889,6 +1060,7 @@ void pvr_apple_fence_bind(struct pvr_device *pvr_dev, struct dma_fence *base,
 	spin_lock_irqsave(&apple->fence_lock, flags);
 	fence->sched = sched;
 	fence->submitted = ktime_get();
+	WRITE_ONCE(apple->kick, fence->submitted);
 	spin_unlock_irqrestore(&apple->fence_lock, flags);
 }
 
@@ -1207,9 +1379,17 @@ void pvr_apple_firmware_progress(struct pvr_apple *apple)
 static irqreturn_t pvr_apple_firmware_irq(int irq, void *data)
 {
 	struct pvr_apple *apple = data;
+	ktime_t kick = READ_ONCE(apple->kick), now = ktime_get();
 
 	/* At its source first, as Apple's kext does before it reads the rings */
 	apple->chip->irq_ack(apple);
+	atomic64_inc(&apple->irqs);
+	if (kick) {
+		WRITE_ONCE(apple->kick, 0);
+		pvr_apple_stat_add(&apple->irq_us, ktime_us_delta(now, kick));
+	}
+	if (!READ_ONCE(apple->irq_at))
+		WRITE_ONCE(apple->irq_at, now);
 	if (apple->chip->irq_thread)
 		return READ_ONCE(apple->stopping) ? IRQ_HANDLED : IRQ_WAKE_THREAD;
 	pvr_apple_firmware_event(apple);
@@ -1287,15 +1467,18 @@ static void pvr_apple_check(struct pvr_apple *apple, bool from_irq)
 	struct pvr_apple_fence *fence, *tmp;
 	unsigned int retired = 0, us;
 	bool pending = false, irq_on;
+	ktime_t now, irq_at;
 	int engine;
 
 	if (READ_ONCE(apple->stopping))
 		return;
+	atomic64_inc(&apple->polls);
 	if (!apple->chip->events)
 		pvr_apple_ack_events(apple);
 	if (atomic_xchg(&apple->fault_pending, 0))
 		pvr_apple_fault_pending(apple);
 	spin_lock_irq(&apple->fence_lock);
+	now = ktime_get();
 	for (engine = 0; engine < APPLE_ENGINES; engine++) {
 		u32 done = pvr_apple_engine_done(apple, engine);
 
@@ -1315,11 +1498,64 @@ static void pvr_apple_check(struct pvr_apple *apple, bool from_irq)
 			if ((s32)(done - (u32)fence->base.seqno) < 0)
 				break;
 			list_del_init(&fence->node);
+			if (fence->submitted) {
+				u64 job_us = ktime_us_delta(ktime_get(), fence->submitted);
+
+				apple->job_us_last[engine] = job_us;
+				apple->job_us_max[engine] = max(apple->job_us_max[engine], job_us);
+				apple->job_us_sum[engine] += job_us;
+				apple->job_us_n[engine]++;
+			}
+			if (apple->chip->job_retired)
+				apple->chip->job_retired(apple, engine, (u32)fence->base.seqno);
 			dma_fence_signal_locked(&fence->base);
 			dma_fence_put(&fence->base);
 			retired++;
+			if (engine == APPLE_ENGINE_GEOM)
+				apple->geom_signalled = now;
 		}
 		pending |= !list_empty(&apple->pending[engine]);
+	}
+	/* statistics: the interrupt that led to these signals; none kept once idle */
+	/*
+	 * Statistics: an interrupt that came before this check is this
+	 * check's, whether it found a job or not (one whose job a poll had
+	 * retired first must not be charged to the next job); one that came
+	 * while it ran (after @now) is the next check's.
+	 */
+	irq_at = READ_ONCE(apple->irq_at);
+	if (irq_at && !ktime_after(irq_at, now)) {
+		WRITE_ONCE(apple->irq_at, 0);
+		pvr_apple_stat_add(&apple->irq_to_check_us, ktime_us_delta(now, irq_at));
+		if (retired) {
+			pvr_apple_stat_add(&apple->irq_to_signal_us,
+					   ktime_us_delta(ktime_get(), irq_at));
+			apple->retired_after_irq += retired;
+		} else {
+			apple->irq_empty++;
+			/* the checks it starts are its own (below) */
+			if (from_irq)
+				apple->irq_recheck_at = irq_at;
+		}
+		if (apple->chip->irq_checked) {
+			apple->chip->irq_checked(apple, retired, apple->retired_since_irq);
+			apple->retired_since_irq = false;
+		}
+	} else if (retired && apple->irq_recheck_at) {
+		/* found by the re-check an interrupt that came too early started */
+		pvr_apple_stat_add(&apple->irq_recheck_to_signal_us,
+				   ktime_us_delta(ktime_get(), apple->irq_recheck_at));
+		apple->irq_recheck_at = 0;
+		apple->retired_after_irq_recheck += retired;
+		apple->retired_since_irq = true;
+	} else if (retired) {
+		apple->retired_by_poll += retired;
+		apple->retired_since_irq = true;
+	}
+	if (!pending) {
+		WRITE_ONCE(apple->kick, 0);
+		WRITE_ONCE(apple->irq_at, 0);
+		apple->irq_recheck_at = 0;
 	}
 	if (!pending && apple->busy_since) {
 		apple->busy_ns += ktime_to_ns(ktime_sub(ktime_get(), apple->busy_since));
@@ -1842,6 +2078,8 @@ void pvr_apple_job_armed(struct pvr_job *job, struct dma_fence *finished)
 	bool joint = apple->chip->scenes > 1 || (apple->chip->joint && apple->chip->joint(apple));
 	struct dma_fence **last, *old;
 
+	job->apple_armed = ktime_get();	/* statistics: pvr_apple_job_ran() */
+
 	if (job->type == DRM_PVR_JOB_TYPE_GEOMETRY)
 		last = &apple->last_geom;
 	else if (job->type == DRM_PVR_JOB_TYPE_FRAGMENT)
@@ -2355,6 +2593,32 @@ bool pvr_apple_vm_evictable(struct pvr_device *pvr_dev, struct pvr_vm_context *v
 int pvr_apple_job_prepare_resources(struct pvr_job *job)
 {
 	struct pvr_apple *apple = to_apple(job->pvr_dev);
+	ktime_t start = ktime_get();
+	int err;
 
-	return apple->chip->prepare_job ? apple->chip->prepare_job(apple, job) : 0;
+	if (!apple->chip->prepare_job)
+		return 0;
+	err = apple->chip->prepare_job(apple, job);
+	spin_lock_irq(&apple->fence_lock);
+	pvr_apple_stat_add(&apple->prepare_us, ktime_us_delta(ktime_get(), start));
+	spin_unlock_irq(&apple->fence_lock);
+	return err;
+}
+
+/**
+ * pvr_apple_ioctl_time() - Account an ioctl's time (statistics only)
+ * @pvr_dev: Target device.
+ * @ioctl: Which one.
+ * @start: When it began.
+ */
+void pvr_apple_ioctl_time(struct pvr_device *pvr_dev, enum pvr_apple_ioctl ioctl, ktime_t start)
+{
+	struct pvr_apple *apple = pvr_dev->apple;
+	unsigned long flags;
+
+	if (!apple || ioctl >= APPLE_IOCTLS)
+		return;
+	spin_lock_irqsave(&apple->fence_lock, flags);
+	pvr_apple_stat_add(&apple->ioctl_us[ioctl], ktime_us_delta(ktime_get(), start));
+	spin_unlock_irqrestore(&apple->fence_lock, flags);
 }

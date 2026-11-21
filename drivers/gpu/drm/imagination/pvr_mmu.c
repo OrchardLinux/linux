@@ -300,6 +300,7 @@ pvr_mmu_backing_page_init(struct pvr_mmu_backing_page *page,
 	page->pvr_dev = pvr_dev;
 	page->raw_page = raw_page;
 	kmemleak_alloc(page->host_ptr, PAGE_SIZE, 1, GFP_KERNEL);
+	atomic_inc(&pvr_dev->live.mmu_pages);
 
 	return 0;
 
@@ -345,6 +346,7 @@ pvr_mmu_backing_page_fini(struct pvr_mmu_backing_page *page)
 	vunmap(page->host_ptr);
 
 	__free_page(page->raw_page);
+	atomic_dec(&page->pvr_dev->live.mmu_pages);
 
 	memset(page, 0, sizeof(*page));
 }

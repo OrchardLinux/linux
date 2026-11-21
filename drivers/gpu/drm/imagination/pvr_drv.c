@@ -1272,6 +1272,28 @@ pvr_set_uobj_array(const struct drm_pvr_obj_array *out, u32 min_stride, u32 obj_
 	return 0;
 }
 
+/* Apple: the ioctl's time in debugfs apple_jobs (statistics only) */
+#define PVR_IOCTL_TIMED(_name, _func) \
+static int pvr_ioctl_timed_##_func(struct drm_device *drm_dev, void *raw_args, \
+				   struct drm_file *file) \
+{ \
+	ktime_t start = ktime_get(); \
+	int err = pvr_ioctl_##_func(drm_dev, raw_args, file); \
+ \
+	pvr_apple_ioctl_time(to_pvr_device(drm_dev), APPLE_IOCTL_##_name, start); \
+	return err; \
+}
+
+PVR_IOCTL_TIMED(CREATE_BO, create_bo)
+PVR_IOCTL_TIMED(VM_MAP, vm_map)
+PVR_IOCTL_TIMED(CREATE_VM_CONTEXT, create_vm_context)
+PVR_IOCTL_TIMED(CREATE_CONTEXT, create_context)
+PVR_IOCTL_TIMED(CREATE_FREE_LIST, create_free_list)
+PVR_IOCTL_TIMED(CREATE_HWRT_DATASET, create_hwrt_dataset)
+PVR_IOCTL_TIMED(SUBMIT_JOBS, submit_jobs)
+
+#undef PVR_IOCTL_TIMED
+
 #define DRM_PVR_IOCTL(_name, _func, _flags) \
 	DRM_IOCTL_DEF_DRV(PVR_##_name, pvr_ioctl_##_func, _flags)
 
@@ -1279,19 +1301,19 @@ pvr_set_uobj_array(const struct drm_pvr_obj_array *out, u32 min_stride, u32 obj_
 
 static const struct drm_ioctl_desc pvr_drm_driver_ioctls[] = {
 	DRM_PVR_IOCTL(DEV_QUERY, dev_query, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_BO, create_bo, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_BO, timed_create_bo, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(GET_BO_MMAP_OFFSET, get_bo_mmap_offset, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_VM_CONTEXT, create_vm_context, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_VM_CONTEXT, timed_create_vm_context, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(DESTROY_VM_CONTEXT, destroy_vm_context, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(VM_MAP, vm_map, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(VM_MAP, timed_vm_map, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(VM_UNMAP, vm_unmap, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_CONTEXT, create_context, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_CONTEXT, timed_create_context, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(DESTROY_CONTEXT, destroy_context, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_FREE_LIST, create_free_list, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_FREE_LIST, timed_create_free_list, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(DESTROY_FREE_LIST, destroy_free_list, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_HWRT_DATASET, create_hwrt_dataset, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_HWRT_DATASET, timed_create_hwrt_dataset, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(DESTROY_HWRT_DATASET, destroy_hwrt_dataset, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(SUBMIT_JOBS, submit_jobs, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(SUBMIT_JOBS, timed_submit_jobs, DRM_RENDER_ALLOW),
 };
 
 /* clang-format on */

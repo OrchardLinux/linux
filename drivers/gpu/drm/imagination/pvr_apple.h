@@ -162,8 +162,21 @@ struct pvr_apple_g5p_cmd_compute {
 	struct pvr_apple_g5p_compute_regs g5p;
 };
 
+/* The ioctls whose time debugfs apple_jobs shows (pvr_apple_ioctl_time()) */
+enum pvr_apple_ioctl {
+	APPLE_IOCTL_CREATE_BO,
+	APPLE_IOCTL_VM_MAP,
+	APPLE_IOCTL_CREATE_VM_CONTEXT,
+	APPLE_IOCTL_CREATE_CONTEXT,
+	APPLE_IOCTL_CREATE_FREE_LIST,
+	APPLE_IOCTL_CREATE_HWRT_DATASET,
+	APPLE_IOCTL_SUBMIT_JOBS,
+	APPLE_IOCTLS
+};
+
 #if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
 void pvr_apple_debugfs_init(struct pvr_device *pvr_dev, struct dentry *root);
+void pvr_apple_ioctl_time(struct pvr_device *pvr_dev, enum pvr_apple_ioctl ioctl, ktime_t start);
 int pvr_apple_fw_init(struct pvr_device *pvr_dev);
 void pvr_apple_fw_fini(struct pvr_device *pvr_dev);
 struct pvr_gem_object *pvr_apple_pm_pages(struct pvr_device *pvr_dev, size_t size);
@@ -203,6 +216,8 @@ int pvr_apple_queue_job_init(struct pvr_job *job, u64 drm_client_id);
 void pvr_apple_queue_job_cleanup(struct pvr_job *job);
 #else
 static inline void pvr_apple_debugfs_init(struct pvr_device *pvr_dev, struct dentry *root) {}
+static inline void pvr_apple_ioctl_time(struct pvr_device *pvr_dev, enum pvr_apple_ioctl ioctl,
+					ktime_t start) {}
 static inline int pvr_apple_fw_init(struct pvr_device *pvr_dev) { return -ENODEV; }
 static inline void pvr_apple_fw_fini(struct pvr_device *pvr_dev) {}
 static inline struct pvr_gem_object *pvr_apple_pm_pages(struct pvr_device *pvr_dev, size_t size)

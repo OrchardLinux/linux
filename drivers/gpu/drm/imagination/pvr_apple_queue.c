@@ -48,6 +48,7 @@ static struct dma_fence *pvr_apple_submit(struct pvr_job *job)
 static struct dma_fence *pvr_apple_run_job(struct drm_sched_job *sched_job)
 {
 	struct pvr_job *job = container_of(sched_job, struct pvr_job, base);
+	ktime_t start = ktime_get();
 	struct dma_fence *fence;
 	int err;
 
@@ -60,6 +61,8 @@ static struct dma_fence *pvr_apple_run_job(struct drm_sched_job *sched_job)
 		pvr_power_put(job->pvr_dev);
 	else
 		pvr_apple_fence_bind(job->pvr_dev, fence, sched_job->sched);
+	if (!IS_ERR(fence))
+		pvr_apple_job_ran(job, start);
 	return fence;
 }
 

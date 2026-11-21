@@ -52,6 +52,7 @@
 #include "pvr_vm.h"
 
 #include <clocksource/arm_arch_timer.h>
+#include <asm/arch_timer.h>
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
@@ -325,7 +326,36 @@ struct s8003_pm {
 	bool clean;			/* both of its jobs were handed to the firmware */
 };
 
+/*
+ * Why a job was refused (s8003_submit_error(), t7000_prepare_job()), for the
+ * counters in debugfs apple_jobs. Names as printed there.
+ */
+enum s8003_refusal {
+	S8003_REFUSED_NOT_PREPARED,	/* geometry: no region ring or PM objects */
+	S8003_REFUSED_NO_GEOM,		/* fragment: its geometry job failed or was not submitted */
+	S8003_REFUSED_RT,		/* the target's geometry */
+	S8003_REFUSED_PM,		/* no PM set, or its pool or set not built */
+	S8003_REFUSED_SLOT_WAIT,	/* the engine's record slot stayed busy */
+	S8003_REFUSED_PUBLISH,		/* the firmware's ring was not ours to publish to */
+	S8003_REFUSED_FILL,		/* the 3D record */
+	S8003_REFUSED_PREPARE_RT,	/* at the ioctl: the target */
+	S8003_REFUSED_PREPARE_SAMPLES,	/* at the ioctl: more than one sample */
+	S8003_REFUSED_PREPARE_RING,	/* at the ioctl: region headers not a mirrored ring */
+	S8003_REFUSALS
+};
 
+static const char *const s8003_refusal_name[S8003_REFUSALS] = {
+	[S8003_REFUSED_NOT_PREPARED] = "not_prepared",
+	[S8003_REFUSED_NO_GEOM] = "frag_no_geom",
+	[S8003_REFUSED_RT] = "rt_derive",
+	[S8003_REFUSED_PM] = "pm",
+	[S8003_REFUSED_SLOT_WAIT] = "slot_wait",
+	[S8003_REFUSED_PUBLISH] = "publish",
+	[S8003_REFUSED_FILL] = "fill",
+	[S8003_REFUSED_PREPARE_RT] = "prepare_rt",
+	[S8003_REFUSED_PREPARE_SAMPLES] = "prepare_samples",
+	[S8003_REFUSED_PREPARE_RING] = "prepare_ring",
+};
 
 struct s8003_vm {
 	struct pvr_vm_context *vm_ctx;
@@ -352,6 +382,30 @@ struct s8003_vm {
 		u32 ta_seq;
 		u64 rgn_addr;			/* the scene's region-header slice */
 	} t7000;
+};
+
+/*
+ * An A8 engine's jobs, phase by phase, in us (debugfs apple_jobs "a8 <engine>
+ * phases"), over the jobs whose firmware timestamps were usable, so that
+ * host + wait + run + tail = total for each job: from the chip's submit to
+ * the fence's signal. Inside host: the PM pool's feedback and build
+ * (geometry), the wait for the engine's record slot, the wait for the work
+ * ring's slot. Inside wait (doorbell to the firmware's start of the work):
+ * the doorbells that found the GPU awake and those that found Fender in
+ * state 0 (powered down, woken by the doorbell); a fragment job kicked
+ * before its geometry job's end instead: its wait for that end and the
+ * firmware's hand-off from there to the 3D's start. Inside tail (the
+ * firmware's end to the signal): ended by a check that the firmware's
+ * interrupt led to (end to interrupt, interrupt to signal), or by a check
+ * without one (the backup poll or a re-check).
+ */
+struct t7000_phases {
+	struct pvr_apple_stat total, host, wait, run, tail;
+	struct pvr_apple_stat pm, slot, ring;
+	struct pvr_apple_stat wait_awake, wait_woke, ta_wait, ta_to_3d;
+	struct pvr_apple_stat end_to_irq, irq_to_signal, end_to_check;
+	/* the firmware's stamped start (+8): none, or more than 2 us from end - result */
+	u64 start_stamp_none, start_stamp_off;
 };
 
 struct pvr_apple_s8003 {
@@ -425,13 +479,52 @@ struct pvr_apple_s8003 {
 	u32 t7000_trace;		/* the records' trace ID, one per job */
 
 	struct s8003_idle idle;
+
 	/* The A8: the smallest PM pool a stall taught; the VM of the last geometry job */
 	u32 t7000_pm_floor;
 	struct s8003_vm *t7000_geom_vm;
 	bool t7000_mmu_arm;		/* a lockup event came from the MMU-fault arm */
+	/*
+	 * The A8's job timeline (debugfs apple_jobs), per engine: the system
+	 * counter at the doorbell; the firmware's own timestamps of the job
+	 * (start, end), read once when the job retires; under fence_lock.
+	 */
+	u64 t7000_kick[APPLE_ENGINES];
+	struct pvr_apple_stat t7000_fw_wait_us[APPLE_ENGINES], t7000_fw_run_us[APPLE_ENGINES];
+	struct pvr_apple_stat t7000_fw_tail_us[APPLE_ENGINES];
+	u64 t7000_fw_bad[APPLE_ENGINES], t7000_pm_builds;
+	/*
+	 * Where each job's time goes (t7000_phases()), in system counter ticks:
+	 * set at submit under submit_lock (the A8 has one job per engine with
+	 * the firmware, and an engine's next job is submitted only after this
+	 * one retired), read when it retires under fence_lock. The geometry
+	 * job's firmware end, for the hand-off to its fragment job.
+	 */
+	u64 t7000_submit_at[APPLE_ENGINES];
+	u32 t7000_pm_ticks[APPLE_ENGINES], t7000_slot_ticks[APPLE_ENGINES];
+	u32 t7000_ring_ticks[APPLE_ENGINES];
+	bool t7000_kick_woke[APPLE_ENGINES];
+	u32 t7000_geom_end;
+	struct t7000_phases t7000_ph[APPLE_ENGINES];
 	/* The 3D record the last fragment job was written to (T7000_RCH_W or T7000_RCH1_W) */
 	u32 t7000_frag_w;
+	/*
+	 * The A8's firmware interrupts by what the check that took each one
+	 * found (t7000_irq_checked()): its job, or nothing after a poll had
+	 * retired a job since the previous interrupt, or nothing with a stamp
+	 * event posted, or with only log/statistics/trace entries, or with
+	 * nothing new at all; under fence_lock.
+	 */
+	u64 t7000_irq_found, t7000_irq_polled, t7000_irq_stamp_event, t7000_irq_rings, t7000_irq_none;
+	/* stamp events posted and jobs retired (statistics), their difference (kept) */
+	u64 t7000_stamp_events, t7000_jobs_retired;
+	s64 t7000_ev_lead;
+	u32 t7000_ev_cursor, t7000_ev_gen;	/* the next event to count, for start @t7000_ev_gen */
 
+	/* Statistics (debugfs apple_jobs): live per-VM states and A8 PM objects, doorbells */
+	atomic_t vms_live, pm_objs_live;
+	atomic64_t doorbells, doorbell_wakes, doorbell_pll_unlocked, doorbell_refused;
+	atomic64_t refused[S8003_REFUSALS];	/* jobs refused, by reason */
 	bool bif_read;			/* t7000_report_fault() read the fault registers */
 };
 
@@ -1696,6 +1789,8 @@ static int pvr_apple_s8003_vm_init(struct pvr_apple *apple, struct pvr_vm_contex
 		err = xa_err(xa_store(&s->vms, (unsigned long)vm_ctx, vm, GFP_KERNEL));
 	if (err)
 		kfree(vm);
+	else
+		atomic_inc(&s->vms_live);
 	return err;
 }
 
@@ -1818,6 +1913,7 @@ static void pvr_apple_s8003_vm_fini(struct pvr_apple *apple, struct pvr_vm_conte
 	mutex_unlock(&apple->submit_lock);
 	if (s->v->vm_unmap)
 		s->v->vm_unmap(apple, vm_ctx);
+	atomic_dec(&s->vms_live);
 	kfree(vm);
 }
 
@@ -2592,8 +2688,12 @@ out:
 }
 
 static int s8003_submit_error(struct pvr_apple *apple, struct s8003_vm *vm,
-			      const char *engine, int err, const char *reason)
+			      const char *engine, int err, enum s8003_refusal why,
+			      const char *reason)
 {
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
+	atomic64_inc(&s->refused[why]);
 	dev_warn_ratelimited(apple_dev(apple),
 			     "%s job not submitted: error=%d VM=%p: %s\n",
 			     engine, err, vm->vm_ctx, reason);
@@ -2614,7 +2714,8 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 
 	err = s8003_rt_derive(hwrt, &rt);
 	if (err)
-		return s8003_submit_error(apple, vm, "geometry", err, "rt derive");
+		return s8003_submit_error(apple, vm, "geometry", err, S8003_REFUSED_RT,
+					  "rt derive");
 	/* The VM's sets were taken when the job was ordered (pvr_apple_s8003_vm_scenes()) */
 	for (i = 0; i < 2 && !pm; i++)
 		if (vm->pm[i].set >= 0 && vm->pm[i].ready &&
@@ -2629,7 +2730,8 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		    !s8003_wait_done(apple, APPLE_ENGINE_GEOM, vm->pm[i].ta_seq))
 			pm = &vm->pm[i];
 	if (!pm)
-		return s8003_submit_error(apple, vm, "geometry", -EBUSY, "no PM set");
+		return s8003_submit_error(apple, vm, "geometry", -EBUSY, S8003_REFUSED_PM,
+					  "no PM set");
 
 	/*
 	 * Take the firmware's feedback. The worker does not allocate: a larger
@@ -2646,12 +2748,14 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	pm->clean = false;
 	err = s8003_pm_build(apple, vm, pm, min(blocks, S8003_PM_BLOCKS_MAX));
 	if (err)
-		return s8003_submit_error(apple, vm, "geometry", err, "PM pool build failed");
+		return s8003_submit_error(apple, vm, "geometry", err, S8003_REFUSED_PM,
+					  "PM pool build failed");
 	/* The record slot of the job before the last one is free again */
 	if (apple->ta_seq)
 		err = s8003_wait_done(apple, APPLE_ENGINE_GEOM, apple->ta_seq - 1);
 	if (err)
-		return s8003_submit_error(apple, vm, "geometry", err, "record slot wait");
+		return s8003_submit_error(apple, vm, "geometry", err, S8003_REFUSED_SLOT_WAIT,
+					  "record slot wait");
 
 	seq = apple->ta_seq + 1;
 	if (!pm_record) {
@@ -2683,7 +2787,8 @@ static int s8003_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	apple->ta_seq = seq;
 	err = s8003_publish(apple, APPLE_ENGINE_GEOM, seq, (2 * seq) % S8003_CH_ENTRIES);
 	if (err)
-		return s8003_submit_error(apple, vm, "geometry", err, "publish");
+		return s8003_submit_error(apple, vm, "geometry", err, S8003_REFUSED_PUBLISH,
+					  "publish");
 	return seq;
 }
 
@@ -2702,20 +2807,23 @@ static int s8003_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		if (vm->pm[i].scene == s->gen && vm->pm[i].hwrt == job->hwrt && !vm->pm[i].td_seq)
 			pm = &vm->pm[i];
 	if (!pm)
-		return s8003_submit_error(apple, vm, "fragment", -ECANCELED,
+		return s8003_submit_error(apple, vm, "fragment", -ECANCELED, S8003_REFUSED_NO_GEOM,
 					   "its geometry job failed or was not submitted");
 	err = s8003_rt_derive(job->hwrt->hwrt_dataset, &rt);
 	if (err)
-		return s8003_submit_error(apple, vm, "fragment", err, "rt derive");
+		return s8003_submit_error(apple, vm, "fragment", err, S8003_REFUSED_RT,
+					  "rt derive");
 	if (apple->frag_seq)
 		err = s8003_wait_done(apple, APPLE_ENGINE_FRAG, apple->frag_seq - 1);
 	if (err)
-		return s8003_submit_error(apple, vm, "fragment", err, "record slot wait");
+		return s8003_submit_error(apple, vm, "fragment", err, S8003_REFUSED_SLOT_WAIT,
+					  "record slot wait");
 
 	seq = apple->frag_seq + 1;
 	err = s8003_fill_3d(p + s8003_slot_of(seq, true).w, job->cmd, job->hwrt, &rt);
 	if (err)
-		return s8003_submit_error(apple, vm, "fragment", err, "3D record fill");
+		return s8003_submit_error(apple, vm, "fragment", err, S8003_REFUSED_FILL,
+					  "3D record fill");
 	s8003_job_write(p, s8003_channel_addr(s, APPLE_ENGINE_FRAG),
 			s8003_object_addr(&s->layout, S8003_CHANNEL + 1),
 			s8003_meta_addr(s8003_pm_set_va(pm, 0)), pm->set + 1, vm->slot[1], true, seq,
@@ -2725,7 +2833,8 @@ static int s8003_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	apple->frag_seq = seq;
 	err = s8003_publish(apple, APPLE_ENGINE_FRAG, seq, (2 * seq) % S8003_CH_ENTRIES);
 	if (err)
-		return s8003_submit_error(apple, vm, "fragment", err, "publish");
+		return s8003_submit_error(apple, vm, "fragment", err, S8003_REFUSED_PUBLISH,
+					  "publish");
 	pm->clean = true;
 	return seq;
 }
@@ -2750,7 +2859,8 @@ static int s8003_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, st
 
 	err = s8003_wait_done(apple, APPLE_ENGINE_COMPUTE, apple->last_seq);
 	if (err)
-		return s8003_submit_error(apple, vm, "compute", err, "record slot wait");
+		return s8003_submit_error(apple, vm, "compute", err, S8003_REFUSED_SLOT_WAIT,
+					  "record slot wait");
 	seq = apple->last_seq + 1;
 	{
 		const u32 useq[] = {
@@ -2797,7 +2907,8 @@ static int s8003_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, st
 	apple->last_seq = seq;
 	err = s8003_publish(apple, APPLE_ENGINE_COMPUTE, seq, seq % S8003_CH_ENTRIES);
 	if (err)
-		return s8003_submit_error(apple, vm, "compute", err, "publish");
+		return s8003_submit_error(apple, vm, "compute", err, S8003_REFUSED_PUBLISH,
+					  "publish");
 	return seq;
 }
 
@@ -3687,7 +3798,7 @@ static void t7000_init_build(struct pvr_apple *apple, u32 q)
 #define T7000_RCH_W			0x400
 #define T7000_RCH_TA_USEQ		0xa00
 #define T7000_RCH_3D_USEQ		0xd00
-#define T7000_RCH_TIMES			0x2800	/* the 3D record's times, 16 bytes */
+#define T7000_RCH_TIMES			0x2800	/* the record's times: end, -, start, - */
 #define T7000_RCH_SIZE			0x3000
 /*
  * The 3D channel's second record (a8_joint): its barrier command, record,
@@ -4136,44 +4247,53 @@ static void t7000_idle(struct pvr_apple *apple)
  * within 1 ms). In state 1 Apple reads no PLL: the firmware's own power
  * and clock changes (its idle gating, DVFS) can leave PLL5 relocking while
  * the state reads 1 (iOS shows that in 30 of 200 draw rounds), and Apple
- * rings then too, and so does this driver. It
+ * rings then too. So does this driver; such doorbells are counted. It
  * still does not write the register with Fender's control 0 or the snoop
  * not armed in state 0 (never seen here; Apple's restart is not
  * implemented): the job is then in the ring and its wait ends in the reset.
  *
  * Nothing here fails: a job's publish checks first (t7000_publish_check()).
+ *
+ * Return: whether the doorbell found Fender in state 0 (statistics).
  */
-static void t7000_ring(struct pvr_apple *apple, u32 dm)
+static bool t7000_ring(struct pvr_apple *apple, u32 dm)
 {
 	struct pvr_apple_s8003 *s = apple->chip_data;
-	u32 state, pll, ctrl, snoop;
+	u32 state, pll = 0, ctrl = 0, snoop;
 
 	if (s->stuck) {
+		atomic64_inc(&s->doorbell_refused);
 		dev_err_ratelimited(apple_dev(apple),
 				    "doorbell not rung: the GPU is stuck; the job waits for the reset\n");
-		return;
+		return false;
 	}
 	mb();	/* what the firmware is rung for is in memory */
 	writel(FENDER_WAKE_ALL, apple->fender + FENDER_WAKE);
 	state = readl(apple->fender + FENDER_POWER_STATE);
+	atomic64_inc(&s->doorbells);
 	if (!(state & 0xf)) {
+		atomic64_inc(&s->doorbell_wakes);
 		ctrl = readl(apple->fender + FENDER_CTRL);
 		snoop = readl(apple->fender + T7000_FENDER_SNOOP);
 		if (!ctrl || (!(ctrl & T7000_FENDER_CTRL_SNOOP) && !(snoop & BIT(1)))) {
+			atomic64_inc(&s->doorbell_refused);
 			dev_err_ratelimited(apple_dev(apple),
 					    "doorbell not rung: Fender state %#x, control %#x, snoop %#x; the job waits for the reset\n",
 					    state, ctrl, snoop);
-			return;
+			return true;
 		}
 	} else {
-		/* logged only: Apple reads no PLL here */
+		/* statistics: Apple reads no PLL here */
 		pll = pmgr_read(s, T7000_PMGR_PLL5);
-		if (!(pll & T7000_PLL_LOCKED))
+		if (!(pll & T7000_PLL_LOCKED)) {
+			atomic64_inc(&s->doorbell_pll_unlocked);
 			dev_info_ratelimited(apple_dev(apple),
 					     "doorbell rung with PLL5 relocking, as Apple's kext rings: Fender state %#x, PLL5 %#x\n",
 					     state, pll);
+		}
 	}
 	pvr_cr_write32(apple->pvr_dev, ROGUE_CR_MTS_SCHEDULE, ROGUE_CR_MTS_SCHEDULE_TASK_COUNTED | dm);
+	return !(state & 0xf);
 }
 
 /* The variant's doorbell, for device-control commands */
@@ -4293,7 +4413,8 @@ static void t7000_publish(struct pvr_apple *apple, enum pvr_apple_engine engine,
 	wmb();
 	WRITE_ONCE(*(__le32 *)(ctl + S8003_RING_PRODUCER),
 		   cpu_to_le32((start + 1) % APPLE_RING_ENTRIES));
-	t7000_ring(apple, dm[fw_engine]);
+	s->t7000_kick[engine] = arch_timer_read_counter();
+	s->t7000_kick_woke[engine] = t7000_ring(apple, dm[fw_engine]);
 }
 
 /* The A8's compute record: the A9's with every offset from 0x10 on 8 further */
@@ -4324,10 +4445,12 @@ static int t7000_submit_compute(struct pvr_apple *apple, struct s8003_vm *vm, st
 
 	err = s8003_wait_done(apple, APPLE_ENGINE_COMPUTE, apple->last_seq);
 	if (err)
-		return s8003_submit_error(apple, vm, "compute", err, "record slot wait");
+		return s8003_submit_error(apple, vm, "compute", err, S8003_REFUSED_SLOT_WAIT,
+					  "record slot wait");
 	err = t7000_publish_check(apple, APPLE_ENGINE_COMPUTE);
 	if (err)
-		return s8003_submit_error(apple, vm, "compute", err, "publish");
+		return s8003_submit_error(apple, vm, "compute", err, S8003_REFUSED_PUBLISH,
+					  "publish");
 	seq = apple->last_seq + 1;
 	k = seq - 1;
 	{
@@ -4477,6 +4600,7 @@ static int t7000_pm_build(struct pvr_apple *apple, struct s8003_vm *vm)
 	if (!blocks || blocks > T7000_PM_BLOCKS_MAX)
 		return -EINVAL;
 	vm->t7000.built = 0;
+	s->t7000_pm_builds++;
 	memset(stack, 0, T7000_PM_STACK_SIZE);
 	/* The stack first: the pool's page numbers from index 0 (0x847fef0) */
 	for (i = 0; i < pages; i++) {
@@ -4525,8 +4649,11 @@ static int t7000_pm_build(struct pvr_apple *apple, struct s8003_vm *vm)
 
 static void t7000_pm_obj_put(struct pvr_apple *apple, struct pvr_gem_object **obj, u8 **map)
 {
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
 	if (!*obj)
 		return;
+	atomic_dec(&s->pm_objs_live);
 	if (*map)
 		pvr_gem_object_vunmap(*obj);
 	pvr_gem_object_put(*obj);
@@ -4545,6 +4672,8 @@ static void t7000_vm_put(struct pvr_apple *apple, struct s8003_vm *vm)
 
 static int t7000_pm_obj(struct pvr_apple *apple, size_t size, struct pvr_gem_object **obj, u8 **map)
 {
+	struct pvr_apple_s8003 *s = apple->chip_data;
+
 	*obj = pvr_gem_object_create(apple->pvr_dev, size, T7000_VM_FLAGS);
 	if (IS_ERR(*obj)) {
 		int err = PTR_ERR(*obj);
@@ -4552,6 +4681,7 @@ static int t7000_pm_obj(struct pvr_apple *apple, size_t size, struct pvr_gem_obj
 		*obj = NULL;
 		return err;
 	}
+	atomic_inc(&s->pm_objs_live);
 	*map = pvr_gem_object_vmap(*obj);
 	if (IS_ERR(*map)) {
 		int err = PTR_ERR(*map);
@@ -4618,13 +4748,17 @@ static int t7000_prepare_job(struct pvr_apple *apple, struct pvr_job *job)
 	dataset = job->hwrt->hwrt_dataset;
 	err = s8003_rt_derive(dataset, &rt);
 	if (err) {
+		atomic64_inc(&s->refused[S8003_REFUSED_PREPARE_RT]);
 		return err;
 	}
-	if (dataset->samples != 1)
+	if (dataset->samples != 1) {
+		atomic64_inc(&s->refused[S8003_REFUSED_PREPARE_SAMPLES]);
 		return -EOPNOTSUPP;
+	}
 	slice = ALIGN(rt.header, SZ_4K);
 	err = t7000_rgn_ring(vm->vm_ctx, job->hwrt->data.rgn_header_dev_addr, slice, &ring);
 	if (err) {
+		atomic64_inc(&s->refused[S8003_REFUSED_PREPARE_RING]);
 		dev_warn_ratelimited(apple_dev(apple),
 				     "geometry job refused: region headers at %#llx are not a mirrored ring of 16 slices of %#x\n",
 				     job->hwrt->data.rgn_header_dev_addr, slice);
@@ -4860,6 +4994,14 @@ static const u32 t7000_3d_wait[24] = {
  * and the microsequence: start (TA 0x23, 3D 0x25 with 23 arguments), the
  * timestamps around the wait, finish (0x24, 0x26). @k is the stamp's value
  * before this job; the job's finish writes k + 1.
+ *
+ * The timestamps are Apple's op 0x18 pair with Apple's operands (TA
+ * FUN_fffffff00848d3e0: {W+0x558, W+0x560, W+0x560} after 0x23, {W+0x558,
+ * W+0x560, W+0x564} after the wait; 3D {W+0x8a0, W+0x8a8, W+0x8ac}): the
+ * result word gets the work's duration, and the firmware stores the
+ * absolute start and end where the two pointer words point. Both engines
+ * point them at their channel's @times, the start at +8 and the end at +0,
+ * as the A9's s8003_job_write() points its own pair at two times per job.
  */
 struct t7000_rjob {
 	u32 ch, w, useq, object, slot, pm_id, control, s, dep, seq, k, trace, times;
@@ -4897,6 +5039,8 @@ static void t7000_ta_write(u8 *work, u8 *useq, const struct t7000_rjob *j)
 	put32(work + 0x53c, j->k + 1);
 	put32(work + 0x54c, j->seq);
 	put32(work + 0x550, j->k);
+	put32(work + 0x560, j->times + 8);
+	put32(work + 0x564, j->times);
 	memset(useq, 0, T7000_TA_USEQ_SIZE);
 	useq_put(useq, words, ARRAY_SIZE(words));
 }
@@ -4936,6 +5080,7 @@ static void t7000_3d_write(u8 *work, u8 *useq, const struct t7000_rjob *j)
 	put32(work + 0x878, j->k + 1);
 	put32(work + 0x888, j->seq);
 	put32(work + 0x88c, j->k);
+	put32(work + 0x8a8, j->times + 8);
 	put32(work + 0x8ac, j->times);
 	memset(useq, 0, T7000_3D_USEQ_SIZE);
 	out = useq_put(useq, start, ARRAY_SIZE(start));
@@ -5006,6 +5151,21 @@ static void t7000_pm_feedback(struct pvr_apple *apple, struct s8003_vm *vm)
 }
 
 /*
+ * A job's submit phases for t7000_phases(), in system counter ticks: from
+ * the chip's submit (@t0) to the PM step's end (@t1), to the record slot
+ * wait's end (@t2), to now, after the work ring's slot wait. Statistics
+ * only; submit_lock held, right before the job's publish.
+ */
+static void t7000_submit_times(struct pvr_apple_s8003 *s, enum pvr_apple_engine engine,
+			       u64 t0, u64 t1, u64 t2)
+{
+	s->t7000_submit_at[engine] = t0;
+	s->t7000_pm_ticks[engine] = t1 - t0;
+	s->t7000_slot_ticks[engine] = t2 - t1;
+	s->t7000_ring_ticks[engine] = arch_timer_read_counter() - t2;
+}
+
+/*
  * A fragment job is submitted once its geometry job is (pvr_apple_job_armed()),
  * not once it finished: the firmware holds the 3D itself. Each 3D record
  * goes behind the barrier command {4, the TA's finish stamp, the value it
@@ -5052,17 +5212,20 @@ static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	struct pvr_apple_s8003 *s = apple->chip_data;
 	u32 addr = s8003_channel_addr(s, APPLE_ENGINE_GEOM);
 	u8 *p = s8003_channel(s, APPLE_ENGINE_GEOM);
+	u64 t0 = arch_timer_read_counter(), t1, t2;
 	struct t7000_rjob j;
 	struct s8003_rt rt;
 	u64 slice_addr;
 	u32 seq;
 	int err;
 
-		return s8003_submit_error(apple, vm, "geometry", -EINVAL, "not prepared");
 	if (!dataset->apple_rgn.ring || !vm->t7000.stack)
+		return s8003_submit_error(apple, vm, "geometry", -EINVAL, S8003_REFUSED_NOT_PREPARED,
+					  "not prepared");
 	err = s8003_rt_derive(dataset, &rt);
 	if (err)
-		return s8003_submit_error(apple, vm, "geometry", err, "rt derive");
+		return s8003_submit_error(apple, vm, "geometry", err, S8003_REFUSED_RT,
+					  "rt derive");
 	/*
 	 * Every earlier scene is done here (a geometry job waits for the last
 	 * fragment job, pvr_apple_job_add_deps()): the pool is the firmware's
@@ -5086,19 +5249,26 @@ static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	if (vm->t7000.built != s->gen || vm->t7000.open) {
 		err = t7000_pm_build(apple, vm);
 		if (err)
-			return s8003_submit_error(apple, vm, "geometry", err, "PM set build");
+			return s8003_submit_error(apple, vm, "geometry", err, S8003_REFUSED_PM,
+						  "PM set build");
 	}
+	t1 = arch_timer_read_counter();
 	err = s8003_wait_done(apple, APPLE_ENGINE_GEOM, apple->ta_seq);
 	if (err)
-		return s8003_submit_error(apple, vm, "geometry", err, "record slot wait");
+		return s8003_submit_error(apple, vm, "geometry", err, S8003_REFUSED_SLOT_WAIT,
+					  "record slot wait");
+	t2 = arch_timer_read_counter();
 	err = t7000_publish_check(apple, APPLE_ENGINE_GEOM);
 	if (err)
-		return s8003_submit_error(apple, vm, "geometry", err, "publish");
+		return s8003_submit_error(apple, vm, "geometry", err, S8003_REFUSED_PUBLISH,
+					  "publish");
+	t7000_submit_times(s, APPLE_ENGINE_GEOM, t0, t1, t2);
 
 	seq = apple->ta_seq + 1;
 	slice_addr = job->hwrt->data.rgn_header_dev_addr +
 		     (dataset->apple_rgn.cursor & (dataset->apple_rgn.ring - 1));
 	t7000_fill_ta(p + T7000_RCH_W, job->cmd, job->hwrt, &rt, slice_addr);
+	memset(p + T7000_RCH_TIMES, 0, 16);
 	j = (struct t7000_rjob) {
 		.ch = addr, .w = addr + T7000_RCH_W, .useq = addr + T7000_RCH_TA_USEQ,
 		.object = s8003_object_addr(&s->layout, S8003_CHANNEL), .slot = vm->slot[0],
@@ -5106,6 +5276,7 @@ static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		.s = t7000_pm_s(vm), .dep = addr + S8003_CH_DEP, .seq = seq, .k = seq - 1,
 		.trace = ++s->t7000_trace, .pr_ch = s8003_channel_addr(s, APPLE_ENGINE_FRAG),
 		.pr_index = (2 * (apple->frag_seq + 1) - 1) % T7000_RCH_ENTRIES,
+		.times = addr + T7000_RCH_TIMES,
 	};
 	t7000_ta_write(p + T7000_RCH_W, p + T7000_RCH_TA_USEQ, &j);
 	put32(p + T7000_RCH_RING + ((seq - 1) % T7000_RCH_ENTRIES) * 4, j.w);
@@ -5142,6 +5313,7 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	u32 addr = s8003_channel_addr(s, APPLE_ENGINE_FRAG);
 	u32 ta_addr = s8003_channel_addr(s, APPLE_ENGINE_GEOM);
 	u8 *p = s8003_channel(s, APPLE_ENGINE_FRAG), *cmd;
+	u64 t0 = arch_timer_read_counter(), t2;
 	u32 cmd_off, w_off, useq_off, times_off;
 	struct t7000_rjob j;
 	struct s8003_rt rt;
@@ -5154,17 +5326,22 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	BUILD_BUG_ON(T7000_3D_CHANNEL + T7000_RCH1_TIMES + 16 > T7000_PM_CONTROL);
 
 	if (!vm->t7000.open || vm->t7000.hwrt != job->hwrt || vm->t7000.built != s->gen)
-		return s8003_submit_error(apple, vm, "fragment", -ECANCELED,
+		return s8003_submit_error(apple, vm, "fragment", -ECANCELED, S8003_REFUSED_NO_GEOM,
 					   "its geometry job failed or was not submitted");
 	err = s8003_rt_derive(job->hwrt->hwrt_dataset, &rt);
 	if (err)
-		return s8003_submit_error(apple, vm, "fragment", err, "rt derive");
+		return s8003_submit_error(apple, vm, "fragment", err, S8003_REFUSED_RT,
+					  "rt derive");
 	err = s8003_wait_done(apple, APPLE_ENGINE_FRAG, apple->frag_seq);
 	if (err)
-		return s8003_submit_error(apple, vm, "fragment", err, "record slot wait");
+		return s8003_submit_error(apple, vm, "fragment", err, S8003_REFUSED_SLOT_WAIT,
+					  "record slot wait");
+	t2 = arch_timer_read_counter();
 	err = t7000_publish_check(apple, APPLE_ENGINE_FRAG);
 	if (err)
-		return s8003_submit_error(apple, vm, "fragment", err, "publish");
+		return s8003_submit_error(apple, vm, "fragment", err, S8003_REFUSED_PUBLISH,
+					  "publish");
+	t7000_submit_times(s, APPLE_ENGINE_FRAG, t0, t0, t2);
 
 	seq = apple->frag_seq + 1;
 	/*
@@ -5186,7 +5363,8 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	cmd = p + cmd_off;
 	err = t7000_fill_3d(p + w_off, job->cmd, &rt, vm->t7000.rgn_addr);
 	if (err)
-		return s8003_submit_error(apple, vm, "fragment", err, "3D record fill");
+		return s8003_submit_error(apple, vm, "fragment", err, S8003_REFUSED_FILL,
+					  "3D record fill");
 	memset(p + times_off, 0, 16);
 	j = (struct t7000_rjob) {
 		.ch = addr, .w = addr + w_off, .useq = addr + useq_off,
@@ -5445,6 +5623,231 @@ static void t7000_report_hang(struct pvr_apple *apple)
 }
 
 /*
+ * A retired job's timeline from its record, which a later job of the
+ * engine overwrites only once this one is done (s8003_wait_done()); the
+ * record's sequence word tells. Its microsequence times the engine's work:
+ * op 0x80000018 {result, start pointer, start pointer, seq} after the start
+ * packet, op 0x18 {result, start pointer, end pointer, seq} after the wait,
+ * with Apple's operands (TA W+0x558, W+0x560, W+0x564; 3D W+0x8a0, W+0x8a8,
+ * W+0x8ac; CL W+0x280, W+0x288, W+0x28c). The result word is the work's
+ * duration in the firmware's 24 MHz time (the firmware converts the Rogue
+ * timer through its correlation and compares such times against 0x5dbf,
+ * 1 ms; PLATFORM +0x280 = 24000; the A9's same op measured 24 ticks/us)
+ * [I]: measured raw words were 0x25e..0x2e5 (TA) and 0x35a..0x424 (3D), 25..44
+ * us. The pointer words say where the firmware stores the absolute start
+ * and end (t7000_ta_write(), t7000_3d_write(): T7000_RCH_TIMES +8 and +0,
+ * zeroed per job); measurements showed the 3D's end there in the system counter's
+ * clock. Both render engines: start_to_end from the result, kick_to_start
+ * and end_to_signal from the end, the phases of the job (t7000_phases()),
+ * and the first four whose end is missing or off by more than a second are
+ * logged raw. Memory only, under fence_lock.
+ */
+#define T7000_FW_TICKS_PER_US		24
+
+/* The phases of a job whose timeline is usable (struct t7000_phases), in counter ticks */
+static void t7000_phases(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 kick,
+			 u32 start, u32 end, u32 now, u32 stamped_start, ktime_t now_kt, u32 freq)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	struct t7000_phases *ph = &s->t7000_ph[engine];
+	u32 submit = (u32)s->t7000_submit_at[engine], host = kick - submit;
+	u32 tail_us = (now - end) / freq;
+	ktime_t irq_at = READ_ONCE(apple->irq_at);
+	s64 irq_us;
+
+	if (!stamped_start)
+		ph->start_stamp_none++;
+	else if (abs((s32)(stamped_start - start)) > 2 * (s32)freq)
+		ph->start_stamp_off++;
+	if (!s->t7000_submit_at[engine] || host / freq > USEC_PER_SEC)
+		return;
+	pvr_apple_stat_add(&ph->total, (now - submit) / freq);
+	pvr_apple_stat_add(&ph->host, host / freq);
+	pvr_apple_stat_add(&ph->wait, (start - kick) / freq);
+	pvr_apple_stat_add(&ph->run, (end - start) / freq);
+	pvr_apple_stat_add(&ph->tail, tail_us);
+	if (engine == APPLE_ENGINE_GEOM)
+		pvr_apple_stat_add(&ph->pm, s->t7000_pm_ticks[engine] / freq);
+	pvr_apple_stat_add(&ph->slot, s->t7000_slot_ticks[engine] / freq);
+	pvr_apple_stat_add(&ph->ring, s->t7000_ring_ticks[engine] / freq);
+	/* a fragment job the firmware held for its TA (a8_joint): that wait, then the hand-off */
+	if (engine == APPLE_ENGINE_FRAG && s->t7000_geom_end &&
+	    (s32)(s->t7000_geom_end - kick) > 0 && (s32)(start - s->t7000_geom_end) >= 0) {
+		pvr_apple_stat_add(&ph->ta_wait, (s->t7000_geom_end - kick) / freq);
+		pvr_apple_stat_add(&ph->ta_to_3d, (start - s->t7000_geom_end) / freq);
+	} else {
+		pvr_apple_stat_add(s->t7000_kick_woke[engine] ? &ph->wait_woke : &ph->wait_awake,
+				   (start - kick) / freq);
+	}
+	/* the check that retires this job: one an interrupt after the end led to, or not */
+	irq_us = irq_at && !ktime_after(irq_at, now_kt) ? ktime_us_delta(now_kt, irq_at) : -1;
+	if (irq_us >= 0 && irq_us <= tail_us) {
+		pvr_apple_stat_add(&ph->end_to_irq, tail_us - irq_us);
+		pvr_apple_stat_add(&ph->irq_to_signal, irq_us);
+	} else {
+		pvr_apple_stat_add(&ph->end_to_check, tail_us);
+	}
+}
+
+static void t7000_job_retired(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 seq)
+{
+	static const struct { u32 w, seq, result; } at[APPLE_ENGINES] = {
+		[APPLE_ENGINE_GEOM] = { T7000_RCH_W, 0x54c, 0x558 },
+		[APPLE_ENGINE_FRAG] = { T7000_RCH_W, 0x888, 0x8a0 },
+		[APPLE_ENGINE_COMPUTE] = { S8003_CH_W, 0x278, 0x280 },
+	};
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	const u8 *p = s8003_channel(s, engine), *w = p + at[engine].w;
+	u32 times = T7000_RCH_TIMES;
+	ktime_t now_kt = ktime_get();
+	u32 freq = arch_timer_get_cntfrq() / 1000000, now = (u32)arch_timer_read_counter();
+	u32 kick = (u32)s->t7000_kick[engine], end, start;
+	u64 run = get_unaligned_le64(w + at[engine].result);
+	s32 wait, tail;
+
+	s->t7000_jobs_retired++;
+	s->t7000_ev_lead--;
+	if (engine == APPLE_ENGINE_GEOM)
+		s->t7000_geom_end = 0;
+	/* the record this fragment job was written to: no later one is written before it retires */
+	if (engine == APPLE_ENGINE_FRAG && s->t7000_frag_w == T7000_RCH1_W) {
+		w = p + T7000_RCH1_W;
+		times = T7000_RCH1_TIMES;
+	}
+	if (get32(w + at[engine].seq) != seq)
+		return;
+	if (run / T7000_FW_TICKS_PER_US <= USEC_PER_SEC)
+		pvr_apple_stat_add(&s->t7000_fw_run_us[engine], run / T7000_FW_TICKS_PER_US);
+	if (engine == APPLE_ENGINE_COMPUTE || !freq)
+		return;
+	end = get32(p + times);
+	start = end - (u32)run * (freq / T7000_FW_TICKS_PER_US ?: 1);
+	wait = start - kick;
+	tail = now - end;
+	if (!end || wait < 0 || tail < 0 || wait / freq > USEC_PER_SEC ||
+	    tail / freq > USEC_PER_SEC) {
+		/* the first few raw, to tell what the firmware stored and in which clock */
+		if (s->t7000_fw_bad[engine]++ < 4)
+			dev_info(apple_dev(apple),
+				 "A8 timeline raw: engine %d seq %u kick %#x now %#x (counter %u MHz); result %#llx; times %08x %08x %08x %08x\n",
+				 engine, seq, kick, now, freq, run, get32(p + times),
+				 get32(p + times + 4), get32(p + times + 8),
+				 get32(p + times + 12));
+		return;
+	}
+	pvr_apple_stat_add(&s->t7000_fw_wait_us[engine], wait / freq);
+	pvr_apple_stat_add(&s->t7000_fw_tail_us[engine], tail / freq);
+	if (engine == APPLE_ENGINE_GEOM)
+		s->t7000_geom_end = end;
+	t7000_phases(apple, engine, kick, start, end, now, get32(p + times + 8),
+		     now_kt, freq);
+}
+
+static void t7000_debugfs_reset(struct pvr_apple *apple)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	unsigned int i;
+
+	if (!s)
+		return;
+	memset(s->t7000_fw_wait_us, 0, sizeof(s->t7000_fw_wait_us));
+	memset(s->t7000_fw_run_us, 0, sizeof(s->t7000_fw_run_us));
+	memset(s->t7000_fw_tail_us, 0, sizeof(s->t7000_fw_tail_us));
+	memset(s->t7000_fw_bad, 0, sizeof(s->t7000_fw_bad));
+	memset(s->t7000_ph, 0, sizeof(s->t7000_ph));
+	s->t7000_pm_builds = 0;
+	s->t7000_irq_found = 0;
+	s->t7000_irq_polled = 0;
+	s->t7000_irq_stamp_event = 0;
+	s->t7000_irq_rings = 0;
+	s->t7000_irq_none = 0;
+	s->t7000_stamp_events = 0;
+	s->t7000_jobs_retired = 0;
+	atomic64_set(&s->doorbells, 0);
+	atomic64_set(&s->doorbell_wakes, 0);
+	atomic64_set(&s->doorbell_pll_unlocked, 0);
+	atomic64_set(&s->doorbell_refused, 0);
+	for (i = 0; i < S8003_REFUSALS; i++)
+		atomic64_set(&s->refused[i], 0);
+}
+
+/*
+ * Which A8 interrupts find their job (&pvr_apple_chip.irq_checked), from
+ * memory only, before the rings are drained. A private cursor over the
+ * event ring counts every stamp event the firmware posts; t7000_job_retired()
+ * counts every retired job. Their running difference (never reset) tells,
+ * at an interrupt whose check found nothing, whether the firmware had posted
+ * more stamp events than jobs retired (stamp_event_ahead: the event came
+ * before the stamp it reports; the first four are logged with the event and
+ * the stamps) or not (for_retired_job: the interrupt of a job a check
+ * without an interrupt had retired first, when one had since the previous
+ * interrupt; else one with only log/statistics/trace entries, or with
+ * nothing new). Meaningful while the firmware posts one stamp event per job:
+ * stamp_events against jobs_retired shows it. Under fence_lock.
+ */
+static void t7000_irq_checked(struct pvr_apple *apple, unsigned int retired, bool polled)
+{
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	u8 *ctl = s8003_object(s, S8003_EVENT_CTL);
+	const u8 *events = s8003_object(s, S8003_EVENTS), *stamp_event = NULL;
+	u32 producer = ring_read(ctl, S8003_RING_PRODUCER), cursor = s->t7000_ev_cursor;
+	unsigned int lane;
+	bool rings = false;
+
+	if (producer >= APPLE_RING_ENTRIES)
+		return;
+	/* a new start of the firmware: its rings begin anew; count from here */
+	if (s->t7000_ev_gen != s->gen || cursor >= APPLE_RING_ENTRIES) {
+		s->t7000_ev_gen = s->gen;
+		s->t7000_ev_lead = 0;
+		cursor = producer;
+	}
+	rmb();	/* the index before the entries it covers */
+	for (; cursor != producer; cursor = (cursor + 1) % APPLE_RING_ENTRIES) {
+		const u8 *e = events + cursor * S8003_EVENT_SIZE;
+
+		if (get_unaligned_le32(e) == S8003_EVENT_STAMP) {
+			s->t7000_stamp_events++;
+			s->t7000_ev_lead++;
+			stamp_event = e;
+		}
+	}
+	s->t7000_ev_cursor = cursor;
+	for (lane = 0; lane < 4 && !rings; lane++) {
+		u8 *log = s8003_object(s, S8003_LOG_CTL) + lane * s->v->ring_ctl_size;
+
+		rings = ring_read(log, S8003_RING_CONSUMER) != ring_read(log, S8003_RING_PRODUCER);
+	}
+	rings |= ring_read(s8003_object(s, S8003_STATS_CTL), S8003_RING_CONSUMER) !=
+		 ring_read(s8003_object(s, S8003_STATS_CTL), S8003_RING_PRODUCER);
+	rings |= ring_read(s8003_object(s, S8003_TRACE_CTL), S8003_RING_CONSUMER) !=
+		 ring_read(s8003_object(s, S8003_TRACE_CTL), S8003_RING_PRODUCER);
+
+	if (retired) {
+		s->t7000_irq_found++;
+	} else if (s->t7000_ev_lead > 0) {
+		if (s->t7000_irq_stamp_event++ < 4) {
+			const u8 *ta = s8003_channel(s, APPLE_ENGINE_GEOM);
+			const u8 *td = s8003_channel(s, APPLE_ENGINE_FRAG);
+
+			dev_info(apple_dev(apple),
+				 "A8 interrupt before its stamp: events ahead of retirements by %lld, last new stamp event %*ph; TA submitted %u stamps %u %u; 3D submitted %u stamps %u %u\n",
+				 s->t7000_ev_lead, S8003_EVENT_SIZE - 4,
+				 stamp_event ? stamp_event + 4 : events, s8003_submitted(apple, APPLE_ENGINE_GEOM),
+				 get32(ta + S8003_CH_STAMP), get32(ta + S8003_CH_STAMP + 4),
+				 s8003_submitted(apple, APPLE_ENGINE_FRAG), get32(td + S8003_CH_STAMP),
+				 get32(td + S8003_CH_STAMP + 4));
+		}
+	} else if (polled) {
+		s->t7000_irq_polled++;
+	} else if (rings) {
+		s->t7000_irq_rings++;
+	} else {
+		s->t7000_irq_none++;
+	}
+}
+
+/*
  * The backup completion check's period while jobs are pending (with the
  * interrupt taken): the firmware raises its interrupt some time after it
  * writes a job's stamp, and in one measurement the 250 us check found 71% of
@@ -5472,6 +5875,90 @@ MODULE_PARM_DESC(a8_recheck_us, "A8: first re-check after an interrupt that foun
 static unsigned int t7000_recheck_us(struct pvr_apple *apple)
 {
 	return clamp(READ_ONCE(a8_recheck_us), 5u, 250u);
+}
+
+static u64 t7000_avg(const struct pvr_apple_stat *st)
+{
+	return st->n ? div64_u64(st->sum, st->n) : 0;
+}
+
+/*
+ * debugfs apple_jobs: an engine's phases (struct t7000_phases), averages in
+ * us over the same jobs, so the first line adds up to its total; the second
+ * splits its parts, each with its own count.
+ */
+static void t7000_phases_show(struct seq_file *m, const char *name, const struct t7000_phases *ph)
+{
+	seq_printf(m, "a8 %s phases_us n %llu total %llu = submit_to_doorbell %llu + doorbell_to_start %llu + start_to_end %llu + end_to_signal %llu\n",
+		   name, ph->total.n, t7000_avg(&ph->total), t7000_avg(&ph->host),
+		   t7000_avg(&ph->wait), t7000_avg(&ph->run), t7000_avg(&ph->tail));
+	seq_printf(m, "a8 %s phases_detail_us submit: pm %llu slot_wait %llu ring_wait %llu; doorbell_to_start: awake %llu (n %llu) after_fender_wake %llu (n %llu) behind_ta %llu + ta_end_to_3d_start %llu (n %llu); end_to_signal: irq %llu + irq_to_signal %llu (n %llu) by_check %llu (n %llu); max total %llu host %llu wait %llu run %llu tail %llu; start_stamp none %llu off %llu\n",
+		   name, t7000_avg(&ph->pm), t7000_avg(&ph->slot), t7000_avg(&ph->ring),
+		   t7000_avg(&ph->wait_awake), ph->wait_awake.n,
+		   t7000_avg(&ph->wait_woke), ph->wait_woke.n,
+		   t7000_avg(&ph->ta_wait), t7000_avg(&ph->ta_to_3d), ph->ta_wait.n,
+		   t7000_avg(&ph->end_to_irq), t7000_avg(&ph->irq_to_signal), ph->end_to_irq.n,
+		   t7000_avg(&ph->end_to_check), ph->end_to_check.n,
+		   ph->total.max, ph->host.max, ph->wait.max, ph->run.max, ph->tail.max,
+		   ph->start_stamp_none, ph->start_stamp_off);
+}
+
+/* debugfs apple_jobs: per-VM state alive and the doorbells, statistics only */
+static void t7000_debugfs_show(struct pvr_apple *apple, struct seq_file *m)
+{
+	static const char *const names[APPLE_ENGINES] = {
+		[APPLE_ENGINE_GEOM] = "geometry",
+		[APPLE_ENGINE_FRAG] = "fragment",
+		[APPLE_ENGINE_COMPUTE] = "compute",
+	};
+	struct pvr_apple_s8003 *s = apple->chip_data;
+	unsigned int r;
+	int engine;
+
+	if (!s)
+		return;
+	/* the park VM is a VM context with a VM state of its own: the idle baseline */
+	seq_printf(m, "a8 live vm_states %d pm_objs %d (park VM %d)\n", atomic_read(&s->vms_live),
+		   atomic_read(&s->pm_objs_live), s->park_vm ? 1 : 0);
+	seq_printf(m, "a8 pm_blocks new VMs %u (a8_pm_blocks %u, stall floor %u, max %u)\n",
+		   clamp(max(READ_ONCE(a8_pm_blocks), READ_ONCE(s->t7000_pm_floor)), 2u,
+			 (u32)T7000_PM_BLOCKS_MAX),
+		   READ_ONCE(a8_pm_blocks), READ_ONCE(s->t7000_pm_floor), (u32)T7000_PM_BLOCKS_MAX);
+	seq_printf(m, "a8 doorbells %lld in_fender_state_0 %lld pll5_relocking %lld not_rung %lld\n",
+		   (long long)atomic64_read(&s->doorbells),
+		   (long long)atomic64_read(&s->doorbell_wakes),
+		   (long long)atomic64_read(&s->doorbell_pll_unlocked),
+		   (long long)atomic64_read(&s->doorbell_refused));
+	/* jobs refused, by reason: all 0 when every job reached the firmware */
+	seq_puts(m, "a8 refused");
+	for (r = 0; r < S8003_REFUSALS; r++)
+		seq_printf(m, " %s %lld", s8003_refusal_name[r],
+			   (long long)atomic64_read(&s->refused[r]));
+	seq_putc(m, '\n');
+	seq_printf(m, "a8 irqs found_job %llu; found nothing: stamp_event_ahead %llu for_retired_job %llu other_rings_only %llu nothing_new %llu; stamp_events %llu jobs_retired %llu lead %lld\n",
+		   s->t7000_irq_found, s->t7000_irq_stamp_event, s->t7000_irq_polled,
+		   s->t7000_irq_rings, s->t7000_irq_none, s->t7000_stamp_events,
+		   s->t7000_jobs_retired, s->t7000_ev_lead);
+	seq_printf(m, "a8 pm_builds %llu poll_us %u\n", s->t7000_pm_builds, t7000_poll_us(apple));
+	for (engine = 0; engine < APPLE_ENGINES; engine++) {
+		const struct pvr_apple_stat *st[3] = {
+			&s->t7000_fw_wait_us[engine], &s->t7000_fw_run_us[engine],
+			&s->t7000_fw_tail_us[engine],
+		};
+		static const char *const what[3] = { "kick_to_start", "start_to_end", "end_to_signal" };
+		int i;
+
+		for (i = 0; i < 3; i++)
+			seq_printf(m, "a8 %s fw %s_us last %llu max %llu avg %llu n %llu\n",
+				   names[engine], what[i], st[i]->last, st[i]->max,
+				   st[i]->n ? div64_u64(st[i]->sum, st[i]->n) : 0, st[i]->n);
+		seq_printf(m, "a8 %s fw timestamps unusable %llu\n", names[engine],
+			   s->t7000_fw_bad[engine]);
+		if (engine != APPLE_ENGINE_COMPUTE)
+			t7000_phases_show(m, names[engine], &s->t7000_ph[engine]);
+	}
+	seq_printf(m, "a8 joint %d (fragment job submitted after its geometry job's submit)\n",
+		   READ_ONCE(a8_joint));
 }
 
 static void t7000_iounmap(void *addr)
@@ -5734,8 +6221,12 @@ const struct pvr_apple_chip pvr_apple_chip_t7000 = {
 	.heaps = t7000_heaps,
 	.read_gpu_id = pvr_apple_t7000_read_gpu_id,
 	.report_fault = t7000_report_fault,
+	.debugfs_show = t7000_debugfs_show,
+	.debugfs_reset = t7000_debugfs_reset,
+	.job_retired = t7000_job_retired,
 	.poll_us = t7000_poll_us,
 	.recheck_us = t7000_recheck_us,
+	.irq_checked = t7000_irq_checked,
 	.joint = t7000_joint,
 	.init = pvr_apple_s8003_init,
 	.boot = pvr_apple_s8003_boot,

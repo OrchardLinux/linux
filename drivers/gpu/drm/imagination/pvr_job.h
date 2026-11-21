@@ -67,6 +67,9 @@ struct pvr_job {
 	/** @pvr_dev: Device pointer. */
 	struct pvr_device *pvr_dev;
 
+	/** @apple_armed: Apple: when the job was armed at submit (statistics). */
+	ktime_t apple_armed;
+
 	/** @ctx: Pointer to owning context. */
 	struct pvr_context *ctx;
 

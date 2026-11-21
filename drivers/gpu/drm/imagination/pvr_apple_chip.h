@@ -79,6 +79,19 @@ struct pvr_apple_layout {
 
 struct seq_file;
 
+/* A time in microseconds: the last, the largest, the sum and the count */
+struct pvr_apple_stat {
+	u64 last, max, sum, n;
+};
+
+static inline void pvr_apple_stat_add(struct pvr_apple_stat *stat, u64 us)
+{
+	stat->last = us;
+	stat->max = max(stat->max, us);
+	stat->sum += us;
+	stat->n++;
+}
+
 struct pvr_apple {
 	struct pvr_device *pvr_dev;
 	const struct pvr_apple_chip *chip;
@@ -157,6 +170,50 @@ struct pvr_apple {
 	ktime_t busy_since;
 	u64 busy_ns;
 	u64 retired_total; /* retired or cancelled jobs, fence_lock */
+	/* per engine: run (fence bound) to fence signal, in us; fence_lock */
+	u64 job_us_last[APPLE_ENGINES], job_us_max[APPLE_ENGINES];
+	u64 job_us_sum[APPLE_ENGINES], job_us_n[APPLE_ENGINES];
+	/*
+	 * Where else a job's time goes (debugfs apple_jobs), statistics only.
+	 * Per engine: from the job's arming at submit to its run_job (its
+	 * dependencies and the scheduler), and run_job itself (the power
+	 * reference, the chip's prepare and submit with the doorbell); under
+	 * fence_lock. The firmware's interrupt: how many were taken, and the
+	 * time from the last job bound (@kick) to the next one, written in
+	 * hard IRQ context without a lock. Completion checks run (@polls).
+	 */
+	struct pvr_apple_stat wait_us[APPLE_ENGINES], run_us[APPLE_ENGINES];
+	struct pvr_apple_stat irq_us;
+	ktime_t kick;
+	atomic64_t irqs, polls;
+	/*
+	 * More of the same, under fence_lock: an interrupt to the fence
+	 * signals it led to (@irq_at, 0 once used); a geometry job's signal
+	 * (@geom_signalled) to the next fragment job's run_job; the firmware
+	 * starts a job's run_job paid (pvr_apple_prepare_job()); the chip's
+	 * job preparation in the submitting process; and the ioctls in
+	 * enum pvr_apple_ioctl. Writing apple_jobs zeroes them all.
+	 */
+	ktime_t irq_at, geom_signalled;
+	struct pvr_apple_stat irq_to_signal_us, geom_to_frag_us, boot_us, prepare_us;
+	struct pvr_apple_stat ioctl_us[APPLE_IOCTLS];
+	/*
+	 * Jobs retired by a check an interrupt led to, and by the backup
+	 * poll; interrupts whose check found nothing; the interrupt to its
+	 * check (the work item's or the thread's wake-up).
+	 */
+	u64 retired_after_irq, retired_by_poll, irq_empty;
+	struct pvr_apple_stat irq_to_check_us;
+	/*
+	 * Jobs found by the re-checks an interrupt started after finding
+	 * nothing (its job's stamp not yet in memory), and that interrupt to
+	 * their signal; fence_lock.
+	 */
+	ktime_t irq_recheck_at;
+	u64 retired_after_irq_recheck;
+	/* a check without an interrupt retired a job since the last interrupt's */
+	bool retired_since_irq;
+	struct pvr_apple_stat irq_recheck_to_signal_us;
 
 	ktime_t stat_since;
 
@@ -261,10 +318,18 @@ struct pvr_apple {
  * @max_power_state: Highest state licensed for fault capture; optional.
  * @report_fault: Capture the MMU fault state after a firmware fault, in place
  *	of the licence-checked bank read (pvr_apple_report_mmu_fault()); optional.
+ * @debugfs_show: More lines for debugfs apple_jobs; optional.
+ * @debugfs_reset: Zero the chip's statistics with apple_jobs'; optional.
+ * @job_retired: Job @seq of @engine left the pending list, under fence_lock
+ *	with interrupts off (statistics); optional.
  * @poll_us: The backup check period with the interrupt taken, in place of
  *	@irq_poll_us (a tunable); optional.
  * @recheck_us: After an interrupt whose check found nothing, the delay of
  *	the first re-check, in place of the fast period; optional.
+ * @irq_checked: The check an interrupt started is done: @retired jobs found,
+ *	@polled whether a check without an interrupt retired one since the
+ *	previous interrupt's; before the rings are drained, under fence_lock,
+ *	statistics only; optional.
  * @events: Read what the firmware posted. Before @engine_done wherever a job
  *	is waited for; may sleep.
  * @vm_init: A userspace VM was created: map what the firmware needs in it.
@@ -320,8 +385,12 @@ struct pvr_apple_chip {
 	void (*write_frag)(struct pvr_apple *apple, u32 seq, const void *hw);
 	void (*report_hang)(struct pvr_apple *apple);
 	void (*report_fault)(struct pvr_apple *apple);
+	void (*debugfs_show)(struct pvr_apple *apple, struct seq_file *s);
+	void (*debugfs_reset)(struct pvr_apple *apple);
+	void (*job_retired)(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 seq);
 	unsigned int (*poll_us)(struct pvr_apple *apple);
 	unsigned int (*recheck_us)(struct pvr_apple *apple);
+	void (*irq_checked)(struct pvr_apple *apple, unsigned int retired, bool polled);
 
 	int (*prepare_job)(struct pvr_apple *apple, struct pvr_job *job);
 	int (*submit)(struct pvr_apple *apple, struct pvr_job *job);
@@ -367,6 +436,7 @@ static inline struct device *apple_dev(struct pvr_apple *apple)
 void pvr_apple_report_mmu_fault(struct pvr_apple *apple);
 void pvr_apple_firmware_fault(struct pvr_apple *apple);
 bool pvr_apple_fence_faulted(struct dma_fence *fence);
+void pvr_apple_job_ran(struct pvr_job *job, ktime_t start);
 void pvr_apple_fence_bind(struct pvr_device *pvr_dev, struct dma_fence *fence,
 			  struct drm_gpu_scheduler *sched);
 int pvr_apple_fw_load(struct pvr_apple *apple, size_t max_size);

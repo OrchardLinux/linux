@@ -631,6 +631,7 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 	vm_ctx->last_retired = ktime_get();
 	INIT_LIST_HEAD(&vm_ctx->pins);
 	kref_init(&vm_ctx->ref_count);
+	atomic_inc(&pvr_dev->live.vm_ctxs);	/* until pvr_vm_context_release() */
 
 	if (is_userspace_context && pvr_device_is_apple(pvr_dev)) {
 		err = pvr_apple_vm_init(pvr_dev, vm_ctx);
@@ -664,6 +665,7 @@ pvr_vm_context_release(struct kref *ref_count)
 	struct pvr_vm_context *vm_ctx =
 		container_of(ref_count, struct pvr_vm_context, ref_count);
 
+	atomic_dec(&vm_ctx->pvr_dev->live.vm_ctxs);
 	/* Apple: GPU context 0 must not keep running on these page tables. */
 	if (pvr_device_is_apple(vm_ctx->pvr_dev))
 		pvr_apple_vm_fini(vm_ctx->pvr_dev, vm_ctx);

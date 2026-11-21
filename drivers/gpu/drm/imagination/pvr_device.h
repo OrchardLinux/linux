@@ -260,6 +260,17 @@ struct pvr_device {
 	struct xarray job_ids;
 
 	/**
+	 * @live: Objects alive now, for leak checks (debugfs apple_jobs):
+	 * GEM objects and their bytes, MMU page-table pages, VM contexts.
+	 */
+	struct {
+		atomic_t gem_objs;
+		atomic64_t gem_bytes;
+		atomic_t mmu_pages;
+		atomic_t vm_ctxs;
+	} live;
+
+	/**
 	 * @queues: Queue-related fields.
 	 */
 	struct {
