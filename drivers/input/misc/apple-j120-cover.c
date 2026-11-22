@@ -14,6 +14,15 @@ struct j120_cover {
 	int last_sample;
 };
 
+static int j120_cover_open(struct input_dev *input)
+{
+	struct j120_cover *cover = input_get_drvdata(input);
+
+	/* The first poll after reopening must start a new debounce window. */
+	cover->last_sample = -1;
+	return 0;
+}
+
 static void j120_cover_poll(struct input_dev *input)
 {
 	struct j120_cover *cover = input_get_drvdata(input);
@@ -58,14 +67,13 @@ static int j120_cover_probe(struct platform_device *pdev)
 	cover->regmap = dev_get_regmap(dev->parent, NULL);
 	if (!cover->regmap)
 		return dev_err_probe(dev, -ENODEV, "August PMIC register map unavailable\n");
-	cover->last_sample = -1;
-
 	input = devm_input_allocate_device(dev);
 	if (!input)
 		return -ENOMEM;
 
 	input->name = "Apple J120 Magnetic Cover";
 	input->id.bustype = BUS_I2C;
+	input->open = j120_cover_open;
 	input_set_drvdata(input, cover);
 	input_set_capability(input, EV_SW, SW_MACHINE_COVER);
 
