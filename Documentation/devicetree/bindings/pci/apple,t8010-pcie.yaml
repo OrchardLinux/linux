@@ -4,23 +4,26 @@
 $id: http://devicetree.org/schemas/pci/apple,t8010-pcie.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple S8003, T7000, T8010 and T8015 PCIe host controller
+title: Apple S8000, S8003, T7000, T8010 and T8015 PCIe host controller
 
 maintainers:
   - Paul Praschl <praschlpaul@g-p.at>
 
 description: |
-  Apple A9/S8003 (TSMC), A10/T8010 and A11/T8015 devices use the H8P/H9P
-  PCIe root complex for internal storage and Wi-Fi. It exposes one ECAM
-  window shared by up to four root ports, controller-specific PHY and port
-  register windows, and a local MSI block. The SoCs share this register map
-  but need different power-up and link training sequences.
+  Apple A9 (S8000, Samsung; S8003, TSMC), A10/T8010 and A11/T8015 devices
+  use the H8P/H9P PCIe root complex for internal storage and Wi-Fi. It
+  exposes one ECAM window shared by up to four root ports, controller-specific
+  PHY and port register windows, and a local MSI block. The SoCs share this
+  register map but need different power-up and link training sequences.
 
   The storage port also contains an NVMMU which translates the proprietary
   Apple ANS FlatDMA format. Unlike a general-purpose IOMMU, this block uses a
   loader-provided, physically contiguous host-memory buffer and a fixed IOVA
   window. The PCIe driver owns that NVMMU state and exposes it only to the ANS
   NVMe glue.
+
+  The S8000 has the S8003's root complex without its "phy-ip" window: its
+  PHY lanes are set up through the "phy" window alone.
 
   The T8015 has no PCIe storage port: its NVMe controller is the separate
   ANS2 block, so the T8015 has no storage-port NVMMU and none of its
@@ -113,6 +116,7 @@ allOf:
           compatible:
             contains:
               enum:
+                - apple,s8000-pcie
                 - apple,t7000-pcie
                 - apple,t8015-pcie
     then:
@@ -143,11 +147,39 @@ allOf:
         - clock-names
         - apple,nvmmu-iova
         - apple,nvme-hmb
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,s8000-pcie
+    then:
+      properties:
+        reg:
+          minItems: 8
+          maxItems: 8
+        reg-names:
+          items:
+            - const: config
+            - const: rc
+            - const: phy
+            - const: port0
+            - const: port1
+            - const: port2
+            - const: port3
+            - const: nvmmu
+        interrupts:
+          minItems: 5
+        interrupt-names:
+          minItems: 5
+      required:
+        - apple,nvmmu-iova
+        - apple,nvme-hmb
 
 properties:
   compatible:
     oneOf:
       - enum:
+          - apple,s8000-pcie
           - apple,s8003-pcie
           - apple,t7000-pcie
           - apple,t8010-pcie
@@ -340,7 +372,9 @@ if:
   properties:
     compatible:
       contains:
-        const: apple,s8003-pcie
+        enum:
+          - apple,s8000-pcie
+          - apple,s8003-pcie
 then:
   properties:
     clocks: false
