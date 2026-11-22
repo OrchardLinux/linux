@@ -21,6 +21,7 @@ properties:
       - apple,j71t-touchscreen
       - apple,j72-touchscreen
       - apple,j81-touchscreen
+      - apple,j85-touchscreen
       - apple,j96-touchscreen
       - apple,j172-touchscreen
       - apple,d11-touchscreen
@@ -233,10 +234,38 @@ allOf:
   - if:
       properties:
         compatible:
+          const: apple,j85-touchscreen
+    then:
+      properties:
+        pinctrl-names:
+          items:
+            - const: display-sync-active
+            - const: display-sync-inactive
+        power-ana-gpios: false
+        power-ldo-gpios: false
+        display-sync-gpios: false
+        display-sync1-gpios: false
+        hv-supply: false
+        core-supply: false
+        spi-cpha: false
+        spi-cpol: false
+        apple,z2-bpw16-min-len: false
+        apple,z2-no-init-ack: false
+      required:
+        - clocks
+        - ana-supply
+        - attn-gpios
+        - pinctrl-0
+        - pinctrl-1
+        - pinctrl-names
+  - if:
+      properties:
+        compatible:
           enum:
             - apple,j71t-touchscreen
             - apple,j72-touchscreen
             - apple,j81-touchscreen
+            - apple,j85-touchscreen
             - apple,j96-touchscreen
             - apple,n61-touchscreen
     then:
@@ -252,6 +281,7 @@ allOf:
             - apple,j71t-touchscreen
             - apple,j72-touchscreen
             - apple,j81-touchscreen
+            - apple,j85-touchscreen
             - apple,j96-touchscreen
     then:
       properties:
