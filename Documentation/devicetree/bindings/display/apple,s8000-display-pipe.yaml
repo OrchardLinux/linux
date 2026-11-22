@@ -26,6 +26,7 @@ properties:
   compatible:
     oneOf:
       - const: apple,s8000-display-pipe
+      - const: apple,t7000-display-pipe
       - items:
           - const: apple,t8010-display-pipe
           - const: apple,s8000-display-pipe
@@ -100,7 +101,54 @@ allOf:
             - description: Display pipe front end (disp0_fe)
             - description: Display pipe back end (disp0_be)
             - description: DisplayPort/eDP controller (dp)
-    else:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t7000-display-pipe
+    then:
+      properties:
+        reg:
+          maxItems: 3
+          items:
+            - description:
+                ADP window, with the control and interrupt registers, the
+                parameter FIFO port and the pipe layer registers
+            - description: Display DART (dart-disp0), first window
+            - description: Display DART (dart-disp0), second window
+        reg-names:
+          maxItems: 3
+          items:
+            - const: adp
+            - const: dart0
+            - const: dart1
+        interrupts:
+          maxItems: 5
+          items:
+            - description:
+                Pipe interrupt; carries vblank, parameter packet completion
+                and pipe errors
+            - description: Back-end interrupt
+            - description: Third display interrupt
+            - description: Fourth display interrupt
+            - description: Fifth display interrupt
+        power-domains:
+          maxItems: 2
+          items:
+            - description: Display pipe (disp0)
+            - description:
+                Panel link the bootloader left running, MIPI DSI (mipi_dsi)
+                or DisplayPort (dp)
+        apple,lcd-ldo-gpios: false
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t7000-display-pipe
+                - apple,t8010-display-pipe
+    then:
       properties:
         reg:
           minItems: 6
@@ -205,5 +253,28 @@ examples:
                          <AIC_IRQ 161 IRQ_TYPE_LEVEL_HIGH>,
                          <AIC_IRQ 155 IRQ_TYPE_LEVEL_HIGH>;
             power-domains = <&ps_disp0_fe>, <&ps_disp0_be>, <&ps_dp>;
+        };
+    };
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        display-controller@206200000 {
+            compatible = "apple,t7000-display-pipe";
+            reg = <0x2 0x06200000 0x0 0x100000>,
+                  <0x2 0x06304000 0x0 0x4000>,
+                  <0x2 0x06300000 0x0 0x4000>;
+            reg-names = "adp", "dart0", "dart1";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 103 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 108 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 109 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 110 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 111 IRQ_TYPE_LEVEL_HIGH>;
+            power-domains = <&ps_disp0>, <&ps_mipi_dsi>;
         };
     };
