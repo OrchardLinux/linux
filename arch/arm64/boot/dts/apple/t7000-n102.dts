@@ -173,6 +173,14 @@
 	power-domains = <&ps_disp0 &ps_mipi_dsi>;
 };
 
+/*
+ * The display pipe takes the 640x1136 panel over from simpledrm. No panel
+ * supply is given: the panel stays on in system sleep.
+ */
+&disp0 {
+	status = "okay";
+};
+
 &gpu {
 	status = "okay";
 };
