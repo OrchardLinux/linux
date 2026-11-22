@@ -248,6 +248,30 @@ MODULE_PARM_DESC(dart_scanout,
 #define ADBE_FLIP_TIMEOUT_MS	100	/* complete anyway without an interrupt */
 #define ADBE_INTEN_VBLANK	(ADP_ST_VBI | ADP_ST_APPLIED)
 
+/*
+ * Physical size of the known panels of a SoC, matched by the boot
+ * framebuffer. Any other panel is adopted with its size unknown.
+ */
+struct adbe_panel {
+	u16 width, height;	/* pixels */
+	u16 width_mm, height_mm;
+};
+
+static const struct adbe_panel adbe_panels_s8000[] = {
+	{ 1536, 2048, 148, 197 },	/* 9.7-inch iPad 5 and iPad 6 */
+	{ 1620, 2160, 155, 207 },	/* 10.2-inch iPad 7 */
+	{ }
+};
+
+/* The iPad mini 4 has the 9.7-inch iPad's resolution on a 7.9-inch panel. */
+static const struct adbe_panel adbe_panels_t7000[] = {
+	{ 640, 1136, 50, 89 },		/* 4-inch iPod touch 6, 326 ppi */
+	{ 750, 1334, 58, 104 },		/* 4.7-inch iPhone 6, 326 ppi */
+	{ 1080, 1920, 68, 122 },	/* 5.5-inch iPhone 6 Plus, 401 ppi */
+	{ 1536, 2048, 120, 160 },	/* 7.9-inch iPad mini 4, 326 ppi */
+	{ }
+};
+
 /* What differs between the SoCs whose pipe this driver adopts. */
 struct adbe_hw {
 	/* SPDS version at ADP_SPDS that iOS requires; 0: iOS never reads it */
@@ -257,12 +281,15 @@ struct adbe_hw {
 	 * window: then the link is eDP.
 	 */
 	int connector_type;
+	/* Its known panels, ending with an empty entry */
+	const struct adbe_panel *panels;
 };
 
 /* A9 and A10: iOS's AppleH8ADBE0 panics unless ADP_SPDS reads 0x13. */
 static const struct adbe_hw adbe_hw_s8000 = {
 	.spds_version = ADP_SPDS_VERSION,
 	.connector_type = DRM_MODE_CONNECTOR_eDP,
+	.panels = adbe_panels_s8000,
 };
 
 /*
@@ -277,6 +304,7 @@ static const struct adbe_hw adbe_hw_s8000 = {
 static const struct adbe_hw adbe_hw_t7000 = {
 	.spds_version = 0,
 	.connector_type = DRM_MODE_CONNECTOR_DSI,
+	.panels = adbe_panels_t7000,
 };
 
 struct adbe {
@@ -362,33 +390,19 @@ static struct adbe *to_adbe(struct drm_device *drm)
 	return container_of(drm, struct adbe, drm);
 }
 
-/*
- * Physical size of the known panels, matched by the boot framebuffer. Any
- * other panel is adopted with its size unknown.
- */
-static const struct {
-	u16 width, height;	/* pixels */
-	u16 width_mm, height_mm;
-} adbe_panels[] = {
-	{ 1536, 2048, 148, 197 },	/* 9.7-inch iPad 5 and iPad 6 */
-	{ 1620, 2160, 155, 207 },	/* 10.2-inch iPad 7 */
-	{ 640, 1136, 50, 89 },		/* 4-inch iPod touch 6, 326 ppi */
-};
-
 /* The fixed mode of the panel iBoot left running, at its boot size. */
 static void adbe_init_mode(struct adbe *adbe, u32 width, u32 height)
 {
 	const struct drm_display_mode mode = {
 		DRM_MODE_INIT(60, width, height, 0, 0),
 	};
-	unsigned int i;
+	const struct adbe_panel *panel;
 
 	adbe->mode = mode;
-	for (i = 0; i < ARRAY_SIZE(adbe_panels); i++) {
-		if (adbe_panels[i].width == width &&
-		    adbe_panels[i].height == height) {
-			adbe->mode.width_mm = adbe_panels[i].width_mm;
-			adbe->mode.height_mm = adbe_panels[i].height_mm;
+	for (panel = adbe->hw->panels; panel->width; panel++) {
+		if (panel->width == width && panel->height == height) {
+			adbe->mode.width_mm = panel->width_mm;
+			adbe->mode.height_mm = panel->height_mm;
 			break;
 		}
 	}
