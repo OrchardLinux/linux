@@ -39,6 +39,7 @@
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/i2c.h>
+#include <linux/iio/consumer.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
@@ -248,6 +249,8 @@ struct tristar_charger {
 	u32 control_base;
 	u32 adc_base;
 	unsigned int max_ma;
+	struct iio_channel *vbus;
+	bool vbus_fault;
 
 	/* Serializes policy state and PMIC/Tristar sequences. */
 	struct mutex lock;
@@ -920,6 +923,7 @@ static void tristar_new_attachment(struct tristar_charger *chg, u64 now)
 	/* Before anything else: a host must not start a session yet. */
 	tristar_set_usb(chg, false);
 	chg->present = true;
+	chg->vbus_fault = false;
 	chg->phase = TRISTAR_SETTLING;
 	chg->attach_ns = now;
 	chg->hold_ns = now;
@@ -1314,6 +1318,21 @@ static void tristar_poll(struct work_struct *work)
 		tristar_new_attachment(chg, now);
 		goto again;
 	}
+	if (IS_REACHABLE(CONFIG_IIO) && chg->vbus && !chg->vbus_fault &&
+	    (chg->phase == TRISTAR_RAMPING || chg->phase == TRISTAR_CHARGING) &&
+	    tristar_code_ma(chg, chg->target_code) > 1000) {
+		int mv, ret;
+
+		ret = iio_read_channel_processed(chg->vbus, &mv);
+		if (ret || mv < 4750 || mv > 5500) {
+			chg->vbus_fault = true;
+			chg->phase = TRISTAR_FAULT;
+			dev_warn(chg->dev, "VBUS guard tripped (sample %d mV, error %d)\n",
+				 ret ? 0 : mv, ret);
+		}
+	}
+	if (chg->vbus_fault)
+		tristar_withdraw(chg, chg->chip->fallback_code);
 	if (chg->phase == TRISTAR_FAULT) {
 		/* USB data must not depend on charging working. */
 		if (!chg->usb_on)
@@ -1731,6 +1750,14 @@ static int tristar_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "missing board input-current maximum\n");
 	chg->max_ma = max_ua / 1000;
+	if (device_property_present(dev, "io-channels")) {
+		if (!IS_REACHABLE(CONFIG_IIO))
+			return -EOPNOTSUPP;
+		chg->vbus = devm_iio_channel_get(dev, "vbus");
+		if (IS_ERR(chg->vbus))
+			return dev_err_probe(dev, PTR_ERR(chg->vbus), "VBUS telemetry unavailable\n");
+	}
+
 	if (chg->chip->prepare) {
 		ret = chg->chip->prepare(chg);
 		if (ret)
