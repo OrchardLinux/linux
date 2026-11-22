@@ -500,6 +500,62 @@ static const struct apple_h9p_tunable s8003_port_tunables[] = {
 };
 
 /*
+ * S8000 tunables, from the n66 live ADT (iOS 15.8.8 iBoot). Its
+ * apcie-common-tunables and apcie-config-tunables equal the S8003 ones
+ * above. Its apcie-phy-tunables differ: without a phy-ip window, they
+ * carry the PHY lane setup (per lane, stride 0x200), and its
+ * pcie-rc-tunables set the 0x154 field the S8003 clears.
+ */
+static const struct apple_h9p_tunable s8000_phy_tunables[] = {
+	{ 0x1a18, 0x0000000f, 0x0000000b },
+	{ 0x1a58, 0x000000ff, 0x00000099 },
+	{ 0x0108, 0xffffffff, 0x0000212a },
+	{ 0x0118, 0x00001800, 0x00001800 },
+	{ 0x011c, 0x00001800, 0x00001800 },
+	{ 0x0308, 0xffffffff, 0x0000212a },
+	{ 0x0318, 0x00001800, 0x00001800 },
+	{ 0x031c, 0x00001800, 0x00001800 },
+	{ 0x0518, 0x00001800, 0x00001800 },
+	{ 0x051c, 0x00001800, 0x00001800 },
+	{ 0x0718, 0x00001800, 0x00001800 },
+	{ 0x071c, 0x00001800, 0x00001800 },
+	{ 0x0918, 0x00001800, 0x00001800 },
+	{ 0x091c, 0x00001800, 0x00001800 },
+	{ 0x0a24, 0x000000fc, 0x000000a0 },
+	{ 0x0a34, 0x0000f000, 0x00005000 },
+	{ 0x0a40, 0x00007eff, 0x00000018 },
+	{ 0x0a44, 0x000000c0, 0x00000040 },
+	{ 0x0c24, 0x000000fc, 0x000000a0 },
+	{ 0x0c34, 0x0000f000, 0x00005000 },
+	{ 0x0c40, 0x00007eff, 0x00000018 },
+	{ 0x0c44, 0x000000c0, 0x00000040 },
+	{ 0x0e24, 0x000000fc, 0x000000a0 },
+	{ 0x0e34, 0x0000f000, 0x00005000 },
+	{ 0x0e40, 0x00007eff, 0x00000018 },
+	{ 0x0e44, 0x000000c0, 0x00000040 },
+	{ 0x1024, 0x000000fc, 0x000000a0 },
+	{ 0x1034, 0x0000f000, 0x00005000 },
+	{ 0x1040, 0x00007eff, 0x00000018 },
+	{ 0x1044, 0x000000c0, 0x00000040 },
+	{ 0x1224, 0x000000fc, 0x000000a0 },
+	{ 0x1234, 0x0000f000, 0x00005000 },
+	{ 0x1240, 0x00007eff, 0x00000018 },
+	{ 0x1244, 0x000000c0, 0x00000040 },
+	{ 0x0b4c, 0xffffffff, 0x00000520 },
+	{ 0x0b50, 0x000001ef, 0x000000e7 },
+	{ 0x0d4c, 0xffffffff, 0x00000520 },
+	{ 0x0d50, 0x000001ef, 0x000000e7 },
+	{ 0x0f50, 0x000001ef, 0x000000e7 },
+	{ 0x1150, 0x000001ef, 0x000000e7 },
+	{ 0x1350, 0x000001ef, 0x000000e7 },
+};
+
+static const struct apple_h9p_tunable s8000_config_tunables[] = {
+	{ 0x0098, 0x0000000f, 0x00000000 },
+	{ 0x0154, 0x00f8ff00, 0x00001900 },
+};
+
+/*
  * T8015 tunables, from the d221 runtime ADT. apcie-phy-tunables go to the
  * "phy" window, apcie-common-tunables to the root complex window,
  * pcie-rc-tunables to the root port's configuration space and
@@ -643,7 +699,10 @@ enum apple_h9p_port_result {
  * @default_link_speed: target link speed of a root port without
  *	max-link-speed (used by T7000)
  * @has_clocks: the controller takes "aux" and "ref" clocks
- * @has_phy: the controller has "phy" and "phy-ip" register windows
+ * @has_phy: the controller has a "phy" register window
+ * @has_phy_ip: the controller also has a "phy-ip" register window, through
+ *              which the driver sets up the PHY lanes (all but the S8000,
+ *              whose lane setup comes with its "phy" tunables)
  * @has_nvmmu: the storage port has an NVMMU ("nvmmu" window and interrupt)
  * @port3_link_events: port 3's event interrupt is armed by @setup_port, and
  *	its link event re-enables the root complex
@@ -653,10 +712,10 @@ enum apple_h9p_port_result {
  *                   complex is switched into NVMe mode before they power up
  * @link_settle_ms: delay between link training and the first configuration
  *                  request below the root ports (required with @setup_ports)
- * @phy_tunables: "phy" block tunables (S8003 only, T8010 has none)
- * @common_tunables: root complex tunables (S8003 only; see T8010's code)
- * @config_tunables: root port configuration space tunables (S8003 only)
- * @port_tunables: port block tunables (S8003 only)
+ * @phy_tunables: "phy" block tunables (S8000/S8003 and T8015, T8010 has none)
+ * @common_tunables: root complex tunables (S8000/S8003; see T8010's code)
+ * @config_tunables: root port configuration space tunables (S8000/S8003)
+ * @port_tunables: port block tunables (S8000/S8003)
  * @nvmmu_init_busy: NVMMU TCB control bit that is set while its init runs
  * @nvmmu_inv_fifo: wait for the NVMMU invalidate FIFO before invalidating
  *                  and before (re)initializing the NVMMU, in iOS's S8003 order
@@ -675,6 +734,7 @@ struct apple_h9p_hw {
 	u8 default_link_speed;
 	bool has_clocks;
 	bool has_phy;
+	bool has_phy_ip;
 	bool has_nvmmu;
 	bool port3_link_events;
 	bool no_port_irqs;
@@ -3095,15 +3155,23 @@ static int apple_s8003_start_link(struct apple_h9p_pcie *pcie,
 	if (ret)
 		return ret;
 
-	ret = apple_h9p_wait(pcie->base_phy + H9P_PHY_PORTMASK, lanes, lanes,
-			     lanes, S8003_READY_TIMEOUT_US);
-	if (ret) {
-		dev_warn(dev, "port %u PHY lanes %#x not ready (%#x)\n", port,
-			 lanes, readl(pcie->base_phy + H9P_PHY_PORTMASK));
-		return ret;
-	}
+	/*
+	 * AppleS8003PCIe's lane init. The S8000 has no phy-ip window, and iOS
+	 * neither waits for its lanes nor programs them: their setup comes
+	 * with the apcie-phy-tunables of the common init.
+	 */
+	if (pcie->hw->has_phy_ip) {
+		ret = apple_h9p_wait(pcie->base_phy + H9P_PHY_PORTMASK, lanes,
+				     lanes, lanes, S8003_READY_TIMEOUT_US);
+		if (ret) {
+			dev_warn(dev, "port %u PHY lanes %#x not ready (%#x)\n",
+				 port, lanes,
+				 readl(pcie->base_phy + H9P_PHY_PORTMASK));
+			return ret;
+		}
 
-	apple_s8003_program_phy_lanes(pcie, lanes, speed);
+		apple_s8003_program_phy_lanes(pcie, lanes, speed);
+	}
 
 	writel(H9P_PORT_IRQMASK_LINK_UP, pb + H9P_PORT_IRQMASK);
 	h9p_rmw(pb + H9P_PORT_LTSSMCTL, 0, H9P_PORT_LTSSM_ENABLE);
@@ -3758,7 +3826,9 @@ static int apple_h9p_pcie_map_resources(struct platform_device *pdev,
 			devm_platform_ioremap_resource_byname(pdev, "phy");
 		if (IS_ERR(pcie->base_phy))
 			return PTR_ERR(pcie->base_phy);
+	}
 
+	if (pcie->hw->has_phy_ip) {
 		pcie->base_phy_ip =
 			devm_platform_ioremap_resource_byname(pdev, "phy-ip");
 		if (IS_ERR(pcie->base_phy_ip))
@@ -3813,7 +3883,7 @@ static int apple_h9p_pcie_parse_ports(struct apple_h9p_pcie *pcie)
 		return ret;
 	if (pcie->preinit_phy_ports & ~GENMASK(H9P_NUM_PORTS - 1, 0))
 		return -EINVAL;
-	if (pcie->preinit_phy_ports && !pcie->hw->has_phy)
+	if (pcie->preinit_phy_ports && !pcie->hw->has_phy_ip)
 		return -EINVAL;
 
 	for_each_available_child_of_node(dev->of_node, np) {
@@ -4127,6 +4197,7 @@ static const struct apple_h9p_hw apple_h9p_hw_t8010 = {
 	.nvmmu_init_busy = T8010_NVMMU_TCB_CTRL_INIT_BUSY,
 	.has_clocks = true,
 	.has_phy = true,
+	.has_phy_ip = true,
 	.has_nvmmu = true,
 	.port3_link_events = true,
 };
@@ -4140,6 +4211,7 @@ static const struct apple_h9p_hw apple_h9p_hw_j172 = {
 	.nvmmu_init_busy = T8010_NVMMU_TCB_CTRL_INIT_BUSY,
 	.has_clocks = true,
 	.has_phy = true,
+	.has_phy_ip = true,
 	.has_nvmmu = true,
 	.port3_link_events = true,
 	.j172_bridge_quirk = true,
@@ -4156,6 +4228,7 @@ static const struct apple_h9p_hw apple_h9p_hw_t8015 = {
 	.default_link_speed = H9P_LINK_SPEED_2_5GT,
 	.has_clocks = true,
 	.has_phy = true,
+	.has_phy_ip = true,
 	.phy_tunables = H9P_TUNABLES(t8015_phy_tunables),
 	.common_tunables = H9P_TUNABLES(t8015_rc_common_tunables),
 	.config_tunables = H9P_TUNABLES(t8015_config_tunables),
@@ -4172,6 +4245,7 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
 	.nvme_mode_ports = BIT(0),
 	.link_settle_ms = 100,
 	.has_phy = true,
+	.has_phy_ip = true,
 	.has_nvmmu = true,
 	.phy_tunables = H9P_TUNABLES(s8003_phy_tunables),
 	.common_tunables = H9P_TUNABLES(s8003_rc_common_tunables),
@@ -4184,7 +4258,34 @@ static const struct apple_h9p_hw apple_h9p_hw_s8003 = {
 	.no_port_irqs = true,
 };
 
+/*
+ * The S8000 runs AppleS8003PCIe's sequence without the phy-ip lane init (iOS
+ * AppleS8000PCIe overrides nothing else but the rc+0x114 write of the common
+ * init, which this driver does at port power-up for both).
+ */
+static const struct apple_h9p_hw apple_h9p_hw_s8000 = {
+	.parse = apple_s8003_parse,
+	.setup_common = apple_s8003_setup_common,
+	.setup_ports = apple_s8003_setup_ports,
+	.port_down = apple_s8003_port_down,
+	.resume_port = apple_s8003_resume_port,
+	.recover_port = apple_s8003_setup_endpoint_port,
+	.nvme_mode_ports = BIT(0),
+	.link_settle_ms = 100,
+	.has_phy = true,
+	.has_nvmmu = true,
+	.phy_tunables = H9P_TUNABLES(s8000_phy_tunables),
+	.common_tunables = H9P_TUNABLES(s8003_rc_common_tunables),
+	.config_tunables = H9P_TUNABLES(s8000_config_tunables),
+	.port_tunables = H9P_TUNABLES(s8003_port_tunables),
+	.nvmmu_init_busy = H9P_NVMMU_TCB_CTRL_INIT,
+	.nvmmu_inv_fifo = true,
+	.nvmmu_optional = true,
+	.no_port_irqs = true,
+};
+
 static const struct of_device_id apple_h9p_pcie_of_match[] = {
+	{ .compatible = "apple,s8000-pcie", .data = &apple_h9p_hw_s8000 },
 	{ .compatible = "apple,s8003-pcie", .data = &apple_h9p_hw_s8003 },
 	{ .compatible = "apple,j172-pcie", .data = &apple_h9p_hw_j172 },
 	{ .compatible = "apple,t8015-pcie", .data = &apple_h9p_hw_t8015 },
@@ -4205,5 +4306,5 @@ static struct platform_driver apple_h9p_pcie_driver = {
 };
 module_platform_driver(apple_h9p_pcie_driver);
 
-MODULE_DESCRIPTION("Apple H8P/H9P (S8003/T8010) and T7000 PCIe host bridge driver");
+MODULE_DESCRIPTION("Apple H8P/H9P (S8000/S8003/T8010) and T7000 PCIe host bridge driver");
 MODULE_LICENSE("GPL");
