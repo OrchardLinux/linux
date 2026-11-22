@@ -12,3 +12,11 @@
 	compatible = "apple,n56", "apple,t7000", "apple,arm-platform";
 	model = "Apple iPhone 6 Plus";
 };
+
+/*
+ * The display pipe takes the 1080x1920 MIPI DSI panel over from simpledrm.
+ * No panel supply is given: the panel stays on in system sleep.
+ */
+&disp0 {
+	status = "okay";
+};
