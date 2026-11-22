@@ -185,6 +185,11 @@
 	status = "okay";
 };
 
+/* Tell the USB input supply what the USB host allows. */
+&usbdev {
+	usb-psy-name = "apple-d2186-usb";
+};
+
 &spi2 {
 	cs-gpios = <&pinctrl 185 GPIO_ACTIVE_LOW>;
 	status = "okay";
@@ -267,6 +272,8 @@
 					   "tbat",
 					   "vbus",
 					   "ibus";
+			/* The most an Apple host has granted this iPod: 500 + 1000 mA. */
+			input-current-limit-microamp = <1500000>;
 		};
 
 		rtc@5c0 {
