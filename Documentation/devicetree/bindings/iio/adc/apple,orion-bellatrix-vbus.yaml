@@ -13,6 +13,9 @@ description:
   Orion Bellatrix provides an ADC input wired to Lightning VBUS on J120.
 
 properties:
+  "#io-channel-cells":
+    const: 1
+
   compatible:
     const: apple,orion-bellatrix-vbus
 
