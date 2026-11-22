@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Read-only battery and USB charger monitor for the Dialog D2186 PMIC on
- * Apple A8 devices without a dedicated fuel-gauge IC.
+ * Battery and USB charger monitor for the Dialog D2186 PMIC on Apple A8
+ * devices without a dedicated fuel-gauge IC.
  *
  * Reads telemetry from the D2186 housekeeping ADC via IIO and reads charger
  * status from PMIC registers 0x60 and 0x62 (plus optional read-only hardware
- * averaged charge current at 0x4e2). Never writes to charger current limits
- * or any charging control register.
+ * averaged charge current at 0x4e2). With a board input-current maximum in
+ * the device tree, it also sets the USB input-current limit to what the USB
+ * host grants (see "USB input-current grant" below); it never writes the
+ * battery charge current, the charge voltage or the input-suspend control.
  *
  * State-of-charge estimation follows AppleARMPMUCharger's pmu-measured model
  * for battery-family 6 (N102): 10-sample VBAT burst averaging, the 100-point
  * 0006-default OCV curve (3400..4275 mV), a 6-slot median-filtered OCV ring
  * (4-sample window while charging, 6-sample while discharging), and monotonic
- * rate limiting (at most 1% per 20 s). Because this driver is strictly
- * read-only and does not suspend charging to take a rest-voltage reading,
+ * rate limiting (at most 1% per 20 s). Because this driver never suspends
+ * charging to take a rest-voltage reading,
  * charging mode pairs VBAT with ICH to apply IR compensation
  * (V_ocv = V_bat - I_ch * R_int) and integrates charge current
  * (I_ch * dt / Q_full) with gentle OCV drift anchoring.
@@ -50,6 +52,25 @@
 /* Hardware-averaged charge current register (AppleD2186PMU ich_avg, read-only) */
 #define D2186_ICH_AVG_REG		0x4e2
 #define D2186_ICH_AVG_INVALID		0xff
+
+/*
+ * D2186 charger controls, as AppleD2186PMUPowerSource (iOS 12) uses them.
+ * Input limit: 70 mA + 10 mA per code, 0xff from 2620 mA; iOS sets the input
+ * suspend bit only for a target under 70 mA. Charge current: 30 mA per code.
+ */
+#define D2186_CHG_CONTROL		0x10
+#define D2186_CHG_CONTROL_INPUT_SUSPEND	BIT(2)
+#define D2186_CHG_INPUT_LIMIT		0x4c0
+#define D2186_CHG_CHARGE_CURRENT	0x4c6
+#define D2186_CHG_CHARGE_CURRENT_MASK	GENMASK(5, 0)
+#define D2186_CHG_CHARGE_CURRENT_STEP_MA 30
+
+#define D2186_ILIM_HANDOFF_CODE		0x03	/* 100 mA */
+#define D2186_ILIM_FALLBACK_CODE	0x2b	/* 500 mA, a USB 2.0 port */
+#define D2186_ILIM_MAX_CODE		0xff	/* 2620 mA */
+#define D2186_GRANT_POLL_MS		1000
+#define D2186_RAMP_HOLD_MS		100
+#define D2186_RAMP_STEP_MA		100
 
 #define D2186_DEFAULT_CHARGE_FULL_UAH	1080000
 #define D2186_DEFAULT_VMIN_UV		3400000
@@ -130,6 +151,25 @@ struct apple_d2186_battery {
 	int display_upct;
 	int reported_cap;
 	unsigned int low_vbat_count;
+
+	/* USB input-current grant; grant_lock protects everything below. */
+	struct mutex grant_lock;
+	struct delayed_work grant_work;
+	unsigned int max_ma;		/* board maximum; 0: no grant */
+	unsigned int boot_code;		/* input limit as the boot loader left it */
+	unsigned int code;		/* last verified input limit */
+	unsigned int target_code;
+	unsigned int usb_ma;		/* accepted USB host allowance */
+	unsigned int usb_report_ma;	/* report held over system sleep */
+	bool usb_report_held;
+	bool present;
+	bool ramping;
+	bool fault;
+	bool sleeping;
+	bool stopping;
+	u64 step_ns;
+	u64 step_wait_ns;
+	u64 guard_ns;
 };
 
 static int apple_d2186_read_status_regs(struct apple_d2186_battery *bat,
@@ -665,15 +705,426 @@ static int apple_d2186_bat_get_property(struct power_supply *psy,
 	}
 }
 
+/*
+ * USB input-current grant
+ *
+ * The same contract as the Lightning charger on the iPad (apple-tristar-
+ * charger): the USB device controller reports what the host allows the
+ * device to draw (vbus_draw, which includes an Apple host's current grant)
+ * as this supply's input current limit. Without that report, or for anything
+ * up to 500 mA, an attached source gets the 500 mA of a USB 2.0 port. A
+ * larger allowance is granted up to the board maximum, ramped as iOS does
+ * (100 mA held for 100 ms, then 100 mA steps 10 ms apart), only while the
+ * battery is inside the charging window. Every write is read back; the
+ * limit is checked once a second and put back if the PMIC changed it. The
+ * end of the input ends the grant.
+ *
+ * Differences from the iPad: the D2186 encodes the limit as 70 mA + 10 mA
+ * per code (iOS: AppleD2186PMUPowerSource), and n102 has no PMU event line
+ * for this driver, so attach and detach come from a 1 s poll of 0x60 bit 0.
+ * The input limit is the only control written: the battery charge current
+ * (0x4c6) and the input-suspend bit stay as iBoot and the PMIC set them, and
+ * the limit the boot loader left is restored on remove and shutdown.
+ */
+static unsigned int d2186_code_ma(unsigned int code)
+{
+	return code * 10 + 70;
+}
+
+/* Round down, as iOS does: quantization must never exceed a permitted current. */
+static unsigned int d2186_ma_code(unsigned int ma)
+{
+	if (ma < 70)
+		return 0;
+	return min((ma - 70) / 10, D2186_ILIM_MAX_CODE);
+}
+
+/* Caller holds grant_lock. */
+static int d2186_set_code(struct apple_d2186_battery *bat, unsigned int code)
+{
+	unsigned int readback;
+	int ret;
+
+	ret = regmap_write(bat->regmap, D2186_CHG_INPUT_LIMIT, code);
+	if (!ret)
+		ret = regmap_read(bat->regmap, D2186_CHG_INPUT_LIMIT, &readback);
+	if (!ret && readback != code)
+		ret = -EIO;
+	if (!ret)
+		bat->code = code;
+	return ret;
+}
+
+/* Caller holds grant_lock. */
+static void d2186_withdraw(struct apple_d2186_battery *bat, unsigned int code)
+{
+	if (bat->code > code && d2186_set_code(bat, code))
+		dev_crit(bat->dev, "input-limit withdrawal failed; limit unverified\n");
+}
+
+/* Grants above the fallback are allowed only inside these pack limits. */
+static bool d2186_pack_allows_grant(struct apple_d2186_battery *bat)
+{
+	int vbat_uv, tenth_c;
+
+	if (iio_read_channel_processed_scale(bat->vbat, &vbat_uv, 1000) ||
+	    apple_d2186_read_temp_tenth_c(bat, &tenth_c))
+		return false;
+	return tenth_c >= 50 && tenth_c <= 400 &&
+	       vbat_uv >= 3200000 && vbat_uv <= 4350000;
+}
+
+/* Caller holds grant_lock. */
+static unsigned int d2186_target_code(struct apple_d2186_battery *bat)
+{
+	if (bat->usb_ma <= d2186_code_ma(D2186_ILIM_FALLBACK_CODE))
+		return D2186_ILIM_FALLBACK_CODE;
+	return d2186_ma_code(min(bat->usb_ma, bat->max_ma));
+}
+
+/* Follow a changed allowance. Caller holds grant_lock. */
+static void d2186_update_target(struct apple_d2186_battery *bat)
+{
+	unsigned int old_target = bat->target_code;
+
+	if (!bat->present || bat->fault)
+		return;
+	bat->target_code = d2186_target_code(bat);
+	if (bat->code > bat->target_code) {
+		d2186_withdraw(bat, bat->target_code);
+		bat->ramping = false;
+	} else if (bat->code < bat->target_code &&
+		   (!bat->ramping || bat->target_code != old_target)) {
+		/* A new ramp, or a new target mid-ramp: check the pack first. */
+		bat->ramping = true;
+		bat->step_ns = 0;
+	}
+}
+
+/* Caller holds grant_lock. */
+static void d2186_ramp_step(struct apple_d2186_battery *bat, u64 now)
+{
+	unsigned int next, from_ma = d2186_code_ma(bat->code);
+	u64 wait;
+
+	if (bat->step_ns && now - bat->step_ns < bat->step_wait_ns)
+		return;
+	if (bat->code >= bat->target_code) {
+		/* Nothing to ramp: a limit above the target goes down at once. */
+		d2186_withdraw(bat, bat->target_code);
+		bat->ramping = false;
+		return;
+	}
+	/* The ADC is slow: look at the pack when a ramp starts, not per step. */
+	if (!bat->step_ns && bat->target_code > D2186_ILIM_FALLBACK_CODE &&
+	    !d2186_pack_allows_grant(bat)) {
+		bat->target_code = D2186_ILIM_FALLBACK_CODE;
+		if (bat->code >= bat->target_code) {
+			d2186_withdraw(bat, bat->target_code);
+			bat->ramping = false;
+			dev_warn(bat->dev, "battery outside the charging window; holding the fallback\n");
+			return;
+		}
+	}
+	if (!bat->step_ns && bat->code <= D2186_ILIM_HANDOFF_CODE) {
+		/* From nothing, iOS writes 100 mA and holds it. */
+		next = D2186_ILIM_HANDOFF_CODE;
+		wait = D2186_RAMP_HOLD_MS * NSEC_PER_MSEC;
+	} else {
+		next = min(bat->target_code,
+			   d2186_ma_code(from_ma + D2186_RAMP_STEP_MA));
+		wait = (u64)(d2186_code_ma(next) - from_ma) * (NSEC_PER_MSEC / 10);
+	}
+	if (d2186_set_code(bat, next)) {
+		bat->fault = true;
+		bat->ramping = false;
+		d2186_withdraw(bat, D2186_ILIM_FALLBACK_CODE);
+		dev_err(bat->dev, "input-limit write failed; holding the fallback\n");
+		return;
+	}
+	bat->step_ns = now;
+	bat->step_wait_ns = wait;
+	if (next >= bat->target_code) {
+		bat->ramping = false;
+		dev_info(bat->dev, "USB input limit %u mA (host allows %u mA)\n",
+			 d2186_code_ma(bat->code), bat->usb_ma);
+	}
+}
+
+/*
+ * Once a second: put back a limit the PMIC changed (an attach default), and
+ * hold the fallback while the pack is outside the charging window or the
+ * PMIC suspends its input. Caller holds grant_lock.
+ */
+static void d2186_guard(struct apple_d2186_battery *bat, u64 now)
+{
+	unsigned int hw, control;
+	bool allowed;
+
+	if (now - bat->guard_ns < (u64)D2186_GRANT_POLL_MS * NSEC_PER_MSEC)
+		return;
+	bat->guard_ns = now;
+
+	if (!regmap_read(bat->regmap, D2186_CHG_INPUT_LIMIT, &hw) &&
+	    hw != bat->code) {
+		dev_warn_ratelimited(bat->dev,
+				     "input limit changed to %u mA by the PMIC; restoring\n",
+				     d2186_code_ma(hw));
+		if (hw > bat->code) {
+			if (d2186_set_code(bat, bat->code))
+				dev_crit(bat->dev, "input-limit write failed; limit unverified\n");
+			return;
+		}
+		if (d2186_set_code(bat, min(bat->code, D2186_ILIM_FALLBACK_CODE))) {
+			dev_crit(bat->dev, "fallback write failed; input limit unverified\n");
+			return;
+		}
+	}
+	if (bat->fault)
+		return;
+
+	allowed = d2186_pack_allows_grant(bat);
+	if (!regmap_read(bat->regmap, D2186_CHG_CONTROL, &control) &&
+	    (control & D2186_CHG_CONTROL_INPUT_SUSPEND))
+		allowed = false;
+
+	bat->target_code = d2186_target_code(bat);
+	if (!allowed && bat->code > D2186_ILIM_FALLBACK_CODE) {
+		bat->ramping = false;
+		d2186_withdraw(bat, D2186_ILIM_FALLBACK_CODE);
+		dev_warn(bat->dev, "battery outside the charging window or input suspended; holding the fallback\n");
+	} else if (allowed && bat->code < bat->target_code && !bat->ramping) {
+		/* Back inside the window: no replug needed to charge again. */
+		bat->ramping = true;
+		bat->step_ns = 0;
+	}
+}
+
+/* Caller holds grant_lock. Returns true when the supply changed. */
+static bool d2186_grant_poll(struct apple_d2186_battery *bat, u64 now)
+{
+	unsigned int status_a, old_code = bat->code, old_usb_ma = bat->usb_ma;
+	bool present, was_present = bat->present;
+
+	if (regmap_read(bat->regmap, D2186_STATUS_A, &status_a)) {
+		dev_err_ratelimited(bat->dev, "PMIC status unreadable; holding the fallback\n");
+		bat->ramping = false;
+		d2186_withdraw(bat, D2186_ILIM_FALLBACK_CODE);
+		return bat->code != old_code;
+	}
+	present = !!(status_a & D2186_STATUS_A_USB_PRESENT);
+
+	if (present && !was_present) {
+		/* A new attachment: the fallback, until the host reports. */
+		bat->present = true;
+		bat->fault = false;
+		bat->usb_ma = 0;
+		bat->target_code = D2186_ILIM_FALLBACK_CODE;
+		bat->ramping = true;
+		bat->step_ns = 0;
+		bat->guard_ns = now;
+	} else if (!present && was_present) {
+		/* Only a lost input ends the grant. */
+		bat->present = false;
+		bat->ramping = false;
+		bat->usb_ma = 0;
+		d2186_withdraw(bat, D2186_ILIM_FALLBACK_CODE);
+	}
+
+	if (bat->present) {
+		if (bat->ramping)
+			d2186_ramp_step(bat, now);
+		else
+			d2186_guard(bat, now);
+	}
+
+	return present != was_present || bat->usb_ma != old_usb_ma ||
+	       (!bat->ramping && bat->code != old_code);
+}
+
+static void apple_d2186_grant_work(struct work_struct *work)
+{
+	struct apple_d2186_battery *bat =
+		container_of(work, struct apple_d2186_battery, grant_work.work);
+	unsigned long delay = msecs_to_jiffies(D2186_GRANT_POLL_MS);
+	bool changed;
+	u64 now;
+
+	mutex_lock(&bat->grant_lock);
+	if (bat->stopping) {
+		mutex_unlock(&bat->grant_lock);
+		return;
+	}
+	now = ktime_get_boottime_ns();
+	changed = d2186_grant_poll(bat, now);
+	if (bat->ramping) {
+		u64 due = bat->step_ns ? bat->step_ns + bat->step_wait_ns : now;
+
+		delay = (s64)(due - now) > 0 ?
+			max(usecs_to_jiffies(div_u64(due - now, NSEC_PER_USEC)), 1UL) : 0;
+	}
+	queue_delayed_work(system_freezable_wq, &bat->grant_work, delay);
+	if (bat->sleeping)
+		changed = false;
+	mutex_unlock(&bat->grant_lock);
+
+	if (changed)
+		power_supply_changed(bat->chg_psy);
+}
+
+/*
+ * The USB device controller reports what the host allows the device to draw
+ * (vbus_draw) as the input current limit: 0 without a session, 100 mA
+ * unconfigured, the configuration's bMaxPower, 2 mA suspended, or more after
+ * an Apple host's current grant. Not writable from user space. A report
+ * while no input is present counts as nothing.
+ *
+ * A system sleep is not the host lowering its grant: a report from prepare
+ * to complete is held and applied at complete, as on the iPad.
+ */
+static int apple_d2186_chg_set_property(struct power_supply *psy,
+					enum power_supply_property psp,
+					const union power_supply_propval *val)
+{
+	struct apple_d2186_battery *bat = power_supply_get_drvdata(psy);
+	unsigned int old_code, old_ma, report_ma, accept_ma;
+	bool changed;
+
+	if (psp != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
+		return -EINVAL;
+	if (!bat->max_ma)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&bat->grant_lock);
+	old_code = bat->code;
+	old_ma = bat->usb_ma;
+	report_ma = max(val->intval, 0) / 1000;
+	accept_ma = bat->present ? min(report_ma, bat->max_ma) : 0;
+	if (bat->sleeping) {
+		bat->usb_report_ma = accept_ma;
+		bat->usb_report_held = accept_ma != old_ma;
+		dev_dbg(bat->dev, "USB budget: reported %u mA, %u mA kept over sleep\n",
+			report_ma, old_ma);
+		mutex_unlock(&bat->grant_lock);
+		return 0;
+	}
+	bat->usb_report_held = false;
+	bat->usb_ma = accept_ma;
+	dev_dbg(bat->dev, "USB budget: reported %u mA, accepted %u mA, present %u\n",
+		report_ma, bat->usb_ma, bat->present);
+	if (!bat->stopping) {
+		d2186_update_target(bat);
+		mod_delayed_work(system_freezable_wq, &bat->grant_work, 0);
+	}
+	changed = bat->code != old_code || bat->usb_ma != old_ma;
+	mutex_unlock(&bat->grant_lock);
+
+	if (changed)
+		power_supply_changed(psy);
+	return 0;
+}
+
+/* Stop granting and put back the limit the boot loader left. */
+static void apple_d2186_grant_stop(struct apple_d2186_battery *bat)
+{
+	if (!bat->max_ma)
+		return;
+
+	mutex_lock(&bat->grant_lock);
+	bat->stopping = true;
+	mutex_unlock(&bat->grant_lock);
+	cancel_delayed_work_sync(&bat->grant_work);
+
+	mutex_lock(&bat->grant_lock);
+	if (bat->code != bat->boot_code &&
+	    d2186_set_code(bat, bat->boot_code))
+		dev_err(bat->dev, "cannot restore the boot input limit\n");
+	mutex_unlock(&bat->grant_lock);
+}
+
+static void apple_d2186_grant_stop_action(void *data)
+{
+	apple_d2186_grant_stop(data);
+}
+
+/* Before the supply registers: set_property may run as soon as it does. */
+static int apple_d2186_grant_init(struct apple_d2186_battery *bat)
+{
+	struct device *dev = bat->dev;
+	unsigned int code, control = 0, charge = 0, status_a;
+	u32 max_ua;
+	int ret;
+
+	ret = devm_mutex_init(dev, &bat->grant_lock);
+	if (ret)
+		return ret;
+	INIT_DELAYED_WORK(&bat->grant_work, apple_d2186_grant_work);
+
+	if (device_property_read_u32(dev, "input-current-limit-microamp", &max_ua))
+		return 0;
+
+	ret = regmap_read(bat->regmap, D2186_CHG_INPUT_LIMIT, &code);
+	if (!ret)
+		ret = regmap_read(bat->regmap, D2186_CHG_CONTROL, &control);
+	if (!ret)
+		ret = regmap_read(bat->regmap, D2186_CHG_CHARGE_CURRENT, &charge);
+	if (!ret)
+		ret = regmap_read(bat->regmap, D2186_STATUS_A, &status_a);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot read the charger controls\n");
+
+	bat->max_ma = min(max_ua / 1000, d2186_code_ma(D2186_ILIM_MAX_CODE));
+	bat->boot_code = code;
+	bat->code = code;
+	bat->target_code = D2186_ILIM_FALLBACK_CODE;
+	dev_info(dev,
+		 "boot loader left: input limit 0x%02x (%u mA), charge current 0x%02x (%u mA), control 0x%02x, status 0x%02x; board maximum %u mA\n",
+		 code, d2186_code_ma(code), charge,
+		 (unsigned int)(charge & D2186_CHG_CHARGE_CURRENT_MASK) *
+		 D2186_CHG_CHARGE_CURRENT_STEP_MA,
+		 control, status_a, bat->max_ma);
+	if (control & D2186_CHG_CONTROL_INPUT_SUSPEND)
+		dev_warn(dev, "PMIC input suspended; holding the fallback\n");
+	return 0;
+}
+
 static int apple_d2186_chg_get_property(struct power_supply *psy,
 					enum power_supply_property psp,
 					union power_supply_propval *val)
 {
 	struct apple_d2186_battery *bat = power_supply_get_drvdata(psy);
-	unsigned int status_a, status_c;
+	unsigned int status_a, status_c, code;
 	int ret;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		if (bat->max_ma) {
+			mutex_lock(&bat->grant_lock);
+			code = bat->code;
+			mutex_unlock(&bat->grant_lock);
+		} else {
+			ret = regmap_read(bat->regmap, D2186_CHG_INPUT_LIMIT, &code);
+			if (ret)
+				return ret;
+		}
+		val->intval = d2186_code_ma(code) * 1000;
+		return 0;
+
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+		/* What the USB host allows, up to the board maximum; 0 when unknown. */
+		mutex_lock(&bat->grant_lock);
+		val->intval = bat->usb_ma * 1000;
+		mutex_unlock(&bat->grant_lock);
+		return 0;
+
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		ret = regmap_read(bat->regmap, D2186_CHG_CHARGE_CURRENT, &code);
+		if (ret)
+			return ret;
+		val->intval = (int)(code & D2186_CHG_CHARGE_CURRENT_MASK) *
+			      D2186_CHG_CHARGE_CURRENT_STEP_MA * 1000;
+		return 0;
+
 	case POWER_SUPPLY_PROP_ONLINE:
 		ret = regmap_read(bat->regmap, D2186_STATUS_A, &status_a);
 		if (ret)
@@ -740,6 +1191,9 @@ static const enum power_supply_property apple_d2186_chg_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+	POWER_SUPPLY_PROP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
 };
 
 static const struct power_supply_desc apple_d2186_chg_desc = {
@@ -748,6 +1202,7 @@ static const struct power_supply_desc apple_d2186_chg_desc = {
 	.properties = apple_d2186_chg_props,
 	.num_properties = ARRAY_SIZE(apple_d2186_chg_props),
 	.get_property = apple_d2186_chg_get_property,
+	.set_property = apple_d2186_chg_set_property,
 };
 
 static struct iio_channel *apple_d2186_opt_chan(struct device *dev,
@@ -862,6 +1317,10 @@ static int apple_d2186_battery_probe(struct platform_device *pdev)
 			bat->r_int_uohm = bat->binfo->factory_internal_resistance_uohm;
 	}
 
+	ret = apple_d2186_grant_init(bat);
+	if (ret)
+		return ret;
+
 	chg_cfg.drv_data = bat;
 	chg_cfg.no_wakeup_source = true;
 
@@ -870,6 +1329,15 @@ static int apple_d2186_battery_probe(struct platform_device *pdev)
 	if (IS_ERR(bat->chg_psy))
 		return dev_err_probe(dev, PTR_ERR(bat->chg_psy),
 				     "failed to register USB power supply\n");
+
+	if (bat->max_ma) {
+		ret = devm_add_action_or_reset(dev, apple_d2186_grant_stop_action,
+					       bat);
+		if (ret)
+			return ret;
+		platform_set_drvdata(pdev, bat);
+		queue_delayed_work(system_freezable_wq, &bat->grant_work, 0);
+	}
 
 	mutex_lock(&bat->lock);
 	apple_d2186_update_locked(bat, NULL, NULL);
@@ -891,15 +1359,72 @@ static const struct of_device_id apple_d2186_battery_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_d2186_battery_of_match);
 
+static void apple_d2186_battery_shutdown(struct platform_device *pdev)
+{
+	struct apple_d2186_battery *bat = platform_get_drvdata(pdev);
+
+	if (bat)
+		apple_d2186_grant_stop(bat);
+}
+
+static int apple_d2186_battery_prepare(struct device *dev)
+{
+	struct apple_d2186_battery *bat = dev_get_drvdata(dev);
+
+	if (bat) {
+		mutex_lock(&bat->grant_lock);
+		bat->sleeping = true;
+		bat->usb_report_held = false;
+		mutex_unlock(&bat->grant_lock);
+	}
+	return 0;
+}
+
+static void apple_d2186_battery_complete(struct device *dev)
+{
+	struct apple_d2186_battery *bat = dev_get_drvdata(dev);
+	bool changed = false;
+
+	if (!bat)
+		return;
+
+	mutex_lock(&bat->grant_lock);
+	bat->sleeping = false;
+	if (bat->usb_report_held) {
+		unsigned int old_code = bat->code;
+
+		bat->usb_report_held = false;
+		bat->usb_ma = bat->present ? bat->usb_report_ma : 0;
+		if (!bat->stopping) {
+			d2186_update_target(bat);
+			mod_delayed_work(system_freezable_wq, &bat->grant_work, 0);
+		}
+		changed = true;
+		dev_dbg(dev, "USB budget: %u mA applied after sleep (limit %u -> %u mA)\n",
+			bat->usb_ma, d2186_code_ma(old_code), d2186_code_ma(bat->code));
+	}
+	mutex_unlock(&bat->grant_lock);
+
+	if (changed)
+		power_supply_changed(bat->chg_psy);
+}
+
+static const struct dev_pm_ops apple_d2186_battery_pm_ops = {
+	.prepare = apple_d2186_battery_prepare,
+	.complete = apple_d2186_battery_complete,
+};
+
 static struct platform_driver apple_d2186_battery_driver = {
 	.probe = apple_d2186_battery_probe,
+	.shutdown = apple_d2186_battery_shutdown,
 	.driver = {
 		.name = "apple-d2186-battery",
 		.of_match_table = apple_d2186_battery_of_match,
+		.pm = &apple_d2186_battery_pm_ops,
 	},
 };
 module_platform_driver(apple_d2186_battery_driver);
 
 MODULE_IMPORT_NS("IIO_CONSUMER");
-MODULE_DESCRIPTION("Apple D2186 PMIC read-only battery and charger status driver");
+MODULE_DESCRIPTION("Apple D2186 PMIC battery and USB charger driver");
 MODULE_LICENSE("GPL");
