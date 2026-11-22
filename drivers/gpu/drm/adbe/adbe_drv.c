@@ -252,7 +252,10 @@ MODULE_PARM_DESC(dart_scanout,
 struct adbe_hw {
 	/* SPDS version at ADP_SPDS that iOS requires; 0: iOS never reads it */
 	u16 spds_version;
-	/* The panel link iBoot left running */
+	/*
+	 * The panel link iBoot left running, unless the pipe has a "dp"
+	 * window: then the link is eDP.
+	 */
 	int connector_type;
 };
 
@@ -268,7 +271,8 @@ static const struct adbe_hw adbe_hw_s8000 = {
  * masks the same errors at start, but has no SPDS check: it reads the
  * display_spdsversion_mismatch_is_panic boot argument and never ADP_SPDS.
  * Neither does this driver there. The iPod touch 6 and the iPhone 6 drive
- * a MIPI DSI panel.
+ * a MIPI DSI panel; the iPad mini 4 drives eDP, and its pipe has the
+ * DisplayPort transmitter's "dp" window.
  */
 static const struct adbe_hw adbe_hw_t7000 = {
 	.spds_version = 0,
@@ -1915,7 +1919,7 @@ static int adbe_adopt(struct adbe *adbe)
 static int adbe_modeset_init(struct adbe *adbe)
 {
 	struct drm_device *drm = &adbe->drm;
-	int ret;
+	int connector_type, ret;
 
 	ret = drmm_mode_config_init(drm);
 	if (ret)
@@ -1950,8 +1954,11 @@ static int adbe_modeset_init(struct adbe *adbe)
 		return ret;
 	adbe->encoder.possible_crtcs = drm_crtc_mask(&adbe->crtc);
 
+	connector_type = adbe->hw->connector_type;
+	if (of_property_match_string(drm->dev->of_node, "reg-names", "dp") >= 0)
+		connector_type = DRM_MODE_CONNECTOR_eDP;
 	ret = drmm_connector_init(drm, &adbe->connector, &adbe_connector_funcs,
-				  adbe->hw->connector_type, NULL);
+				  connector_type, NULL);
 	if (ret)
 		return ret;
 	drm_connector_helper_add(&adbe->connector, &adbe_connector_helper_funcs);
