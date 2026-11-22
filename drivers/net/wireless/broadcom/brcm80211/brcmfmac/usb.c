@@ -9,14 +9,6 @@
 #include <linux/of.h>
 #include <linux/crc32.h>
 #include <linux/jiffies.h>
-
-/* J72 adapts the P105 USB/HSIC work from Project Cascadia, pin c20b85e.
- * The transport owner retains the exclusive GPIO descriptor. */
-struct usb_device;
-extern int j72_wlan_transport_ready(struct usb_device *udev, bool cycle);
-static bool j72_bind;
-module_param(j72_bind, bool, 0600);
-MODULE_PARM_DESC(j72_bind, "Opt in to exact J72 USB firmware probe after vendor-helper readiness");
 #include <linux/usb.h>
 #include <linux/vmalloc.h>
 
@@ -30,6 +22,16 @@ MODULE_PARM_DESC(j72_bind, "Opt in to exact J72 USB firmware probe after vendor-
 #include "core.h"
 #include "common.h"
 #include "bcdc.h"
+
+/* The Apple A7 HSIC adaptation (J72, J85) adapts the P105 USB/HSIC work from
+ * Project Cascadia, pin c20b85e. The apple-a7-wlan transport owner retains
+ * the exclusive HOST_READY GPIO descriptor; it is looked up at run time so
+ * that brcmfmac does not depend on it on other machines.
+ */
+int apple_a7_wlan_host_ready(struct usb_device *udev, bool cycle);
+static bool hsic_bind;
+module_param(hsic_bind, bool, 0600);
+MODULE_PARM_DESC(hsic_bind, "Opt in to the Apple A7 HSIC USB firmware probe after vendor-helper readiness");
 
 
 #define IOCTL_RESP_TIMEOUT		msecs_to_jiffies(2000)
@@ -55,6 +57,7 @@ BRCMF_FW_DEF(4373, "brcmfmac4373");
  * host.  Apple's firmware for it is a TRX image (wifi/4334b1/borg.trx in the
  * iOS root filesystem), the format this driver downloads over USB. */
 BRCMF_FW_DEF(43241J72, "brcmfmac43241-j72-usb");
+BRCMF_FW_DEF(43241J85, "brcmfmac43241-j85-usb");
 
 static const struct brcmf_firmware_mapping brcmf_usb_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_43143_CHIP_ID, 0xFFFFFFFF, 43143),
@@ -64,13 +67,42 @@ static const struct brcmf_firmware_mapping brcmf_usb_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_43242_CHIP_ID, 0xFFFFFFFF, 43242A),
 	BRCMF_FW_ENTRY(BRCM_CC_43566_CHIP_ID, 0xFFFFFFFF, 43569),
 	BRCMF_FW_ENTRY(BRCM_CC_43569_CHIP_ID, 0xFFFFFFFF, 43569),
-	BRCMF_FW_ENTRY(CY_CC_4373_CHIP_ID, 0xFFFFFFFF, 4373),
+	BRCMF_FW_ENTRY(CY_CC_4373_CHIP_ID, 0xFFFFFFFF, 4373)
+};
+
+/* The firmware is per board (module NVRAM appended), so it is not chosen by
+ * chip/revision alone.
+ */
+static const struct brcmf_firmware_mapping brcmf_usb_j72_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_43241_CHIP_ID, BIT(6), 43241J72)
 };
 
+static const struct brcmf_firmware_mapping brcmf_usb_j85_fwnames[] = {
+	BRCMF_FW_ENTRY(BRCM_CC_43241_CHIP_ID, 0xFFFFFFFF, 43241J85)
+};
+
+/* BCM43241 on the internal HSIC port of an Apple A7 board. */
+struct brcmf_usb_hsic_board {
+	const char *compatible;
+	/* The ROM identity was measured on this board and is enforced. */
+	bool measured;
+	const struct brcmf_firmware_mapping *fwnames;
+};
+
+static const struct brcmf_usb_hsic_board brcmf_usb_hsic_boards[] = {
+	{ "apple,j72", true, brcmf_usb_j72_fwnames },
+	/* Unmeasured: the ADT names the chip (4324); the rest is J72's. */
+	{ "apple,j85", false, brcmf_usb_j85_fwnames },
+};
+
+/* Measured on J72; unverified on J85. */
+#define BRCMF_USB_HSIC_ROM_REV		6
+#define BRCMF_USB_HSIC_ROM_RAMSIZE	0x90000
+#define BRCMF_USB_HSIC_ROM_REMAP	0x60000000
+
 /* Cascadia: the iPad mini 1's BCM4334 on HSIC, as both its boot ROM and
  * Apple's firmware enumerate ("M=HEIN m=2.6 V=t", bcdDevice 0.01). */
-#define BRCM_USB_J72_HSIC_DEVICE_ID	0xbd1c
+#define BRCM_USB_APPLE_HSIC_DEVICE_ID	0xbd1c
 /* Cascadia: how long that firmware gets to start before its bus is reset */
 #define BRCMF_USB_HSIC_BOOT_WAIT	500	/* in unit of ms */
 
@@ -175,6 +207,7 @@ struct brcmf_usbdev_info {
 
 	struct usb_device *usbdev;
 	bool hsic_reenum;	/* Cascadia: firmware started, reset the bus */
+	u32 hsic_ramsize;	/* ROM-reported RAM, bounds the HSIC image */
 	struct device *dev;
 	struct completion dev_init_done;
 
@@ -837,7 +870,24 @@ brcmf_usb_sync_complete(struct urb *urb)
 	brcmf_usb_ioctl_resp_wake(devinfo);
 }
 
-static bool brcmf_usb_is_hsic(struct brcmf_usbdev_info *devinfo);
+static const struct brcmf_usb_hsic_board *
+brcmf_usb_hsic_board(struct usb_device *udev)
+{
+	int i;
+
+	if (le16_to_cpu(udev->descriptor.idVendor) != BRCM_USB_VENDOR_ID_BROADCOM ||
+	    le16_to_cpu(udev->descriptor.idProduct) != BRCM_USB_APPLE_HSIC_DEVICE_ID)
+		return NULL;
+	for (i = 0; i < ARRAY_SIZE(brcmf_usb_hsic_boards); i++)
+		if (of_machine_is_compatible(brcmf_usb_hsic_boards[i].compatible))
+			return &brcmf_usb_hsic_boards[i];
+	return NULL;
+}
+
+static bool brcmf_usb_is_hsic(struct brcmf_usbdev_info *devinfo)
+{
+	return devinfo && brcmf_usb_hsic_board(devinfo->usbdev);
+}
 
 static int brcmf_usb_dl_cmd(struct brcmf_usbdev_info *devinfo, u8 cmd,
 			    void *buffer, int buflen)
@@ -907,16 +957,46 @@ err:
 	return ret;
 }
 
-static bool brcmf_usb_is_hsic(struct brcmf_usbdev_info *devinfo)
-{
- return of_machine_is_compatible("apple,j72") &&
-        le16_to_cpu(devinfo->usbdev->descriptor.idVendor) == 0x0a5c &&
-        le16_to_cpu(devinfo->usbdev->descriptor.idProduct) == 0xbd1c;
-}
-
 static int brcmf_usb_hsic_host_ready(struct usb_device *udev, bool cycle)
 {
- return j72_wlan_transport_ready(udev, cycle);
+	int (*host_ready)(struct usb_device *udev, bool cycle);
+	int ret;
+
+	host_ready = symbol_get(apple_a7_wlan_host_ready);
+	if (!host_ready) {
+		brcmf_err("HSIC: apple-a7-wlan transport is not loaded\n");
+		return -ENODEV;
+	}
+	ret = host_ready(udev, cycle);
+	symbol_put(apple_a7_wlan_host_ready);
+	return ret;
+}
+
+/* Check the boot ROM identity of the HSIC radio. */
+static int brcmf_usb_hsic_rom(struct brcmf_usbdev_info *devinfo,
+			      const struct bootrom_id_le *id)
+{
+	const struct brcmf_usb_hsic_board *board =
+		brcmf_usb_hsic_board(devinfo->usbdev);
+	u32 chipid = le32_to_cpu(id->chip), chiprev = le32_to_cpu(id->chiprev);
+	u32 ramsize = le32_to_cpu(id->ramsize), remap = le32_to_cpu(id->remapbase);
+	bool j72 = chiprev == BRCMF_USB_HSIC_ROM_REV &&
+		   ramsize == BRCMF_USB_HSIC_ROM_RAMSIZE &&
+		   remap == BRCMF_USB_HSIC_ROM_REMAP;
+
+	if (chipid == BRCMF_POSTBOOT_ID)
+		return 0;
+	if (chipid != BRCM_CC_43241_CHIP_ID || (board->measured && !j72))
+		return -ENODEV;
+	if (!j72)
+		brcmf_info("HSIC ROM rev %u ram %#x remap %#x, J72 measured rev %u ram %#x remap %#x (unverified here)\n",
+			   chiprev, ramsize, remap, BRCMF_USB_HSIC_ROM_REV,
+			   BRCMF_USB_HSIC_ROM_RAMSIZE, BRCMF_USB_HSIC_ROM_REMAP);
+	/* chiprev selects the firmware by BIT(chiprev) */
+	if (chiprev >= 32 || !ramsize || ramsize > BRCMF_USB_HSIC_ROM_RAMSIZE)
+		return -ENODEV;
+	devinfo->hsic_ramsize = ramsize;
+	return 0;
 }
 
 static int brcmf_usb_dlneeded(struct brcmf_usbdev_info *devinfo)
@@ -930,12 +1010,12 @@ static int brcmf_usb_dlneeded(struct brcmf_usbdev_info *devinfo)
  chipid = le32_to_cpu(id.chip);
  chiprev = le32_to_cpu(id.chiprev);
  if (brcmf_usb_is_hsic(devinfo)) {
-  if (chipid != BRCMF_POSTBOOT_ID &&
-      (chipid != BRCM_CC_43241_CHIP_ID || chiprev != 6 ||
-       le32_to_cpu(id.ramsize) != 0x90000 ||
-       le32_to_cpu(id.remapbase) != 0x60000000)) return -ENODEV;
+  ret = brcmf_usb_hsic_rom(devinfo, &id);
+  if (ret) return ret;
   devinfo->bus_pub.devid = BRCM_CC_43241_CHIP_ID;
-  devinfo->bus_pub.chiprev = 6;
+  /* J72: the measured revision; others: as reported */
+  devinfo->bus_pub.chiprev = brcmf_usb_hsic_board(devinfo->usbdev)->measured ?
+   BRCMF_USB_HSIC_ROM_REV : chiprev;
  }
  if (chipid == BRCMF_POSTBOOT_ID) {
   if (!brcmf_usb_is_hsic(devinfo)) {
@@ -1226,11 +1306,32 @@ static void brcmf_usb_detach(struct brcmf_usbdev_info *devinfo)
 }
 
 
-static int check_file(const u8 *headers, size_t size)
+static int check_file(const u8 *headers)
+{
+	struct trx_header_le *trx;
+	int actual_len = -1;
+
+	brcmf_dbg(USB, "Enter\n");
+	/* Extract trx header */
+	trx = (struct trx_header_le *) headers;
+	if (trx->magic != cpu_to_le32(TRX_MAGIC))
+		return -1;
+
+	headers += sizeof(struct trx_header_le);
+
+	if (le32_to_cpu(trx->flag_version) & TRX_UNCOMP_IMAGE) {
+		actual_len = le32_to_cpu(trx->offsets[TRX_OFFSETS_DLFWLEN_IDX]);
+		return actual_len + sizeof(struct trx_header_le);
+	}
+	return -1;
+}
+
+/* HSIC: the whole file is downloaded, firmware plus appended NVRAM. */
+static int check_hsic_file(const u8 *headers, size_t size, u32 ramsize)
 {
  const struct trx_header_le *trx;
  u32 fwlen, nvlen;
- if (size < sizeof(*trx) || size > 0x90000) return -EINVAL;
+ if (size < sizeof(*trx) || size > ramsize) return -EINVAL;
  trx = (const struct trx_header_le *)headers;
  if (le32_to_cpu(trx->magic) != TRX_MAGIC ||
      le32_to_cpu(trx->len) != size ||
@@ -1336,7 +1437,10 @@ static void brcmf_usb_probe_phase2(struct device *dev, int ret,
 	fw = fwreq->items[BRCMF_USB_FW_CODE].binary;
 	kfree(fwreq);
 
-	ret = check_file(fw->data, fw->size);
+	if (brcmf_usb_is_hsic(devinfo))
+		ret = check_hsic_file(fw->data, fw->size, devinfo->hsic_ramsize);
+	else
+		ret = check_file(fw->data);
 	if (ret < 0) {
 		brcmf_err("invalid firmware\n");
 		release_firmware(fw);
@@ -1389,6 +1493,8 @@ error:
 static struct brcmf_fw_request *
 brcmf_usb_prepare_fw_request(struct brcmf_usbdev_info *devinfo)
 {
+	const struct brcmf_usb_hsic_board *board =
+		brcmf_usb_hsic_board(devinfo->usbdev);
 	struct brcmf_fw_request *fwreq;
 	struct brcmf_fw_name fwnames[] = {
 		{ ".bin", devinfo->fw_name },
@@ -1396,8 +1502,8 @@ brcmf_usb_prepare_fw_request(struct brcmf_usbdev_info *devinfo)
 
 	fwreq = brcmf_fw_alloc_request(devinfo->bus_pub.devid,
 				       devinfo->bus_pub.chiprev,
-				       brcmf_usb_fwnames,
-				       ARRAY_SIZE(brcmf_usb_fwnames),
+				       board ? board->fwnames : brcmf_usb_fwnames,
+				       board ? 1 : ARRAY_SIZE(brcmf_usb_fwnames),
 				       fwnames, ARRAY_SIZE(fwnames));
 	if (!fwreq)
 		return NULL;
@@ -1527,9 +1633,9 @@ brcmf_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	u32 num_of_eps;
 	u8 endpoint_num, ep;
 
- if (le16_to_cpu(usb->descriptor.idVendor) == 0x0a5c &&
-     le16_to_cpu(usb->descriptor.idProduct) == 0xbd1c &&
-     (!of_machine_is_compatible("apple,j72") || !j72_bind)) return -ENODEV;
+ if (le16_to_cpu(usb->descriptor.idVendor) == BRCM_USB_VENDOR_ID_BROADCOM &&
+     le16_to_cpu(usb->descriptor.idProduct) == BRCM_USB_APPLE_HSIC_DEVICE_ID &&
+     (!brcmf_usb_hsic_board(usb) || !hsic_bind)) return -ENODEV;
 
 	if (!id) {
 		id = usb_match_id(intf, brcmf_usb_devid_table);
@@ -1737,7 +1843,7 @@ static const struct usb_device_id brcmf_usb_devid_table[] = {
 	BRCMF_USB_DEVICE(BRCM_USB_43236_DEVICE_ID),
 	BRCMF_USB_DEVICE(BRCM_USB_43242_DEVICE_ID),
 	BRCMF_USB_DEVICE(BRCM_USB_43569_DEVICE_ID),
-	BRCMF_USB_DEVICE(BRCM_USB_J72_HSIC_DEVICE_ID),	/* Cascadia */
+	BRCMF_USB_DEVICE(BRCM_USB_APPLE_HSIC_DEVICE_ID),	/* Cascadia */
 	LINKSYS_USB_DEVICE(BRCM_USB_43235_LINKSYS_DEVICE_ID),
 	CYPRESS_USB_DEVICE(CY_USB_4373_DEVICE_ID),
 	{ USB_DEVICE(BRCM_USB_VENDOR_ID_LG, BRCM_USB_43242_LG_DEVICE_ID) },
