@@ -4574,6 +4574,18 @@ static u32 t7000_pm_list_va(const struct s8003_vm *vm)
 	return T7000_PM_LIST + (vm->slot[0] - T7000_SLOT_FIRST) * T7000_PM_SET_SIZE;
 }
 
+/*
+ * The VM's PM id: one per set, so one per live VM. The firmware loads a
+ * set's free list into the PM only when a job names an id other than the
+ * one that PM side last loaded, after saving the running set back to its
+ * control block (0x10007fd8). Apple's kext gives each live PM its own id,
+ * out of the firmware table's 127 (assignPMId, 0xfffffff008486614).
+ */
+static u32 t7000_pm_id(const struct s8003_vm *vm)
+{
+	return vm->slot[0] - T7000_SLOT_FIRST;
+}
+
 static u32 t7000_pm_s(const struct s8003_vm *vm)
 {
 	return s8003_meta_addr(S8003_ROOT_VA + t7000_pm_control_va(vm)) + 0x80 +
@@ -5272,7 +5284,8 @@ static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	j = (struct t7000_rjob) {
 		.ch = addr, .w = addr + T7000_RCH_W, .useq = addr + T7000_RCH_TA_USEQ,
 		.object = s8003_object_addr(&s->layout, S8003_CHANNEL), .slot = vm->slot[0],
-		.pm_id = 0, .control = s8003_meta_addr(S8003_ROOT_VA + t7000_pm_control_va(vm)),
+		.pm_id = t7000_pm_id(vm),
+		.control = s8003_meta_addr(S8003_ROOT_VA + t7000_pm_control_va(vm)),
 		.s = t7000_pm_s(vm), .dep = addr + S8003_CH_DEP, .seq = seq, .k = seq - 1,
 		.trace = ++s->t7000_trace, .pr_ch = s8003_channel_addr(s, APPLE_ENGINE_FRAG),
 		.pr_index = (2 * (apple->frag_seq + 1) - 1) % T7000_RCH_ENTRIES,
@@ -5369,7 +5382,8 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	j = (struct t7000_rjob) {
 		.ch = addr, .w = addr + w_off, .useq = addr + useq_off,
 		.object = s8003_object_addr(&s->layout, S8003_CHANNEL + 1), .slot = vm->slot[0],
-		.pm_id = 0, .control = s8003_meta_addr(S8003_ROOT_VA + t7000_pm_control_va(vm)),
+		.pm_id = t7000_pm_id(vm),
+		.control = s8003_meta_addr(S8003_ROOT_VA + t7000_pm_control_va(vm)),
 		.s = t7000_pm_s(vm), .dep = ta_addr + S8003_CH_DEP, .seq = seq, .k = seq - 1,
 		.trace = ++s->t7000_trace, .times = addr + times_off,
 	};
