@@ -13,7 +13,8 @@ description: |
   Devices such as the Apple iPod touch 6 (N102) have no dedicated fuel-gauge
   IC. Battery telemetry is sampled through the Dialog D2186 PMIC housekeeping
   ADC and charging state is read from the PMIC status registers (0x60..0x6d)
-  through the parent Apple I2C PMIC regmap.
+  through the parent Apple I2C PMIC regmap. The node also provides the USB
+  input supply, whose input-current limit can follow the USB host's grant.
 
 allOf:
   - $ref: power-supply.yaml#
@@ -38,6 +39,12 @@ properties:
         - ibus
 
   monitored-battery: true
+
+  input-current-limit-microamp:
+    description:
+      The highest USB input current the board may draw. With it, the
+      driver sets the PMIC input-current limit to what the USB host
+      allows, up to this value; without it, the limit is left alone.
 
 required:
   - compatible
@@ -83,6 +90,7 @@ examples:
                               <&pmu_adc 15>,
                               <&pmu_adc 9>;
                 io-channel-names = "vbat", "ich", "tbat", "vbus", "ibus";
+                input-current-limit-microamp = <1500000>;
             };
         };
     };
