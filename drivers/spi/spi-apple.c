@@ -948,12 +948,12 @@ static int apple_spi_transfer_one_s5l8960x(struct spi_controller *ctlr,
 	struct apple_spi *spi = spi_controller_get_devdata(ctlr);
 	unsigned int bits_per_word = t->bits_per_word ?: device->bits_per_word;
 	unsigned long rate = clk_get_rate(spi->clk);
-	unsigned int sent = 0, received = 0, iterations = 0;
+	unsigned int sent = 0, received = 0, iterations = 0, last_received = 0;
 	const u8 *tx = t->tx_buf;
 	u8 *rx = t->rx_buf;
 	u32 cfg, div, status, tx_level, rx_level, word_delay;
 	u64 wire_us, delay_cycles;
-	ktime_t deadline;
+	ktime_t deadline, stall_deadline;
 	int delay_ns, ret;
 
 	if (!t->len)
@@ -1004,6 +1004,7 @@ static int apple_spi_transfer_one_s5l8960x(struct spi_controller *ctlr,
 	reg_write(spi, APPLE_SPI_RXCNT, t->len);
 	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_RUN);
 
+	stall_deadline = ktime_add_ms(ktime_get(), APPLE_SPI_TIMEOUT_MS);
 	ret = 0;
 	while (received < t->len) {
 		status = reg_read(spi, APPLE_SPI_STATUS);
@@ -1029,7 +1030,19 @@ static int apple_spi_transfer_one_s5l8960x(struct spi_controller *ctlr,
 			sent++;
 			tx_level++;
 		}
-		if (ktime_after(ktime_get(), deadline)) {
+		/*
+		 * Time out on a stall, not on the whole transfer: the loop
+		 * yields the CPU, and on a busy boot the yields alone can
+		 * outlast a fixed budget for a large transfer (the J85
+		 * touchscreen's 57 KB firmware at 1 MHz).
+		 */
+		if (received != last_received) {
+			last_received = received;
+			stall_deadline = ktime_add_ms(ktime_get(),
+						      APPLE_SPI_TIMEOUT_MS);
+		}
+		if (ktime_after(ktime_get(), deadline) &&
+		    ktime_after(ktime_get(), stall_deadline)) {
 			ret = -ETIMEDOUT;
 			break;
 		}
