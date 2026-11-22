@@ -66,6 +66,30 @@
 #define TRISTAR_CHG_ADC_START		BIT(7)	/* D2207 ADC control */
 #define TRISTAR_CHG_ADC_LATCH		GENMASK(7, 3)	/* D2207 ADC control + 1 */
 
+struct tristar_charger;
+struct tristar_pack;
+
+/* Keep shared charging policy independent of the PMIC input-limit registers. */
+struct tristar_chip_info {
+	int (*prepare)(struct tristar_charger *chg);
+	bool (*pack_allows)(struct tristar_charger *chg, const struct tristar_pack *pack);
+	unsigned int status_size, control_size;
+	u8 adc_error_mask;
+	bool strict_limit_errors;
+	bool require_pack_telemetry;
+	bool invalidate_on_line;
+	int (*read_limit)(struct tristar_charger *chg, unsigned int *code);
+	int (*write_limit)(struct tristar_charger *chg, unsigned int code);
+	unsigned int (*code_ma)(struct tristar_charger *chg, unsigned int code);
+	unsigned int (*ma_code)(struct tristar_charger *chg, unsigned int ma);
+	int (*read_status)(struct tristar_charger *chg, unsigned int *status);
+	unsigned int handoff_code;
+	unsigned int attach_code;
+	unsigned int online_status;
+	unsigned int ramp_step_ms;
+	unsigned int fallback_code;
+};
+
 /*
  * Where a PMIC keeps the charger registers, relative to the banks the
  * device tree gives, and how its ADC is driven. The functions are the same
@@ -202,30 +226,6 @@ enum cbtl_route {
 	CBTL_ROUTE_MBUS,
 	CBTL_ROUTE_USBC,
 	CBTL_ROUTE_UART2,
-};
-
-struct tristar_charger;
-struct tristar_pack;
-
-/* Keep shared charging policy independent of the PMIC input-limit registers. */
-struct tristar_chip_info {
-	int (*prepare)(struct tristar_charger *chg);
-	bool (*pack_allows)(struct tristar_charger *chg, const struct tristar_pack *pack);
-	unsigned int status_size, control_size;
-	u8 adc_error_mask;
-	bool strict_limit_errors;
-	bool require_pack_telemetry;
-	bool invalidate_on_line;
-	int (*read_limit)(struct tristar_charger *chg, unsigned int *code);
-	int (*write_limit)(struct tristar_charger *chg, unsigned int code);
-	unsigned int (*code_ma)(struct tristar_charger *chg, unsigned int code);
-	unsigned int (*ma_code)(struct tristar_charger *chg, unsigned int ma);
-	int (*read_status)(struct tristar_charger *chg, unsigned int *status);
-	unsigned int handoff_code;
-	unsigned int attach_code;
-	unsigned int online_status;
-	unsigned int ramp_step_ms;
-	unsigned int fallback_code;
 };
 
 struct tristar_charger {
