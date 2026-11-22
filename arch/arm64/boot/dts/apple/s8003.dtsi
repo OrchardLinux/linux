@@ -176,7 +176,7 @@
 
 	/*
 	 * The TSMC part has the same PCIe PHY ("phy-ip" block) as T8010.
-	 * The S8000's root complex has no phy-ip region and isn't described.
+	 * The S8000's root complex has no phy-ip region.
 	 */
 	pcie0: pcie@610000000 {
 		compatible = "apple,s8003-pcie";
