@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Exact J72/7.3 pw1 native PHY/reset/HSIC transport owner.
- * GPIO3 PMIC bit1:09->0b->09. HOST_READY uses a standard exclusive gpiod
- * consumer claim, retains direction/mux, and returns low before reset/PHY stop.
- * Standard EHCI enumeration and strict ROM query; optional persistent owner for separately loaded firmware driver.
+/* Apple A7 (S5L8960X) HSIC Wi-Fi transport owner: PHY, radio reset, HOST_READY
+ * and the EHCI root port of the BCM43241, from per-board data.
+ *
+ * Measured on the iPad Air 1 (J72, EHCI0 port 3): PMU GPIO3 09->0b->09,
+ * HOST_READY uses a standard exclusive gpiod consumer claim, retains
+ * direction/mux, and returns low before reset/PHY stop. Standard EHCI
+ * enumeration and strict ROM query; optional persistent owner for the
+ * separately loaded firmware driver.
+ *
+ * The iPad mini 2 (J85, EHCI1 port 1) addresses come from its Apple device
+ * tree and this kernel's PMGR description. Its register baselines have not
+ * been measured: the J85 path logs observed and J72-measured values, and
+ * refuses any write whose precondition is a J72 measurement it does not meet.
  */
 #include <linux/delay.h>
 #include <linux/mutex.h>
@@ -28,11 +37,120 @@
 #include <linux/usb/hcd.h>
 #include "ehci.h"
 
-#define DOMAIN "/soc/power-management@20e000000/power-controller@20120"
-#define HOST "/soc/power-management@20e000000/power-controller@20170"
-#define PHY_BASE 0x20c000050ULL
-#define PHY_STATE 0x20e020120ULL
-#define HOST_STATE 0x20e020170ULL
+#define DRV_NAME "apple-a7-wlan"
+#define PMGR "/soc/power-management@20e000000/"
+#define PMGR_BASE 0x20e000000ULL
+#define USB_COMPLEX 0x20c900000ULL	/* ADT usb-complex reg, usb_widget at +1c/3c/5c/7c */
+#define GPIO_BASE 0x20e300000ULL
+#define PMU_GPIO3 0x403		/* D2089 GPIO3 configuration: radio reset */
+
+/* Measured on J72 (iPad Air 1); unverified on any other board. */
+#define J72_PHY_CONTROL 4
+#define J72_PHY_CONFIG 0x153
+#define J72_WIDGET 0x108
+#define J72_PMU_RESET 0x09
+#define J72_HOST_READY_CFG 0x00072602
+#define J72_DEVICE_READY_CFG 0x00070200
+#define J72_EHCI_CAPLENGTH 0x01000010
+#define J72_EHCI_HCSPARAMS 0x1313
+#define J72_EHCI_HCCPARAMS 0x2a026
+#define J72_ROM_CHIP 0x4324
+#define J72_ROM_REV 6
+#define J72_ROM_RAMSIZE 0x90000
+#define J72_ROM_REMAP 0x60000000
+
+struct a7_wlan_board {
+	const char *compatible;
+	const char *name;
+	/* true: every J72 baseline is enforced exactly (J72 itself). */
+	bool measured;
+	const char *release;		/* exact kernel release pin, or NULL */
+	const char *phy_domain;		/* PMGR child: HSIC PHY power state */
+	const char *host_domain;	/* PMGR child: USB2HOST power state */
+	u32 phy_domain_reg, host_domain_reg;
+	u64 phy_base;			/* HSIC PHY control (+0) / config (+8) */
+	u64 ehci_base;
+	u32 ehci_irq;
+	unsigned int port;		/* EHCI root port of the radio */
+	u32 host_ready_gpio, device_ready_gpio;
+	u16 usb_pid;			/* 0a5c:xxxx boot ROM identity */
+};
+
+static const struct a7_wlan_board boards[] = {
+	{
+		/* All values measured on the J72 itself. */
+		.compatible = "apple,j72",
+		.name = "J72",
+		.measured = true,
+		.release = "7.3.0-rc1-j72-pw1-orchard-apple-4k",
+		.phy_domain = PMGR "power-controller@20120",	/* hsic1_phy */
+		.host_domain = PMGR "power-controller@20170",	/* usb2host0 */
+		.phy_domain_reg = 0x20120,
+		.host_domain_reg = 0x20170,
+		.phy_base = 0x20c000050ULL,
+		.ehci_base = 0x20c200000ULL,
+		.ehci_irq = 163,
+		.port = 3,
+		.host_ready_gpio = 163,
+		.device_ready_gpio = 164,
+		.usb_pid = 0xbd1c,
+	},
+	{
+		/* J85 ADT /arm-io/usb-complex/usb-ehci1/wlan: EHCI1 reg 0x400000
+		 * (0x20c400000), irq 0xa5, port 1, PHY reg 0x60 (0x20c000060),
+		 * host_ready GPIO 0xa3, device_ready GPIO 0xa4, reset PMU GPIO 3.
+		 * ADT pmgr devices: HSIC2_PHY (0x20128) is the only HSIC PHY whose
+		 * parent is USB2HOST1 (0x20180), matching ps_hsic2_phy/ps_usb2host1.
+		 * The 0a5c:bd1c identity is the J72 one, assumed for the same chip.
+		 */
+		.compatible = "apple,j85",
+		.name = "J85",
+		.measured = false,
+		.phy_domain = PMGR "power-controller@20128",	/* hsic2_phy */
+		.host_domain = PMGR "power-controller@20180",	/* usb2host1 */
+		.phy_domain_reg = 0x20128,
+		.host_domain_reg = 0x20180,
+		.phy_base = 0x20c000060ULL,
+		.ehci_base = 0x20c400000ULL,
+		.ehci_irq = 165,
+		.port = 1,
+		.host_ready_gpio = 163,
+		.device_ready_gpio = 164,
+		.usb_pid = 0xbd1c,
+	},
+};
+static const struct a7_wlan_board *board;
+
+/* A J72 measurement that this board need not match: J72 refuses a mismatch,
+ * unmeasured boards log it and continue.
+ */
+static bool observe(const char *what, u32 seen, u32 j72)
+{
+	if (seen == j72)
+		return true;
+	if (board->measured)
+		return false;
+	pr_warn(DRV_NAME ": %s %s=%08x, J72 measured %08x (unverified on %s); continuing\n",
+		board->name, what, seen, j72, board->name);
+	return true;
+}
+
+/* A J72 measurement that a following write depends on: every board must
+ * match it, so an unmeasured board only logs and never writes on a guess.
+ */
+static bool gate(const char *what, u32 seen, u32 j72)
+{
+	if (seen == j72) {
+		if (!board->measured)
+			pr_info(DRV_NAME ": %s %s=%08x matches J72 (measured on J72, unverified on %s)\n",
+				board->name, what, seen, board->name);
+		return true;
+	}
+	pr_warn(DRV_NAME ": %s %s=%08x, J72 measured %08x (unverified on %s); refusing the dependent write\n",
+		board->name, what, seen, j72, board->name);
+	return false;
+}
+
 static u32 before[2], active[2], after[2], control, config;
 static u32 widgets_before[4], widgets_active[4], widgets_after[4];
 static int result = -EAGAIN, suspend_result, detach_result;
@@ -56,10 +174,10 @@ static bool consumer_driver_registered;
 static int consumer_probe(struct platform_device *pdev) { return 0; }
 static struct platform_driver consumer_driver = {
  .probe = consumer_probe,
- .driver = { .name = "j72-wlan-transport-v3", .owner = THIS_MODULE },
+ .driver = { .name = DRV_NAME, .owner = THIS_MODULE },
 };
 
-#include "j72-wlan-hcd.h"
+#include "apple-a7-wlan-hcd.h"
 
 static void ehci_state(void __iomem *base, u32 *values)
 {
@@ -72,9 +190,9 @@ static void ehci_state(void __iomem *base, u32 *values)
 }
 
 static struct gpiod_lookup_table ready_lookup = {
- .dev_id = "j72-wlan-transport-v3",
+ .dev_id = DRV_NAME,
  .table = {
-  { .key = NULL, .chip_hwnum = 163, .con_id = "host-ready", .idx = 0, .flags = GPIO_ACTIVE_HIGH },
+  { .key = NULL, .chip_hwnum = 0, .con_id = "host-ready", .idx = 0, .flags = GPIO_ACTIVE_HIGH },
   { }
  }
 };
@@ -90,6 +208,7 @@ static int acquire_host_ready(struct device *consumer)
  if (!ready_gdev) return -ENODEV;
  ready_lookup.table[0].key = gpio_device_get_label(ready_gdev);
  if (!ready_lookup.table[0].key) return -ENODEV;
+ ready_lookup.table[0].chip_hwnum = board->host_ready_gpio;
  gpiod_add_lookup_table(&ready_lookup);
  lookup_installed = true;
  host_ready = gpiod_get(consumer, "host-ready", GPIOD_ASIS);
@@ -98,15 +217,20 @@ static int acquire_host_ready(struct device *consumer)
  return ret < 0 ? ret : (ret == 0 ? 0 : -EPROTO);
 }
 
+static u32 host_ready_reg(void __iomem *gpio)
+{
+ return readl(gpio + board->host_ready_gpio * 4);
+}
+
 static int ready_window(void __iomem *gpio, u32 expected_host, u32 *samples, u32 *high)
 {
  unsigned int i;
  for (i = 0; i < 50; i++) {
-  last_device_ready = readl(gpio + 164 * 4);
+  last_device_ready = readl(gpio + board->device_ready_gpio * 4);
   (*samples)++;
   if (last_device_ready & 1) (*high)++;
-  if ((last_device_ready & ~1U) != device_ready_before ||
-      readl(gpio + 163 * 4) != expected_host) return -EIO;
+  if ((last_device_ready & ~1U) != (device_ready_before & ~1U) ||
+      host_ready_reg(gpio) != expected_host) return -EIO;
   usleep_range(2000, 2500);
  }
  return 0;
@@ -130,7 +254,7 @@ static int acquire_pmu(void)
  pmu_map = dev_get_regmap(pmic, NULL);
  if (!pmic->driver || !pmu_map || regmap_get_val_bytes(pmu_map) != 1)
   return -ENODEV;
- return regmap_read_bypassed(pmu_map, 0x403, &pmu_before);
+ return regmap_read_bypassed(pmu_map, PMU_GPIO3, &pmu_before);
 }
 module_param(confirm_native, bool, 0400);
 
@@ -166,9 +290,21 @@ static void widgets(void __iomem *base, u32 *values)
 		values[i] = readl(base + 0x1c + i * 0x20);
 }
 
+static int ports_get(char *buf, int len, const char *name, const u32 *ports)
+{
+	unsigned int i, n = max(n_ports, 3U);
+
+	len += scnprintf(buf + len, PAGE_SIZE - len, "%s=", name);
+	for (i = 0; i < n && i < HCS_N_PORTS_MAX; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s%08x",
+				 i ? "," : "", ports[i]);
+	return len + scnprintf(buf + len, PAGE_SIZE - len, "\n");
+}
+
 static int status_get(char *buf, const struct kernel_param *unused)
 {
-	return scnprintf(buf, PAGE_SIZE,
+	int len = scnprintf(buf, PAGE_SIZE,
+		"board=%s\n"
 		"result=%d\nobserved=%u\nrestored=%u\nconsumer_removed=%u\n"
         "phy_touched=%u\nphy_restored=%u\ncontrol_before=%08x\ncontrol_running=%08x\n"
         "reset_touched=%u\nreset_restored=%u\npmu_before=%02x\npmu_released=%02x\npmu_after=%02x\n"
@@ -177,8 +313,20 @@ static int status_get(char *buf, const struct kernel_param *unused)
         "high_window_samples=%u\nhigh_window_ready=%u\nlow_window_samples=%u\nlow_window_ready=%u\n"
         "dma_checked=%u\nhcd_attempted=%u\nhcd_stopped=%u\ncontroller_restored=%u\nretain_controller=%u\n"
         "enumerate_result=%d\nradio_vid=%04x\nradio_pid=%04x\nradio_speed=%u\nrom_result=%d\n"
-        "rom_identity=%08x,%08x,%08x,%08x,%08x,%08x\n"
-        "saved_ports=%08x,%08x,%08x\nlive_ports=%08x,%08x,%08x\n"
+        "rom_identity=%08x,%08x,%08x,%08x,%08x,%08x\n",
+		board ? board->name : "none",
+		result, observed, restored, consumer_removed, phy_touched, phy_restored, original_control, running_control,
+        reset_touched, reset_restored, pmu_before, pmu_released, pmu_after,
+        host_ready_before, device_ready_before, ready_samples, ready_high_samples, last_device_ready,
+        host_touched, host_restored, gpio_released, host_high_cfg, host_after,
+        high_window_samples, high_window_ready, low_window_samples, low_window_ready,
+        dma_checked, hcd_attempted, hcd_stopped, controller_restored, retain_controller,
+        enumerate_result, radio_vid, radio_pid, radio_speed, rom_result,
+        rom_words[0],rom_words[1],rom_words[2],rom_words[3],rom_words[4],rom_words[5]);
+
+	len = ports_get(buf, len, "saved_ports", saved_ports);
+	len = ports_get(buf, len, "live_ports", live_ports);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
         "ehci_valid=%u\nehci_caps=%08x,%08x,%08x\n"
         "ehci_initial=%08x,%08x,%08x,%08x,%08x,%08x,%08x\n"
         "ehci_high=%08x,%08x,%08x,%08x,%08x,%08x,%08x\n"
@@ -190,15 +338,6 @@ static int status_get(char *buf, const struct kernel_param *unused)
 		"control=%08x\nconfig=%08x\n"
 		"widget_1c=%08x,%08x,%08x\nwidget_3c=%08x,%08x,%08x\n"
 		"widget_5c=%08x,%08x,%08x\nwidget_7c=%08x,%08x,%08x\n",
-		result, observed, restored, consumer_removed, phy_touched, phy_restored, original_control, running_control,
-        reset_touched, reset_restored, pmu_before, pmu_released, pmu_after,
-        host_ready_before, device_ready_before, ready_samples, ready_high_samples, last_device_ready,
-        host_touched, host_restored, gpio_released, host_high_cfg, host_after,
-        high_window_samples, high_window_ready, low_window_samples, low_window_ready,
-        dma_checked, hcd_attempted, hcd_stopped, controller_restored, retain_controller,
-        enumerate_result, radio_vid, radio_pid, radio_speed, rom_result,
-        rom_words[0],rom_words[1],rom_words[2],rom_words[3],rom_words[4],rom_words[5],
-        saved_ports[0],saved_ports[1],saved_ports[2],live_ports[0],live_ports[1],live_ports[2],
         ehci_valid, ehci_caps[0], ehci_caps[1], ehci_caps[2],
         ehci_initial[0], ehci_initial[1], ehci_initial[2], ehci_initial[3], ehci_initial[4], ehci_initial[5], ehci_initial[6],
         ehci_high[0], ehci_high[1], ehci_high[2], ehci_high[3], ehci_high[4], ehci_high[5], ehci_high[6],
@@ -212,6 +351,7 @@ static int status_get(char *buf, const struct kernel_param *unused)
 		widgets_before[1], widgets_active[1], widgets_after[1],
 		widgets_before[2], widgets_active[2], widgets_after[2],
 		widgets_before[3], widgets_active[3], widgets_after[3]);
+	return len;
 }
 static const struct kernel_param_ops ops = { .get = status_get };
 module_param_cb(status, &ops, NULL, 0400);
@@ -230,33 +370,34 @@ module_param(keep_active, bool, 0400);
 module_param(session_active, bool, 0400);
 static int cleanup_session(void);
 
-int j72_wlan_transport_ready(struct usb_device *udev, bool cycle);
-int j72_wlan_transport_ready(struct usb_device *udev, bool cycle)
+/* Raise (cycle: lower, then raise) HOST_READY for the retained radio. */
+int apple_a7_wlan_host_ready(struct usb_device *udev, bool cycle);
+int apple_a7_wlan_host_ready(struct usb_device *udev, bool cycle)
 {
  int ret = -ENODEV, high_ret;
  mutex_lock(&ready_lock);
  if (!session_active || stopping || !host_ready || !radio_hcd || !hcd_added ||
      !udev || udev->bus != &radio_hcd->self ||
-     udev->parent != radio_hcd->self.root_hub || udev->portnum != 3 ||
+     udev->parent != radio_hcd->self.root_hub || udev->portnum != board->port ||
      le16_to_cpu(udev->descriptor.idVendor) != 0x0a5c ||
-     le16_to_cpu(udev->descriptor.idProduct) != 0xbd1c ||
+     le16_to_cpu(udev->descriptor.idProduct) != board->usb_pid ||
      udev->speed != USB_SPEED_HIGH) goto out;
  ret = 0;
  if (cycle) {
   ret = gpiod_set_raw_value_cansleep(host_ready, 0);
-  if (!ret && readl(gpio + 163 * 4) != host_ready_before) ret = -EIO;
+  if (!ret && host_ready_reg(gpio) != host_ready_before) ret = -EIO;
   msleep(20);
  }
  /* Always attempt HIGH after a possibly ambiguous LOW write. */
  high_ret = gpiod_set_raw_value_cansleep(host_ready, 1);
  if (!ret) ret = high_ret;
- if (!ret && readl(gpio + 163 * 4) != (host_ready_before | 1)) ret = -EIO;
+ if (!ret && host_ready_reg(gpio) != (host_ready_before | 1)) ret = -EIO;
  msleep(20);
 out:
  mutex_unlock(&ready_lock);
  return ret;
 }
-EXPORT_SYMBOL_GPL(j72_wlan_transport_ready);
+EXPORT_SYMBOL_GPL(apple_a7_wlan_host_ready);
 
 static int stop_set(const char *value, const struct kernel_param *unused)
 {
@@ -276,25 +417,51 @@ static int stop_set(const char *value, const struct kernel_param *unused)
 static const struct kernel_param_ops stop_ops = { .set = stop_set };
 module_param_cb(stop, &stop_ops, NULL, 0200);
 
+static bool rom_identity_ok(void)
+{
+	if (rom_result || radio_vid != 0x0a5c || radio_pid != board->usb_pid)
+		return false;
+	if (board->measured)
+		return rom_words[0] == J72_ROM_CHIP && rom_words[1] == J72_ROM_REV &&
+		       rom_words[2] == J72_ROM_RAMSIZE && rom_words[3] == J72_ROM_REMAP;
+	/* The ADT names the chipset ('wifi-chipset' 4324); the rest is J72's. */
+	if (rom_words[0] != J72_ROM_CHIP) {
+		pr_warn(DRV_NAME ": %s ROM chip %04x is not the ADT 4324\n",
+			board->name, rom_words[0]);
+		return false;
+	}
+	observe("ROM revision", rom_words[1], J72_ROM_REV);
+	observe("ROM ramsize", rom_words[2], J72_ROM_RAMSIZE);
+	observe("ROM remap", rom_words[3], J72_ROM_REMAP);
+	return true;
+}
+
 static int __init observer_init(void)
 {
  int ret, i;
+ u32 highest;
 
 	if (!confirm_native)
         return -EPERM;
-    if (!of_machine_is_compatible("apple,j72") ||
-	    strcmp(utsname()->release, "7.3.0-rc1-j72-pw1-orchard-apple-4k"))
+	for (i = 0; i < ARRAY_SIZE(boards); i++)
+		if (of_machine_is_compatible(boards[i].compatible))
+			board = &boards[i];
+	if (!board || (board->release && strcmp(utsname()->release, board->release)))
 		return -ENODEV;
-	np = of_find_node_by_path(DOMAIN);
-	host_np = of_find_node_by_path(HOST);
+	if (!board->measured)
+		pr_info(DRV_NAME ": %s: addresses from its ADT; register baselines measured on J72, unverified on %s\n",
+			board->name, board->name);
+	highest = max(board->phy_domain_reg, board->host_domain_reg) + 4;
+	np = of_find_node_by_path(board->phy_domain);
+	host_np = of_find_node_by_path(board->host_domain);
 	if (!np || !host_np || !of_device_is_compatible(np, "apple,pmgr-pwrstate") ||
 	    np->parent != host_np->parent ||
 	    of_property_read_u32_array(np, "reg", provider_reg, 2) ||
 	    of_property_read_u32_array(host_np, "reg", host_reg, 2) ||
-	    provider_reg[0] != 0x20120 || provider_reg[1] != 4 ||
-	    host_reg[0] != 0x20170 || host_reg[1] != 4 ||
+	    provider_reg[0] != board->phy_domain_reg || provider_reg[1] != 4 ||
+	    host_reg[0] != board->host_domain_reg || host_reg[1] != 4 ||
 	    of_address_to_resource(np->parent, 0, &resource) ||
-	    resource.start != 0x20e000000ULL || resource_size(&resource) < 0x20174) {
+	    resource.start != PMGR_BASE || resource_size(&resource) < highest) {
 		result = -ENODEV;
 		goto out;
 	}
@@ -303,23 +470,25 @@ static int __init observer_init(void)
 		result = -ENODEV;
 		goto out;
 	}
-	phy = ioremap(PHY_STATE, 4);
-	host = ioremap(HOST_STATE, 4);
-	base = ioremap(PHY_BASE, 0x10);
-	complex = ioremap(0x20c900000ULL, 0x80);
-    gpio = ioremap(0x20e300000ULL, 0x1000);
-    ehci = ioremap(0x20c200000ULL, 0x10000);
+	phy = ioremap(PMGR_BASE + board->phy_domain_reg, 4);
+	host = ioremap(PMGR_BASE + board->host_domain_reg, 4);
+	base = ioremap(board->phy_base, 0x10);
+	complex = ioremap(USB_COMPLEX, 0x80);
+    gpio = ioremap(GPIO_BASE, 0x1000);
+    ehci = ioremap(board->ehci_base, 0x10000);
 	if (!phy || !host || !base || !complex || !gpio || !ehci) {
 		result = -ENOMEM;
 		goto out;
 	}
 	widgets(complex, widgets_before);
 	states(phy, host, before);
-	if ((before[0] & 0xff) || (before[1] & 0xff)) {
+	/* J72: both domains are off before the owner. Genpd owns any change. */
+	if (!observe("HSIC PHY domain state", before[0] & 0xff, 0) ||
+	    !observe("USB2HOST domain state", before[1] & 0xff, 0)) {
 		result = -EBUSY;
 		goto out;
 	}
-	pdev = platform_device_register_simple("j72-wlan-transport-v3", -1, NULL, 0);
+	pdev = platform_device_register_simple(DRV_NAME, -1, NULL, 0);
 	if (IS_ERR(pdev)) {
 		result = PTR_ERR(pdev);
 		pdev = NULL;
@@ -358,29 +527,42 @@ static int __init observer_init(void)
     original_control = control;
     original_config = config;
     phy_restored = true;
-    if (control != 4 || config != 0x153) {
+    /* The native PHY transition below was qualified from this baseline. */
+    if (!gate("PHY control", control, J72_PHY_CONTROL) ||
+        !gate("PHY config", config, J72_PHY_CONFIG)) {
         result = -EPROTO;
         goto cleanup;
     }
+    /* The usb_widget remap words decide where EHCI DMA lands. */
     for (i = 0; i < 4; i++) {
-        if (widgets_before[i] != 0x108 || widgets_active[i] != 0x108) {
+        if (!gate("usb_widget", widgets_before[i], J72_WIDGET) ||
+            !gate("usb_widget active", widgets_active[i], J72_WIDGET)) {
             result = -EPROTO;
             goto cleanup;
         }
     }
     result = acquire_pmu();
     if (result) goto cleanup;
-    host_ready_before = readl(gpio + 163 * 4);
-    device_ready_before = readl(gpio + 164 * 4);
-    if (pmu_before != 0x09 || host_ready_before != 0x00072602 ||
-        device_ready_before != 0x00070200) {
+    host_ready_before = host_ready_reg(gpio);
+    device_ready_before = readl(gpio + board->device_ready_gpio * 4);
+    /* The reset write 0b is only known from the 09 baseline. */
+    if (!gate("PMU GPIO3", pmu_before, J72_PMU_RESET) ||
+        !observe("HOST_READY config", host_ready_before, J72_HOST_READY_CFG) ||
+        !observe("DEVICE_READY config", device_ready_before, J72_DEVICE_READY_CFG)) {
+        result = -EPROTO;
+        goto cleanup;
+    }
+    /* Both lines must start low: HOST_READY is restored to this word. */
+    if ((host_ready_before & 1) || (device_ready_before & 1)) {
+        pr_warn(DRV_NAME ": %s HOST_READY/DEVICE_READY not low (%08x/%08x)\n",
+                board->name, host_ready_before, device_ready_before);
         result = -EPROTO;
         goto cleanup;
     }
     reset_restored = true;
     host_restored = true;
     result = acquire_host_ready(&pdev->dev);
-    if (host_ready) host_restored = readl(gpio + 163 * 4) == host_ready_before;
+    if (host_ready) host_restored = host_ready_reg(gpio) == host_ready_before;
     if (result) goto cleanup;
     if (!host_restored) { result = -EPROTO; goto cleanup; }
     /* Exact native transition: no cfg property => leave config unchanged.
@@ -397,7 +579,15 @@ static int __init observer_init(void)
     result = (running_control == 0 && readl(base + 8) == original_config) ? 0 : -EIO;
     if (result) goto cleanup;
     for (i = 0; i < 3; i++) ehci_caps[i] = readl(ehci + i * 4);
-    if (ehci_caps[0] != 0x01000010 || ehci_caps[1] != 0x1313 || ehci_caps[2] != 0x2a026) {
+    /* Operational registers are addressed at caplength 0x10, EHCI 1.0. */
+    n_ports = HCS_N_PORTS(ehci_caps[1]);
+    if (ehci_caps[0] != J72_EHCI_CAPLENGTH ||
+        !observe("EHCI HCSPARAMS", ehci_caps[1], J72_EHCI_HCSPARAMS) ||
+        !observe("EHCI HCCPARAMS", ehci_caps[2], J72_EHCI_HCCPARAMS) ||
+        board->port < 1 || board->port > n_ports) {
+        pr_warn(DRV_NAME ": %s EHCI caps %08x,%08x,%08x, J72 measured %08x,%08x,%08x\n",
+                board->name, ehci_caps[0], ehci_caps[1], ehci_caps[2],
+                J72_EHCI_CAPLENGTH, J72_EHCI_HCSPARAMS, J72_EHCI_HCCPARAMS);
         result = -EPROTO;
         goto cleanup;
     }
@@ -407,7 +597,7 @@ static int __init observer_init(void)
         goto cleanup;
     }
     ehci_valid = true;
-    pr_info("j72-wlan-transport-v3: phase prepare bound HCD\n");
+    pr_info(DRV_NAME ": phase prepare bound HCD\n");
     result = hcd_prepare(pdev, ehci);
     if (result) goto cleanup;
     /* Mark before attempting the write: an I2C error may follow a write. */
@@ -416,9 +606,9 @@ static int __init observer_init(void)
     /* Known full byte avoids consulting a potentially cached RMW value.
      * Exact native function yields0b from our required raw baseline09.
      */
-    result = regmap_write(pmu_map, 0x403, 0x0b);
+    result = regmap_write(pmu_map, PMU_GPIO3, 0x0b);
     if (result) goto cleanup;
-    result = regmap_read_bypassed(pmu_map, 0x403, &pmu_released);
+    result = regmap_read_bypassed(pmu_map, PMU_GPIO3, &pmu_released);
     if (result) goto cleanup;
     if (pmu_released != 0x0b) {
         result = -EIO;
@@ -434,21 +624,23 @@ static int __init observer_init(void)
     host_restored = false;
     result = gpiod_set_raw_value_cansleep(host_ready, 1);
     if (result) goto cleanup;
-    host_high_cfg = readl(gpio + 163 * 4);
+    host_high_cfg = host_ready_reg(gpio);
     if (host_high_cfg != (host_ready_before | 1)) { result = -EIO; goto cleanup; }
     result = ready_window(gpio, host_ready_before | 1, &high_window_samples, &high_window_ready);
     if (result) goto cleanup;
+    if (!board->measured)
+        pr_info(DRV_NAME ": %s DEVICE_READY high in %u/%u samples after HOST_READY (J72: 45/50)\n",
+                board->name, high_window_ready, high_window_samples);
     result = hcd_enumerate(ehci);
     ehci_state(ehci, ehci_high);
     if (!result && keep_active) {
-        if (rom_result || radio_vid != 0x0a5c || radio_pid != 0xbd1c ||
-            rom_words[0] != 0x4324 || rom_words[1] != 6 ||
-            rom_words[2] != 0x90000 || rom_words[3] != 0x60000000) {
+        if (!rom_identity_ok()) {
             result = -EPROTO;
             goto cleanup;
         }
         session_active = true;
-        pr_info("j72-wlan-transport-v3: exact ROM verified; HCD retained ACTIVE for opt-in firmware driver; root-only stop available\n");
+        pr_info(DRV_NAME ": %s ROM %04x rev %u ram %#x remap %#x; HCD retained ACTIVE for opt-in firmware driver; root-only stop available\n",
+                board->name, rom_words[0], rom_words[1], rom_words[2], rom_words[3]);
         return 0;
     }
 cleanup:
@@ -473,13 +665,13 @@ static int cleanup_session(void)
     }
     if (host_pending) {
         int host_ret = gpiod_set_raw_value_cansleep(host_ready, 0);
-        host_after = readl(gpio + 163 * 4);
+        host_after = host_ready_reg(gpio);
         host_restored = !host_ret && host_after == host_ready_before;
         if (!host_restored) {
             result = -EIO;
             /* One cleanup retry covers an ambiguous first GPIO write. */
             host_ret = gpiod_set_raw_value_cansleep(host_ready, 0);
-            host_after = readl(gpio + 163 * 4);
+            host_after = host_ready_reg(gpio);
             host_restored = !host_ret && host_after == host_ready_before;
         }
         if (host_restored) {
@@ -494,8 +686,8 @@ static int cleanup_session(void)
         goto out;
     }
     if (reset_touched) {
-        int reset_ret = regmap_write(pmu_map, 0x403, pmu_before);
-        int read_ret = regmap_read_bypassed(pmu_map, 0x403, &pmu_after);
+        int reset_ret = regmap_write(pmu_map, PMU_GPIO3, pmu_before);
+        int read_ret = regmap_read_bypassed(pmu_map, PMU_GPIO3, &pmu_after);
         reset_restored = !reset_ret && !read_ret && pmu_after == pmu_before;
         if (!reset_restored) {
             result = -EIO;
@@ -557,7 +749,7 @@ static int cleanup_session(void)
 		result = -EIO;
 out:
     if (retain_controller) {
-        pr_err("j72_wlan_transport_v3: halted/restoration check failed; retaining DMA, GPIO, PHY and domain owners until reboot\n");
+        pr_err(DRV_NAME ": halted/restoration check failed; retaining DMA, GPIO, PHY and domain owners until reboot\n");
         return 0;
     }
     if (consumer_driver_registered && (!pdev || consumer_removed)) {
@@ -569,8 +761,8 @@ out:
     if (ready_gdev && !host_ready) { gpio_device_put(ready_gdev); ready_gdev = NULL; }
     gpio_released = !host_ready && !ready_gdev && !lookup_installed;
     if (pmic) { put_device(pmic); pmic = NULL; pmu_map = NULL; }
-	pr_info("j72_wlan_transport_v3: result=%d observed=%u restored=%u removed=%u\n",
-		result, observed, restored, consumer_removed);
+	pr_info(DRV_NAME ": %s result=%d observed=%u restored=%u removed=%u\n",
+		board ? board->name : "none", result, observed, restored, consumer_removed);
 	if (base)
 		iounmap(base);
 	if (complex)
@@ -595,4 +787,4 @@ static void __exit observer_exit(void) { }
 module_init(observer_init);
 module_exit(observer_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("J72 opt-in persistent HSIC owner with synchronized stop and strict ROM gate");
+MODULE_DESCRIPTION("Apple A7 HSIC Wi-Fi owner (J72 measured, J85 unverified) with synchronized stop and strict ROM gate");

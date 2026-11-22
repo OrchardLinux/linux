@@ -734,10 +734,16 @@ config USB_XEN_HCD
 	  Only needed if the kernel is running in a Xen guest and generic
 	  access to a USB device is needed.
 
-config J72_WLAN_TRANSPORT
-	tristate "Opt-in J72 internal HSIC Wi-Fi transport"
+config APPLE_A7_WLAN
+	tristate "Apple A7 (S5L8960X) internal HSIC Wi-Fi transport"
 	depends on ARCH_APPLE && USB_EHCI_HCD && I2C && GPIOLIB && PM_GENERIC_DOMAINS
 	help
-	  Exact J72 measured PHY, radio reset, HOST_READY and EHCI ownership.
-	  Requires explicit confirm_native; checks initial hardware state and
-	  uses the normal USB HCD/DMA APIs. No automatic DT probe.
+	  Owns the HSIC PHY, radio reset, HOST_READY and the EHCI root port
+	  of the BCM43241 on the iPad Air 1 (J72) and iPad mini 2 (J85), so
+	  that brcmfmac can download its firmware over USB.
+
+	  The J72 baseline was measured on that board and is enforced. The
+	  J85 addresses come from its Apple device tree; its register
+	  baselines are unmeasured, so they are logged and any write that
+	  depends on a J72 baseline is refused unless the board matches it.
+	  Requires the confirm_native parameter; there is no DT probe.
