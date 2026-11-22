@@ -19,6 +19,12 @@ allOf:
   - $ref: power-supply.yaml#
 
 properties:
+  io-channels:
+    maxItems: 1
+
+  io-channel-names:
+    const: vbus
+
   compatible:
     const: apple,d2355-tristar-charger
 
