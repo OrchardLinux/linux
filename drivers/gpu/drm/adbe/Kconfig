@@ -11,8 +11,9 @@ config DRM_APPLE_ADBE
 	select DRM_KMS_HELPER
 	help
 	  KMS driver for the display pipe (disp0) of the Apple A9 SoCs
-	  (S8000/S8003), as used in the iPad 5. It adopts the mode the
-	  bootloader leaves running, takes the framebuffer over from
+	  (S8000/S8003), as used in the iPad 5, and of the A8 (T7000), as
+	  used in the iPod touch 6. It adopts the mode the bootloader
+	  leaves running, takes the framebuffer over from
 	  simpledrm, and adds page flips and vblank interrupts. It never
 	  programs timings or clocks, and trains the eDP link only to bring
 	  the panel back after a sleep with its supply off.

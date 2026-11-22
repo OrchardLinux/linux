@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * DRM/KMS driver for the Apple A9/A10 display pipe, disp0.
+ * DRM/KMS driver for the Apple A8, A9 and A10 display pipe, disp0.
  *
- * iBoot leaves the eDP link, the panel and the timing generator running.
+ * iBoot leaves the panel link (eDP on the iPads, MIPI DSI on the A8 iPod
+ * touch and iPhone), the panel and the timing generator running.
  * This driver adopts that mode and never programs timings or clocks; it
  * trains the link only after a sleep with the panel off (see below), with the
  * boot loader's link settings. It offers one XRGB8888 primary plane. A new
@@ -247,8 +248,36 @@ MODULE_PARM_DESC(dart_scanout,
 #define ADBE_FLIP_TIMEOUT_MS	100	/* complete anyway without an interrupt */
 #define ADBE_INTEN_VBLANK	(ADP_ST_VBI | ADP_ST_APPLIED)
 
+/* What differs between the SoCs whose pipe this driver adopts. */
+struct adbe_hw {
+	/* SPDS version at ADP_SPDS that iOS requires; 0: iOS never reads it */
+	u16 spds_version;
+	/* The panel link iBoot left running */
+	int connector_type;
+};
+
+/* A9 and A10: iOS's AppleH8ADBE0 panics unless ADP_SPDS reads 0x13. */
+static const struct adbe_hw adbe_hw_s8000 = {
+	.spds_version = ADP_SPDS_VERSION,
+	.connector_type = DRM_MODE_CONNECTOR_eDP,
+};
+
+/*
+ * A8 (T7000): iOS 12's AppleH7ADBE0 has the same ADP control, parameter
+ * FIFO, layer and blend CRC registers, builds the same format words and
+ * masks the same errors at start, but has no SPDS check: it reads the
+ * display_spdsversion_mismatch_is_panic boot argument and never ADP_SPDS.
+ * Neither does this driver there. The iPod touch 6 and the iPhone 6 drive
+ * a MIPI DSI panel.
+ */
+static const struct adbe_hw adbe_hw_t7000 = {
+	.spds_version = 0,
+	.connector_type = DRM_MODE_CONNECTOR_DSI,
+};
+
 struct adbe {
 	struct drm_device drm;
+	const struct adbe_hw *hw;
 	struct drm_plane plane;
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
@@ -339,6 +368,7 @@ static const struct {
 } adbe_panels[] = {
 	{ 1536, 2048, 148, 197 },	/* 9.7-inch iPad 5 and iPad 6 */
 	{ 1620, 2160, 155, 207 },	/* 10.2-inch iPad 7 */
+	{ 640, 1136, 50, 89 },		/* 4-inch iPod touch 6, 326 ppi */
 };
 
 /* The fixed mode of the panel iBoot left running, at its boot size. */
@@ -1829,18 +1859,25 @@ static void adbe_dart_exit(struct adbe *adbe)
 static int adbe_adopt(struct adbe *adbe)
 {
 	struct device *dev = adbe->drm.dev;
-	u32 base, stride, format;
+	u32 base, stride, format, spds = 0, valid, layers, status;
 	u16 frame;
 	int ret;
 
+	/* Only read where iOS reads it: an absent register may not answer. */
+	if (adbe->hw->spds_version)
+		spds = readl(adbe->regs + ADP_SPDS);
 	format = readl(adbe->regs + ADP_FORMAT) & ~ADP_FORMAT_FLAGS;
-	if ((readl(adbe->regs + ADP_SPDS) & 0xffff) != ADP_SPDS_VERSION ||
+	valid = readl(adbe->regs + ADP_VALID);
+	layers = readl(adbe->regs + ADP_LAYERS);
+	status = readl(adbe->regs + ADP_STATUS);
+	if ((adbe->hw->spds_version &&
+	     (spds & 0xffff) != adbe->hw->spds_version) ||
 	    (format != 0xc6000 && format != 0xe4000) ||
-	    !(readl(adbe->regs + ADP_VALID) & BIT(0)) ||
-	    (readl(adbe->regs + ADP_LAYERS) & 0xf) != 1 ||
-	    (readl(adbe->regs + ADP_STATUS) & ADP_ST_ERRORS))
+	    !(valid & BIT(0)) || (layers & 0xf) != 1 ||
+	    (status & ADP_ST_ERRORS))
 		return dev_err_probe(dev, -ENODEV,
-				     "pipe is not running as iBoot leaves it\n");
+				     "pipe is not running as iBoot leaves it (spds %#x format %#x valid %#x layers %#x status %#x)\n",
+				     spds, format, valid, layers, status);
 
 	frame = readl(adbe->regs + ADP_FRAME);
 	msleep(50);
@@ -1914,7 +1951,7 @@ static int adbe_modeset_init(struct adbe *adbe)
 	adbe->encoder.possible_crtcs = drm_crtc_mask(&adbe->crtc);
 
 	ret = drmm_connector_init(drm, &adbe->connector, &adbe_connector_funcs,
-				  DRM_MODE_CONNECTOR_eDP, NULL);
+				  adbe->hw->connector_type, NULL);
 	if (ret)
 		return ret;
 	drm_connector_helper_add(&adbe->connector, &adbe_connector_helper_funcs);
@@ -2415,6 +2452,9 @@ static int adbe_probe(struct platform_device *pdev)
 	if (IS_ERR(adbe))
 		return PTR_ERR(adbe);
 	platform_set_drvdata(pdev, adbe);
+	adbe->hw = of_device_get_match_data(dev);
+	if (!adbe->hw)
+		return -ENODEV;
 	timer_setup(&adbe->flip_timer, adbe_flip_timeout, 0);
 	spin_lock_init(&adbe->hold_lock);
 	INIT_DELAYED_WORK(&adbe->hold_work, adbe_hold_work);
@@ -2597,7 +2637,8 @@ static int adbe_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(adbe_pm_ops, adbe_suspend, adbe_resume);
 
 static const struct of_device_id adbe_of_match[] = {
-	{ .compatible = "apple,s8000-display-pipe" },
+	{ .compatible = "apple,t7000-display-pipe", .data = &adbe_hw_t7000 },
+	{ .compatible = "apple,s8000-display-pipe", .data = &adbe_hw_s8000 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, adbe_of_match);
@@ -2614,6 +2655,6 @@ static struct platform_driver adbe_platform_driver = {
 };
 module_platform_driver(adbe_platform_driver);
 
-MODULE_DESCRIPTION("DRM driver for the Apple A9 display pipe");
+MODULE_DESCRIPTION("DRM driver for the Apple A8, A9 and A10 display pipe");
 MODULE_AUTHOR("Berkay Kösebay <brkosebay@users.noreply.github.com>");
 MODULE_LICENSE("GPL");
