@@ -174,7 +174,9 @@
 /*
  * ADT displayport ("displayport,t7000", embedded, four lanes): the panel
  * link is eDP, so the pipe holds the dp domain instead of mipi_dsi and
- * gets the transmitter's window.
+ * gets the transmitter's window. The pipe takes the 1536x2048 panel over
+ * from simpledrm. No panel supply is given: the panel stays on in system
+ * sleep.
  */
 &disp0 {
 	reg = <0x2 0x06200000 0x0 0x100000>,
@@ -183,6 +185,7 @@
 	      <0x2 0x06700000 0x0 0x1000>;
 	reg-names = "adp", "dart0", "dart1", "dp";
 	power-domains = <&ps_disp0>, <&ps_dp>;
+	status = "okay";
 };
 
 &gpu {
