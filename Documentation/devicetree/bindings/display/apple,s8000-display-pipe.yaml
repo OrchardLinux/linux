@@ -109,19 +109,25 @@ allOf:
     then:
       properties:
         reg:
-          maxItems: 3
+          minItems: 3
+          maxItems: 4
           items:
             - description:
                 ADP window, with the control and interrupt registers, the
                 parameter FIFO port and the pipe layer registers
             - description: Display DART (dart-disp0), first window
             - description: Display DART (dart-disp0), second window
+            - description:
+                DisplayPort transmitter (displayport), on the boards whose
+                panel link is eDP
         reg-names:
-          maxItems: 3
+          minItems: 3
+          maxItems: 4
           items:
             - const: adp
             - const: dart0
             - const: dart1
+            - const: dp
         interrupts:
           maxItems: 5
           items:
