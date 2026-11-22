@@ -107,12 +107,14 @@ static const struct brcmf_feat_fwfeat brcmf_feat_fwfeat_map[] = {
 /* Features a given firmware build advertises but can't actually do */
 static const struct brcmf_feat_fwfeat brcmf_feat_fwfeat_disable_map[] = {
 	/*
-	 * Apple BCM4355 firmware answers the "p2p" iovar but fails
-	 * "p2p_da_override" with -52, so every P2P device creation fails.
+	 * These Apple BCM4355 builds advertise P2P but reject P2P device
+	 * setup with -EBADE.
 	 * Apple uses AWDL, not Wi-Fi P2P.
 	 */
 	/* iOS 16 C0 "FearA" (iPad 5), 9.44.205.0.3.50.46 */
 	{ "01-9787ef4d", BIT(BRCMF_FEAT_P2P) },
+	/* 9.44.205.0.3.50.46, iPad Pro 12.9 (2017) */
+	{ "01-c372c45d", BIT(BRCMF_FEAT_P2P) },
 	/* iPadOS 17.7 C1 (iPad 6), 9.30.503.2.3.50.99 */
 	{ "01-d0cb7703", BIT(BRCMF_FEAT_P2P) },
 };
