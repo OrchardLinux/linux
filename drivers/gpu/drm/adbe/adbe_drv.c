@@ -712,8 +712,8 @@ static void adbe_hold_work(struct work_struct *work)
 	adbe_hold_release(adbe, false);
 	/* The newest entry is the one on screen: it stays until replaced. */
 	if (READ_ONCE(adbe->nhold) > 1)
-		schedule_delayed_work(&adbe->hold_work,
-				      msecs_to_jiffies(ADBE_HOLD_POLL_MS));
+		queue_delayed_work(system_dfl_wq, &adbe->hold_work,
+				   msecs_to_jiffies(ADBE_HOLD_POLL_MS));
 }
 
 /*
@@ -759,7 +759,7 @@ static void adbe_hold_push(struct adbe *adbe, struct drm_framebuffer *fb,
 				     "pipe not following updates, releasing the oldest held buffer\n");
 		drm_framebuffer_put(old);
 	}
-	mod_delayed_work(system_wq, &adbe->hold_work,
+	mod_delayed_work(system_dfl_wq, &adbe->hold_work,
 			 msecs_to_jiffies(ADBE_HOLD_POLL_MS));
 }
 
