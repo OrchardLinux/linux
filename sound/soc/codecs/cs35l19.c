@@ -56,6 +56,7 @@
 #define CS35L19_MAX_REG		0x7f
 
 #define CS35L19_VOL_MUTE	0x19	/* what iOS writes to mute */
+#define CS35L19_VOL_0DB		0x00
 #define CS35L19_CFG_LEN		20
 
 /* The ADT's speaker-config for P105AP, the same for both amps. */
@@ -78,6 +79,24 @@ struct cs35l19 {
 	unsigned int slot;		/* TDM slot index */
 	unsigned int slot_bytes;	/* TDM slot width in bytes, 2 or 4 */
 };
+
+/*
+ * DIG_VOL counts 0.5 dB steps: 0x34 is -102 dB, 0xff -0.5 dB, 0x00 0 dB and
+ * 0x18 +12 dB; 0x19 is iOS's mute. iOS may go above 0 dB because its speaker
+ * protection (the amp's V/I sense, read back on the serial port) keeps the
+ * speaker in its limits. Linux has no speaker protection yet, so the gain
+ * stays at 0 dB or below: a positive gain, however it got into the register,
+ * becomes 0 dB, and the codes above +12 dB become the mute.
+ */
+static unsigned int cs35l19_safe_vol(unsigned int vol)
+{
+	vol &= 0xff;
+	if (vol > CS35L19_VOL_0DB && vol < CS35L19_VOL_MUTE)
+		return CS35L19_VOL_0DB;
+	if (vol >= CS35L19_VOL_MUTE && vol < 0x34)
+		return CS35L19_VOL_MUTE;
+	return vol;
+}
 
 static void cs35l19_alive(struct work_struct *work)
 {
@@ -182,7 +201,7 @@ static int cs35l19_power_on(struct cs35l19 *cs)
 	regmap_write(map, CS35L19_RX_SPLY, 0x80);
 	regmap_write(map, CS35L19_RX_ALIVE, 0x80);
 
-	return regmap_write(map, CS35L19_DIG_VOL, vol);
+	return regmap_write(map, CS35L19_DIG_VOL, cs35l19_safe_vol(vol));
 }
 
 static void cs35l19_power_off(struct cs35l19 *cs)
@@ -198,7 +217,7 @@ static void cs35l19_power_off(struct cs35l19 *cs)
 	usleep_range(1000, 2000);
 	regmap_write(map, CS35L19_PWRCTL1, 0x87);
 	usleep_range(4000, 5000);
-	regmap_write(map, CS35L19_DIG_VOL, vol);
+	regmap_write(map, CS35L19_DIG_VOL, cs35l19_safe_vol(vol));
 }
 
 static int cs35l19_amp_event(struct snd_soc_dapm_widget *w,
@@ -240,11 +259,14 @@ static int cs35l19_amp_event(struct snd_soc_dapm_widget *w,
 	return 0;
 }
 
-/* 0.5 dB steps around 0 dB: 0x34 is -102 dB, 0x00 0 dB, 0x18 +12 dB */
+/*
+ * -102 dB (0x34) up to 0 dB (0x00), 204 steps of 0.5 dB: the amp could go to
+ * +12 dB, but without speaker protection 0 dB is the top (cs35l19_safe_vol).
+ */
 static const DECLARE_TLV_DB_SCALE(cs35l19_vol_tlv, -10200, 50, 0);
 
 static const struct snd_kcontrol_new cs35l19_controls[] = {
-	SOC_SINGLE_SX_TLV("Speaker Volume", CS35L19_DIG_VOL, 0, 0x34, 0xe4,
+	SOC_SINGLE_SX_TLV("Speaker Volume", CS35L19_DIG_VOL, 0, 0x34, 0xcc,
 			  cs35l19_vol_tlv),
 };
 
