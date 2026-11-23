@@ -42,9 +42,30 @@
 		ranges;
 
 		/* To be filled by loader */
+
+		ans_firmware: ans-firmware {
+			/* Filled in by the loader. */
+			reg = <0 0 0 0>;
+			no-map;
+		};
 	};
 };
 
 &serial0 {
+	status = "okay";
+};
+
+/*
+ * Internal storage: the ANS (Apple's iop,s5l8960x with an rtbuddy nub), at
+ * the same address with the same interrupts in the device tree of every A7
+ * board. The loader fills in its firmware region from the ADT.
+ */
+&ps_ans {
+	apple,always-on;
+};
+
+&ans {
+	memory-region = <&ans_firmware>;
+	memory-region-names = "firmware";
 	status = "okay";
 };

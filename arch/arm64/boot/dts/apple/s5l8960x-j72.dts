@@ -15,14 +15,6 @@
 	aliases {
 		touchscreen0 = &touchscreen; /* Used by loader */
 	};
-
-	reserved-memory {
-		ans_firmware: ans-firmware {
-			/* Filled in by the loader. */
-			reg = <0 0 0 0>;
-			no-map;
-		};
-	};
 };
 
 &pinctrl {
@@ -49,16 +41,6 @@
 		compatible = "apple,d2089-touch-core-regulator";
 		regulator-name = "touch-core";
 	};
-};
-
-&ps_ans {
-	apple,always-on;
-};
-
-&ans {
-	memory-region = <&ans_firmware>;
-	memory-region-names = "firmware";
-	status = "okay";
 };
 
 &touchclk {
