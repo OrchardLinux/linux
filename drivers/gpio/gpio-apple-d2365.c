@@ -110,6 +110,18 @@
 #define D2333_GPIO_OUTPUT	BIT(7)
 
 /*
+ * D2255 (A9 iPhones), as iOS AppleD2255PMU accesses it: the configuration
+ * byte of line n is 0x900 + 2 * n for lines 0-16 and 0x8c0 + 6 * n for
+ * lines 17-20 (_index2GPIOAddress). Bits 7:6 are the mode as on the D2333,
+ * and bit 0 is the output level; input levels are bit n % 8 of
+ * 0x186 + n / 8 (_getGPIOValue). The lines iBoot leaves as outputs read
+ * 0x80, as on the D2333.
+ */
+#define D2255_GPIO_SPLIT		17
+#define D2255_GPIO_CFG_0_16	0x900
+#define D2255_GPIO_CFG_17_20	0x8c0
+
+/*
  * D2365 PMU events, one bit each (event n: byte n / 8, bit n % 8). iOS
  * fetches them by reading all 30 bytes at 0x140 (clear on read); 0x1c0 is
  * the matching interrupt mask (set = masked), which iOS sets to all ones at
@@ -198,6 +210,14 @@ static unsigned int d2365_gpio_config_reg(unsigned int offset)
 		return D2365_GPIO_CFG_0_17 + 2 * offset;
 
 	return D2365_GPIO_CFG_18_23 + 6 * offset;
+}
+
+static unsigned int d2255_gpio_config_reg(unsigned int offset)
+{
+	if (offset < D2255_GPIO_SPLIT)
+		return D2255_GPIO_CFG_0_16 + 2 * offset;
+
+	return D2255_GPIO_CFG_17_20 + 6 * offset;
 }
 
 static const unsigned int d2333_gpio_config_regs[] = {
@@ -1054,6 +1074,17 @@ static const struct apple_pmic_gpio_info d2207_gpio_info = {
 	.events = &d2207_event_info,
 };
 
+static const struct apple_pmic_gpio_info d2255_gpio_info = {
+	.label = "d2255-pmic-gpio",
+	.ngpio = 21,
+	.input_base = 0x186,
+	.value_mask = D2333_GPIO_VALUE,
+	.direction_mask = D2333_GPIO_DIRECTION_MASK,
+	.input_mode = D2333_GPIO_INPUT,
+	.output_mode = D2333_GPIO_OUTPUT,
+	.config_reg = d2255_gpio_config_reg,
+};
+
 static const struct apple_pmic_gpio_info d2333_gpio_info = {
 	.label = "d2333-pmic-gpio",
 	.ngpio = ARRAY_SIZE(d2333_gpio_config_regs),
@@ -1097,6 +1128,10 @@ static const struct of_device_id d2365_gpio_of_match[] = {
 	{
 		.compatible = "apple,d2207-pmic-gpio",
 		.data = &d2207_gpio_info,
+	},
+	{
+		.compatible = "apple,d2255-pmic-gpio",
+		.data = &d2255_gpio_info,
 	},
 	{
 		.compatible = "apple,d2333-pmic-gpio",
