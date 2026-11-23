@@ -7,7 +7,7 @@
 /dts-v1/;
 
 #include "s8003.dtsi"
-#include "s800x-se.dtsi"
+#include "s800x-n69.dtsi"
 
 / {
 	compatible = "apple,n69", "apple,s8003", "apple,arm-platform";

@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iPhone 6s Plus (N66, N66m): what the Samsung and TSMC models share
+ */
+
+#include "s800x-6s.dtsi"
+
+/* ADT i2c2/als: als,ct821 */
+&als {
+	compatible = "apple,ct821", "amstaos,tsl2581";
+};
+
+/* ADT multi-touch,n66; AppleMultitouchN1SPI personality C1F5C */
+&touchscreen {
+	compatible = "apple,n66-touchscreen";
+	firmware-name = "apple/n66-fwstart.z2fw";
+	touchscreen-size-x = <1080>;
+	touchscreen-size-y = <1920>;
+};

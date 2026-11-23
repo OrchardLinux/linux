@@ -7,75 +7,9 @@
 /dts-v1/;
 
 #include "s8000.dtsi"
-#include "s800x-6s.dtsi"
+#include "s800x-n66.dtsi"
 
 / {
 	compatible = "apple,n66", "apple,s8000", "apple,arm-platform";
 	model = "Apple iPhone 6s Plus (Samsung)";
-
-	aliases {
-		als0 = &als;	/* the loader copies the ADT's alsCalibration here */
-		spi2 = &spi2;
-		touchscreen0 = &touchscreen;	/* the loader copies the ADT calibration */
-	};
-};
-
-&i2c2 {
-	status = "okay";
-
-	/* ADT i2c2/als: als,ct821 @0x29, interrupt AP GPIO 131 */
-	als: light-sensor@29 {
-		compatible = "apple,ct821", "amstaos,tsl2581";
-		reg = <0x29>;
-		interrupts-extended = <&pinctrl_ap 131 IRQ_TYPE_LEVEL_LOW>;
-	};
-};
-
-
-
-&i2c0 {
-	/* ADT display-pmu,chestnut @0x27: touch power_ana = dpLE(0x302) */
-	display-pmu@27 {
-		compatible = "apple,chestnut-pmic";
-		reg = <0x27>;
-
-		touch_ana: regulator-touch-hv {
-			compatible = "apple,chestnut-touch-hv-regulator";
-			regulator-name = "touch-analog";
-		};
-	};
-};
-
-&{/soc/i2c@20a110000/pmic@74} {
-	/* ADT multi-touch power_ldo = pmuL(0x219) */
-	touch_core: regulator-touch-core {
-		compatible = "apple,antigua-touch-core-regulator";
-		regulator-name = "touch-core";
-	};
-};
-
-/* ADT /arm-io/spi2/multi-touch: multi-touch,n66 */
-&spi2 {
-	cs-gpios = <&pinctrl_ap 44 GPIO_ACTIVE_LOW>;	/* function-enable_cs */
-	status = "okay";
-
-	touchscreen: touchscreen@0 {
-		compatible = "apple,n66-touchscreen";
-		reg = <0>;
-		spi-max-frequency = <8064516>;		/* ADT 124 ns bit period */
-		interrupts-extended = <&pinctrl_ap 142 IRQ_TYPE_EDGE_FALLING>;
-		attn-gpios = <&pinctrl_ap 142 GPIO_ACTIVE_LOW>;
-		reset-gpios = <&pinctrl_ap 75 GPIO_ACTIVE_LOW>;	/* function-reset */
-		ana-supply = <&touch_ana>;
-		core-supply = <&touch_core>;
-		clocks = <&touchclk>;
-		firmware-name = "apple/n66-fwstart.z2fw";
-		touchscreen-size-x = <1080>;
-		touchscreen-size-y = <1920>;
-		touchscreen-inverted-y;
-	};
-};
-
-&touchclk {
-	status = "okay";
 };
