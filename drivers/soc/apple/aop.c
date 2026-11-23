@@ -54,9 +54,17 @@
 
 #define APPLE_AOP_CONTROL_AUTO_BOOT	0x0
 
-/* Main image header: location of the boot argument key/value block */
-#define APPLE_AOP_IMAGE_BOOTARGS_OFFSET	0x48
-#define APPLE_AOP_IMAGE_BOOTARGS_SIZE	0x4c
+/*
+ * Main image: an RTKit header ("uuid", then its version) that gives the
+ * offset and size of the boot argument key/value block. Version 5 (iPadOS 16)
+ * has two more words before them than version 4 (iOS 15).
+ */
+#define APPLE_AOP_IMAGE_MAGIC		0x20
+#define APPLE_AOP_IMAGE_MAGIC_UUID	0x64697575	/* "uuid" */
+#define APPLE_AOP_IMAGE_VERSION		0x24
+#define APPLE_AOP_IMAGE_BOOTARGS_V4	0x40
+#define APPLE_AOP_IMAGE_BOOTARGS_V5	0x48
+#define APPLE_AOP_IMAGE_HEADER_SIZE	0x50
 
 #define APPLE_AOP_FOURCC(a, b, c, d)                                     \
 	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | (u32)(d))
@@ -281,11 +289,17 @@ static void apple_aop_add_bootarg(struct apple_aop_bootarg *args, unsigned int *
 static int apple_aop_patch_bootargs(struct apple_aop *aop, u8 *image, size_t size,
 				    struct apple_aop_bootarg *args, unsigned int count)
 {
-	size_t offset, end, pos;
+	size_t offset, end, pos, location;
 	unsigned int i;
 
-	offset = get_unaligned_le32(image + APPLE_AOP_IMAGE_BOOTARGS_OFFSET);
-	end = get_unaligned_le32(image + APPLE_AOP_IMAGE_BOOTARGS_SIZE);
+	if (get_unaligned_le32(image + APPLE_AOP_IMAGE_MAGIC) == APPLE_AOP_IMAGE_MAGIC_UUID &&
+	    get_unaligned_le32(image + APPLE_AOP_IMAGE_VERSION) == 4)
+		location = APPLE_AOP_IMAGE_BOOTARGS_V4;
+	else
+		location = APPLE_AOP_IMAGE_BOOTARGS_V5;
+
+	offset = get_unaligned_le32(image + location);
+	end = get_unaligned_le32(image + location + 4);
 	if (offset >= size || end > size - offset)
 		return -EINVAL;
 	end += offset;
@@ -373,7 +387,7 @@ static int apple_aop_load(struct apple_aop *aop, u64 ecid)
 		goto out_main;
 
 	if (main_fw->size > aop->sram_size || main_fw->size % 4 ||
-	    main_fw->size < APPLE_AOP_IMAGE_BOOTARGS_SIZE + 4 || !ext_fw->size) {
+	    main_fw->size < APPLE_AOP_IMAGE_HEADER_SIZE || !ext_fw->size) {
 		dev_err(aop->dev, "invalid firmware sizes %zu/%zu\n",
 			main_fw->size, ext_fw->size);
 		ret = -EINVAL;
