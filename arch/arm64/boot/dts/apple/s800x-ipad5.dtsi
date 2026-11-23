@@ -324,10 +324,6 @@
 	};
 };
 
-&sio {
-	status = "okay";
-};
-
 &spi1 {
 	/* ADT function-spi_cs0 */
 	cs-gpios = <&pinctrl_ap 16 GPIO_ACTIVE_LOW>;

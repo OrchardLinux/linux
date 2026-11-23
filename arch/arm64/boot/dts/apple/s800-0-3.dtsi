@@ -50,6 +50,18 @@
 		clock-output-names = "spi3-nclk";
 	};
 
+	/*
+	 * The NCO's reference: the ADT's clock-frequencies entry for the
+	 * NCO's first clock-id (269), 800 MHz on the n66. A board whose ADT
+	 * says otherwise overrides it.
+	 */
+	nco_clkref: clock-ref-nco {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <800000000>;
+		clock-output-names = "nco_ref";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -260,6 +272,28 @@
 			status = "disabled";
 		};
 
+		/*
+		 * ADT /arm-io/mca2: the speaker TDM link of the iPhones (pad 2),
+		 * SmartIO endpoint 0x2c, bitclock from NCO 2.
+		 */
+		mca2: mca@20a0a8000 {
+			compatible = "apple,s8000-mca-tdm";
+			reg = <0x2 0x0a0a8000 0x0 0x4000>,
+			      <0x2 0x0a002008 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 203 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca2>;
+			clocks = <&nco 2>;
+			clock-names = "bitclk";
+			dmas = <&sio 0x2c>;
+			dma-names = "tx";
+			#clock-cells = <0>;
+			clock-output-names = "mca2-mclk";
+			#sound-dai-cells = <0>;
+			status = "okay";
+		};
+
 		serial0: serial@20a0c0000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x0a0c0000 0x0 0x4000>;
@@ -335,7 +369,7 @@
 			power-domains = <&ps_i2c1>;
 			#address-cells = <1>;
 			#size-cells = <0>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		i2c2: i2c@20a112000 {
@@ -368,7 +402,7 @@
 			firmware-name = "apple/s8000-smartio.bin";
 			dma-channels = <64>;
 			#dma-cells = <1>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		bus@20c000000 {
@@ -466,6 +500,15 @@
 				clock-frequency = <32768>;
 				status = "disabled";
 			};
+		};
+
+		/* ADT /arm-io/nco: nco,s8000, five channels 0x4000 apart */
+		nco: clock-controller@20e044000 {
+			compatible = "apple,s8000-nco", "apple,t8010-nco";
+			reg = <0x2 0x0e044000 0x0 0x14000>;
+			clocks = <&nco_clkref>;
+			#clock-cells = <1>;
+			status = "okay";
 		};
 
 		pmgr_misc: power-management@20e068000 {
