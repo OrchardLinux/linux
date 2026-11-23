@@ -53,6 +53,11 @@
 #define SN2400_FAST_POLL_MS		300
 #define SN2400_STABLE_POLL_MS		2000
 #define SN2400_VBUS_DETACH_MS		5000
+/* USB 2.0: 2.5 mA suspended, 100 mA until a configuration is set */
+#define SN2400_USB_SUSPEND_UA		2500
+#define SN2400_USB_UNCONFIGURED_UA	100000
+/* A host configures within a second or two of a reset */
+#define SN2400_USB_ENUM_MS		10000
 #define SN2400_ADC_POLL_US		5000
 #define SN2400_ADC_TIMEOUT_US		100000
 
@@ -96,6 +101,11 @@ struct sn2400_charger {
 	unsigned int usb_grant_ua;
 	/* The cap the probe stopped at; 0 when VBUS droop stopped it */
 	unsigned int settle_cap_ua;
+	/* A USB host configured the device during this VBUS session */
+	bool usb_configured;
+	/* Whether the last cap came from a USB host (-1 none yet), for the log */
+	int usb_host_logged;
+	unsigned long vbus_since;
 	unsigned int max_charge_ua;
 	unsigned int target_limit_ua;
 	unsigned int input_limit_ua;
@@ -294,18 +304,56 @@ static bool sn2400_vbus_drooped(struct sn2400_charger *charger, int vbus_uv)
 }
 
 /*
+ * Whether a USB host is behind VBUS. The device controller reports 0 mA
+ * without a session and 2 mA when the bus is suspended, which is also what
+ * it reports on a dedicated charger: nothing enumerates the device there and
+ * the idle lines look like a suspended bus. So a suspended bus is a host only
+ * if a host configured the device during this VBUS session. A reset without
+ * a configuration (100 mA) counts as a host for SN2400_USB_ENUM_MS.
+ */
+static bool sn2400_usb_host(struct sn2400_charger *charger, unsigned int grant)
+{
+	if (!grant)
+		return false;
+	if (READ_ONCE(charger->usb_configured))
+		return true;
+	if (grant <= SN2400_USB_SUSPEND_UA)
+		return false;
+
+	return time_is_after_jiffies(charger->vbus_since +
+				     msecs_to_jiffies(SN2400_USB_ENUM_MS));
+}
+
+/*
  * A USB host session caps the input at what the host allows (500 mA from a
- * USB 2.0 port, more after an Apple host's grant). Without a session, a wall
- * adapter, the VBUS-droop foldback alone finds the limit.
+ * USB 2.0 port, more after an Apple host's grant). Without a host, as on a
+ * wall adapter, the VBUS-droop foldback alone finds the limit.
  */
 static unsigned int sn2400_input_cap(struct sn2400_charger *charger)
 {
 	unsigned int grant = READ_ONCE(charger->usb_grant_ua);
 
-	if (!grant)
+	if (!sn2400_usb_host(charger, grant))
 		return charger->session_max_input_ua;
 
 	return min(charger->session_max_input_ua, grant);
+}
+
+static void sn2400_log_usb_host(struct sn2400_charger *charger)
+{
+	unsigned int grant = READ_ONCE(charger->usb_grant_ua);
+	bool host = sn2400_usb_host(charger, grant);
+
+	if (charger->usb_host_logged == host)
+		return;
+	charger->usb_host_logged = host;
+	if (host)
+		dev_info(charger->dev, "USB host: input up to %u mA\n",
+			 sn2400_input_cap(charger) / 1000);
+	else
+		dev_info(charger->dev,
+			 "no USB host (%u mA reported, not configured): VBUS foldback up to %u mA\n",
+			 grant / 1000, sn2400_input_cap(charger) / 1000);
 }
 
 static int sn2400_raise_input_limit(struct sn2400_charger *charger,
@@ -366,6 +414,8 @@ static void sn2400_charger_work(struct work_struct *work)
 		}
 		charger->state = SN2400_FOLDBACK_IDLE;
 		charger->target_limit_ua = 0;
+		/* A new cable needs a new configuration to count as a host. */
+		WRITE_ONCE(charger->usb_configured, false);
 		if (!charger->vbus_absent) {
 			charger->vbus_absent = true;
 			charger->vbus_absent_since = jiffies;
@@ -381,7 +431,10 @@ static void sn2400_charger_work(struct work_struct *work)
 	    time_is_before_jiffies(charger->vbus_absent_since +
 				   msecs_to_jiffies(SN2400_VBUS_DETACH_MS)))
 		charger->session_max_input_ua = charger->max_input_ua;
+	if (charger->vbus_absent)
+		charger->vbus_since = jiffies;
 	charger->vbus_absent = false;
+	sn2400_log_usb_host(charger);
 
 	/* The USB host lowered what it allows: follow it at once. */
 	if (READ_ONCE(charger->usb_grant_ua) &&
@@ -644,6 +697,10 @@ static int sn2400_charger_set_property(struct power_supply *psy,
 
 	grant = max(val->intval, 0);
 	mutex_lock(&charger->lock);
+	if (grant > SN2400_USB_UNCONFIGURED_UA)
+		WRITE_ONCE(charger->usb_configured, true);
+	else if (!grant)
+		WRITE_ONCE(charger->usb_configured, false);
 	if (charger->usb_grant_ua == grant) {
 		mutex_unlock(&charger->lock);
 		return 0;
@@ -841,6 +898,8 @@ static int sn2400_charger_probe(struct platform_device *pdev)
 		sn2400_decode_input_limit(sn2400_encode_input_limit(input_limit_ua));
 	charger->max_input_ua = input_limit_ua;
 	charger->session_max_input_ua = input_limit_ua;
+	charger->vbus_since = jiffies;
+	charger->usb_host_logged = -1;
 
 	ret = devm_mutex_init(&pdev->dev, &charger->adc_lock);
 	if (ret)
