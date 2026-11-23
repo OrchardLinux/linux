@@ -19,7 +19,12 @@ properties:
           - const: brcm,bcm4355c0-bt
           - const: brcm,bcm4345c5
       - items:
-          - const: apple,j71t-bcm4355c0-bt
+          - enum:
+              - apple,j71t-bcm4355c0-bt
+              - apple,j120-bcm4355c0-bt
+              - apple,j121-bcm4355c0-bt
+              - apple,j207-bcm4355c0-bt
+              - apple,j208-bcm4355c0-bt
           - const: brcm,bcm4355c0-bt
       - items:
           - enum:
@@ -105,6 +110,21 @@ properties:
   vddio-supply:
     description: phandle to regulator supply for VDDIO
 
+  local-bd-address:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 6
+    maxItems: 6
+    description: Device Bluetooth address in least significant byte first order
+
+  brcm,taurus-cal-blob:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 1
+    maxItems: 15073280
+    description:
+      Per-device Taurus calibration supplied by the bootloader. Do not put
+      calibration bytes in board source files. The transport supports at most
+      65536 blocks of 230 bytes.
+
   brcm,bt-pcm-int-params:
     $ref: /schemas/types.yaml#/definitions/uint8-array
     minItems: 5
@@ -150,6 +170,18 @@ dependencies:
 
 allOf:
   - $ref: /schemas/serial/serial-peripheral-props.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,j120-bcm4355c0-bt
+              - apple,j121-bcm4355c0-bt
+              - apple,j207-bcm4355c0-bt
+              - apple,j208-bcm4355c0-bt
+    then:
+      required:
+        - local-bd-address
   - if:
       not:
         properties:
