@@ -257,6 +257,119 @@
 };
 
 /*
+ * Speakers, the same on every iPad mini 2 and 3 (IPSW device trees of
+ * J85, J86, J87, J85m, J86m and J87m): two CS35L19 amplifiers on I2C2,
+ * audio-speaker0 at 0x40 and its secondary at 0x41, sharing the reset on
+ * GPIO 114, fed by MCA1 (aud1 to pin1) over TDM, 8 x 16-bit slots,
+ * amplifier n in slot n. The MCA is a consumer: the first amplifier
+ * drives the frame from MCA1's 12 MHz MCLK. SmartIO endpoint 0x2a carries
+ * the samples. speaker-config is the IPSW's record, the same for both.
+ * Full scale is bounded to -12 dB in the MCA; there is no speaker
+ * protection. iOS feeds the amplifiers' alive watchdog on GPIO 161; the
+ * driver keeps it off instead, so it is not described.
+ */
+&mca1 {
+	status = "okay";
+
+	mca1_port: port {
+		mca1_ep: endpoint {
+			remote-endpoint = <&speakers_cpu_ep>;
+			format = "dsp_a";
+		};
+	};
+};
+
+&i2c2 {
+	status = "okay";
+
+	speaker_amp0: amplifier@40 {
+		compatible = "cirrus,cs35l19";
+		reg = <0x40>;
+		reset-gpios = <&pinctrl 114 GPIO_ACTIVE_LOW>;
+		clocks = <&mca1>;
+		clock-names = "mclk";
+		apple,speaker-config = /bits/ 8 <
+			0x49 0x30 0x02 0x70 0x6a 0x80 0x30 0x1e 0x02 0x04
+			0x14 0x89 0x8a 0x10 0x74 0x03 0x05 0x00 0x00 0x40>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left";
+
+		port {
+			amp0_ep: endpoint {
+				remote-endpoint = <&speaker_amp0_ep>;
+				dai-tdm-slot-num = <8>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <1>;		/* slot 0 */
+				bitclock-master;
+				frame-master;
+			};
+		};
+	};
+
+	speaker_amp1: amplifier@41 {
+		compatible = "cirrus,cs35l19";
+		reg = <0x41>;
+		reset-gpios = <&pinctrl 114 GPIO_ACTIVE_LOW>;
+		clocks = <&mca1>;
+		clock-names = "mclk";
+		apple,speaker-config = /bits/ 8 <
+			0x49 0x30 0x02 0x70 0x6a 0x80 0x30 0x1e 0x02 0x04
+			0x14 0x89 0x8a 0x10 0x74 0x03 0x05 0x00 0x00 0x40>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right";
+
+		port {
+			amp1_ep: endpoint {
+				remote-endpoint = <&speaker_amp1_ep>;
+				dai-tdm-slot-num = <8>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <0 1>;		/* slot 1 */
+			};
+		};
+	};
+};
+
+/ {
+	sound-speakers {
+		compatible = "audio-graph-card2";
+		label = "iPad mini Speakers";
+		links = <&mca1_port>;
+
+		multi {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ports@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					speakers_cpu_ep: endpoint {
+						remote-endpoint = <&mca1_ep>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					speaker_amp0_ep: endpoint {
+						remote-endpoint = <&amp0_ep>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+					speaker_amp1_ep: endpoint {
+						remote-endpoint = <&amp1_ep>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/*
  * The battery gauge on UART5's HDQ line: a BQ27540 by Apple's device tree
  * (/arm-io/uart5/gas-gauge), the same on every A7 iPad. It runs the gauge
  * firmware profile measured on the J72.
