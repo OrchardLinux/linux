@@ -1309,7 +1309,6 @@ static bool tristar_event_debounce(struct tristar_charger *chg)
  */
 static void tristar_source_event(struct tristar_charger *chg)
 {
-	u32 reg = chg->limit_reg;
 	unsigned int i;
 	u64 now;
 
@@ -1331,10 +1330,11 @@ count:
 		chg->storm_count = 0;
 	}
 	if (++chg->storm_count > TRISTAR_IRQ_STORM) {
-		dev_crit(chg->dev, "PMU source events storming; holding the fallback\n");
-		regmap_write(chg->regmap, reg, TRISTAR_CHG_FALLBACK_CODE);
-		WRITE_ONCE(chg->code, TRISTAR_CHG_FALLBACK_CODE);
 		WRITE_ONCE(chg->phase, TRISTAR_FAULT);
+		if (tristar_set_code(chg, TRISTAR_CHG_FALLBACK_CODE))
+			dev_crit(chg->dev, "PMU source events storming; input limit unverified\n");
+		else
+			dev_crit(chg->dev, "PMU source events storming; holding the fallback\n");
 		for (i = TRISTAR_IRQ_SOURCE; i < chg->nirqs; i++)
 			disable_irq_nosync(chg->irqs[i]);
 	}
