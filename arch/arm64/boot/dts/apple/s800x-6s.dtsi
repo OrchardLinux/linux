@@ -164,6 +164,68 @@
 	};
 };
 
+/*
+ * The loudspeaker of the iPhone 6s and 6s Plus: the IPSW device trees of
+ * N66, N66m, N71 and N71m (iOS 15.8.8) describe the same amplifier, link
+ * and route (i2c1/audio-speaker, mca2/audio-speaker). The iPhone SE's
+ * MCA2 link differs (other slots and SmartIO FIFO words).
+ */
+/ {
+	/*
+	 * The loudspeaker: MCA2 to the CS35L19 at i2c1 0x40 on the TDM link of
+	 * pad 2, speaker in slot 1 of 8 x 16 bit (ADT mca2/audio-speaker). iOS
+	 * clocks this link from the CS42L71 codec, which has no driver yet;
+	 * here MCA2 provides the clocks and the codec's port stays untouched.
+	 */
+	sound-speaker {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "iPhone Speaker";
+		simple-audio-card,format = "dsp_a";
+		simple-audio-card,bitclock-master = <&speaker_cpu>;
+		simple-audio-card,frame-master = <&speaker_cpu>;
+		simple-audio-card,widgets = "Speaker", "Speaker";
+		simple-audio-card,routing = "Speaker", "SPK";
+
+		speaker_cpu: simple-audio-card,cpu {
+			sound-dai = <&mca2>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&speaker_amp>;
+			dai-tdm-slot-num = <8>;
+			dai-tdm-slot-width = <16>;
+			dai-tdm-slot-rx-mask = <0 1 0 0 0 0 0 0>;
+		};
+	};
+};
+
+/* ADT mca2 function-i2s_route: aud2 -> pin2 */
+&mca2 {
+	apple,i2s-switch = <&i2s_switch 2 2>;
+	status = "okay";
+};
+
+&i2c1 {
+	/*
+	 * ADT i2c1/audio-speaker: audio-control,cs35l19 @0x40, reset AP GPIO
+	 * 70 (0x46), interrupt AP GPIO 68 (unused). speaker-config is the
+	 * IPSW device tree's 20-byte record, the same in the 6s and 6s Plus
+	 * (iOS 15.8.8); iBoot may adjust it per unit. The Taptic Engine's
+	 * CS35L19 (@0x41, reset 116) is left alone.
+	 */
+	speaker_amp: amplifier@40 {
+		compatible = "cirrus,cs35l19";
+		reg = <0x40>;
+		reset-gpios = <&pinctrl_ap 70 GPIO_ACTIVE_LOW>;
+		clocks = <&mca2>;
+		clock-names = "mclk";
+		apple,speaker-config = /bits/ 8 <0xaa 0x30 0x02 0x70 0x6a 0x80 0x30
+						 0x1e 0x02 0x04 0x14 0x89 0x8a 0x10
+						 0x73 0x03 0x05 0xd0 0x04 0x40>;
+		#sound-dai-cells = <0>;
+	};
+};
+
 &framebuffer0 {
 	power-domains = <&ps_disp0 &ps_mipi_dsi>;
 };

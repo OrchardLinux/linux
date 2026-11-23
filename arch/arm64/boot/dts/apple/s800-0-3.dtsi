@@ -273,8 +273,10 @@
 		};
 
 		/*
-		 * ADT /arm-io/mca2: the speaker TDM link of the iPhones (pad 2),
-		 * SmartIO endpoint 0x2c, bitclock from NCO 2.
+		 * ADT /arm-io/mca2: the speaker TDM link of the iPhone 6s and 6s
+		 * Plus (pad 2), SmartIO endpoint 0x2c, bitclock from NCO 2. The
+		 * compatible names that link's setup, so the boards that have
+		 * the link enable it.
 		 */
 		mca2: mca@20a0a8000 {
 			compatible = "apple,s8000-mca-tdm";
@@ -291,7 +293,7 @@
 			#clock-cells = <0>;
 			clock-output-names = "mca2-mclk";
 			#sound-dai-cells = <0>;
-			status = "okay";
+			status = "disabled";
 		};
 
 		serial0: serial@20a0c0000 {
