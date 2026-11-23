@@ -2169,7 +2169,8 @@ static void bq27xxx_battery_refresh_cache(struct bq27xxx_device_info *di)
 
 	if (bq27xxx_cache_has_prop(di, POWER_SUPPLY_PROP_CYCLE_COUNT)) {
 		ret = bq27xxx_battery_read_cyct(di, &value);
-		bq27xxx_cache_value(&cache.cycle_count, ret, &value);
+		/* Keep optional telemetry errors out of the battery uevent. */
+		bq27xxx_cache_value(&cache.cycle_count, ret ? -ENODATA : 0, &value);
 	}
 
 	if (bq27xxx_cache_has_prop(di, POWER_SUPPLY_PROP_POWER_AVG)) {
@@ -2591,9 +2592,11 @@ int bq27xxx_battery_setup(struct bq27xxx_device_info *di)
 	di->dm_regs    = bq27xxx_chip_data[di->chip].dm_regs;
 	di->opts       = bq27xxx_chip_data[di->chip].opts;
 
-	if (di->cache_only && di->chip != BQ27545)
+	if (di->cache_only && di->chip != BQ27545 &&
+	    (di->chip != BQ27541 || !di->cache_properties ||
+	     !di->num_cache_properties))
 		return dev_err_probe(di->dev, -EINVAL,
-				     "cache-only mode only supports BQ27545\n");
+				     "unsupported or missing battery cache profile\n");
 	if (di->cache_only && !di->cache_properties) {
 		di->cache_properties = bq27545_cache_props;
 		di->num_cache_properties = ARRAY_SIZE(bq27545_cache_props);

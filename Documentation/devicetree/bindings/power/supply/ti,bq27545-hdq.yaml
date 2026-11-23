@@ -15,6 +15,8 @@ description: |
   ROM address, so it is represented as the single child of an HDQ bus.
   D11, D111 and J72 devices use Apple-specific gauge firmware whose
   charge-remaining register set differs from the generic BQ27545 profile.
+  The iPad Pro 2's (J120) BQ27540 answers RemainingCapacity but not
+  NominalAvailableCapacity.
 
 allOf:
   - $ref: power-supply.yaml#
@@ -30,6 +32,9 @@ properties:
               - apple,d111-bq27545
               - apple,j72-bq27545
           - const: ti,bq27545-hdq
+      - items:
+          - const: apple,j120-bq27540
+          - const: ti,bq27540-hdq
 
   power-supplies:
     maxItems: 1

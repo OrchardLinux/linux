@@ -42,11 +42,26 @@ static const enum power_supply_property bq27545_iphone7_plus_cache_props[] = {
 	POWER_SUPPLY_PROP_MANUFACTURER,
 };
 
+/* RemainingCapacity answers, NominalAvailableCapacity does not. */
+static const enum power_supply_property bq27540_j120_cache_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_CHARGE_NOW,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
+};
+
 struct bq27xxx_hdq_data {
 	enum bq27xxx_chip chip;
 	const enum power_supply_property *cache_properties;
 	size_t num_cache_properties;
 	bool use_remaining_capacity;
+	/* Cached telemetry, refreshed periodically (always for the BQ27545) */
+	bool cache_only;
 };
 
 static int w1_bq27000_read(struct w1_slave *sl, unsigned int reg)
@@ -114,8 +129,7 @@ static int bq27xxx_battery_hdq_add_slave(struct w1_slave *sl)
 
 		di->chip = data->chip;
 		di->name = "battery";
-		/* Only the BQ27545 profile needs cached telemetry. */
-		di->cache_only = di->chip == BQ27545;
+		di->cache_only = di->chip == BQ27545 || data->cache_only;
 		di->cache_refresh_ms = di->cache_only ? 30000 : 0;
 		if (data->cache_properties) {
 			di->cache_properties = data->cache_properties;
@@ -176,7 +190,20 @@ static const struct bq27xxx_hdq_data bq27541_data = {
 	.chip = BQ27541,
 };
 
+/*
+ * The iPad Pro 12.9 (2017)'s BQ27540 (ADT gas-gauge): the BQ27541 register
+ * layout, RemainingCapacity instead of NominalAvailableCapacity, cached.
+ */
+static const struct bq27xxx_hdq_data bq27540_j120_data = {
+	.chip = BQ27541,
+	.cache_only = true,
+	.cache_properties = bq27540_j120_cache_props,
+	.num_cache_properties = ARRAY_SIZE(bq27540_j120_cache_props),
+	.use_remaining_capacity = true,
+};
+
 static const struct of_device_id bq27xxx_battery_hdq_of_match[] = {
+	{ .compatible = "apple,j120-bq27540", .data = &bq27540_j120_data },
 	{ .compatible = "apple,d11-bq27545", .data = &bq27545_iphone7_plus_data },
 	{ .compatible = "apple,d111-bq27545", .data = &bq27545_iphone7_plus_data },
 	{ .compatible = "apple,j72-bq27545", .data = &bq27545_ipad_air_data },
