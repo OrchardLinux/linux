@@ -46,6 +46,7 @@ properties:
               - apm,xgene-mcb
               - apm,xgene-rb
               - apm,xgene-scu
+              - apple,s5l8960x-i2s-switch
               - apple,s8000-i2s-switch
               - apple,t7001-i2s-switch
               - apple,t8010-aop-i2s-oe
