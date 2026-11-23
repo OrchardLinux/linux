@@ -179,6 +179,81 @@
 	};
 };
 
+
+/*
+ * The touchscreen: an N1 on SPI1, the same in the device trees of every
+ * iPad mini 2 and 3 (J85-J87, J85m-J87m: /arm-io/spi1/multi-touch,
+ * multi-touch,j85): chip select GPIO 71, attention GPIO 15, reset GPIO 23,
+ * display sync GPIO 119, the D2089's analog supply and core LDO. The J85,
+ * J86 and J87 ship the same J85.mtprops, and the iPad mini 3, whose tree
+ * names the j85 controller, has none of its own, so the firmware is the
+ * j85 one on each. The loader adds the unit's calibration through the
+ * touchscreen0 alias.
+ */
+/ {
+	aliases {
+		touchscreen0 = &touchscreen; /* Used by loader */
+	};
+};
+
+&pinctrl {
+	spi1_sleep_pins: spi1-sleep-pins {
+		pinmux = <APPLE_PINMUX(71, 0)>;
+	};
+
+	touch_sync_active: touch-sync-active-pins {
+		pinmux = <APPLE_PINMUX(119, 1)>;
+	};
+
+	touch_sync_inactive: touch-sync-inactive-pins {
+		pinmux = <APPLE_PINMUX(119, 0)>;
+	};
+};
+
+&{/soc/i2c@20a110000/pmic@3c} {
+	touch_analog: regulator-touch-analog {
+		compatible = "apple,d2089-touch-analog-regulator";
+		regulator-name = "touch-analog";
+	};
+
+	/* The N1 runtime switches only the analog supply; keep the LDO on. */
+	touch_core: regulator-touch-core {
+		compatible = "apple,d2089-touch-core-regulator";
+		regulator-name = "touch-core";
+		regulator-always-on;
+	};
+};
+
+&touchclk {
+	status = "okay";
+};
+
+&spi1 {
+	pinctrl-names = "default", "sleep";
+	pinctrl-1 = <&spi1_sleep_pins>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,j85-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <1000000>;
+		interrupt-parent = <&pinctrl>;
+		interrupts = <15 IRQ_TYPE_EDGE_FALLING>;
+		attn-gpios = <&pinctrl 15 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&pinctrl 23 GPIO_ACTIVE_LOW>;
+		clocks = <&touchclk>;
+		ana-supply = <&touch_analog>;
+		pinctrl-names = "display-sync-active", "display-sync-inactive";
+		pinctrl-0 = <&touch_sync_active>;
+		pinctrl-1 = <&touch_sync_inactive>;
+		touchscreen-size-x = <1536>;
+		touchscreen-size-y = <2048>;
+		touchscreen-inverted-y;
+		firmware-name = "apple/j85-fwstart.z2fw";
+		/* apple,z2-cal-blob: the unit's calibration, filled in by the loader */
+	};
+};
+
 /*
  * The battery gauge on UART5's HDQ line: a BQ27540 by Apple's device tree
  * (/arm-io/uart5/gas-gauge), the same on every A7 iPad. It runs the gauge
