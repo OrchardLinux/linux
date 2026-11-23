@@ -536,6 +536,8 @@ static const struct apple_mbox_hw apple_mbox_a7iop_hw = {
  * its interrupt setup is a single enable write at +0x04. Its FIFOs
  * must be enabled at probe, before the client starts the IOP; the
  * V2 setup instead enables them when starting mailbox communication.
+ * They are enabled again on every start too: after system sleep the
+ * A7's ANS mailbox comes back with its FIFOs off.
  * The 64-bit endpoint/payload format and FIFO locations are shared.
  */
 static const struct apple_mbox_hw apple_mbox_a7iop_v1_hw = {
@@ -546,6 +548,7 @@ static const struct apple_mbox_hw apple_mbox_a7iop_v1_hw = {
 	.i2a_control = APPLE_A7IOP_MBOX_I2A_CONTROL,
 	.i2a_recv0 = APPLE_A7IOP_MBOX_I2A_RECV,
 	.packed_endpoint = true,
+	.needs_enable = true,
 	.needs_early_enable = true,
 	.has_irq_enable_only = true,
 	.irq_enable = 0x04,
