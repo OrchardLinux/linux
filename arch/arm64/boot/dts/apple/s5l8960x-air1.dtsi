@@ -136,3 +136,68 @@
 		#sound-dai-cells = <0>;
 	};
 };
+
+/*
+ * Lightning charging, at the D2089's registers as iOS 12
+ * AppleD2089PMUPowerSource uses them: connection and charger state at
+ * 0x60, the input-current limit at 0x4c0, the ADC at 0x500.
+ */
+&{/soc/i2c@20a110000/pmic@3c} {
+	/* The PMU event line, from the ADT pmu node: AP GPIO 103. */
+	pmu_events: interrupt-controller {
+		compatible = "apple,d2089-pmic-gpio";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupts-extended = <&pinctrl 103 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	/*
+	 * The ADT's charger node allows 0x960 = 2400 mA of input on every iPad Air.
+	 * The maximum here is the highest input limit measured on an A7
+	 * so far: 1050 mA (0x4e) charged a J72's battery at +279 to +423 mA
+	 * under the desktop, at 36 C, in thisiscamk's ten-minute run.
+	 */
+	tristar_charger: charger@60 {
+		compatible = "apple,d2089-tristar-charger";
+		reg = <0x60 0x0d>, <0x4c0 0x01>, <0x500 0x04>;
+		reg-names = "status", "control", "adc";
+		interrupt-parent = <&pmu_events>;
+		/*
+		 * The PMU line and ADC done. No source events, as on the iPad
+		 * Air 2: the charger's 100 ms poll of 0x60 sees plug and unplug.
+		 */
+		interrupts = <112 IRQ_TYPE_EDGE_RISING>,
+			     <89 IRQ_TYPE_EDGE_RISING>;
+		apple,tristar = <&tristar>;
+		input-current-limit-microamp = <1050000>;
+
+		/* The charger decides when USB data may come on. */
+		port {
+			tristar_charger_usb: endpoint {
+				remote-endpoint = <&usbdev_role>;
+			};
+		};
+	};
+};
+
+&i2c2 {
+	status = "okay";
+
+	/* The Lightning port controller, from the ADT i2c2/tristar node. */
+	tristar: port-controller@1a {
+		compatible = "nxp,cbtl1610";
+		reg = <0x1a>;
+	};
+};
+
+/* Tell the Lightning charger what the USB host allows. */
+&usbdev {
+	usb-psy-name = "lightning";
+	usb-role-switch;
+
+	port {
+		usbdev_role: endpoint {
+			remote-endpoint = <&tristar_charger_usb>;
+		};
+	};
+};
