@@ -42,7 +42,22 @@
 	};
 };
 
+/*
+ * Internal NAND through the ANS1 storage processor, on every A8 board (the
+ * ADT ans node is the same on N102, N56 and N61, and J96/J97 have the J81's
+ * iOS 15 form of it). The boot loader started its firmware and iOS never
+ * shuts it down (no-shutdown in the ADT), so keep its power domain on.
+ */
 &ans {
 	memory-region = <&ans_firmware>;
 	memory-region-names = "firmware";
+	status = "okay";
+};
+
+&ans_mbox {
+	status = "okay";
+};
+
+&ps_ans {
+	apple,always-on;
 };

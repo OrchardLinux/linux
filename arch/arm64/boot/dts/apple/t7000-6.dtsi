@@ -8,6 +8,7 @@
 #include "t7000.dtsi"
 #include "t7000-common.dtsi"
 #include "t7000-handheld.dtsi"
+#include "t7000-bcm4345.dtsi"
 
 / {
 	chassis-type = "handset";
@@ -88,6 +89,14 @@
 		reg = <0x74>;
 		#address-cells = <1>;
 		#size-cells = <1>;
+
+		pmu_gpio: gpio {
+			compatible = "apple,d2186-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			/* Only Bluetooth (8) and Wi-Fi (10) REG_ON are used; the others stay as iBoot left them. */
+			gpio-reserved-ranges = <0 8>, <9 1>, <11 10>;
+		};
 
 		rtc@5c0 {
 			compatible = "apple,adi-pmic-rtc", "apple,amber-pmic-rtc";
