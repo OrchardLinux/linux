@@ -25,6 +25,31 @@
 		clock-output-names = "clkref";
 	};
 
+	/*
+	 * The SPI bus clocks: the ADT arm-io clock-frequencies of their
+	 * clock-ids, the same on every A9 board.
+	 */
+	spi1_nclk: clock-spi1-nclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <61538461>;
+		clock-output-names = "spi1-nclk";
+	};
+
+	spi2_nclk: clock-spi2-nclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <61538461>;
+		clock-output-names = "spi2-nclk";
+	};
+
+	spi3_nclk: clock-spi3-nclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <61538461>;
+		clock-output-names = "spi3-nclk";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -99,7 +124,7 @@
 			reg = <0x2 0x0a084000 0x0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 189 IRQ_TYPE_LEVEL_HIGH>;
-			clocks = <&clkref>;
+			clocks = <&spi1_nclk>;
 			power-domains = <&ps_spi1>;
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -112,7 +137,7 @@
 			reg = <0x2 0x0a088000 0x0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 190 IRQ_TYPE_LEVEL_HIGH>;
-			clocks = <&clkref>;
+			clocks = <&spi2_nclk>;
 			power-domains = <&ps_spi2>;
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -124,7 +149,7 @@
 			reg = <0x2 0x0a08c000 0x0 0x4000>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 191 IRQ_TYPE_LEVEL_HIGH>;
-			clocks = <&clkref>;
+			clocks = <&spi3_nclk>;
 			power-domains = <&ps_spi3>;
 			#address-cells = <1>;
 			#size-cells = <0>;

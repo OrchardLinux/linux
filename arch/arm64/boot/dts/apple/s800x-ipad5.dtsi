@@ -76,21 +76,6 @@
 		};
 	};
 
-	/* ADT arm-io clock-frequencies of the spi1 and spi3 clock-ids */
-	spi1_nclk: clock-spi1-nclk {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <61538461>;
-		clock-output-names = "spi1-nclk";
-	};
-
-	spi3_nclk: clock-spi3-nclk {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <61538461>;
-		clock-output-names = "spi3-nclk";
-	};
-
 	/*
 	 * CS42L81 on SPI1 (control) and MCA0 (data): built-in speakers,
 	 * 3.5 mm headphones and the two built-in microphones (ADT
@@ -323,7 +308,6 @@
 };
 
 &spi1 {
-	clocks = <&spi1_nclk>;
 	/* ADT function-spi_cs0 */
 	cs-gpios = <&pinctrl_ap 16 GPIO_ACTIVE_LOW>;
 	status = "okay";
@@ -343,7 +327,6 @@
 };
 
 &spi3 {
-	clocks = <&spi3_nclk>;
 	cs-gpios = <&pinctrl_ap 102 GPIO_ACTIVE_LOW>;
 	status = "okay";
 
