@@ -121,6 +121,7 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 	int min_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MINVER, msg);
 	int max_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MAXVER, msg);
 	int want_ver = min(APPLE_RTKIT_MAX_SUPPORTED_VERSION, max_ver);
+	int ret = -EINVAL;
 
 	/*
 	 * Protocol 10 firmware carries its minor version in the HELLO's
@@ -161,12 +162,12 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 	reply = FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MINVER,
 			   rtk->version == 10 ? rtk->minor_version : want_ver);
 	reply |= FIELD_PREP(APPLE_RTKIT_MGMT_HELLO_MAXVER, want_ver);
-	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY, reply);
-
-	return;
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_HELLO_REPLY, reply);
+	if (!ret)
+		return;
 
 abort_boot:
-	rtk->boot_result = -EINVAL;
+	WRITE_ONCE(rtk->boot_result, ret);
 	complete_all(&rtk->epmap_completion);
 }
 
@@ -176,6 +177,7 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 	u64 reply;
 	unsigned long bitmap = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BITMAP, msg);
 	u32 base = FIELD_GET(APPLE_RTKIT_MGMT_EPMAP_BASE, msg);
+	int ret;
 
 	dev_dbg(rtk->dev,
 		"RTKit: received endpoint bitmap 0x%lx with base 0x%x\n",
@@ -195,7 +197,9 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 			reply |= APPLE_RTKIT_MGMT_EPMAP_REPLY_MORE;
 	}
 
-	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY, reply);
+	ret = apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_EPMAP_REPLY, reply);
+	if (ret)
+		goto done;
 
 	if (rtk->version > 10 && !(msg & APPLE_RTKIT_MGMT_EPMAP_LAST))
 		return;
@@ -214,7 +218,9 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_OSLOG:
 			dev_dbg(rtk->dev,
 				"RTKit: Starting system endpoint 0x%02x\n", ep);
-			apple_rtkit_start_ep(rtk, ep);
+			ret = apple_rtkit_start_ep(rtk, ep);
+			if (ret)
+				goto done;
 			break;
 
 		default:
@@ -224,10 +230,11 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		}
 	}
 
-	rtk->boot_result = 0;
+done:
+	WRITE_ONCE(rtk->boot_result, ret);
 	complete_all(&rtk->epmap_completion);
 
-	if (rtk->ops->epmap_done)
+	if (!ret && rtk->ops->epmap_done)
 		rtk->ops->epmap_done(rtk->cookie);
 }
 
@@ -676,9 +683,7 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 
 	msg = FIELD_PREP(APPLE_RTKIT_MGMT_STARTEP_EP, endpoint);
 	msg |= APPLE_RTKIT_MGMT_STARTEP_FLAG;
-	apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
-
-	return 0;
+	return apple_rtkit_management_send(rtk, APPLE_RTKIT_MGMT_STARTEP, msg);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
@@ -782,6 +787,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
+	rtk->boot_result = 0;
 	reinit_completion(&rtk->epmap_completion);
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 	reinit_completion(&rtk->ap_pwr_ack_completion);
@@ -886,8 +892,9 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	ret = apple_rtkit_wait_for_completion(&rtk->epmap_completion);
 	if (ret)
 		return ret;
-	if (rtk->boot_result)
-		return rtk->boot_result;
+	ret = READ_ONCE(rtk->boot_result);
+	if (ret)
+		return ret;
 
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
 	ret = apple_rtkit_wait_for_completion(&rtk->iop_pwr_ack_completion);
