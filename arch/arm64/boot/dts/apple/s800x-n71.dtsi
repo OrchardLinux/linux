@@ -22,3 +22,8 @@
 &battery_info {
 	constant-charge-current-max-microamp = <1195000>;
 };
+
+/* ADT uart4/wlan module-instance */
+&wifi0 {
+	brcm,board-type = "apple,albarossa";
+};
