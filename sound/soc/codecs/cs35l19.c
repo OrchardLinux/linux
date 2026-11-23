@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Cirrus Logic CS35L19 boosted class-D speaker amplifier (iPad mini 1).
+ * Cirrus Logic CS35L19 boosted class-D speaker amplifier (iPad mini 1 and 2,
+ * iPhone 6s and 6s Plus).
  *
  * The CS35L19 is the CS35L33's sibling -- the register map matches it reset
  * value for reset value -- with Apple's power-on sequence, which is what this
@@ -17,6 +18,10 @@
  * Both amps of the iPad share one reset line and one keep-alive line; the
  * reset is requested non-exclusively, and only the node that carries the
  * keep-alive GPIO toggles it.
+ *
+ * On the iPad mini 2 the SoC is a consumer of the TDM frame: one amp drives
+ * it from MCLK, and the other reads it. The link says which one, by the
+ * clock provider flags of that amp's endpoint.
  */
 
 #include <linux/clk.h>
@@ -41,6 +46,7 @@
 #define CS35L19_BST_CTL1	0x0b
 #define CS35L19_BST_CTL2	0x0c
 #define CS35L19_ADSP_CTL	0x0d
+#define  CS35L19_ADSP_PROVIDER	BIT(6)	/* drive BCLK and FSYNC */
 #define CS35L19_ADC_CTL		0x0e
 #define CS35L19_DAC_CTL		0x0f
 #define CS35L19_DIG_VOL		0x10
@@ -86,6 +92,7 @@ struct cs35l19 {
 	unsigned int rate_code;
 	unsigned int slot;		/* TDM slot index */
 	unsigned int slot_bytes;	/* TDM slot width in bytes, 2 or 4 */
+	bool provider;			/* drives the TDM frame */
 };
 
 /*
@@ -241,7 +248,8 @@ static int cs35l19_power_on(struct cs35l19 *cs)
 		regmap_write(map, CS35L19_TX_VMON + i, 0x80);
 	for (i = 0; i < 4; i++)
 		regmap_write(map, CS35L19_TX_EN1 + i, 0);
-	regmap_write(map, CS35L19_ADSP_CTL, 3);
+	regmap_write(map, CS35L19_ADSP_CTL,
+		     3 | (cs->provider ? CS35L19_ADSP_PROVIDER : 0));
 	regmap_write(map, CS35L19_CLK_CTL, cs->rate_code);
 	/* RX_AUD: [4:0] byte offset of the slot, [6:5] its width in bytes - 1 */
 	regmap_write(map, CS35L19_RX_AUD, (cs->slot * cs->slot_bytes) |
@@ -376,7 +384,32 @@ static int cs35l19_set_tdm_slot(struct snd_soc_dai *dai, unsigned int tx_mask,
 	return 0;
 }
 
+/*
+ * The amp either reads the frame (the iPad mini 1 and the iPhones, where
+ * the SoC drives it) or drives it from MCLK for the SoC and the other amp
+ * (the iPad mini 2's first amp, as iOS sets ADSP_CTL to 0x43 there).
+ */
+static int cs35l19_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+{
+	struct cs35l19 *cs = snd_soc_component_get_drvdata(dai->component);
+
+	if ((fmt & SND_SOC_DAIFMT_FORMAT_MASK) != SND_SOC_DAIFMT_DSP_A)
+		return -EINVAL;
+
+	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+	case SND_SOC_DAIFMT_CBC_CFC:
+		cs->provider = false;
+		return 0;
+	case SND_SOC_DAIFMT_CBP_CFP:
+		cs->provider = true;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct snd_soc_dai_ops cs35l19_dai_ops = {
+	.set_fmt = cs35l19_set_fmt,
 	.hw_params = cs35l19_hw_params,
 	.set_tdm_slot = cs35l19_set_tdm_slot,
 };
@@ -503,5 +536,5 @@ static struct i2c_driver cs35l19_i2c_driver = {
 };
 module_i2c_driver(cs35l19_i2c_driver);
 
-MODULE_DESCRIPTION("Cirrus Logic CS35L19 speaker amplifier (iPad mini 1)");
+MODULE_DESCRIPTION("Cirrus Logic CS35L19 speaker amplifier driver");
 MODULE_LICENSE("GPL");
