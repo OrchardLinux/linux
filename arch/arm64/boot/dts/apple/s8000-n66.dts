@@ -15,6 +15,16 @@
 
 	aliases {
 		als0 = &als;	/* the loader copies the ADT's alsCalibration here */
+		spi2 = &spi2;
+		touchscreen0 = &touchscreen;	/* the loader copies the ADT calibration */
+	};
+
+	/* ADT arm-io clock-frequencies of the spi2 clock-id (303) */
+	spi2_nclk: clock-spi2-nclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <61538461>;
+		clock-output-names = "spi2-nclk";
 	};
 };
 
@@ -40,4 +50,54 @@
 		reg = <0x29>;
 		interrupts-extended = <&pinctrl_ap 131 IRQ_TYPE_LEVEL_LOW>;
 	};
+};
+
+
+
+&i2c0 {
+	/* ADT display-pmu,chestnut @0x27: touch power_ana = dpLE(0x302) */
+	display-pmu@27 {
+		compatible = "apple,chestnut-pmic";
+		reg = <0x27>;
+
+		touch_ana: regulator-touch-hv {
+			compatible = "apple,chestnut-touch-hv-regulator";
+			regulator-name = "touch-analog";
+		};
+	};
+};
+
+&{/soc/i2c@20a110000/pmic@74} {
+	/* ADT multi-touch power_ldo = pmuL(0x219) */
+	touch_core: regulator-touch-core {
+		compatible = "apple,antigua-touch-core-regulator";
+		regulator-name = "touch-core";
+	};
+};
+
+/* ADT /arm-io/spi2/multi-touch: multi-touch,n66 */
+&spi2 {
+	clocks = <&spi2_nclk>;
+	cs-gpios = <&pinctrl_ap 44 GPIO_ACTIVE_LOW>;	/* function-enable_cs */
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,n66-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <8064516>;		/* ADT 124 ns bit period */
+		interrupts-extended = <&pinctrl_ap 142 IRQ_TYPE_EDGE_FALLING>;
+		attn-gpios = <&pinctrl_ap 142 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&pinctrl_ap 75 GPIO_ACTIVE_LOW>;	/* function-reset */
+		ana-supply = <&touch_ana>;
+		core-supply = <&touch_core>;
+		clocks = <&touchclk>;
+		firmware-name = "apple/n66-fwstart.z2fw";
+		touchscreen-size-x = <1080>;
+		touchscreen-size-y = <1920>;
+		touchscreen-inverted-y;
+	};
+};
+
+&touchclk {
+	status = "okay";
 };
