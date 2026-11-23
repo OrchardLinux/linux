@@ -53,6 +53,8 @@
 #define ASP_QUEUE_SIZE  (ASP_TAG_SIZE * ASP_NUM_TAGS)
 
 #define ASP_TIMEOUT_MS		30000
+/* How long suspend waits for commands in flight before it gives up */
+#define ASP_SUSPEND_DRAIN_MS	5000
 /* After this long a command is reported (it is not aborted: the ANS has no abort) */
 #define ASP_IO_STUCK_MS		10000
 #define ASP_CMD_HDR_SIZE	0x30
@@ -1147,8 +1149,10 @@ static void apple_asp_setup_queue(struct apple_asp *asp)
 
 	dev_dbg(asp->dev, "Initializing command buffer");
 
-	asp->q = dma_alloc_coherent(asp->dev, ASP_QUEUE_SIZE, &asp->q_iova,
-				    GFP_KERNEL);
+	/* On resume the ANS starts again with the buffer it already had. */
+	if (!asp->q)
+		asp->q = dma_alloc_coherent(asp->dev, ASP_QUEUE_SIZE,
+					    &asp->q_iova, GFP_KERNEL);
 
 	if (!asp->q) {
 		asp->init_ret = -ENOMEM;
@@ -1404,6 +1408,103 @@ static void apple_asp_remove(struct platform_device *pdev)
 }
 
 
+/*
+ * Across system sleep the ANS may lose its state: on the iPad mini 2 its CPU
+ * comes back stopped and the mailbox FIFOs disabled, although the power
+ * domain stays on. Put the firmware to sleep through RTKit before, and bring
+ * it up again afterwards the way probe does: mailbox, firmware window, CPU
+ * start, HELLO, then the command buffer and tags. A firmware that kept its
+ * state answers the wake with HELLO too.
+ */
+
+/* Every queue on the tag set: the admin queue and one per namespace. */
+#define asp_for_each_queue(asp, q, i)					\
+	for (i = -1; i < ASP_QUEUE_TYPE_COUNT; i++)			\
+		if (((q) = i < 0 ? (asp)->admin_rq :			\
+			   (i >= ASP_QUEUE_TYPE_USERAREA && (asp)->q_data[i].disk ? \
+			    (asp)->q_data[i].disk->queue : NULL)))
+
+static void asp_unfreeze_all(struct apple_asp *asp)
+{
+	struct request_queue *q;
+	int i;
+
+	asp_for_each_queue(asp, q, i)
+		blk_mq_unfreeze_queue_non_owner(q);
+}
+
+static int apple_asp_suspend(struct device *dev)
+{
+	struct apple_asp *asp = dev_get_drvdata(dev);
+	struct request_queue *q;
+	int i, ret;
+
+	/*
+	 * Drain first: a command still in the ANS when RTKit goes to sleep
+	 * never completes, and every later flush waits behind it. Freezing
+	 * blocks new requests and waits for the ones in flight.
+	 */
+	asp_for_each_queue(asp, q, i)
+		blk_freeze_queue_start_non_owner(q);
+	asp_for_each_queue(asp, q, i) {
+		if (!blk_mq_freeze_queue_wait_timeout(q,
+				msecs_to_jiffies(ASP_SUSPEND_DRAIN_MS))) {
+			dev_err(dev, "suspend: %d command(s) did not finish, staying awake\n",
+				asp_busy_tags(asp));
+			asp_unfreeze_all(asp);
+			return -EBUSY;
+		}
+	}
+	blk_mq_quiesce_tagset(&asp->tagset);
+
+	ret = apple_rtkit_shutdown(asp->rtk);
+	if (ret)
+		dev_warn(dev, "RTKit sleep failed: %d\n", ret);
+	writel(0, asp->akf_base + AKF_V1_CPU_CONTROL);
+
+	return 0;
+}
+
+static int apple_asp_resume(struct device *dev)
+{
+	struct apple_asp *asp = dev_get_drvdata(dev);
+	int ret;
+
+	ret = apple_rtkit_reinit(asp->rtk);
+	if (ret)
+		goto out;
+
+	ret = apple_asp_setup_firmware(asp);
+	if (ret)
+		goto out;
+
+	reinit_completion(&asp->init_done);
+	asp->init_ret = 0;
+	writel(AKF_V1_CPU_CONTROL_START, asp->akf_base + AKF_V1_CPU_CONTROL);
+
+	ret = apple_rtkit_wake(asp->rtk);
+	if (ret)
+		goto out;
+
+	if (!wait_for_completion_timeout(&asp->init_done,
+					 msecs_to_jiffies(ASP_TIMEOUT_MS)))
+		ret = -ETIMEDOUT;
+	else
+		ret = asp->init_ret;
+out:
+	if (ret)
+		dev_err(dev, "ANS did not come back after resume: %d\n", ret);
+	else
+		dev_dbg(dev, "ANS back after resume, %d busy tag(s)\n",
+			asp_busy_tags(asp));
+	blk_mq_unquiesce_tagset(&asp->tagset);
+	asp_unfreeze_all(asp);
+	return ret;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_asp_pm_ops, apple_asp_suspend,
+				apple_asp_resume);
+
 static const struct of_device_id apple_asp_of_match[] = {
 	{ .compatible = "apple,s5l8960x-ans" },
 	{}
@@ -1414,6 +1515,7 @@ static struct platform_driver apple_asp_driver = {
 	.driver = {
 		.name = "apple-asp",
 		.of_match_table = apple_asp_of_match,
+		.pm = pm_sleep_ptr(&apple_asp_pm_ops),
 	},
 	.probe = apple_asp_probe,
 	.remove = apple_asp_remove,
