@@ -110,8 +110,10 @@
 	/*
 	 * The ADT's charger node allows 0x960 = 2400 mA of input on every iPad mini 2 and 3.
 	 * The maximum here is the highest input limit measured on an A7
-	 * so far: 1050 mA (0x4e) charged a J72's battery at +279 to +423 mA
-	 * under the desktop, at 36 C, in thisiscamk's ten-minute run.
+	 * so far: 1500 mA (0x72) charged an iPad mini 2's battery at +958 mA
+	 * from a Mac's CDP port, at 31 C. Before that, 1050 mA (0x4e)
+	 * charged a J72's battery at +279 to +423 mA under the desktop, at
+	 * 36 C, in thisiscamk's ten-minute run.
 	 */
 	tristar_charger: charger@60 {
 		compatible = "apple,d2089-tristar-charger";
@@ -125,7 +127,7 @@
 		interrupts = <112 IRQ_TYPE_EDGE_RISING>,
 			     <89 IRQ_TYPE_EDGE_RISING>;
 		apple,tristar = <&tristar>;
-		input-current-limit-microamp = <1050000>;
+		input-current-limit-microamp = <1500000>;
 
 		/* The charger decides when USB data may come on. */
 		port {
