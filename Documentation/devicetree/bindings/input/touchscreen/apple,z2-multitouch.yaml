@@ -29,6 +29,8 @@ properties:
       - apple,n61-touchscreen
       - apple,n102-touchscreen
       - apple,n66-touchscreen
+      - apple,n69-touchscreen
+      - apple,n71-touchscreen
 
   interrupts:
     maxItems: 1
@@ -189,6 +191,8 @@ allOf:
             - apple,j96-touchscreen
             - apple,n102-touchscreen
             - apple,n66-touchscreen
+            - apple,n69-touchscreen
+            - apple,n71-touchscreen
     then:
       properties:
         pinctrl-names:
@@ -212,6 +216,8 @@ allOf:
             enum:
               - apple,n102-touchscreen
               - apple,n66-touchscreen
+              - apple,n69-touchscreen
+              - apple,n71-touchscreen
       then:
         properties:
           power-ldo-gpios: false
@@ -288,6 +294,8 @@ allOf:
             - apple,n61-touchscreen
             - apple,n102-touchscreen
             - apple,n66-touchscreen
+            - apple,n69-touchscreen
+            - apple,n71-touchscreen
     then:
       properties:
         ana-supply: true
@@ -305,6 +313,8 @@ allOf:
             - apple,j96-touchscreen
             - apple,n102-touchscreen
             - apple,n66-touchscreen
+            - apple,n69-touchscreen
+            - apple,n71-touchscreen
     then:
       properties:
         attn-gpios: true
