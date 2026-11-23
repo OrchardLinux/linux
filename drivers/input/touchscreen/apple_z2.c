@@ -4837,6 +4837,27 @@ static const struct apple_z2_chip_info apple_z2_n66_info = {
 	.n1 = &apple_z2_n102_n1,
 };
 
+/*
+ * iPhone 6s (N71) and iPhone SE (N69), AppleMultitouchN1SPI personalities
+ * C1F5B,1 and C1F57,5: the same N1 clock values, entry point and
+ * calibration addresses as the iPhone 6s Plus's in iOS 19H422.
+ */
+static const struct apple_z2_chip_info apple_z2_n71_info = {
+	.name = "iPhone8,1 Touchscreen",
+	.variant = APPLE_Z2_VARIANT_J71T,
+	.cs_setup_us = 10,
+	.cs_hold_us = 10,
+	.n1 = &apple_z2_n102_n1,
+};
+
+static const struct apple_z2_chip_info apple_z2_n69_info = {
+	.name = "iPhone8,4 Touchscreen",
+	.variant = APPLE_Z2_VARIANT_J71T,
+	.cs_setup_us = 10,
+	.cs_hold_us = 10,
+	.n1 = &apple_z2_n102_n1,
+};
+
 static const struct apple_z2_chip_info apple_z2_j172_info = {
 	.name = "iPad 7 Touchscreen",
 	.variant = APPLE_Z2_VARIANT_J172,
@@ -5264,6 +5285,8 @@ static const struct of_device_id apple_z2_of_match[] = {
 	{ .compatible = "apple,n61-touchscreen", .data = &apple_z2_n61_info },
 	{ .compatible = "apple,n102-touchscreen", .data = &apple_z2_n102_info },
 	{ .compatible = "apple,n66-touchscreen", .data = &apple_z2_n66_info },
+	{ .compatible = "apple,n69-touchscreen", .data = &apple_z2_n69_info },
+	{ .compatible = "apple,n71-touchscreen", .data = &apple_z2_n71_info },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_z2_of_match);
@@ -5283,6 +5306,8 @@ static struct spi_device_id apple_z2_of_id[] = {
 	{ .name = "n61-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n61_info },
 	{ .name = "n102-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n102_info },
 	{ .name = "n66-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n66_info },
+	{ .name = "n69-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n69_info },
+	{ .name = "n71-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n71_info },
 	{}
 };
 MODULE_DEVICE_TABLE(spi, apple_z2_of_id);
