@@ -11,4 +11,52 @@
 / {
 	compatible = "apple,d21", "apple,t8015", "apple,arm-platform";
 	model = "Apple iPhone 8 Plus (Global)";
+
+	/* m1n1 copies the ADT's touch calibrations to this node. */
+	aliases {
+		touchscreen0 = &touchscreen;
+	};
+};
+
+/* The display PMIC, ADT "display-pmu,chestnut". */
+&i2c0 {
+	status = "okay";
+
+	pmic@27 {
+		compatible = "apple,chestnut-pmic";
+		reg = <0x27>;
+
+		/* ADT multi-touch function-power_ana = dpLE(0x302) */
+		touch_hv: regulator-touch-hv {
+			compatible = "apple,chestnut-touch-hv-regulator";
+		};
+	};
+};
+
+/*
+ * The touch controller (ADT "hid-transport,k1"), chip select GPIO 138.
+ * The core rail (ADT function-power_ldo = pKW4('rBK3', 0x5020000)) is
+ * switched by the driver through the SMC, so it is not a supply here.
+ * The line is level-low in hardware; the driver sets that type anyway,
+ * and declaring it keeps a module reload from a type mismatch.
+ */
+&spi1 {
+	cs-gpios = <&pinctrl_ap 138 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,d21-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <3000000>;
+		spi-cpol;
+		spi-cpha;
+		apple,z2-no-init-ack;
+		interrupts-extended = <&pinctrl_ap 102 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&pinctrl_ap 33 GPIO_ACTIVE_LOW>;
+		hv-supply = <&touch_hv>;
+		clocks = <&touchclk>;
+		firmware-name = "apple/dfrmtfw-d21-c1f5e-4.bin";
+		touchscreen-size-x = <1080>;
+		touchscreen-size-y = <1920>;
+	};
 };
