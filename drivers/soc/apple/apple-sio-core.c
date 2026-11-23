@@ -1224,9 +1224,13 @@ static const struct apple_sio_hw apple_sio_t7000_hw = {
 	.num_dma_ranges = ARRAY_SIZE(apple_sio_t7000_dma_ranges),
 };
 
-/* MCA0, the codec's link, as described by the J72 ADT */
+/*
+ * MCA0, the codec's link, as described by the J72 ADT, and MCA1 TX, the
+ * iPad mini 2's (J85) speaker link, as its ADT describes it
+ */
 static const struct apple_sio_dma_range apple_sio_s5l8960x_dma_ranges[] = {
 	{ 0x28, 0x29 },
+	{ 0x2a, 0x2a },
 };
 
 /*
