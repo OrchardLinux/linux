@@ -1095,10 +1095,6 @@ static int apple_asp_setup_firmware(struct apple_asp *asp)
 	writel(AKF_V1_LITTLE_ENDIAN,
 	       asp->akf_base + AKF_V1_ENDIANNESS);
 
-	/* start ASP */
-	writel(AKF_V1_CPU_CONTROL_START,
-	       asp->akf_base + AKF_V1_CPU_CONTROL);
-
 	return 0;
 }
 
@@ -1300,6 +1296,14 @@ static int apple_asp_probe(struct platform_device *pdev)
 
 	init_completion(&asp->init_done);
 
+	/*
+	 * Start the ANS only once RTKit owns the mailbox. iBoot leaves the A7's
+	 * ANS firmware initialised, and then it sends HELLO within milliseconds
+	 * of the start bit: before RTKit has started the mailbox, that message
+	 * can be lost and the wake below times out.
+	 */
+	writel(AKF_V1_CPU_CONTROL_START, asp->akf_base + AKF_V1_CPU_CONTROL);
+
 	ret = apple_rtkit_wake(asp->rtk);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "Failed to wake ASP");
@@ -1336,7 +1340,7 @@ static int apple_asp_probe(struct platform_device *pdev)
 out_rtkit:
 	apple_rtkit_shutdown(asp->rtk);
 out_stop_iop:
-	writel(0, asp->akf_base + AKF_V1_CPU_CONTROL_START);
+	writel(0, asp->akf_base + AKF_V1_CPU_CONTROL);
 
 	return ret;
 }
@@ -1364,7 +1368,7 @@ static void apple_asp_remove(struct platform_device *pdev)
 
 	dma_free_coherent(asp->dev, ASP_QUEUE_SIZE, asp->q, asp->q_iova);
 
-	writel(0, asp->akf_base + AKF_V1_CPU_CONTROL_START);
+	writel(0, asp->akf_base + AKF_V1_CPU_CONTROL);
 }
 
 
