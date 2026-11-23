@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/gpu/apple,s8003-gpu.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple S8003 (A9) and T7000 (A8) GPU
+title: Apple S8000/S8003 (A9) and T7000 (A8) GPU
 
 maintainers:
   - Berkay Kösebay <brkosebay@users.noreply.github.com>
@@ -23,9 +23,13 @@ description: |
 
 properties:
   compatible:
-    enum:
-      - apple,s8003-gpu
-      - apple,t7000-gpu
+    oneOf:
+      - enum:
+          - apple,s8003-gpu
+          - apple,t7000-gpu
+      - items:
+          - const: apple,s8000-gpu
+          - const: apple,s8003-gpu
 
   reg:
     minItems: 2
