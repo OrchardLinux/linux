@@ -139,8 +139,18 @@ struct apple_mbox_hw {
 	unsigned int irq_bit_send_empty;
 };
 
-int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
-		    bool atomic)
+static void apple_mbox_disarm_tx_irq(struct apple_mbox *mbox)
+{
+	lockdep_assert_held(&mbox->tx_lock);
+
+	if (mbox->tx_irq_armed) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_armed = false;
+	}
+}
+
+static int apple_mbox_send_locked(struct apple_mbox *mbox,
+				  const struct apple_mbox_msg msg, bool atomic)
 {
 	unsigned long flags;
 	int ret;
@@ -182,19 +192,22 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			writel_relaxed(mbox->hw->irq_bit_send_empty,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
-		enable_irq(mbox->irq_send_empty);
 		reinit_completion(&mbox->tx_empty);
+		mbox->tx_irq_armed = true;
+		enable_irq(mbox->irq_send_empty);
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 		t = wait_for_completion_interruptible_timeout(
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
-		if (t < 0)
-			return t;
-		else if (t == 0)
-			return -ETIMEDOUT;
-
 		spin_lock_irqsave(&mbox->tx_lock, flags);
+		if (t <= 0) {
+			apple_mbox_disarm_tx_irq(mbox);
+			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			/* Drain a handler already dispatched before the disable. */
+			synchronize_irq(mbox->irq_send_empty);
+			return t < 0 ? t : -ETIMEDOUT;
+		}
 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
 	}
 
@@ -212,6 +225,21 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 
 	return 0;
 }
+
+int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
+		    bool atomic)
+{
+	int ret;
+
+	if (atomic)
+		return apple_mbox_send_locked(mbox, msg, true);
+
+	mutex_lock(&mbox->tx_mutex);
+	ret = apple_mbox_send_locked(mbox, msg, false);
+	mutex_unlock(&mbox->tx_mutex);
+
+	return ret;
+}
 EXPORT_SYMBOL(apple_mbox_send);
 
 static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
@@ -226,8 +254,10 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 	 * it at the main controller again.
 	 */
 	spin_lock(&mbox->tx_lock);
-	disable_irq_nosync(mbox->irq_send_empty);
-	complete(&mbox->tx_empty);
+	if (mbox->tx_irq_armed) {
+		apple_mbox_disarm_tx_irq(mbox);
+		complete(&mbox->tx_empty);
+	}
 	spin_unlock(&mbox->tx_lock);
 
 	return IRQ_HANDLED;
@@ -464,6 +494,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 
 	spin_lock_init(&mbox->rx_lock);
 	spin_lock_init(&mbox->tx_lock);
+	mutex_init(&mbox->tx_mutex);
 	init_completion(&mbox->tx_empty);
 
 	irqname = devm_kasprintf(dev, GFP_KERNEL, "%s-recv", dev_name(dev));
