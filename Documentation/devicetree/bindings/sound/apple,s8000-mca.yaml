@@ -26,7 +26,9 @@ description: |
   NCO channel running at twice the bit clock. The S5L8960X (A7) MCA is
   version 1 as well: apple,s5l8960x-mca is the playback-only I2S link of the
   iPad Air to its codec, which provides the bit and frame clocks as on the
-  A9.
+  A9; apple,s5l8960x-mca-tdm the playback-only speaker link (TDM) of the
+  iPad mini 2, a consumer of the clocks of its amplifiers, to which it
+  supplies MCLK.
 
 allOf:
   - $ref: dai-common.yaml#
@@ -56,6 +58,7 @@ properties:
   compatible:
     enum:
       - apple,s5l8960x-mca
+      - apple,s5l8960x-mca-tdm
       - apple,s8000-mca
       - apple,s8000-mca-tdm
       - apple,t7001-mca
