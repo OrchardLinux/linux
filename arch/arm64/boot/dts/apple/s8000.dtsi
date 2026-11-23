@@ -181,3 +181,8 @@
 		};
 	};
 };
+
+/* ADT sgx: gpu,s8000, the S8003's GPU */
+&gpu {
+	compatible = "apple,s8000-gpu", "apple,s8003-gpu";
+};

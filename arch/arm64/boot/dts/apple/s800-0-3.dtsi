@@ -102,6 +102,28 @@
 		};
 
 		/*
+		 * The GPU: a PowerVR Rogue core (GT7600) behind Apple's Fender
+		 * block, with Apple's firmware on the core's own processor. The
+		 * IPSW device trees of every A9 board give it the same registers,
+		 * interrupts and power gate (ADT sgx); the firmware comes from
+		 * each board's recipe.
+		 */
+		gpu: gpu@201000000 {
+			compatible = "apple,s8003-gpu";
+			reg = <0x2 0x01000000 0x0 0x100000>,
+			      <0x2 0x01e00000 0x0 0x100000>;
+			reg-names = "rgx", "fender";
+			power-domains = <&ps_gfx>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 170 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 171 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 172 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 173 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 174 IRQ_TYPE_LEVEL_HIGH>;
+			firmware-name = "apple/gfx-s8003.bin";
+		};
+
+		/*
 		 * Imagination MSVDX ("VXD") H.264 decoder, ADT vxd@7F00000. It
 		 * has its own two-level GART, so no DART.
 		 */
