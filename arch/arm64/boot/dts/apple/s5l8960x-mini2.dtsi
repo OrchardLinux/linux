@@ -157,3 +157,24 @@
 		};
 	};
 };
+
+/ {
+	/*
+	 * The BCM43241 Wi-Fi radio on HSIC, where the device trees of
+	 * the J85-J87 and J85m-J87m put it (/arm-io/usb-complex/usb-ehci1/wlan):
+	 * EHCI1 root port 1, its HSIC PHY at usb-complex +0x60, HOST_READY
+	 * on GPIO 163, DEVICE_READY on GPIO 164 and the reset on the D2089's
+	 * GPIO3. apple-a7-wlan owns it.
+	 */
+	wifi@20c000060 {
+		compatible = "apple,s5l8960x-hsic-wlan";
+		reg = <0x2 0x0c000060 0x0 0x10>, <0x2 0x0c400000 0x0 0x10000>;
+		reg-names = "phy", "ehci";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 165 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_hsic2_phy>;
+		apple,ehci-port = <1>;
+		host-ready-gpios = <&pinctrl 163 GPIO_ACTIVE_HIGH>;
+		device-ready-gpios = <&pinctrl 164 GPIO_ACTIVE_HIGH>;
+	};
+};
