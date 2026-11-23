@@ -108,3 +108,64 @@
 	apple,always-on;
 	apple,manual-pm;
 };
+
+/*
+ * Wi-Fi, the same on every A11 iPhone (iOS 16.7.16 DeviceTree.d20ap, d201ap,
+ * d21ap, d211ap, d22ap, d221ap): a BCM4357 on PCIe port 3 behind
+ * dart-apcie3, PERST# on AP GPIO 167, CLKREQ# on 163, device-wake on 40, and
+ * REG_ON on SMC PMU GPIO 14 ("gP0e"). brcmfmac takes the module (apolloe,
+ * pegasusk, herculese, ...) from the ADT's module-instance.
+ */
+/ {
+	aliases {
+		wifi0 = &wifi0;
+	};
+
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&smc_gpio 14 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <2500>;
+	};
+};
+
+&apcie {
+	iommu-map = <0x100 &dart_apcie3 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	pinctrl-0 = <&wifi_clkreq>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	port03: pci@3,0 {
+		device_type = "pci";
+		reg = <0x1800 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		max-link-speed = <2>;
+		apple,manual-availability-iommu = <&dart_apcie3 0>;
+		reset-gpios = <&pinctrl_ap 167 GPIO_ACTIVE_LOW>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,440a";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl_ap 40 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+			brcm,ccode-map-trivial;
+		};
+	};
+};
+
+/* The Wi-Fi port's DART: apple-h9p reloads it by hand and needs its device. */
+&dart_apcie3 {
+	status = "okay";
+};
+
+&pinctrl_ap {
+	wifi_clkreq: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(163, 1)>;
+	};
+};
