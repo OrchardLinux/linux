@@ -18,9 +18,10 @@
  * (0x10c0, 0x402c, 0x4030, 0x4038, 0x4068) sit at the same offsets as in the
  * H7 pipe driven by drivers/gpu/drm/adp.
  *
- * Disabling the CRTC scans out the boot framebuffer, cleared to black,
- * instead of clearing the layer enable or touching the link: neither has
- * been verified on hardware.
+ * Disabling the CRTC scans out the boot framebuffer instead of clearing
+ * the layer enable or touching the link: neither has been verified on
+ * hardware. It is cleared to black once a client frame has replaced the
+ * boot picture; before that, the picture iBoot or m1n1 left stays.
  *
  * The pipe's bus is 32 bits wide with DRAM at bus address 0. iBoot leaves
  * the display DART in bypass, so the plane base register holds the low 32
@@ -29,6 +30,10 @@
  * never writing it, and leaves the display to simpledrm otherwise.
  * Scanout buffers are ordinary DMA allocations that must fall inside the
  * same 4 GiB window.
+ *
+ * By default the pipe keeps reading the boot framebuffer exactly as iBoot or
+ * m1n1 left it: probe neither switches its path nor shows anything else
+ * until a client's first frame.
  *
  * With dart_scanout=1 the pipe reads through dart-disp0 instead, as on iOS,
  * where IOMobileFramebuffer maps every swap surface through the display's
@@ -240,10 +245,13 @@
 #define ADBE_VERIFY_PAGE	SZ_16K
 #define ADBE_VERIFY_IOVA_START	SZ_16M
 
-static bool dart_scanout = true;
+/* Off by default: switching the live pipe to translated reads, and the
+ * self-check that must precede it, disturb the boot picture at probe.
+ */
+static bool dart_scanout;
 module_param(dart_scanout, bool, 0444);
 MODULE_PARM_DESC(dart_scanout,
-		 "Scan out through the display DART, so any dma-buf can be shown (reads back the active mode)");
+		 "Scan out through the display DART, so any dma-buf can be shown; changes the boot picture during probe (default: off)");
 #define ADBE_FLIP_VBLANKS	3	/* complete on VBI if bit 10 never comes */
 #define ADBE_FLIP_TIMEOUT_MS	100	/* complete anyway without an interrupt */
 #define ADBE_INTEN_VBLANK	(ADP_ST_VBI | ADP_ST_APPLIED)
@@ -610,7 +618,8 @@ static int adbe_kick(struct adbe *adbe, u32 base, u32 stride,
 }
 
 /*
- * Scan out the boot framebuffer, cleared to black. If the packet is not
+ * Scan out the boot framebuffer, cleared to black once a client frame has
+ * been shown. If the packet is not
  * applied in time, store the base directly and push an empty packet, as the
  * H7 pipe driver does.
  */
@@ -619,7 +628,8 @@ static void adbe_park_pipe(struct adbe *adbe)
 	unsigned long flags;
 	u32 base;
 
-	if (!adbe->boot_black) {
+	/* Until a client frame replaces it, the boot picture stays as it is. */
+	if (!adbe->boot_black && adbe->cur_base != adbe->boot_base) {
 		memset_io(adbe->boot_va, 0, adbe->fb_size);
 		wmb();	/* publish the write-combined stores before the flip */
 		adbe->boot_black = true;
