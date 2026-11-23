@@ -7,6 +7,7 @@
 
 #include <linux/bits.h>
 #include <linux/delay.h>
+#include <linux/hwmon.h>
 #include <linux/jiffies.h>
 #include <linux/limits.h>
 #include <linux/mod_devicetable.h>
@@ -34,6 +35,10 @@
 #define SN2400_ADC_CHANNEL_MASK		GENMASK(3, 1)
 #define SN2400_ADC_CHANNEL_VBUS		0
 #define SN2400_ADC_CHANNEL_IBUS		BIT(1)
+/* iOS names channel 6 both "vdd_main" and "vbat": 2.5 V + 10 mV/LSB */
+#define SN2400_ADC_CHANNEL_VDD_MAIN	6
+/* iOS "tjunc": the die, about 1.8276 K/LSB from 0 K */
+#define SN2400_ADC_CHANNEL_TJUNC		8
 #define SN2400_ADC_START			BIT(4)
 #define SN2400_REG_ADC_DATA		0x12
 
@@ -82,6 +87,8 @@ struct sn2400_charger {
 	struct delayed_work work;
 	/* Protects cached power-supply data and the stopped flag. */
 	struct mutex lock;
+	/* Serializes conversions: the work and hwmon share 0x11/0x12. */
+	struct mutex adc_lock;
 	enum sn2400_foldback_state state;
 	unsigned int max_input_ua;
 	unsigned int session_max_input_ua;
@@ -109,21 +116,20 @@ static int sn2400_read_adc(struct sn2400_charger *charger,
 	unsigned int value;
 	int ret;
 
+	mutex_lock(&charger->adc_lock);
 	ret = regmap_write(charger->regmap, SN2400_REG_ADC_CONTROL,
 			   (channel & SN2400_ADC_CHANNEL_MASK) |
 			   SN2400_ADC_START);
-	if (ret)
-		return ret;
-
-	ret = regmap_read_poll_timeout(charger->regmap,
-				       SN2400_REG_ADC_CONTROL, value,
-				       !(value & SN2400_ADC_START),
-				       SN2400_ADC_POLL_US,
-				       SN2400_ADC_TIMEOUT_US);
-	if (ret)
-		return ret;
-
-	ret = regmap_read(charger->regmap, SN2400_REG_ADC_DATA, &value);
+	if (!ret)
+		ret = regmap_read_poll_timeout(charger->regmap,
+					       SN2400_REG_ADC_CONTROL, value,
+					       !(value & SN2400_ADC_START),
+					       SN2400_ADC_POLL_US,
+					       SN2400_ADC_TIMEOUT_US);
+	if (!ret)
+		ret = regmap_read(charger->regmap, SN2400_REG_ADC_DATA,
+				  &value);
+	mutex_unlock(&charger->adc_lock);
 	if (ret)
 		return ret;
 
@@ -133,6 +139,13 @@ static int sn2400_read_adc(struct sn2400_charger *charger,
 		break;
 	case SN2400_ADC_CHANNEL_IBUS:
 		*result = value * 10000;
+		break;
+	case SN2400_ADC_CHANNEL_VDD_MAIN:
+		*result = 2500000 + value * 10000;
+		break;
+	case SN2400_ADC_CHANNEL_TJUNC:
+		/* iOS: (value * 3900 - 581300) / 2134.4, in degrees C */
+		*result = value * 1827553 / 1000 - 272399;
 		break;
 	default:
 		return -EINVAL;
@@ -724,11 +737,76 @@ static void sn2400_charger_cache_suspend(struct sn2400_charger *charger,
 		power_supply_changed(charger->psy);
 }
 
+/*
+ * In control mode, the charger's own ADC on demand: VBUS, VDD_MAIN (which
+ * iOS also reports as the battery voltage) and the die temperature. A
+ * charge test can watch these when the gauge cannot be read. Each read
+ * starts a conversion (a write to 0x11), so read-only boards have none.
+ */
+static const u8 sn2400_hwmon_in[] = {
+	SN2400_ADC_CHANNEL_VBUS, SN2400_ADC_CHANNEL_VDD_MAIN,
+};
+static const char *const sn2400_hwmon_in_label[] = { "vbus", "vdd_main" };
+
+static umode_t sn2400_hwmon_is_visible(const void *data,
+				       enum hwmon_sensor_types type,
+				       u32 attr, int channel)
+{
+	return 0444;
+}
+
+static int sn2400_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+			     u32 attr, int channel, long *val)
+{
+	struct sn2400_charger *charger = dev_get_drvdata(dev);
+	int result, ret;
+
+	if (type == hwmon_temp) {
+		ret = sn2400_read_adc(charger, SN2400_ADC_CHANNEL_TJUNC,
+				      &result);
+		if (!ret)
+			*val = result;
+		return ret;
+	}
+
+	ret = sn2400_read_adc(charger, sn2400_hwmon_in[channel], &result);
+	if (!ret)
+		*val = result / 1000;
+	return ret;
+}
+
+static int sn2400_hwmon_read_string(struct device *dev,
+				    enum hwmon_sensor_types type, u32 attr,
+				    int channel, const char **str)
+{
+	*str = type == hwmon_temp ? "tjunc" : sn2400_hwmon_in_label[channel];
+	return 0;
+}
+
+static const struct hwmon_ops sn2400_hwmon_ops = {
+	.is_visible = sn2400_hwmon_is_visible,
+	.read = sn2400_hwmon_read,
+	.read_string = sn2400_hwmon_read_string,
+};
+
+static const struct hwmon_channel_info *const sn2400_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(in, HWMON_I_INPUT | HWMON_I_LABEL,
+			   HWMON_I_INPUT | HWMON_I_LABEL),
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL),
+	NULL
+};
+
+static const struct hwmon_chip_info sn2400_hwmon_chip = {
+	.ops = &sn2400_hwmon_ops,
+	.info = sn2400_hwmon_info,
+};
+
 static int sn2400_charger_probe(struct platform_device *pdev)
 {
 	struct power_supply_battery_info *battery_info;
 	struct power_supply_config psy_config = {};
 	struct sn2400_charger *charger;
+	struct device *hwmon;
 	u32 input_limit_ua;
 	unsigned int status;
 	int ret;
@@ -764,6 +842,9 @@ static int sn2400_charger_probe(struct platform_device *pdev)
 	charger->max_input_ua = input_limit_ua;
 	charger->session_max_input_ua = input_limit_ua;
 
+	ret = devm_mutex_init(&pdev->dev, &charger->adc_lock);
+	if (ret)
+		return ret;
 	ret = devm_mutex_init(&pdev->dev, &charger->lock);
 	if (ret)
 		return ret;
@@ -861,6 +942,12 @@ static int sn2400_charger_probe(struct platform_device *pdev)
 			return dev_err_probe(&pdev->dev, ret,
 					     "failed to program battery charge current limit\n");
 	}
+
+	hwmon = devm_hwmon_device_register_with_info(&pdev->dev, "sn2400",
+						     charger,
+						     &sn2400_hwmon_chip, NULL);
+	if (IS_ERR(hwmon))
+		dev_warn(&pdev->dev, "no hwmon: %pe\n", hwmon);
 	power_supply_changed(charger->psy);
 
 start:
