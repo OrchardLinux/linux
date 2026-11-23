@@ -23,6 +23,9 @@ properties:
       - const: apple,t7001-nco
       - const: apple,t8010-nco
       - items:
+          - const: apple,s8000-nco
+          - const: apple,t8010-nco
+      - items:
           - const: apple,t6020-nco
           - const: apple,t8103-nco
       - items:
