@@ -14,3 +14,27 @@
 	compatible = "apple,j207", "apple,t8011", "apple,arm-platform";
 	model = "Apple iPad Pro 2 (10.5-inch) (Wi-Fi)";
 };
+
+&bluetooth {
+	compatible = "apple,j207-bcm4355c0-bt", "brcm,bcm4355c0-bt";
+};
+
+&headphones {
+	simple-audio-card,name = "J207 Headphones";
+};
+
+&microphones {
+	simple-audio-card,name = "J207 Microphones";
+};
+
+/* Touch personality K1F19,2 (ADT multi-touch hid-merge-personality) */
+&touchscreen {
+	compatible = "apple,j207-touchscreen";
+	firmware-name = "apple/j207-touch-K1F19,2.z2fw";
+	touchscreen-size-x = <1668>;
+	touchscreen-size-y = <2224>;
+};
+
+&wifi {
+	brcm,board-type = "apple,j207";
+};

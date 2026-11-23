@@ -6,9 +6,112 @@
  */
 
 #include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/*
+ * The four iPad Pro 2 boards (J120, J121: 12.9-inch; J207, J208:
+ * 10.5-inch) are wired alike: their iPadOS 17.7.11 (21H461) device trees
+ * differ in the panel, the touch firmware personality, the Wi-Fi module
+ * instance and, on the cellular boards, the baseband. The boards name
+ * their touch firmware, panel size, Wi-Fi board type and sound cards.
+ */
 
 / {
 	chassis-type = "tablet";
+
+	aliases {
+		aop = &aop;
+		bluetooth0 = &bluetooth;
+		nvme-hmb = &nvme_hmb;
+		touchscreen0 = &touchscreen;
+		wifi0 = &wifi;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* The boot loader fills this from the ADT's sart-region. */
+		nvme_hmb: nvme-hmb@0 {
+			reg = <0 0 0 0>;
+			no-map;
+		};
+	};
+
+	/* WLAN REG_ON is the D2401's GPIO 1 (ADT wlan function-reg_on). */
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&autumn_gpio 1 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	/* ADT clock 0x134; the boot loader sets this source up. */
+	spi3_nclk: clock-spi3-nclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <61538461>;
+		clock-output-names = "spi3-nclk";
+	};
+
+	/*
+	 * Smart Cover hall sensors: D2400 GPIO 0 ("halleffect1") and 10
+	 * ("halleffect") in the ADT /buttons node, low while the cover is
+	 * closed. Reported as SW_MACHINE_COVER, as on the iPad 6; the PMU
+	 * events of both lines wake the system (apple,wake-events).
+	 */
+	smart-cover {
+		compatible = "gpio-keys-polled";
+		poll-interval = <50>;
+		label = "iPad Smart Cover";
+
+		cover-switch {
+			label = "Smart Cover (PMIC GPIO 0)";
+			gpios = <&august_gpio 0 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_MACHINE_COVER>;
+			debounce-interval = <50>;
+		};
+	};
+
+	/* The two built-in PDM microphones */
+	dmics: audio-codec {
+		compatible = "dmic-codec";
+		#sound-dai-cells = <0>;
+		num-channels = <2>;
+	};
+
+	headphones: sound-headphones {
+		compatible = "simple-audio-card";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,bitclock-master = <&jack_cpu>;
+		simple-audio-card,frame-master = <&jack_cpu>;
+		simple-audio-card,widgets = "Headphone", "Headphones";
+		simple-audio-card,routing = "Headphones", "Jack HP";
+		simple-audio-card,pin-switches = "Headphones";
+		simple-audio-card,aux-devs = <&jack_codec>;
+
+		jack_cpu: simple-audio-card,cpu {
+			sound-dai = <&mca4>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&jack_codec>;
+		};
+	};
+
+	microphones: sound-microphones {
+		compatible = "simple-audio-card";
+
+		simple-audio-card,cpu {
+			sound-dai = <&pdm>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&dmics>;
+		};
+	};
 
 	gpio-keys {
 		compatible = "gpio-keys";
@@ -46,6 +149,252 @@
 		compatible = "apple,august-pmic-bl", "apple,aria-pmic-bl";
 		reg = <0xb00 0x2>;
 	};
+
+	august_gpio: gpio {
+		compatible = "apple,d2400-pmic-gpio";
+		gpio-controller;
+		#gpio-cells = <2>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&pinctrl_aop>;
+		interrupts = <26 IRQ_TYPE_LEVEL_LOW>;
+		apple,wake-events = <0x30 0x3a>;
+	};
+
+	touch_analog: regulator-touch-analog {
+		compatible = "apple,august-touch-analog-regulator";
+		regulator-name = "touch-analog";
+	};
+};
+
+/* GPIO 0 (Bluetooth shutdown) and 1 (WLAN enable) are driven; the rest stay with the firmware. */
+&autumn_pmic {
+	/* Its only child here has no register range. */
+	/delete-property/ #address-cells;
+	/delete-property/ #size-cells;
+
+	autumn_gpio: gpio {
+		compatible = "apple,d2401-pmic-gpio";
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-reserved-ranges = <2 18>;
+	};
+};
+
+&i2c2 {
+	status = "okay";
+
+	jack_codec: audio-codec@48 {
+		compatible = "cirrus,cs42l83";
+		reg = <0x48>;
+		reset-gpios = <&pinctrl_ap 67 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 50 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&aop {
+	firmware-name = "apple/aop-ipad7.bin", "apple/aop-ipad7-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&i2s_switch {
+	status = "okay";
+};
+
+&aop_i2s_switch {
+	status = "okay";
+};
+
+&aop_i2s_oe {
+	status = "okay";
+};
+
+/* The CS42L83 sits on AOP pads behind the AOP's i2s-switch. */
+&mca4 {
+	apple,i2s-switch = <&i2s_switch 4 4>;
+	apple,aop-i2s-route = <&aop_i2s_switch 0x0 0x00010101>,
+			      <&aop_i2s_switch 0xc 0x00080818>,
+			      <&aop_i2s_oe 0x0 0xf>;
+	status = "okay";
+};
+
+&nco {
+	status = "okay";
+};
+
+&nco_clkref {
+	clock-frequency = <800000000>;
+};
+
+&pdm {
+	status = "okay";
+};
+
+&sio {
+	status = "okay";
+};
+
+&vxd {
+	status = "okay";
+};
+
+&pcie0_dart0 {
+	status = "okay";
+};
+
+&pcie0_dart2 {
+	status = "okay";
+};
+
+&pcie0 {
+	apple,nvme-hmb = <&nvme_hmb>;
+	/* Storage is bus 1, Wi-Fi bus 2, each behind its own DART. */
+	iommu-map = <0x100 &pcie0_dart0 0 0x0 0x80000000 0x0 0x3c000000 1>,
+		    <0x200 &pcie0_dart2 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	pinctrl-0 = <&storage_clkreq>, <&wifi_clkreq>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		max-link-speed = <3>;
+		reset-gpios = <&pinctrl_ap 10 GPIO_ACTIVE_LOW>;
+		apple,manual-availability-iommu = <&pcie0_dart0 0>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+	};
+
+	/* ADT pci-bridge2: MSI vectors 16-19, 2.5 GT/s. */
+	pci@2,0 {
+		device_type = "pci";
+		reg = <0x1000 0x0 0x0 0x0 0x0>;
+		bus-range = <2 2>;
+		max-link-speed = <1>;
+		reset-gpios = <&pinctrl_ap 100 GPIO_ACTIVE_LOW>;
+		apple,msi-vector-range = <16 4>;
+		apple,manual-availability-iommu = <&pcie0_dart2 0>;
+		apple,endpoint-power-after-link-setup;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi: wifi@0,0 {
+			compatible = "pci14e4,43dc";
+			reg = <0x20000 0x0 0x0 0x0 0x0>;
+			apple,wlan-uart = <&wlan_uart2>;
+			device-wake-gpios = <&pinctrl_ap 164 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+		};
+	};
+};
+
+&pinctrl_ap {
+	battery_swi_pins: battery-swi-pins {
+		pinmux = <APPLE_PINMUX(163, 1)>;
+	};
+
+	/* The native UART3 node describes TX and RTS. */
+	bluetooth_uart3_pins: bluetooth-uart3-pins {
+		pinmux = <APPLE_PINMUX(145, 1)>,
+			 <APPLE_PINMUX(147, 1)>;
+	};
+
+	storage_clkreq: storage-clkreq-pins {
+		pinmux = <APPLE_PINMUX(13, 1)>;
+	};
+
+	wifi_clkreq: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(101, 1)>;
+	};
+
+	wlan_uart2_pins: wlan-uart2-pins {
+		pinmux = <APPLE_PINMUX(150, 1)>,
+			 <APPLE_PINMUX(152, 1)>;
+	};
+
+	/* The display sync pins: function 1 while touch runs, GPIO otherwise. */
+	touch_sync_active: touch-sync-active-pins {
+		pinmux = <APPLE_PINMUX(205, 1)>,
+			 <APPLE_PINMUX(206, 1)>,
+			 <APPLE_PINMUX(207, 1)>;
+	};
+
+	touch_sync_inactive: touch-sync-inactive-pins {
+		pinmux = <APPLE_PINMUX(207, 0)>,
+			 <APPLE_PINMUX(206, 0)>,
+			 <APPLE_PINMUX(205, 0)>;
+	};
+};
+
+&serial3 {
+	pinctrl-0 = <&bluetooth_uart3_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "brcm,bcm4355c0-bt";
+		max-speed = <3000000>;
+		shutdown-gpios = <&autumn_gpio 0 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl_ap 166 GPIO_ACTIVE_HIGH>;
+		apple,wlan = <&wifi>;
+		/* The boot loader fills in the unit's address and calibration. */
+		local-bd-address = [00 00 00 00 00 00];
+	};
+};
+
+&serial5 {
+	pinctrl-0 = <&battery_swi_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		battery: fuel-gauge {
+			compatible = "apple,j120-bq27540", "ti,bq27540-hdq";
+		};
+	};
+};
+
+&spi3 {
+	clocks = <&spi3_nclk>;
+	cs-gpios = <&pinctrl_ap 203 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	/* The K1 controller; boards give its firmware and panel size. */
+	touchscreen: touchscreen@0 {
+		reg = <0>;
+		spi-max-frequency = <24390243>;
+		spi-cpha;
+		spi-cpol;
+		interrupts-extended = <&pinctrl_ap 104 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&pinctrl_ap 103 GPIO_ACTIVE_LOW>;
+		power-ldo-gpios = <&pinctrl_ap 120 GPIO_ACTIVE_HIGH>;
+		ana-supply = <&touch_analog>;
+		clocks = <&touchclk>;
+		pinctrl-names = "display-sync-active", "display-sync-inactive";
+		pinctrl-0 = <&touch_sync_active>;
+		pinctrl-1 = <&touch_sync_inactive>;
+	};
+};
+
+&wlan_uart2 {
+	pinctrl-0 = <&wlan_uart2_pins>;
+	pinctrl-names = "default";
+	status = "okay";
 };
 
 &ps_dcs6 {

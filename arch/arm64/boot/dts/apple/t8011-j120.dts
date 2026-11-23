@@ -14,3 +14,27 @@
 	compatible = "apple,j120", "apple,t8011", "apple,arm-platform";
 	model = "Apple iPad Pro 2 (12.9-inch) (Wi-Fi)";
 };
+
+&bluetooth {
+	compatible = "apple,j120-bcm4355c0-bt", "brcm,bcm4355c0-bt";
+};
+
+&headphones {
+	simple-audio-card,name = "J120 Headphones";
+};
+
+&microphones {
+	simple-audio-card,name = "J120 Microphones";
+};
+
+/* Touch personality K1F18,3 (ADT multi-touch hid-merge-personality) */
+&touchscreen {
+	compatible = "apple,j120-touchscreen";
+	firmware-name = "apple/j120-touch-K1F18,3.z2fw";
+	touchscreen-size-x = <2048>;
+	touchscreen-size-y = <2732>;
+};
+
+&wifi {
+	brcm,board-type = "apple,j120";
+};
