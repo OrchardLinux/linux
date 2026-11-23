@@ -4825,6 +4825,18 @@ static const struct apple_z2_chip_info apple_z2_n102_info = {
 	.n1 = &apple_z2_n102_n1,
 };
 
+/*
+ * iPhone 6s Plus (N66), AppleMultitouchN1SPI personality C1F5C,1: the N1
+ * clock values in iOS 19H422 match the iPod touch 6's.
+ */
+static const struct apple_z2_chip_info apple_z2_n66_info = {
+	.name = "iPhone8,2 Touchscreen",
+	.variant = APPLE_Z2_VARIANT_J71T,
+	.cs_setup_us = 10,
+	.cs_hold_us = 10,
+	.n1 = &apple_z2_n102_n1,
+};
+
 static const struct apple_z2_chip_info apple_z2_j172_info = {
 	.name = "iPad 7 Touchscreen",
 	.variant = APPLE_Z2_VARIANT_J172,
@@ -5251,6 +5263,7 @@ static const struct of_device_id apple_z2_of_match[] = {
 	{ .compatible = "apple,d111-touchscreen", .data = &apple_z2_d111_info },
 	{ .compatible = "apple,n61-touchscreen", .data = &apple_z2_n61_info },
 	{ .compatible = "apple,n102-touchscreen", .data = &apple_z2_n102_info },
+	{ .compatible = "apple,n66-touchscreen", .data = &apple_z2_n66_info },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_z2_of_match);
@@ -5269,6 +5282,7 @@ static struct spi_device_id apple_z2_of_id[] = {
 	{ .name = "d111-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_d111_info },
 	{ .name = "n61-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n61_info },
 	{ .name = "n102-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n102_info },
+	{ .name = "n66-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n66_info },
 	{}
 };
 MODULE_DEVICE_TABLE(spi, apple_z2_of_id);
