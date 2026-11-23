@@ -523,10 +523,6 @@
 	status = "okay";
 };
 
-&vxd {
-	status = "okay";
-};
-
 &wlan_uart2 {
 	pinctrl-0 = <&wlan_uart2_pins>;
 	pinctrl-names = "default";
