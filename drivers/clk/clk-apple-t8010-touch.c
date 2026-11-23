@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Apple T8010 touchscreen clock driver
+ * Apple T7000/T8010 touchscreen clock driver
  *
  * Copyright (C) Corellium LLC
  * Copyright (C) Paul Praschl
@@ -187,6 +187,7 @@ static int apple_t8010_touch_clk_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_t8010_touch_clk_of_match[] = {
+	{ .compatible = "apple,t7000-touch-clock" },
 	{ .compatible = "apple,t8010-touch-clock" },
 	{ }
 };
@@ -201,6 +202,6 @@ static struct platform_driver apple_t8010_touch_clk_driver = {
 };
 module_platform_driver(apple_t8010_touch_clk_driver);
 
-MODULE_DESCRIPTION("Apple T8010 touchscreen clock driver");
+MODULE_DESCRIPTION("Apple T7000/T8010 touchscreen clock driver");
 MODULE_AUTHOR("Paul Praschl");
 MODULE_LICENSE("Dual MIT/GPL");

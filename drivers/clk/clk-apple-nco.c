@@ -8,7 +8,9 @@
 
 #include <linux/bits.h>
 #include <linux/bitfield.h>
+#include <linux/clk.h>
 #include <linux/clk-provider.h>
+#include <linux/property.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/math64.h>
@@ -64,7 +66,15 @@ struct applnco_tables {
 	u16 inv[LFSR_TBLSIZE];
 };
 
+struct applnco_hw {
+	u32 stride;
+	u32 enable_mask;
+	u32 control_set;
+	u32 control_clear;
+};
+
 struct applnco_channel {
+	const struct applnco_hw *soc;
 	void __iomem *base;
 	struct applnco_tables *tbl;
 	struct clk_hw hw;
@@ -80,7 +90,8 @@ static void applnco_enable_nolock(struct clk_hw *hw)
 	u32 val;
 
 	val = readl_relaxed(chan->base + REG_CTRL);
-	writel_relaxed(val | CTRL_ENABLE, chan->base + REG_CTRL);
+	writel_relaxed(val | (chan->soc ? chan->soc->enable_mask : CTRL_ENABLE),
+		       chan->base + REG_CTRL);
 }
 
 static void applnco_disable_nolock(struct clk_hw *hw)
@@ -89,14 +100,16 @@ static void applnco_disable_nolock(struct clk_hw *hw)
 	u32 val;
 
 	val = readl_relaxed(chan->base + REG_CTRL);
-	writel_relaxed(val & ~CTRL_ENABLE, chan->base + REG_CTRL);
+	writel_relaxed(val & ~(chan->soc ? chan->soc->enable_mask : CTRL_ENABLE),
+		       chan->base + REG_CTRL);
 }
 
 static int applnco_is_enabled(struct clk_hw *hw)
 {
 	struct applnco_channel *chan = to_applnco_channel(hw);
 
-	return (readl_relaxed(chan->base + REG_CTRL) & CTRL_ENABLE) != 0;
+	return (readl_relaxed(chan->base + REG_CTRL) &
+		(chan->soc ? chan->soc->enable_mask : CTRL_ENABLE)) != 0;
 }
 
 static void applnco_compute_tables(struct applnco_tables *tbl)
@@ -158,6 +171,7 @@ static int applnco_set_rate(struct clk_hw *hw, unsigned long rate,
 	unsigned long flags;
 	u32 div, inc1, inc2;
 	bool was_enabled;
+	u32 control;
 
 	div = 2 * parent_rate / rate;
 	inc1 = 2 * parent_rate - div * rate;
@@ -171,13 +185,21 @@ static int applnco_set_rate(struct clk_hw *hw, unsigned long rate,
 	spin_lock_irqsave(&chan->lock, flags);
 	was_enabled = applnco_is_enabled(hw);
 	applnco_disable_nolock(hw);
+	if (chan->soc) {
+		/* T8010: choose input zero and the fractional accumulator mode. */
+		control = readl_relaxed(chan->base + REG_CTRL);
+		control &= ~chan->soc->control_clear;
+		control |= chan->soc->control_set;
+		writel_relaxed(control, chan->base + REG_CTRL);
+	}
 
 	writel_relaxed(div,  chan->base + REG_DIV);
 	writel_relaxed(inc1, chan->base + REG_INC1);
 	writel_relaxed(inc2, chan->base + REG_INC2);
 
 	/* Presumably a neutral initial value for accumulator */
-	writel_relaxed(1 << 31, chan->base + REG_ACCINIT);
+	writel_relaxed(chan->soc ? (inc1 ^ BIT(31)) - rate : BIT(31),
+		       chan->base + REG_ACCINIT);
 
 	if (was_enabled)
 		applnco_enable_nolock(hw);
@@ -263,17 +285,29 @@ static int applnco_probe(struct platform_device *pdev)
 	void __iomem *base;
 	struct resource *res;
 	struct applnco_tables *tbl;
-	unsigned int nchannels;
+	unsigned int nchannels, stride;
+	const struct applnco_hw *soc = device_get_match_data(&pdev->dev);
 	int ret, i;
+
+	if (soc) {
+		struct clk *reference = devm_clk_get(&pdev->dev, NULL);
+
+		if (IS_ERR(reference))
+			return dev_err_probe(&pdev->dev, PTR_ERR(reference),
+					     "failed to get NCO reference\n");
+		if (!clk_get_rate(reference))
+			return dev_err_probe(&pdev->dev, -EINVAL,
+					     "NCO reference has no rate\n");
+	}
 
 	base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
+	stride = soc ? soc->stride : NCO_CHANNEL_STRIDE;
 	if (resource_size(res) < NCO_CHANNEL_REGSIZE)
 		return -EINVAL;
-	nchannels = (resource_size(res) - NCO_CHANNEL_REGSIZE)
-			/ NCO_CHANNEL_STRIDE + 1;
+	nchannels = (resource_size(res) - NCO_CHANNEL_REGSIZE) / stride + 1;
 
 	onecell_data = devm_kzalloc(&pdev->dev, struct_size(onecell_data, hws,
 							nchannels), GFP_KERNEL);
@@ -292,7 +326,8 @@ static int applnco_probe(struct platform_device *pdev)
 		chan = devm_kzalloc(&pdev->dev, sizeof(*chan), GFP_KERNEL);
 		if (!chan)
 			return -ENOMEM;
-		chan->base = base + NCO_CHANNEL_STRIDE * i;
+		chan->soc = soc;
+		chan->base = base + stride * i;
 		chan->tbl = tbl;
 		spin_lock_init(&chan->lock);
 
@@ -319,7 +354,29 @@ static int applnco_probe(struct platform_device *pdev)
 							onecell_data);
 }
 
+/* AppleS5L8960XNCO: parent 0, no alternate prescaler, accumulator mode. */
+static const struct applnco_hw t8010_nco_hw = {
+	.stride = NCO_CHANNEL_STRIDE,
+	.enable_mask = BIT(12),
+	.control_set = BIT(31),
+	.control_clear = BIT(24) | BIT(29),
+};
+
+/*
+ * The same block on the A7 to A8X, with its channels 0x1000 apart: iOS's
+ * AppleS5L8960XNCO takes the stride from "pmgr-nco-page-size" and falls back
+ * to 0x1000, which T7001's ADT relies on (reg size 0x5000, five channels).
+ */
+static const struct applnco_hw t7001_nco_hw = {
+	.stride = 0x1000,
+	.enable_mask = BIT(12),
+	.control_set = BIT(31),
+	.control_clear = BIT(24) | BIT(29),
+};
+
 static const struct of_device_id applnco_ids[] = {
+	{ .compatible = "apple,t7001-nco", .data = &t7001_nco_hw },
+	{ .compatible = "apple,t8010-nco", .data = &t8010_nco_hw },
 	{ .compatible = "apple,t8103-nco" },
 	{ .compatible = "apple,nco" },
 	{ }

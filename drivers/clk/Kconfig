@@ -66,13 +66,29 @@ config COMMON_CLK_APPLE_NCO
 	  found on Apple SoCs such as t8103 (M1). The blocks are typically
 	  generators of audio clocks.
 
+config COMMON_CLK_APPLE_AOP_AUDIO
+	tristate "Clock driver for the Apple AOP audio service"
+	depends on APPLE_AOP_T8010 || COMPILE_TEST
+	help
+	  This driver supports the clock of the PDM microphones on Apple A10
+	  devices, which the Always-On Processor's audio service generates.
+
+config COMMON_CLK_APPLE_S5L8960X_TOUCH
+	bool "Clock driver for Apple S5L8960X touchscreens"
+	depends on ARCH_APPLE || COMPILE_TEST
+	default ARCH_APPLE
+	help
+	  Support the touchscreen reference clock that PWM0 channel 2
+	  generates on Apple A7 (S5L8960X) devices such as the iPad Air.
+	  The other PWM channels are not exposed by this driver.
+
 config COMMON_CLK_APPLE_T8010_TOUCH
-	bool "Clock driver for Apple T8010 touchscreens"
+	bool "Clock driver for Apple T7000/T8010 touchscreens"
 	depends on ARCH_APPLE || COMPILE_TEST
 	default ARCH_APPLE
 	help
 	  This driver supports the PMGR clock gate and divider used by
-	  touchscreen controllers on A10/T8010 Apple devices. The clock
+	  touchscreen controllers on A8/T7000 and A10/T8010 Apple devices. The clock
 	  is required for firmware upload and runtime touch reports on
 	  iPad models using this controller.
 
