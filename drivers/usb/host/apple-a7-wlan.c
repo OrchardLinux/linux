@@ -28,7 +28,6 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
-#include <linux/utsname.h>
 #include <linux/dma-direct.h>
 #include <linux/of_device.h>
 #include <linux/irqdomain.h>
@@ -64,7 +63,6 @@ struct a7_wlan_board {
 	const char *name;
 	/* true: every J72 baseline is enforced exactly (J72 itself). */
 	bool measured;
-	const char *release;		/* exact kernel release pin, or NULL */
 	const char *phy_domain;		/* PMGR child: HSIC PHY power state */
 	const char *host_domain;	/* PMGR child: USB2HOST power state */
 	u32 phy_domain_reg, host_domain_reg;
@@ -82,7 +80,6 @@ static const struct a7_wlan_board boards[] = {
 		.compatible = "apple,j72",
 		.name = "J72",
 		.measured = true,
-		.release = "7.3.0-rc1-j72-pw1-orchard-apple-4k",
 		.phy_domain = PMGR "power-controller@20120",	/* hsic1_phy */
 		.host_domain = PMGR "power-controller@20170",	/* usb2host0 */
 		.phy_domain_reg = 0x20120,
@@ -446,7 +443,7 @@ static int __init observer_init(void)
 	for (i = 0; i < ARRAY_SIZE(boards); i++)
 		if (of_machine_is_compatible(boards[i].compatible))
 			board = &boards[i];
-	if (!board || (board->release && strcmp(utsname()->release, board->release)))
+	if (!board)
 		return -ENODEV;
 	if (!board->measured)
 		pr_info(DRV_NAME ": %s: addresses from its ADT; register baselines measured on J72, unverified on %s\n",
