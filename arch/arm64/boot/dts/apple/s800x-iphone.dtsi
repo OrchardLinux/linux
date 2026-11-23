@@ -135,8 +135,7 @@
 
 /*
  * Apple's A9 iPhone AOP firmware (aopfw-s8000aop) serves the accelerometer,
- * gyroscope and pressure sensor. Its mount-matrix has not been measured on
- * a phone yet, so the sensors report in the AOP's own frame.
+ * gyroscope and pressure sensor.
  */
 &aop {
 	firmware-name = "apple/aop-s8000.bin", "apple/aop-s8000-ext.bin";
@@ -145,4 +144,21 @@
 
 &aop_mbox {
 	status = "okay";
+};
+
+/*
+ * Measured on an iPhone 6s Plus: the firmware reports on the device's axes
+ * (x right, y up, z out of the screen) with the accelerometer giving
+ * gravity's sign, as on the iPad 5, so the matrices hold for every A9 iPhone.
+ */
+&aop_accel {
+	mount-matrix = "1", "0", "0",
+		       "0", "1", "0",
+		       "0", "0", "-1";
+};
+
+&aop_gyro {
+	mount-matrix = "1", "0", "0",
+		       "0", "1", "0",
+		       "0", "0", "1";
 };
