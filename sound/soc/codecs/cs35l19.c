@@ -37,6 +37,7 @@
 #define CS35L19_PWRCTL2		0x07
 #define CS35L19_CLK_CTL		0x08
 #define CS35L19_BST_PEAK	0x09
+#define CS35L19_PROTECT_CTL	0x0a
 #define CS35L19_BST_CTL1	0x0b
 #define CS35L19_BST_CTL2	0x0c
 #define CS35L19_ADSP_CTL	0x0d
@@ -130,6 +131,15 @@ static int cs35l19_power_on(struct cs35l19 *cs)
 	}
 	regmap_write(map, CS35L19_BST_CTL1, cfg[1] & 0x3f);
 	regmap_update_bits(map, CS35L19_BST_CTL2, 0x03, cfg[2] & 0x03);
+	/*
+	 * Without a keep-alive line (the iPhone 6s Plus has none) the alive
+	 * watchdog trips (INT_STATUS_1 bit 5) and mutes the output; turn it
+	 * off the way cs35l33 does.
+	 */
+	if (!cs->keepalive) {
+		regmap_update_bits(map, CS35L19_PROTECT_CTL, 0x0c, 0x08);
+		regmap_update_bits(map, CS35L19_BST_CTL2, 0x08, 0x08);
+	}
 
 	regmap_write(map, CS35L19_PWRCTL1, 0x80);	/* all on but the amp */
 	regmap_write(map, CS35L19_PWRCTL2, 0xf8);	/* no V/I/VP/VBST sense, TDM */
