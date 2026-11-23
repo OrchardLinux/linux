@@ -169,7 +169,9 @@ allOf:
             - description: Seven-register side block
             - description: Display DART (dart-disp0), first window
             - description: Display DART (dart-disp0), second window
-            - description: DisplayPort transmitter (displayport)
+            - description:
+                DisplayPort transmitter (displayport), on the boards whose
+                panel link is eDP
 
         reg-names:
           minItems: 6
@@ -197,7 +199,9 @@ allOf:
         power-domains:
           items:
             - description: Display pipe (disp0)
-            - description: DisplayPort/eDP controller (dp)
+            - description:
+                Panel link the bootloader left running, MIPI DSI (mipi_dsi)
+                or DisplayPort (dp)
 
 required:
   - compatible
