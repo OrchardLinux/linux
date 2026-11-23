@@ -571,9 +571,12 @@ static int apple_pmic_gpio_to_irq(struct gpio_chip *chip, unsigned int offset)
 static void apple_pmic_event_restore_mask(void *data)
 {
 	struct apple_pmic_gpio *gpio = data;
+	int ret;
 
-	regmap_bulk_write(gpio->regmap, gpio->info->events->mask_base,
-			  gpio->boot_mask, gpio->info->events->bytes);
+	ret = regmap_bulk_write(gpio->regmap, gpio->info->events->mask_base,
+				gpio->boot_mask, gpio->info->events->bytes);
+	if (ret)
+		dev_err(gpio->chip.parent, "failed to restore the event mask: %d\n", ret);
 }
 
 static void apple_pmic_event_remove_domain(void *data)
@@ -655,15 +658,17 @@ static int apple_pmic_event_probe(struct platform_device *pdev,
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to read the event mask\n");
 
+	/* A failed bulk write can still change part of the mask. */
+	ret = devm_add_action(dev, apple_pmic_event_restore_mask, gpio);
+	if (ret)
+		return ret;
+
 	/* As iOS does at probe: mask all, unmask only what has a consumer. */
 	memset(gpio->mask, 0xff, sizeof(gpio->mask));
 	ret = regmap_bulk_write(gpio->regmap, ev->mask_base, gpio->mask,
 				ev->bytes);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to mask the events\n");
-	ret = devm_add_action_or_reset(dev, apple_pmic_event_restore_mask, gpio);
-	if (ret)
-		return ret;
 
 	/* The events, then the line interrupt (hwirq nevents). */
 	gpio->domain = irq_domain_create_linear(dev_fwnode(dev),
