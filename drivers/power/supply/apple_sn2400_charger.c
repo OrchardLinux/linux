@@ -148,7 +148,8 @@ static int sn2400_read_adc(struct sn2400_charger *charger,
 		*result = value * 25000;
 		break;
 	case SN2400_ADC_CHANNEL_IBUS:
-		*result = value * 10000;
+		/* iOS AppleSN2400Charger: 78/10000 A per LSB */
+		*result = value * 7800;
 		break;
 	case SN2400_ADC_CHANNEL_VDD_MAIN:
 		*result = 2500000 + value * 10000;
