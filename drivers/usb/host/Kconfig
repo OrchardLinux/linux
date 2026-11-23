@@ -739,11 +739,11 @@ config APPLE_A7_WLAN
 	depends on ARCH_APPLE && USB_EHCI_HCD && I2C && GPIOLIB && PM_GENERIC_DOMAINS
 	help
 	  Owns the HSIC PHY, radio reset, HOST_READY and the EHCI root port
-	  of the BCM43241 on the iPad Air 1 (J72) and iPad mini 2 (J85), so
-	  that brcmfmac can download its firmware over USB.
+	  of the BCM43241 on the iPad Air and iPad mini 2 and 3, so that
+	  brcmfmac can download its firmware over USB. The radio's wiring
+	  comes from its apple,s5l8960x-hsic-wlan device tree node.
 
-	  The J72 baseline was measured on that board and is enforced. The
-	  J85 addresses come from its Apple device tree; its register
-	  baselines are unmeasured, so they are logged and any write that
-	  depends on a J72 baseline is refused unless the board matches it.
+	  The register baseline was measured on an iPad Air (J72). On every
+	  board a value that differs from it is logged, and any write that
+	  depends on it is refused unless the board matches it.
 	  Requires the confirm_native parameter; there is no DT probe.

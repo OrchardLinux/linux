@@ -102,10 +102,9 @@ static int hcd_prepare(struct platform_device *consumer, void __iomem *ehci)
   saved_ports[i] = readl(ehci + 0x54 + i * 4);
   /* No existing device, powered port, reset or OHCI transaction to disturb. */
   if (saved_ports[i] == PORT_OWNER) continue;
-  if (board->measured) return -EBUSY;
-  pr_warn(DRV_NAME ": %s port%d=%08x, J72 measured %08x on every port (unverified on %s)\n",
-          board->name, i + 1, saved_ports[i], PORT_OWNER, board->name);
-  /* Never take over an enabled or resetting port on an unmeasured board. */
+  pr_warn(DRV_NAME ": %s port%d=%08x, J72 measured %08x on every port\n",
+          board->name, i + 1, saved_ports[i], PORT_OWNER);
+  /* Never take over an enabled or resetting port. */
   if (saved_ports[i] & (PORT_PE | PORT_RESET)) return -EBUSY;
  }
  host_region = request_mem_region(board->ehci_base, 0x10000, DRV_NAME);
@@ -166,9 +165,8 @@ static int hcd_enumerate(void __iomem *ehci)
    usb_unlock_device(radio_device);
    if (!rom_result) for (i = 0; i < 6; i++) rom_words[i] = le32_to_cpu(identity[i]);
   } else {
-   if (!board->measured)
-    pr_warn(DRV_NAME ": %s radio is not 0a5c:%04x high speed as measured on J72 (unverified on %s); no ROM query\n",
-            board->name, board->usb_pid, board->name);
+   pr_warn(DRV_NAME ": %s radio is not 0a5c:%04x high speed as measured on J72; no ROM query\n",
+           board->name, board->usb_pid);
    rom_result = -ENODEV;
   }
   usb_put_dev(radio_device);

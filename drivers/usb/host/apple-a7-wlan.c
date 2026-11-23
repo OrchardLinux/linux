@@ -1,17 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Apple A7 (S5L8960X) HSIC Wi-Fi transport owner: PHY, radio reset, HOST_READY
- * and the EHCI root port of the BCM43241, from per-board data.
+ * and the EHCI root port of the BCM43241.
  *
- * Measured on the iPad Air 1 (J72, EHCI0 port 3): PMU GPIO3 09->0b->09,
- * HOST_READY uses a standard exclusive gpiod consumer claim, retains
- * direction/mux, and returns low before reset/PHY stop. Standard EHCI
- * enumeration and strict ROM query; optional persistent owner for the
- * separately loaded firmware driver.
+ * Where the radio sits is board wiring and comes from the device tree: the
+ * apple,s5l8960x-hsic-wlan node names the HSIC PHY and EHCI registers, the
+ * EHCI interrupt, the HSIC PHY power state (whose parent is the USB2HOST
+ * one), the EHCI root port and the HOST_READY/DEVICE_READY pins. The iPad
+ * Air's radio is on EHCI0 port 3, the iPad mini 2's and 3's on EHCI1 port 1.
  *
- * The iPad mini 2 (J85, EHCI1 port 1) addresses come from its Apple device
- * tree and this kernel's PMGR description. Its register baselines have not
- * been measured: the J85 path logs observed and J72-measured values, and
- * refuses any write whose precondition is a J72 measurement it does not meet.
+ * The register sequence was measured on an iPad Air (J72): PMU GPIO3
+ * 09->0b->09, HOST_READY through a standard exclusive gpiod consumer claim
+ * that retains direction/mux and returns low before reset/PHY stop, standard
+ * EHCI enumeration and a strict ROM query; optional persistent owner for the
+ * separately loaded firmware driver. The iPad mini 2 (J85) ran it too. Every
+ * board gets one policy: a value a following write depends on must match the
+ * J72 measurement or the write is refused; a value that only describes the
+ * starting state is logged when it differs, and the sequence continues.
  */
 #include <linux/delay.h>
 #include <linux/mutex.h>
@@ -42,8 +46,10 @@
 #define USB_COMPLEX 0x20c900000ULL	/* ADT usb-complex reg, usb_widget at +1c/3c/5c/7c */
 #define GPIO_BASE 0x20e300000ULL
 #define PMU_GPIO3 0x403		/* D2089 GPIO3 configuration: radio reset */
+/* The BCM43241 boot ROM: AppleBCMWLANBusInterfaceHSICShim's "4324" personality */
+#define RADIO_PID 0xbd1c
 
-/* Measured on J72 (iPad Air 1); unverified on any other board. */
+/* Measured on J72 (iPad Air 1); the reference for every board. */
 #define J72_PHY_CONTROL 4
 #define J72_PHY_CONFIG 0x153
 #define J72_WIDGET 0x108
@@ -58,14 +64,10 @@
 #define J72_ROM_RAMSIZE 0x90000
 #define J72_ROM_REMAP 0x60000000
 
+/* The radio's wiring, from its apple,s5l8960x-hsic-wlan device tree node. */
 struct a7_wlan_board {
-	const char *compatible;
-	const char *name;
-	/* true: every J72 baseline is enforced exactly (J72 itself). */
-	bool measured;
-	const char *phy_domain;		/* PMGR child: HSIC PHY power state */
-	const char *host_domain;	/* PMGR child: USB2HOST power state */
-	u32 phy_domain_reg, host_domain_reg;
+	const char *name;		/* the machine's first compatible */
+	u32 phy_domain_reg, host_domain_reg;	/* PMGR: HSIC PHY, USB2HOST */
 	u64 phy_base;			/* HSIC PHY control (+0) / config (+8) */
 	u64 ehci_base;
 	u32 ehci_irq;
@@ -74,77 +76,29 @@ struct a7_wlan_board {
 	u16 usb_pid;			/* 0a5c:xxxx boot ROM identity */
 };
 
-static const struct a7_wlan_board boards[] = {
-	{
-		/* All values measured on the J72 itself. */
-		.compatible = "apple,j72",
-		.name = "J72",
-		.measured = true,
-		.phy_domain = PMGR "power-controller@20120",	/* hsic1_phy */
-		.host_domain = PMGR "power-controller@20170",	/* usb2host0 */
-		.phy_domain_reg = 0x20120,
-		.host_domain_reg = 0x20170,
-		.phy_base = 0x20c000050ULL,
-		.ehci_base = 0x20c200000ULL,
-		.ehci_irq = 163,
-		.port = 3,
-		.host_ready_gpio = 163,
-		.device_ready_gpio = 164,
-		.usb_pid = 0xbd1c,
-	},
-	{
-		/* J85 ADT /arm-io/usb-complex/usb-ehci1/wlan: EHCI1 reg 0x400000
-		 * (0x20c400000), irq 0xa5, port 1, PHY reg 0x60 (0x20c000060),
-		 * host_ready GPIO 0xa3, device_ready GPIO 0xa4, reset PMU GPIO 3.
-		 * ADT pmgr devices: HSIC2_PHY (0x20128) is the only HSIC PHY whose
-		 * parent is USB2HOST1 (0x20180), matching ps_hsic2_phy/ps_usb2host1.
-		 * The 0a5c:bd1c identity is the J72 one, assumed for the same chip.
-		 */
-		.compatible = "apple,j85",
-		.name = "J85",
-		.measured = false,
-		.phy_domain = PMGR "power-controller@20128",	/* hsic2_phy */
-		.host_domain = PMGR "power-controller@20180",	/* usb2host1 */
-		.phy_domain_reg = 0x20128,
-		.host_domain_reg = 0x20180,
-		.phy_base = 0x20c000060ULL,
-		.ehci_base = 0x20c400000ULL,
-		.ehci_irq = 165,
-		.port = 1,
-		.host_ready_gpio = 163,
-		.device_ready_gpio = 164,
-		.usb_pid = 0xbd1c,
-	},
-};
+static struct a7_wlan_board radio;
 static const struct a7_wlan_board *board;
 
-/* A J72 measurement that this board need not match: J72 refuses a mismatch,
- * unmeasured boards log it and continue.
+/* A J72 measurement that only describes the starting state: a board that
+ * differs logs it and continues.
  */
 static bool observe(const char *what, u32 seen, u32 j72)
 {
-	if (seen == j72)
-		return true;
-	if (board->measured)
-		return false;
-	pr_warn(DRV_NAME ": %s %s=%08x, J72 measured %08x (unverified on %s); continuing\n",
-		board->name, what, seen, j72, board->name);
+	if (seen != j72)
+		pr_warn(DRV_NAME ": %s %s=%08x, J72 measured %08x; continuing\n",
+			board->name, what, seen, j72);
 	return true;
 }
 
 /* A J72 measurement that a following write depends on: every board must
- * match it, so an unmeasured board only logs and never writes on a guess.
+ * match it, so a board that differs only logs and never writes on a guess.
  */
 static bool gate(const char *what, u32 seen, u32 j72)
 {
-	if (seen == j72) {
-		if (!board->measured)
-			pr_info(DRV_NAME ": %s %s=%08x matches J72 (measured on J72, unverified on %s)\n",
-				board->name, what, seen, board->name);
+	if (seen == j72)
 		return true;
-	}
-	pr_warn(DRV_NAME ": %s %s=%08x, J72 measured %08x (unverified on %s); refusing the dependent write\n",
-		board->name, what, seen, j72, board->name);
+	pr_warn(DRV_NAME ": %s %s=%08x, J72 measured %08x; refusing the dependent write\n",
+		board->name, what, seen, j72);
 	return false;
 }
 
@@ -418,9 +372,6 @@ static bool rom_identity_ok(void)
 {
 	if (rom_result || radio_vid != 0x0a5c || radio_pid != board->usb_pid)
 		return false;
-	if (board->measured)
-		return rom_words[0] == J72_ROM_CHIP && rom_words[1] == J72_ROM_REV &&
-		       rom_words[2] == J72_ROM_RAMSIZE && rom_words[3] == J72_ROM_REMAP;
 	/* The ADT names the chipset ('wifi-chipset' 4324); the rest is J72's. */
 	if (rom_words[0] != J72_ROM_CHIP) {
 		pr_warn(DRV_NAME ": %s ROM chip %04x is not the ADT 4324\n",
@@ -433,6 +384,54 @@ static bool rom_identity_ok(void)
 	return true;
 }
 
+/* The ready pins are pinctrl GPIOs: <&pinctrl N flags>. */
+static int radio_pin(struct device_node *node, const char *name, u32 *pin)
+{
+	struct of_phandle_args args;
+	int ret = of_parse_phandle_with_args(node, name, "#gpio-cells", 0, &args);
+
+	if (ret)
+		return ret;
+	ret = of_node_name_eq(args.np, "pinctrl") && args.args_count >= 1 ? 0 : -EINVAL;
+	*pin = args.args[0];
+	of_node_put(args.np);
+	return ret;
+}
+
+/* Fill the radio's wiring from its device tree node. */
+static int radio_from_dt(void)
+{
+	struct device_node *node = of_find_compatible_node(NULL, NULL, "apple,s5l8960x-hsic-wlan");
+	struct resource phy_res, ehci_res;
+	u32 cell[2];
+	int ret = -ENODEV;
+
+	if (!node || !of_device_is_available(node))
+		goto out;
+	if (of_property_read_string_index(of_root, "compatible", 0, &radio.name) ||
+	    of_address_to_resource(node, 0, &phy_res) ||
+	    of_address_to_resource(node, 1, &ehci_res) ||
+	    resource_size(&phy_res) < 0x10 || resource_size(&ehci_res) < 0x10000 ||
+	    of_property_read_u32_array(node, "interrupts", cell, 2) || cell[0] != 0 ||
+	    of_property_read_u32(node, "apple,ehci-port", &radio.port) ||
+	    radio_pin(node, "host-ready-gpios", &radio.host_ready_gpio) ||
+	    radio_pin(node, "device-ready-gpios", &radio.device_ready_gpio))
+		goto out;
+	/* The HSIC PHY power state; its parent is the EHCI's USB2HOST one. */
+	np = of_parse_phandle(node, "power-domains", 0);
+	host_np = np ? of_parse_phandle(np, "power-domains", 0) : NULL;
+	if (!np || !host_np)
+		goto out;
+	radio.phy_base = phy_res.start;
+	radio.ehci_base = ehci_res.start;
+	radio.ehci_irq = cell[1];
+	radio.usb_pid = RADIO_PID;
+	ret = 0;
+out:
+	of_node_put(node);
+	return ret;
+}
+
 static int __init observer_init(void)
 {
  int ret, i;
@@ -440,33 +439,33 @@ static int __init observer_init(void)
 
 	if (!confirm_native)
         return -EPERM;
-	for (i = 0; i < ARRAY_SIZE(boards); i++)
-		if (of_machine_is_compatible(boards[i].compatible))
-			board = &boards[i];
-	if (!board)
+	/* No radio described: nothing to own on this machine. */
+	if (radio_from_dt()) {
+		of_node_put(host_np);
+		of_node_put(np);
+		np = host_np = NULL;
 		return -ENODEV;
-	if (!board->measured)
-		pr_info(DRV_NAME ": %s: addresses from its ADT; register baselines measured on J72, unverified on %s\n",
-			board->name, board->name);
-	highest = max(board->phy_domain_reg, board->host_domain_reg) + 4;
-	np = of_find_node_by_path(board->phy_domain);
-	host_np = of_find_node_by_path(board->host_domain);
-	if (!np || !host_np || !of_device_is_compatible(np, "apple,pmgr-pwrstate") ||
+	}
+	if (!of_device_is_compatible(np, "apple,pmgr-pwrstate") ||
 	    np->parent != host_np->parent ||
 	    of_property_read_u32_array(np, "reg", provider_reg, 2) ||
 	    of_property_read_u32_array(host_np, "reg", host_reg, 2) ||
-	    provider_reg[0] != board->phy_domain_reg || provider_reg[1] != 4 ||
-	    host_reg[0] != board->host_domain_reg || host_reg[1] != 4 ||
-	    of_address_to_resource(np->parent, 0, &resource) ||
+	    provider_reg[1] != 4 || host_reg[1] != 4) {
+		result = -ENODEV;
+		goto out;
+	}
+	radio.phy_domain_reg = provider_reg[0];
+	radio.host_domain_reg = host_reg[0];
+	board = &radio;
+	pr_info(DRV_NAME ": %s: radio on EHCI %#llx port %u, HSIC PHY %#llx\n",
+		board->name, board->ehci_base, board->port, board->phy_base);
+	highest = max(board->phy_domain_reg, board->host_domain_reg) + 4;
+	if (of_address_to_resource(np->parent, 0, &resource) ||
 	    resource.start != PMGR_BASE || resource_size(&resource) < highest) {
 		result = -ENODEV;
 		goto out;
 	}
-	parent = of_parse_phandle(np, "power-domains", 0);
-	if (parent != host_np) {
-		result = -ENODEV;
-		goto out;
-	}
+	parent = of_node_get(host_np);
 	phy = ioremap(PMGR_BASE + board->phy_domain_reg, 4);
 	host = ioremap(PMGR_BASE + board->host_domain_reg, 4);
 	base = ioremap(board->phy_base, 0x10);
@@ -625,9 +624,8 @@ static int __init observer_init(void)
     if (host_high_cfg != (host_ready_before | 1)) { result = -EIO; goto cleanup; }
     result = ready_window(gpio, host_ready_before | 1, &high_window_samples, &high_window_ready);
     if (result) goto cleanup;
-    if (!board->measured)
-        pr_info(DRV_NAME ": %s DEVICE_READY high in %u/%u samples after HOST_READY (J72: 45/50)\n",
-                board->name, high_window_ready, high_window_samples);
+    pr_info(DRV_NAME ": %s DEVICE_READY high in %u/%u samples after HOST_READY (J72: 45/50)\n",
+            board->name, high_window_ready, high_window_samples);
     result = hcd_enumerate(ehci);
     ehci_state(ehci, ehci_high);
     if (!result && keep_active) {
@@ -784,4 +782,4 @@ static void __exit observer_exit(void) { }
 module_init(observer_init);
 module_exit(observer_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Apple A7 HSIC Wi-Fi owner (J72 measured, J85 unverified) with synchronized stop and strict ROM gate");
+MODULE_DESCRIPTION("Apple A7 HSIC Wi-Fi owner with synchronized stop and strict ROM gate");
