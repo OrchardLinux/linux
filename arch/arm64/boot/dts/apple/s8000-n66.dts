@@ -12,6 +12,10 @@
 / {
 	compatible = "apple,n66", "apple,s8000", "apple,arm-platform";
 	model = "Apple iPhone 6s Plus (Samsung)";
+
+	aliases {
+		als0 = &als;	/* the loader copies the ADT's alsCalibration here */
+	};
 };
 
 &pcie0_dart0 {
@@ -25,4 +29,15 @@
 /* Storage only: the Wi-Fi port (pci-bridge1) isn't described yet. */
 &pcie0 {
 	status = "okay";
+};
+
+&i2c2 {
+	status = "okay";
+
+	/* ADT i2c2/als: als,ct821 @0x29, interrupt AP GPIO 131 */
+	als: light-sensor@29 {
+		compatible = "apple,ct821", "amstaos,tsl2581";
+		reg = <0x29>;
+		interrupts-extended = <&pinctrl_ap 131 IRQ_TYPE_LEVEL_LOW>;
+	};
 };
