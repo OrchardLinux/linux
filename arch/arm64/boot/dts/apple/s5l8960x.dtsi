@@ -218,6 +218,28 @@
 			#sound-dai-cells = <0>;
 		};
 
+		/*
+		 * MCA1: Apple's mca,s5l8960x, mca-version 1, the speaker link of
+		 * the iPad mini 2 (J85 ADT, iOS 12.5.8: aud1 to pin1, SmartIO
+		 * 0x2a TX, its MCLK word at 0x20a002004).
+		 */
+		mca1: mca@20a0c4000 {
+			compatible = "apple,s5l8960x-mca-tdm";
+			reg = <0x2 0x0a0c4000 0x0 0x4000>,
+			      <0x2 0x0a002004 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 148 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca1>;
+			dmas = <&sio 0x2a>;
+			dma-names = "tx";
+			apple,i2s-switch = <&i2s_switch 1 1>;
+			#clock-cells = <0>;
+			clock-output-names = "mca1-mclk";
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
 		i2c0: i2c@20a110000 {
 			compatible = "apple,s5l8960x-i2c", "apple,i2c";
 			reg = <0x2 0x0a110000 0x0 0x1000>;
