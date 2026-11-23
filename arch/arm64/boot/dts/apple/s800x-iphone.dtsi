@@ -14,6 +14,7 @@
 		als0 = &als;	/* the loader copies the ADT's alsCalibration here */
 		spi2 = &spi2;
 		touchscreen0 = &touchscreen;	/* the loader copies the ADT calibration */
+		serial5 = &serial5;	/* the gauge's HDQ UART: a fixed port, as on the iPad 5 */
 	};
 };
 
@@ -174,4 +175,9 @@
 	mount-matrix = "1", "0", "0",
 		       "0", "1", "0",
 		       "0", "0", "1";
+};
+
+/* The USB device controller tells the SN2400 driver what the USB host allows. */
+&usbdev {
+	usb-psy-name = "usb";
 };
