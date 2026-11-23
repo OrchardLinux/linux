@@ -1317,6 +1317,51 @@ static const struct s8000_mca_hw s8000_mca_hw = {
 };
 
 /*
+ * N66 (iPhone 6s Plus) MCA2 TX to the CS35L19 speaker amplifier, from the
+ * ADT's /arm-io/mca2/audio-speaker iisConfig (the phone's live ADT, iOS 15):
+ *
+ *   10 12 00 00 08 00 01 00  00 1b b7 00 00 00 10 00
+ *   30 00 01 00 02 00 00 00  0c 00 00 00 01 02 10 10  00 00 00 00
+ *
+ * 8 slots of 16 bits (a 128-bit frame) with a 16-bit sync pulse and one bit
+ * of data delay, format flags 0x12, the speaker in slot 1, a 12 MHz MCLK
+ * output. iOS runs this MCA as a clock consumer of the CS42L71 codec's ASP,
+ * which Linux does not drive yet, so the MCA provides the clocks itself from
+ * NCO 2 (6.144 MHz at 48 kHz), with the polarity bit _setIISConfig_v4 sets
+ * for flags 0x12 in that role (as on J81). The SmartIO shim words are the
+ * ADT's dma-channels for endpoint 0x2c (FIFO 0x60, trigger 0x30).
+ *
+ * The output is capped at -12 dB (attenuation 4), unconditionally: there is
+ * no speaker protection yet. iOS reads the amplifier's voltage and current
+ * sense back and keeps the speaker in its limits; Linux does not. The cap
+ * lives in this table only, so no ALSA control or device tree property can
+ * lift it, and with mmap off every sample passes through mca_attenuate().
+ */
+static const struct s8000_mca_hw s8000_tdm_mca_hw = {
+	.version = 4,
+	.regs = &mca_v4_regs,
+	.clock_provider = true,
+	.dai_format = SND_SOC_DAIFMT_DSP_A,
+	.channels = 1,
+	.slots = 8,
+	.tx_slots = 0x2,
+	.tx_cfg = 0x133,
+	.rx_cfg = 0x137,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.frame_flags = MCA_FRAME_POL,
+	.sync_bits = 16,
+	.stream_irqs = MCA_IRQ_FRAME_ERROR,
+	.attenuation = 4,
+	.mclk_ctl = 0x58,
+	.mclk_rate = 12000000,
+	.sio_xfer16 = 0x21,
+	.sio_xfer32 = 0x22,
+	.sio_timeout = 0,
+	.sio_fifo = 0x60,
+	.sio_trigger = 0x30,
+};
+
+/*
  * J71b MCA2 TX: iPadOS 17.7.11 audio-speaker iisConfig and dma-channels, not
  * the A9 MCA0 values. Slots 0-3 carry the four amplifiers; which speaker sits
  * in which slot is not in the ADT. FRAME has no bits 6:2 set and the IRQ mask
@@ -1428,6 +1473,7 @@ static const struct s8000_mca_hw s5l8960x_mca_hw = {
 static const struct of_device_id s8000_mca_of_match[] = {
 	{ .compatible = "apple,s5l8960x-mca", .data = &s5l8960x_mca_hw },
 	{ .compatible = "apple,s8000-mca", .data = &s8000_mca_hw },
+	{ .compatible = "apple,s8000-mca-tdm", .data = &s8000_tdm_mca_hw },
 	{ .compatible = "apple,t7001-mca", .data = &t7001_mca_hw },
 	{ .compatible = "apple,t8010-mca", .data = &t8010_mca_hw },
 	{ .compatible = "apple,t8010-mca-i2s", .data = &t8010_i2s_mca_hw },
