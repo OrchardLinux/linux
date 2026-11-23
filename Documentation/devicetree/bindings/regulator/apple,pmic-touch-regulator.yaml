@@ -23,6 +23,7 @@ properties:
       - apple,acorn-touch-analog-regulator
       - apple,adelyn-touch-core-regulator
       - apple,angel-touch-analog-regulator
+      - apple,antigua-touch-core-regulator
       - apple,chestnut-touch-hv-regulator
       - apple,d2089-touch-analog-regulator
       - apple,d2089-touch-core-regulator
