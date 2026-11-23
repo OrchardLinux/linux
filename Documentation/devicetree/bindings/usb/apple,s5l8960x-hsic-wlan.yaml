@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/usb/apple,s5l8960x-hsic-wlan.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple A7 HSIC Wi-Fi radio
+
+maintainers:
+  - Henrik Klee <henrik@goat-code.com>
+
+description: |
+  The Apple A7 (S5L8960X) iPads have a Broadcom BCM43241 Wi-Fi radio on
+  an HSIC link: an EHCI root port behind its own HSIC PHY. The node
+  describes that wiring, as Apple's device tree does in
+  /arm-io/usb-complex/usb-ehciN/wlan, for the driver that owns the PHY,
+  the radio's reset and HOST_READY, and the EHCI port. The radio's reset
+  is the PMIC's GPIO3 on every board.
+
+properties:
+  compatible:
+    const: apple,s5l8960x-hsic-wlan
+
+  reg:
+    items:
+      - description: HSIC PHY control (+0) and configuration (+8)
+      - description: EHCI controller the radio is attached to
+
+  reg-names:
+    items:
+      - const: phy
+      - const: ehci
+
+  interrupts:
+    maxItems: 1
+    description: The EHCI controller's interrupt
+
+  power-domains:
+    maxItems: 1
+    description:
+      The HSIC PHY power state; its parent is the EHCI controller's.
+
+  apple,ehci-port:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    description: The EHCI root port of the radio
+
+  host-ready-gpios:
+    maxItems: 1
+    description: HOST_READY, driven by the host
+
+  device-ready-gpios:
+    maxItems: 1
+    description: DEVICE_READY, driven by the radio
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - power-domains
+  - apple,ehci-port
+  - host-ready-gpios
+  - device-ready-gpios
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        wifi@20c000050 {
+            compatible = "apple,s5l8960x-hsic-wlan";
+            reg = <0x2 0x0c000050 0x0 0x10>, <0x2 0x0c200000 0x0 0x10000>;
+            reg-names = "phy", "ehci";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 163 IRQ_TYPE_LEVEL_HIGH>;
+            power-domains = <&ps_hsic1_phy>;
+            apple,ehci-port = <3>;
+            host-ready-gpios = <&pinctrl 163 GPIO_ACTIVE_HIGH>;
+            device-ready-gpios = <&pinctrl 164 GPIO_ACTIVE_HIGH>;
+        };
+    };
