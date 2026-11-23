@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Lightning charging for Apple devices with a Tristar (CBTL1610) port
- * controller and a D2365-family PMIC (D2365, or the iPad Air 2's D2207).
+ * controller and a D2365-family PMIC (D2365, the iPad Air 2's D2207 or the
+ * A7 iPads' D2089).
  *
  * iBoot leaves the PMIC input-current limit at 100 mA. On every attachment
  * this driver identifies the source and grants what it advertises, up to the
@@ -97,6 +98,28 @@ static const struct tristar_pmic tristar_d2365 = {
  * after each read. The plug event is event 0.
  */
 static const struct tristar_pmic tristar_d2207 = {
+	.connected = 0x00,
+	.connected_new = BIT(3),
+	.status = 0x02,
+	.input_limit = 0x00,
+	.adc_start = TRISTAR_CHG_ADC_START | 6,
+	.adc_result = 0x02,
+	.adc_rearm = true,
+	.plug_event = 0,
+};
+
+/*
+ * D2089 (A7 iPads), from iOS 12 AppleD2089PMU and AppleD2089PMUPowerSource:
+ * the D2207's layout. The power source reads the 13 status bytes at 0x60
+ * and takes bit 0 of 0x60 as connected, needing bit 3 as well for a new
+ * connection; it writes the input limit to 0x4c0 as (mA - 75) / 12.5. The
+ * ADC starts with bit 7 and the channel in 0x500 (6 for the Tristar's
+ * BrickID line, the ADT's function-brick_id_voltage), returns 12 bits at
+ * 0x502 that iOS scales for channel 6 as this driver does, and is cleared
+ * through 0x501 and 0x500 after each read. ADC done is event 89; the plug
+ * event is event 0.
+ */
+static const struct tristar_pmic tristar_d2089 = {
 	.connected = 0x00,
 	.connected_new = BIT(3),
 	.status = 0x02,
@@ -1769,6 +1792,7 @@ static const struct dev_pm_ops tristar_pm_ops = {
 };
 
 static const struct of_device_id tristar_of_match[] = {
+	{ .compatible = "apple,d2089-tristar-charger", .data = &tristar_d2089 },
 	{ .compatible = "apple,d2207-tristar-charger", .data = &tristar_d2207 },
 	{ .compatible = "apple,tristar-charger", .data = &tristar_d2365 },
 	{ }
