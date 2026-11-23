@@ -30,6 +30,7 @@
 
 #include "apple_z2_n61.h"
 #include "apple_z2_j72.h"
+#include "apple_z2_d21.h"
 
 #define APPLE_Z2_NUM_FINGERS_OFFSET      16
 #define APPLE_Z2_FINGERS_OFFSET          24
@@ -146,6 +147,7 @@ enum apple_z2_variant {
 	APPLE_Z2_VARIANT_D111,
 	APPLE_Z2_VARIANT_N61,
 	APPLE_Z2_VARIANT_J72,
+	APPLE_Z2_VARIANT_D21,
 };
 
 struct apple_z2_hbpp_reg {
@@ -4873,6 +4875,19 @@ static const struct apple_z2_chip_info apple_z2_d111_info = {
 	.variant = APPLE_Z2_VARIANT_D111,
 };
 
+/* The iPhone 8 Plus runs on the D21 backend (apple_z2_d21.h). */
+static const struct apple_z2_chip_info apple_z2_iphone8_plus_info = {
+	.name = "iPhone 8 Plus Touchscreen",
+	.variant = APPLE_Z2_VARIANT_D21,
+};
+
+static bool apple_z2_spi_is_d21(struct spi_device *spi)
+{
+	const struct apple_z2_chip_info *info = spi_get_device_match_data(spi);
+
+	return info && info->variant == APPLE_Z2_VARIANT_D21;
+}
+
 static const struct apple_z2_chip_info apple_z2_n61_info = {
 	.name = "iPhone 6 Touchscreen",
 	.variant = APPLE_Z2_VARIANT_N61,
@@ -4894,6 +4909,8 @@ static int apple_z2_probe(struct spi_device *spi)
 	info = spi_get_device_match_data(spi);
 	if (!info)
 		return -ENODEV;
+	if (info->variant == APPLE_Z2_VARIANT_D21)
+		return apple_z2_d21_probe(spi);
 
 	z2 = devm_kzalloc(dev, sizeof(*z2), GFP_KERNEL);
 	if (!z2)
@@ -5186,6 +5203,10 @@ static void apple_z2_remove(struct spi_device *spi)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(spi);
 
+	if (apple_z2_spi_is_d21(spi)) {
+		apple_z2_d21_remove(spi);
+		return;
+	}
 	cancel_work_sync(&z2->resume_work);
 	apple_z2_stop(z2);
 }
@@ -5194,6 +5215,8 @@ static void apple_z2_shutdown(struct spi_device *spi)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(spi);
 
+	if (apple_z2_spi_is_d21(spi))
+		return;
 	if (apple_z2_is_j72(z2))
 		apple_z2_stop(z2);
 }
@@ -5202,6 +5225,8 @@ static int apple_z2_suspend(struct device *dev)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
 
+	if (apple_z2_spi_is_d21(to_spi_device(dev)))
+		return apple_z2_d21_suspend(dev);
 	/* A controller still booting from the last resume stops first */
 	cancel_work_sync(&z2->resume_work);
 	apple_z2_stop(z2);
@@ -5248,6 +5273,8 @@ static int apple_z2_resume(struct device *dev)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
 
+	if (apple_z2_spi_is_d21(to_spi_device(dev)))
+		return apple_z2_d21_resume(dev);
 	z2->stopping = false;
 	z2->recovering = false;
 	z2->boot_due = true;
@@ -5259,6 +5286,8 @@ static void __maybe_unused apple_z2_complete(struct device *dev)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
 
+	if (apple_z2_spi_is_d21(to_spi_device(dev)))
+		return;
 	if (!z2->boot_due)
 		return;
 	z2->boot_due = false;
@@ -5282,6 +5311,7 @@ static const struct of_device_id apple_z2_of_match[] = {
 	{ .compatible = "apple,j172-touchscreen", .data = &apple_z2_j172_info },
 	{ .compatible = "apple,d11-touchscreen", .data = &apple_z2_d11_info },
 	{ .compatible = "apple,d111-touchscreen", .data = &apple_z2_d111_info },
+	{ .compatible = "apple,d21-touchscreen", .data = &apple_z2_iphone8_plus_info },
 	{ .compatible = "apple,n61-touchscreen", .data = &apple_z2_n61_info },
 	{ .compatible = "apple,n102-touchscreen", .data = &apple_z2_n102_info },
 	{ .compatible = "apple,n66-touchscreen", .data = &apple_z2_n66_info },
@@ -5303,6 +5333,7 @@ static struct spi_device_id apple_z2_of_id[] = {
 	{ .name = "j172-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_j172_info },
 	{ .name = "d11-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_d11_info },
 	{ .name = "d111-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_d111_info },
+	{ .name = "d21-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_iphone8_plus_info },
 	{ .name = "n61-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n61_info },
 	{ .name = "n102-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n102_info },
 	{ .name = "n66-touchscreen", .driver_data = (kernel_ulong_t)&apple_z2_n66_info },
