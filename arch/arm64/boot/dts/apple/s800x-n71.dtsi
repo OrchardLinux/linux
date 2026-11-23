@@ -17,3 +17,8 @@
 	touchscreen-size-x = <750>;
 	touchscreen-size-y = <1334>;
 };
+
+/* ADT charger charge-limits[0] */
+&battery_info {
+	constant-charge-current-max-microamp = <1195000>;
+};

@@ -73,3 +73,76 @@
 &disp0 {
 	power-domains = <&ps_disp0>, <&ps_mipi_dsi>;
 };
+
+/*
+ * Battery and charger, the same on the iPhone 6s, 6s Plus and SE (iOS
+ * 15.8.8 DeviceTree.n66ap, n71ap, n69uap): an SN2400 charger at i2c1 0x75
+ * owns the battery's HDQ line, and the bq27540 gauge answers on uart5
+ * (function-battery_swi, AP GPIO 2), as on the iPhone 7. Each model sets
+ * its own charge current: the first entry of its ADT charger charge-limits.
+ */
+/ {
+	battery_info: battery {
+		compatible = "simple-battery";
+	};
+};
+
+&i2c1 {
+	status = "okay";
+
+	charger@75 {
+		compatible = "apple,sn2400";
+		reg = <0x75>;
+
+		sn2400_charger: charger {
+			compatible = "apple,sn2400-charger";
+			monitored-battery = <&battery_info>;
+			/* ADT charger usb-input-limit-max */
+			input-current-limit-microamp = <2000000>;
+			mux-states = <&hdq_mux 0>;
+			mux-state-names = "hdq";
+		};
+
+		hdq_mux: hdq-mux {
+			compatible = "apple,sn2400-hdq-mux";
+			#mux-state-cells = <1>;
+		};
+	};
+};
+
+&pinctrl_ap {
+	battery_swi_pins: battery-swi-pins {
+		pinmux = <APPLE_PINMUX(2, 1)>;
+	};
+};
+
+&serial5 {
+	pinctrl-0 = <&battery_swi_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+		mux-states = <&hdq_mux 1>;
+		mux-state-names = "hdq";
+
+		fuel-gauge {
+			compatible = "ti,bq27540-hdq";
+			monitored-battery = <&battery_info>;
+		};
+	};
+};
+
+/*
+ * Apple's A9 iPhone AOP firmware (aopfw-s8000aop) serves the accelerometer,
+ * gyroscope and pressure sensor. Its mount-matrix has not been measured on
+ * a phone yet, so the sensors report in the AOP's own frame.
+ */
+&aop {
+	firmware-name = "apple/aop-s8000.bin", "apple/aop-s8000-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};

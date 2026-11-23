@@ -56,3 +56,8 @@
 &serial0 {
 	status = "okay";
 };
+
+/* The VXD decoder is part of the SoC: every A9 device has it (ADT vxd). */
+&vxd {
+	status = "okay";
+};
