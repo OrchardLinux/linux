@@ -1754,6 +1754,8 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
 	  .data = &bcm4355_j172_device_data },
 	/* The iPad Air 2 BCM4350C2 runs the plain sequence at 115,200 baud. */
 	{ .compatible = "apple,j81-bcm4350c2-bt" },
+	/* The iPhone 6s Plus BCM4350C5, as the iPad Air 2's C2 so far. */
+	{ .compatible = "apple,n66-bcm4350c5-bt" },
 	/* The iPod touch 6 BCM4345B1 uses the plain sequence at 115,200 baud. */
 	{ .compatible = "apple,n102-bcm4345b1-bt" },
 	{ .compatible = "apple,j71b-bcm4355c1-bt",
