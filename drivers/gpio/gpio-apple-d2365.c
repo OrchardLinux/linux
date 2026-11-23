@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * GPIO and PMU event interrupt driver for Apple/Dialog PMICs used with the
- * A8, A8X, A9 and A10 SoCs.
+ * A7, A8, A8X, A9 and A10 SoCs. On the A7's D2089 only the PMU events are
+ * described, not its GPIO lines.
  *
  * The D2365 latches 240 PMU events and the D2207 112 in a read-to-clear
  * block. Any unmasked pending event pulls the PMU interrupt line to the AP
@@ -82,6 +83,18 @@
 #define D2207_EVENT_MASK	0x70
 #define D2207_EVENT_BYTES	14
 #define D2207_GPIO_EVENT	0x18
+
+/*
+ * D2089 PMU events, as iOS 12 AppleD2089PMU accesses them: the same block
+ * as the D2207. The interrupt handler reads all 14 bytes at 0x50 and
+ * dispatches every set bit without writing them back; start writes all
+ * ones to the 14 mask bytes at 0x70 and subscribes events by number (ADC
+ * conversion complete is event 89, as on the D2207). Which events the
+ * GPIO lines raise is not known, so no GPIO line is described.
+ */
+#define D2089_EVENTS		0x50
+#define D2089_EVENT_MASK	0x70
+#define D2089_EVENT_BYTES	14
 
 #define D2365_GPIO_SPLIT		18
 #define D2365_GPIO_CFG_0_17	0x900
@@ -980,6 +993,9 @@ static int apple_pmic_gpio_probe(struct platform_device *pdev)
 	ret = apple_pmic_event_probe(pdev, gpio);
 	if (ret)
 		return ret;
+	/* A PMIC described only by its PMU events has no GPIO chip. */
+	if (!gpio->info->ngpio)
+		return 0;
 
 	gpio->chip.label = gpio->info->label;
 	gpio->chip.owner = THIS_MODULE;
@@ -996,6 +1012,17 @@ static int apple_pmic_gpio_probe(struct platform_device *pdev)
 
 	return devm_gpiochip_add_data(dev, &gpio->chip, gpio);
 }
+
+static const struct apple_pmic_event_info d2089_event_info = {
+	.status_base = D2089_EVENTS,
+	.mask_base = D2089_EVENT_MASK,
+	.bytes = D2089_EVENT_BYTES,
+};
+
+static const struct apple_pmic_gpio_info d2089_gpio_info = {
+	.label = "d2089-pmic-gpio",
+	.events = &d2089_event_info,
+};
 
 static const struct apple_pmic_gpio_info d2186_gpio_info = {
 	.label = "d2186-pmic-gpio",
@@ -1060,6 +1087,10 @@ static const struct apple_pmic_gpio_info d2365_gpio_info = {
 
 static const struct of_device_id d2365_gpio_of_match[] = {
 	{
+		.compatible = "apple,d2089-pmic-gpio",
+		.data = &d2089_gpio_info,
+	},
+	{
 		.compatible = "apple,d2186-pmic-gpio",
 		.data = &d2186_gpio_info,
 	},
@@ -1089,5 +1120,5 @@ static struct platform_driver d2365_gpio_driver = {
 };
 module_platform_driver(d2365_gpio_driver);
 
-MODULE_DESCRIPTION("Apple A8/A8X/A9/A10 PMIC GPIO and event interrupt driver");
+MODULE_DESCRIPTION("Apple A7/A8/A8X/A9/A10 PMIC GPIO and event interrupt driver");
 MODULE_LICENSE("GPL");
