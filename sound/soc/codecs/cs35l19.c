@@ -48,6 +48,11 @@
 #define CS35L19_AMP_CTL		0x12
 #define CS35L19_INT_STATUS_1	0x15
 #define CS35L19_INT_STATUS_2	0x16
+#define CS35L19_INT_OTE		BIT(0)	/* INT_STATUS_1: over-temperature shutdown */
+#define CS35L19_INT_OTW		BIT(1)	/* over-temperature warning */
+#define CS35L19_INT_AMP_SHORT	BIT(2)	/* output short shutdown */
+#define CS35L19_PDN_AMP		BIT(7)	/* PWRCTL1 */
+#define CS35L19_WATCH_MS	500
 #define CS35L19_TX_VMON		0x2d	/* .. 0x31: V, I, VP, VBST, FLAG */
 #define CS35L19_TX_EN1		0x32	/* .. 0x35 */
 #define CS35L19_RX_AUD		0x36
@@ -73,6 +78,9 @@ struct cs35l19 {
 	struct gpio_desc *keepalive;
 	struct delayed_work alive_work;
 	bool alive_level;
+	struct delayed_work watch_work;
+	bool faulted;			/* OTE or AMP_SHORT seen: amp held off */
+	unsigned int fault_vol;		/* DIG_VOL before the fault mute */
 	u8 cfg[CS35L19_CFG_LEN];
 	unsigned int rev;
 	unsigned int rate_code;
@@ -118,6 +126,46 @@ static void cs35l19_alive_stop(struct cs35l19 *cs)
 {
 	if (cs->keepalive)
 		cancel_delayed_work_sync(&cs->alive_work);
+}
+
+/*
+ * The amp's own protections: on over-temperature (OTE) or a shorted output
+ * (AMP_SHORT) it shuts its output down by itself, and it stays down until
+ * the release bits in AMP_CTL[3:0] are toggled, which this driver never
+ * does (power_on changes only AMP_CTL[7:4]). INT_MASK_1/2 gate only the INT
+ * pin, not the protections; they stay at their reset value, all masked, as
+ * iOS leaves them, and no interrupt is wired here. The status bits are
+ * sticky and clear on read: poll them while the amp is on, warn on any of
+ * the three, and on OTE or AMP_SHORT also mute and power the amp stage down
+ * until the stream stops, so that nothing (not even the volume control)
+ * brings the output back during this stream.
+ */
+static void cs35l19_watch(struct work_struct *work)
+{
+	struct cs35l19 *cs = container_of(to_delayed_work(work), struct cs35l19,
+					  watch_work);
+	struct regmap *map = cs->regmap;
+	unsigned int st1;
+
+	if (!regmap_read(map, CS35L19_INT_STATUS_1, &st1)) {
+		if (st1 & CS35L19_INT_OTW)
+			dev_warn(cs->dev, "over-temperature warning (status %02x)\n",
+				 st1);
+		if ((st1 & (CS35L19_INT_OTE | CS35L19_INT_AMP_SHORT)) &&
+		    !cs->faulted) {
+			dev_warn(cs->dev, "%s (status %02x): muted until the stream stops\n",
+				 st1 & CS35L19_INT_AMP_SHORT ? "output short" :
+							       "over-temperature shutdown",
+				 st1);
+			if (regmap_read(map, CS35L19_DIG_VOL, &cs->fault_vol))
+				cs->fault_vol = CS35L19_VOL_MUTE;
+			cs->faulted = true;
+			regmap_write(map, CS35L19_DIG_VOL, CS35L19_VOL_MUTE);
+			regmap_update_bits(map, CS35L19_PWRCTL1, CS35L19_PDN_AMP,
+					   CS35L19_PDN_AMP);
+		}
+	}
+	schedule_delayed_work(&cs->watch_work, msecs_to_jiffies(CS35L19_WATCH_MS));
 }
 
 /* AppleCS35L19Amp's power-on (0x80af55d4) and serial port (0x80af5be0). */
@@ -211,6 +259,10 @@ static void cs35l19_power_off(struct cs35l19 *cs)
 
 	if (regmap_read(map, CS35L19_DIG_VOL, &vol))
 		return;
+	if (cs->faulted) {
+		vol = cs->fault_vol;
+		cs->faulted = false;
+	}
 	regmap_write(map, CS35L19_DIG_VOL, CS35L19_VOL_MUTE);
 	regmap_update_bits(map, CS35L19_PWRCTL1, 0x80, 0x80);
 	regmap_write(map, CS35L19_PWRCTL2, 0xfe);
@@ -248,9 +300,13 @@ static int cs35l19_amp_event(struct snd_soc_dapm_widget *w,
 		if (ret) {
 			cs35l19_alive_stop(cs);
 			clk_disable_unprepare(cs->mclk);
+			return ret;
 		}
-		return ret;
+		schedule_delayed_work(&cs->watch_work,
+				      msecs_to_jiffies(CS35L19_WATCH_MS));
+		return 0;
 	case SND_SOC_DAPM_POST_PMD:
+		cancel_delayed_work_sync(&cs->watch_work);
 		cs35l19_power_off(cs);
 		cs35l19_alive_stop(cs);
 		clk_disable_unprepare(cs->mclk);
@@ -374,6 +430,7 @@ static int cs35l19_i2c_probe(struct i2c_client *client)
 	cs->slot = client->addr & 1;
 	cs->slot_bytes = 4;
 	INIT_DELAYED_WORK(&cs->alive_work, cs35l19_alive);
+	INIT_DELAYED_WORK(&cs->watch_work, cs35l19_watch);
 	i2c_set_clientdata(client, cs);
 
 	cs->regmap = devm_regmap_init_i2c(client, &cs35l19_regmap);
@@ -419,6 +476,7 @@ static void cs35l19_i2c_remove(struct i2c_client *client)
 {
 	struct cs35l19 *cs = i2c_get_clientdata(client);
 
+	cancel_delayed_work_sync(&cs->watch_work);
 	cancel_delayed_work_sync(&cs->alive_work);
 }
 
