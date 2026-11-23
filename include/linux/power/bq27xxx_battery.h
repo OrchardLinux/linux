@@ -21,6 +21,7 @@ enum bq27xxx_chip {
 	BQ27521, /* bq27521 */
 	BQ27530, /* bq27530, bq27531 */
 	BQ27531,
+	BQ27540, /* bq27540 with Apple's gauge firmware */
 	BQ27541, /* bq27541, bq27542, bq27546, bq27742 */
 	BQ27542,
 	BQ27546,

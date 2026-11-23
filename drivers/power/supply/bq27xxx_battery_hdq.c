@@ -193,8 +193,8 @@ static const struct bq27xxx_hdq_data bq27545_data = {
 	.chip = BQ27545,
 };
 
-static const struct bq27xxx_hdq_data bq27541_data = {
-	.chip = BQ27541,
+static const struct bq27xxx_hdq_data bq27540_data = {
+	.chip = BQ27540,
 };
 
 /*
@@ -216,7 +216,7 @@ static const struct of_device_id bq27xxx_battery_hdq_of_match[] = {
 	{ .compatible = "apple,d111-bq27545", .data = &bq27545_iphone7_plus_data },
 	{ .compatible = "apple,j72-bq27545", .data = &bq27545_ipad_air_data },
 	{ .compatible = "ti,bq27545-hdq", .data = &bq27545_data },
-	{ .compatible = "ti,bq27540-hdq", .data = &bq27541_data },
+	{ .compatible = "ti,bq27540-hdq", .data = &bq27540_data },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, bq27xxx_battery_hdq_of_match);

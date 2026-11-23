@@ -25,6 +25,7 @@
  * https://www.ti.com/product/bq27520-g4
  * https://www.ti.com/product/bq27530-g1
  * https://www.ti.com/product/bq27531-g1
+ * https://www.ti.com/product/bq27540-g1
  * https://www.ti.com/product/bq27541-g1
  * https://www.ti.com/product/bq27542-g1
  * https://www.ti.com/product/bq27546-g1
@@ -390,6 +391,33 @@ static u8
 		BQ27XXX_DM_REG_ROWS,
 	},
 #define bq27531_regs bq27530_regs
+	/*
+	 * Apple's BQ27540 gauge firmware answers the BQ27541 commands except
+	 * NominalAvailableCapacity (0x0c): an HDQ read of 0x0d gets no reply
+	 * (iPhone 6s Plus, iPad Pro 10.5). charge_now then comes from
+	 * RemainingCapacity (0x10), which pairs with FullChargeCapacity.
+	 */
+	bq27540_regs[BQ27XXX_REG_MAX] = {
+		[BQ27XXX_REG_CTRL] = 0x00,
+		[BQ27XXX_REG_TEMP] = 0x06,
+		[BQ27XXX_REG_INT_TEMP] = 0x28,
+		[BQ27XXX_REG_VOLT] = 0x08,
+		[BQ27XXX_REG_AI] = 0x14,
+		[BQ27XXX_REG_FLAGS] = 0x0a,
+		[BQ27XXX_REG_TTE] = 0x16,
+		[BQ27XXX_REG_TTF] = INVALID_REG_ADDR,
+		[BQ27XXX_REG_TTES] = INVALID_REG_ADDR,
+		[BQ27XXX_REG_TTECP] = INVALID_REG_ADDR,
+		[BQ27XXX_REG_NAC] = INVALID_REG_ADDR,
+		[BQ27XXX_REG_RC] = 0x10,
+		[BQ27XXX_REG_FCC] = 0x12,
+		[BQ27XXX_REG_CYCT] = 0x2a,
+		[BQ27XXX_REG_AE] = INVALID_REG_ADDR,
+		[BQ27XXX_REG_SOC] = 0x2c,
+		[BQ27XXX_REG_DCAP] = 0x3c,
+		[BQ27XXX_REG_AP] = 0x24,
+		BQ27XXX_DM_REG_ROWS,
+	},
 	bq27541_regs[BQ27XXX_REG_MAX] = {
 		[BQ27XXX_REG_CTRL] = 0x00,
 		[BQ27XXX_REG_TEMP] = 0x06,
@@ -762,6 +790,7 @@ static enum power_supply_property bq27541_props[] = {
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_MANUFACTURER,
 };
+#define bq27540_props bq27541_props
 #define bq27542_props bq27541_props
 #define bq27546_props bq27541_props
 #define bq27742_props bq27541_props
@@ -975,6 +1004,7 @@ static struct bq27xxx_dm_reg bq27500_dm_regs[] = {
 #define bq27521_dm_regs NULL
 #define bq27530_dm_regs NULL
 #define bq27531_dm_regs NULL
+#define bq27540_dm_regs NULL
 #define bq27541_dm_regs NULL
 #define bq27542_dm_regs NULL
 #define bq27546_dm_regs NULL
@@ -1077,6 +1107,7 @@ static struct {
 	[BQ27521]   = BQ27XXX_DATA(bq27521,   0         , 0),
 	[BQ27530]   = BQ27XXX_DATA(bq27530,   0         , BQ27XXX_O_UTOT),
 	[BQ27531]   = BQ27XXX_DATA(bq27531,   0         , BQ27XXX_O_UTOT),
+	[BQ27540]   = BQ27XXX_DATA(bq27540,   0         , BQ27XXX_O_OTDC),
 	[BQ27541]   = BQ27XXX_DATA(bq27541,   0         , BQ27XXX_O_OTDC),
 	[BQ27542]   = BQ27XXX_DATA(bq27542,   0         , BQ27XXX_O_OTDC),
 	[BQ27546]   = BQ27XXX_DATA(bq27546,   0         , BQ27XXX_O_OTDC),
