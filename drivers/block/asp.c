@@ -53,6 +53,8 @@
 #define ASP_QUEUE_SIZE  (ASP_TAG_SIZE * ASP_NUM_TAGS)
 
 #define ASP_TIMEOUT_MS		30000
+/* After this long a command is reported (it is not aborted: the ANS has no abort) */
+#define ASP_IO_STUCK_MS		10000
 #define ASP_CMD_HDR_SIZE	0x30
 
 #define ASP_CMD_MAX_SECTORS	(ASP_TAG_SIZE - ASP_CMD_HDR_SIZE) \
@@ -805,12 +807,42 @@ static void apple_asp_complete_rq(struct request *rq)
 	}
 }
 
+static bool asp_count_busy(struct request *rq, void *data)
+{
+	(*(int *)data)++;
+	return true;
+}
+
+static int asp_busy_tags(struct apple_asp *asp)
+{
+	int n = 0;
+
+	blk_mq_tagset_busy_iter(&asp->tagset, asp_count_busy, &n);
+	return n;
+}
+
+/*
+ * The ANS has no way to abort a command, so a late one is only reported, and
+ * its timer starts again. The block layer did the same silently before.
+ */
+static enum blk_eh_timer_return apple_asp_io_stuck(struct request *rq)
+{
+	struct asp_queue *qd = rq->q->queuedata;
+	struct apple_asp *asp = queue_to_apple_asp(qd);
+
+	dev_warn_ratelimited(asp->dev,
+		"I/O stuck: queue %d tag %d op %d, %u bytes at sector %llu, %d busy tag(s)\n",
+		qd->type, rq->tag, req_op(rq), blk_rq_bytes(rq),
+		(unsigned long long)blk_rq_pos(rq), asp_busy_tags(asp));
+	return BLK_EH_RESET_TIMER;
+}
+
 static const struct blk_mq_ops apple_asp_queue_ops = {
 	.queue_rq = apple_asp_queue_rq,
 	.complete = apple_asp_complete_rq,
 	//.init_request = apple_asp_init_request,
 	.init_hctx = apple_asp_init_hctx,
-	//.timeout = apple_asp_timeout,
+	.timeout = apple_asp_io_stuck,
 };
 
 /*
@@ -852,7 +884,7 @@ static int apple_asp_start_disk(struct apple_asp *asp)
 	asp->tagset.ops = &apple_asp_queue_ops;
 	asp->tagset.nr_hw_queues = 1;
 	asp->tagset.queue_depth = ASP_NUM_TAGS;
-	asp->tagset.timeout = msecs_to_jiffies(ASP_TIMEOUT_MS);
+	asp->tagset.timeout = msecs_to_jiffies(ASP_IO_STUCK_MS);
 	asp->tagset.numa_node = NUMA_NO_NODE;
 	asp->tagset.cmd_size = sizeof(struct asp_iod);
 	asp->tagset.driver_data = asp;
