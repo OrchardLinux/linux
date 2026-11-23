@@ -11,8 +11,11 @@ The block writer allocates from verified blank blocks. An optional, verified
 ``erase_block`` provider operation lets the allocator also reclaim obsolete
 blocks. With a complete native accounting policy the allocator can also
 reserve fresh context sites, relocate live data and publish a checkpoint.
-P105 H2FMI does not enable physical erase or supply this policy. When verified
-blank blocks run out on that profile, a write returns ``-ENOSPC``.
+H2FMI supplies the erase operation for every package whose reported
+geometry validates; the erase row and the pages it clears follow from that
+geometry. The writer and its native accounting are modelled for the 64 GB
+layout only, so the 16 GB layout stays read-only. A writer without the erase
+operation returns ``-ENOSPC`` when blank blocks run out.
 
 Reclaiming an obsolete block
 ----------------------------
@@ -179,12 +182,26 @@ bit count. The 13G36 provider builder at 0x8109de94 also supplies CAU and view
 fields. Both saved parameter copies agree: page bits 7, block bits 12 and CAU
 bits 3. A normal block's page-0 row is ``(cau << 19) | (block << 7)``; the SLC
 view adds bit 22. The normal view reports 128 pages per block. Physical erase
-effects, the SLC alias relationship, timeout, retirement and partial completion
-across CAUs remain unqualified. The H2FMI implementation issues the
-single-row command and checks the erased status, data and OOB on all 128
-normal-view pages. Enabling its callback on hardware requires a qualified
-physical erase extent, exclusive ownership across all affected views, and
-device recovery and interruption checks.
+effects and the SLC alias relationship were checked on a 64 GB P105. The trial
+erased all 16 lanes of an obsolete block. Every one of its 2,048 normal pages
+and 1,024 SLC aliases then read erased, including data and OOB. Linux published
+the incremented wear before it reused the block. A fresh load recovered the
+same mapping and data.
+
+After iOS booted, its System and Data filesystem checks passed. iOS moved the
+test page, reclaimed the block again and saved its next wear value. A second
+Linux boot recovered that state and scanned the full block blank. The final
+iOS boot passed both filesystem checks and reread the 64 MiB Linux witness
+with the same SHA-256.
+
+The H2FMI implementation issues the single-row command and checks the erased
+status, data and OOB on every normal-view page of the block. SFTL owns every
+lane of the block and stops the writer after an uncertain result. Synthetic
+tests cover timeout, retirement and interrupted multi-lane erase behavior.
+The physical callback is enabled for every package whose discovered geometry
+is self-consistent: the page, block and CAU fields fit their address bits and
+the SLC view aliases half of the normal pages. Blocks in the bootstrap window
+at the top of each CAU are never erased.
 
 The source research began with `Cascadia's NAND notes
 <https://github.com/rzxvx/Project-Cascadia/blob/c20b85ebb951c704d7e3a664c378dde8276e3928/docs/research/p105-nand.md>`_.

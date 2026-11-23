@@ -219,8 +219,9 @@ config MTD_APPLE_H2FMI
 
 	  Pages are programmed whole, only when they read back erased, and
 	  each program is verified by reading it back. The aggregate PPN
-	  provider can verify a single-block erase on qualified hardware.
-	  Erase is disabled on the P105.
+	  provider verifies single-block erase on every package whose
+	  reported geometry validates; the erase extent follows from that
+	  geometry.
 
 	  If unsure, say N.
 

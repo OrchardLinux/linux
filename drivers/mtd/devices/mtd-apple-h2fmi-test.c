@@ -110,9 +110,23 @@ static void h2fmi_erase_row_test(struct kunit *test)
 
 	h2fmi_test_params(params, ppn_16gb);
 	KUNIT_ASSERT_EQ(test, h2fmi_parse_geometry(params, sizeof(params), &g), 0);
+	KUNIT_EXPECT_TRUE(test, h2fmi_erase_geometry_valid(&g));
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 2, 1, &row), -EINVAL);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 0, 1064, &row), -EINVAL);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 0, 0, &row), -EPERM);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 1, 1032, &row), -EPERM);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 1, 1063, &row), -EPERM);
+	KUNIT_ASSERT_EQ(test, h2fmi_erase_row(&g, 0, 1, &row), 0);
+	KUNIT_EXPECT_EQ(test, row, 0x100U);
+	KUNIT_ASSERT_EQ(test, h2fmi_erase_row(&g, 1, 1031, &row), 0);
+	KUNIT_EXPECT_EQ(test, row, 0xc0700U);
+	g.slc_pages = 64;
+	KUNIT_EXPECT_FALSE(test, h2fmi_erase_geometry_valid(&g));
 	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 0, 1, &row), -EOPNOTSUPP);
+	row = 0xdeadbeef;
 	h2fmi_test_params(params, ppn_64gb);
 	KUNIT_ASSERT_EQ(test, h2fmi_parse_geometry(params, sizeof(params), &g), 0);
+	KUNIT_EXPECT_TRUE(test, h2fmi_erase_geometry_valid(&g));
 	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 8, 1, &row), -EINVAL);
 	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 0, 2088, &row), -EINVAL);
 	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 0, 0, &row), -EPERM);

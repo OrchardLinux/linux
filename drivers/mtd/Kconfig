@@ -220,8 +220,9 @@ config MTD_APPLE_SFTL
 
 	  Writes are appended to verified blank blocks. A provider with a
 	  qualified erase operation can also recycle verified retired blocks.
-	  The physical P105 provider remains append-only and returns ENOSPC
-	  when its supply of blank blocks runs out.
+	  H2FMI supplies this operation for packages whose geometry
+	  validates. Providers without a qualified erase operation return
+	  ENOSPC when their supply of blank blocks runs out.
 
 config MTD_APPLE_SFTL_KUNIT_TEST
 	tristate "KUnit tests for Apple VFL/SwissPPNFTL" if !KUNIT_ALL_TESTS

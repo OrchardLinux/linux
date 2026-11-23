@@ -87,18 +87,36 @@ static inline int h2fmi_page_row(const struct h2fmi_geometry *g,
 	return 0;
 }
 
-/* The single-row erase trace is available only for the 64 GB package. */
+/* SLC-view bootstrap members may occupy any of the last 32 blocks. */
+#define H2FMI_BOOTSTRAP_BLOCKS	32
+
+/*
+ * A single-row erase clears one block of one CAU: the row of its first
+ * normal-view page, and the pages behind it. Both follow from the geometry
+ * the package reports, so erase is offered only when that geometry is
+ * self-consistent: the page, block and CAU fields fit their address bits,
+ * the SLC view aliases half of the normal pages, and there are blocks below
+ * the bootstrap window.
+ */
+static inline bool h2fmi_erase_geometry_valid(const struct h2fmi_geometry *g)
+{
+	return g->page_bits < 32 && g->block_bits < 32 && g->cau_bits < 32 &&
+	       g->page_bits + g->block_bits + g->cau_bits < 32 &&
+	       g->pages && g->pages == BIT(g->page_bits) &&
+	       g->slc_pages * 2 == g->pages &&
+	       g->blocks > H2FMI_BOOTSTRAP_BLOCKS + 1 &&
+	       g->blocks <= BIT(g->block_bits) &&
+	       g->caus && g->caus <= BIT(g->cau_bits);
+}
+
 static inline int h2fmi_erase_row(const struct h2fmi_geometry *g,
 				 unsigned int cau, unsigned int block, u32 *row)
 {
-	if (g->caus != 8 || g->blocks != 2088 || g->pages != 128 ||
-	    g->slc_pages != 64 || g->page_bits != 7 ||
-	    g->block_bits != 12 || g->cau_bits != 3)
+	if (!h2fmi_erase_geometry_valid(g))
 		return -EOPNOTSUPP;
 	if (cau >= g->caus || block >= g->blocks)
 		return -EINVAL;
-	/* SLC-view bootstrap members may occupy any of the last 32 blocks. */
-	if (!block || block >= g->blocks - 32)
+	if (!block || block >= g->blocks - H2FMI_BOOTSTRAP_BLOCKS)
 		return -EPERM;
 	return h2fmi_page_row(g, cau, block, 0, row);
 }

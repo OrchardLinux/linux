@@ -45,7 +45,6 @@
 #include <linux/mtd/mtd.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
-#include <linux/property.h>
 #include <linux/slab.h>
 
 #include "mtd-apple-h2fmi.h"
@@ -166,10 +165,6 @@ struct h2fmi_die {
 	struct h2fmi *fmi;
 	u8 bus;
 	u8 cau;
-};
-
-struct h2fmi_variant {
-	bool normal_erase_qualified;
 };
 
 struct h2fmi {
@@ -1292,7 +1287,6 @@ static int h2fmi_ppn_erase(void *priv, unsigned int bus, unsigned int cau,
 
 static int h2fmi_register_sftl(struct h2fmi *fmi)
 {
-	const struct h2fmi_variant *variant = device_get_match_data(fmi->dev);
 	const struct h2fmi_geometry *g = &fmi->bus[0].geometry;
 	struct apple_ppn provider = {
 		.dev = fmi->dev,
@@ -1312,8 +1306,16 @@ static int h2fmi_register_sftl(struct h2fmi *fmi)
 		return 0;
 	fmi->ppn_ops.read_page = h2fmi_ppn_read;
 	fmi->ppn_ops.program_page = h2fmi_ppn_program;
-	if (variant && variant->normal_erase_qualified)
+	/*
+	 * Erase follows the discovered geometry. SFTL verifies every erased
+	 * block blank in both views and checks its accounting before reuse.
+	 */
+	if (h2fmi_erase_geometry_valid(g))
 		fmi->ppn_ops.erase_block = h2fmi_ppn_erase;
+	else
+		dev_info(fmi->dev,
+			 "PPN geometry %u CAUs x %u blocks x %u pages has no valid erase extent; reclamation stays off\n",
+			 g->caus, g->blocks, g->pages);
 	fmi->sftl = platform_device_register_data(fmi->dev, "apple-sftl",
 						 PLATFORM_DEVID_AUTO,
 						 &provider, sizeof(provider));
@@ -1607,13 +1609,8 @@ static void h2fmi_remove(struct platform_device *pdev)
 		mtd_device_unregister(&fmi->mtd[i]);
 }
 
-/* Normal/SLC aliasing and the physical erase extent remain unqualified. */
-static const struct h2fmi_variant s5l8940x_ppn = {
-	.normal_erase_qualified = false,
-};
-
 static const struct of_device_id h2fmi_of_match[] = {
-	{ .compatible = "apple,s5l8940x-fmi", .data = &s5l8940x_ppn },
+	{ .compatible = "apple,s5l8940x-fmi" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, h2fmi_of_match);
