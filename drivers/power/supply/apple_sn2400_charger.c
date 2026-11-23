@@ -51,6 +51,21 @@
 #define SN2400_ADC_POLL_US		5000
 #define SN2400_ADC_TIMEOUT_US		100000
 
+#define SN2400_REG_HDQ			0x1d
+
+/*
+ * A board whose charger node has "apple,read-only" gets a driver that only
+ * reads the status, input-limit and control registers and leaves the charger
+ * as the bootloader programmed it: no foldback, no ADC, nothing written on
+ * remove, shutdown or suspend. Every other board keeps the full charging
+ * policy. This parameter overrides the DT for testing; it is read at probe,
+ * so a built-in driver applies a new value when the device is bound again.
+ */
+static int control = -1;
+module_param(control, int, 0644);
+MODULE_PARM_DESC(control,
+		 "Charger control: -1 = follow the DT (default), 0 = read-only, 1 = run the charging policy");
+
 enum sn2400_foldback_state {
 	SN2400_FOLDBACK_IDLE,
 	SN2400_FOLDBACK_NOLOAD,
@@ -81,6 +96,7 @@ struct sn2400_charger {
 	unsigned long vbus_absent_since;
 	bool vbus_absent;
 	bool stopped;
+	bool control;
 };
 
 static int sn2400_read_adc(struct sn2400_charger *charger,
@@ -434,6 +450,41 @@ out_schedule:
 	sn2400_schedule(charger, next_poll_ms);
 }
 
+static unsigned int sn2400_monitor_input_limit(unsigned int control_reg,
+					       unsigned int input_reg)
+{
+	if (control_reg & SN2400_CONTROL_OFF)
+		return 0;
+
+	return sn2400_decode_input_limit(input_reg);
+}
+
+/* Read-only polling: never writes a charger register. */
+static void sn2400_charger_monitor_work(struct work_struct *work)
+{
+	struct sn2400_charger *charger =
+		container_of(to_delayed_work(work), struct sn2400_charger, work);
+	unsigned int status, input_reg, control_reg;
+	int ret;
+
+	ret = regmap_read(charger->regmap, SN2400_REG_STATUS, &status);
+	if (!ret)
+		ret = regmap_read(charger->regmap, SN2400_REG_INPUT_LIMIT,
+				  &input_reg);
+	if (!ret)
+		ret = regmap_read(charger->regmap, SN2400_REG_CONTROL,
+				  &control_reg);
+
+	if (ret)
+		sn2400_cache(charger, ret, 0, 0, 0, 0);
+	else
+		sn2400_cache(charger, 0, status, 0, 0,
+			     sn2400_monitor_input_limit(control_reg,
+							input_reg));
+
+	sn2400_schedule(charger, SN2400_STABLE_POLL_MS);
+}
+
 static int sn2400_charger_get_property(struct power_supply *psy,
 				       enum power_supply_property property,
 				       union power_supply_propval *val)
@@ -464,12 +515,21 @@ static int sn2400_charger_get_property(struct power_supply *psy,
 		ret = charger->status_error;
 		if (ret)
 			break;
+		/* The ADC needs a register write to convert. */
+		if (!charger->control) {
+			ret = -ENODATA;
+			break;
+		}
 		val->intval = charger->vbus_uv;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		ret = charger->status_error;
 		if (ret)
 			break;
+		if (!charger->control) {
+			ret = -ENODATA;
+			break;
+		}
 		val->intval = charger->ibus_ua;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
@@ -516,6 +576,9 @@ static int sn2400_charger_stop(struct sn2400_charger *charger)
 	charger->stopped = true;
 	mutex_unlock(&charger->lock);
 	cancel_delayed_work_sync(&charger->work);
+
+	if (!charger->control)
+		return 0;
 
 	ret = sn2400_disable_input(charger);
 	mutex_lock(&charger->lock);
@@ -618,7 +681,14 @@ static int sn2400_charger_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	INIT_DELAYED_WORK(&charger->work, sn2400_charger_work);
+	if (control >= 0)
+		charger->control = control;
+	else
+		charger->control = !device_property_read_bool(&pdev->dev,
+							      "apple,read-only");
+
+	INIT_DELAYED_WORK(&charger->work, charger->control ?
+			  sn2400_charger_work : sn2400_charger_monitor_work);
 	charger->state = SN2400_FOLDBACK_IDLE;
 	charger->status_error = -EAGAIN;
 	charger->stopped = true;
@@ -654,14 +724,59 @@ static int sn2400_charger_probe(struct platform_device *pdev)
 	charger->max_charge_ua -=
 		charger->max_charge_ua % SN2400_INPUT_REG_STEP_UA;
 
-	ret = regmap_write(charger->regmap, SN2400_REG_CHARGE_LIMIT,
-			   charger->max_charge_ua /
-			    SN2400_INPUT_REG_STEP_UA);
-	if (ret)
-		return dev_err_probe(&pdev->dev, ret,
-				     "failed to program battery charge current limit\n");
+	if (!charger->control) {
+		unsigned int input_reg, charge_reg, control_reg, hdq_reg;
+
+		ret = regmap_read(charger->regmap, SN2400_REG_INPUT_LIMIT,
+				  &input_reg);
+		if (!ret)
+			ret = regmap_read(charger->regmap,
+					  SN2400_REG_CHARGE_LIMIT, &charge_reg);
+		if (!ret)
+			ret = regmap_read(charger->regmap, SN2400_REG_CONTROL,
+					  &control_reg);
+		if (!ret)
+			ret = regmap_read(charger->regmap, SN2400_REG_HDQ,
+					  &hdq_reg);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "failed to read charger state\n");
+
+		dev_info(&pdev->dev,
+			 "read-only: status %#04x input %#04x control %#04x charge %#04x hdq %#04x\n",
+			 status, input_reg, control_reg, charge_reg, hdq_reg);
+		/* Report the limit the bootloader left (D111 encoding: 10 mA steps). */
+		charger->max_charge_ua = charge_reg * SN2400_INPUT_REG_STEP_UA;
+		sn2400_cache(charger, 0, status, 0, 0,
+			     sn2400_monitor_input_limit(control_reg,
+							input_reg));
+		goto start;
+	}
+
+	/*
+	 * "apple,keep-charge-limit": leave 0x0d as the bootloader set it, as
+	 * the iPhone 6s Plus's iOS driver does, and report what it holds.
+	 */
+	if (device_property_read_bool(&pdev->dev, "apple,keep-charge-limit")) {
+		unsigned int charge_reg;
+
+		ret = regmap_read(charger->regmap, SN2400_REG_CHARGE_LIMIT,
+				  &charge_reg);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "failed to read charge limit\n");
+		charger->max_charge_ua = charge_reg * SN2400_INPUT_REG_STEP_UA;
+	} else {
+		ret = regmap_write(charger->regmap, SN2400_REG_CHARGE_LIMIT,
+				   charger->max_charge_ua /
+				    SN2400_INPUT_REG_STEP_UA);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "failed to program battery charge current limit\n");
+	}
 	power_supply_changed(charger->psy);
 
+start:
 	mutex_lock(&charger->lock);
 	charger->stopped = false;
 	mutex_unlock(&charger->lock);
@@ -698,6 +813,9 @@ static int sn2400_charger_suspend(struct device *dev)
 	charger->stopped = true;
 	mutex_unlock(&charger->lock);
 	cancel_delayed_work_sync(&charger->work);
+
+	if (!charger->control)
+		return 0;
 
 	ret = regmap_read(charger->regmap, SN2400_REG_STATUS, &status);
 	if (ret)

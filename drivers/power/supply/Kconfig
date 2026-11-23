@@ -345,6 +345,11 @@ config CHARGER_APPLE_SN2400
 	  in small steps while monitoring VBUS droop. Battery telemetry remains
 	  the responsibility of a separate fuel-gauge driver.
 
+	  A board can describe its charger as read-only (apple,read-only) while
+	  it is brought up: the driver then reports cable presence, the charging
+	  state and the input limit the bootloader left, and writes no charger
+	  register. The control module parameter overrides the DT.
+
 config APPLE_BELLATRIX_POWER
 	tristate "Apple Bellatrix USB power status"
 	depends on I2C
