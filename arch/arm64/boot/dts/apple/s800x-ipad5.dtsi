@@ -2,10 +2,10 @@
 /*
  * Apple iPad 5 common device tree
  *
- * J71s, J72s, J71t and J72t are wired the same; only J72t's Wi-Fi module
- * differs. Storage and Wi-Fi sit behind the PCIe root complex, which is
- * described for the S8003 only: the S8003 boards define S800X_IPAD5_PCIE
- * before including this file.
+ * J71s, J72s, J71t and J72t are wired the same; only the cellular models'
+ * Wi-Fi module differs. The display pipe is described for the S8003 only:
+ * the S8003 boards define S800X_IPAD5_DISPLAY_PIPE before including this
+ * file.
  *
  * Copyright (c) 2022, Konrad Dybcio <konradybcio@kernel.org>
  */
@@ -393,8 +393,6 @@
 	status = "okay";
 };
 
-#ifdef S800X_IPAD5_PCIE
-
 / {
 	aliases {
 		wifi0 = &wifi;
@@ -409,18 +407,6 @@
 		startup-delay-us = <100000>;
 		off-on-delay-us = <100000>;
 	};
-};
-
-/*
- * ADT displayport function-lcd_ldo = PMU GPIO 22: the panel supply, off in
- * system sleep as on iOS. Neither it nor the backlight holds up the
- * pipe's probe; the driver looks them up before the first sleep.
- */
-&disp0 {
-	apple,lcd-ldo-gpios = <&pmu_gpio 22 GPIO_ACTIVE_HIGH>;
-	backlight = <&dwi_bl>;
-	post-init-providers = <&pmu_gpio>, <&dwi_bl>;
-	status = "okay";
 };
 
 &pcie0 {
@@ -480,7 +466,19 @@
 	status = "okay";
 };
 
-#endif /* S800X_IPAD5_PCIE */
+#ifdef S800X_IPAD5_DISPLAY_PIPE
+/*
+ * ADT displayport function-lcd_ldo = PMU GPIO 22: the panel supply, off in
+ * system sleep as on iOS. Neither it nor the backlight holds up the
+ * pipe's probe; the driver looks them up before the first sleep.
+ */
+&disp0 {
+	apple,lcd-ldo-gpios = <&pmu_gpio 22 GPIO_ACTIVE_HIGH>;
+	backlight = <&dwi_bl>;
+	post-init-providers = <&pmu_gpio>, <&dwi_bl>;
+	status = "okay";
+};
+#endif /* S800X_IPAD5_DISPLAY_PIPE */
 
 /*
  * The Lightning charger sets the data role: USB data stays off until the

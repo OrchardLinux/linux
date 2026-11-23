@@ -6,7 +6,7 @@
 
 /dts-v1/;
 
-#define S800X_IPAD5_PCIE
+#define S800X_IPAD5_DISPLAY_PIPE
 
 #include "s8003.dtsi"
 #include "s800x-ipad5.dtsi"
