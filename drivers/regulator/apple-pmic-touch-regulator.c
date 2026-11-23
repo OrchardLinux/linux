@@ -89,6 +89,25 @@ static const struct regulator_desc apple_adelyn_touch_core = {
 };
 
 /*
+ * Antigua (D2255, iPhone 6s/6s Plus) pmuL(0x219): LDO index 25, enable-only,
+ * through register 0x319 bit 0 (iOS 19H422 LDO table 0xfffffff0059cc58e,
+ * _setLDO 0xfffffff0069337f4). iOS turns it off when the PMU driver starts
+ * and the touch driver turns it on.
+ */
+static const struct regulator_desc apple_antigua_touch_core = {
+	.name = "antigua-touch-core",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x319,
+	.enable_mask = 0x01,
+	.enable_val = 0x01,
+	.disable_val = 0,
+	.enable_time = 1000,
+	.off_on_delay = 1000,
+};
+
+/*
  * Angel (D2365, iPad 5) pmuL(0x21f): LDO index 31, enable-only, through
  * register 0x31c bit 0 (iOS 0xfffffff006bbe488, 0xfffffff006bbe388,
  * 0xfffffff006bbcdd8). The ADT names only the function, so the register
@@ -236,6 +255,10 @@ static const struct of_device_id apple_pmic_touch_regulator_of_match[] = {
 	{
 		.compatible = "apple,adelyn-touch-core-regulator",
 		.data = &apple_adelyn_touch_core,
+	},
+	{
+		.compatible = "apple,antigua-touch-core-regulator",
+		.data = &apple_antigua_touch_core,
 	},
 	{
 		.compatible = "apple,angel-touch-analog-regulator",
