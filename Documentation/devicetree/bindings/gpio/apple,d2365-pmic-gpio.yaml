@@ -11,8 +11,8 @@ maintainers:
 
 description: |
   The Dialog D2186 and D2207 PMICs used with the Apple A8 and A8X and the
-  D2333 and D2365 PMICs used in Apple A9 and A10 devices provide 21, 21, 21
-  and 24 GPIOs respectively. The controller is accessed through the regmap exported by the
+  D2255, D2333 and D2365 PMICs used in Apple A9 and A10 devices provide 21,
+  21, 21, 21 and 24 GPIOs respectively. The controller is accessed through the regmap exported by the
   parent Apple I2C PMIC device.
 
   The D2207 and D2365 also latch 112 and 240 PMU events respectively
@@ -42,6 +42,7 @@ properties:
       - apple,d2089-pmic-gpio
       - apple,d2186-pmic-gpio
       - apple,d2207-pmic-gpio
+      - apple,d2255-pmic-gpio
       - apple,d2333-pmic-gpio
       - apple,d2365-pmic-gpio
 
@@ -108,6 +109,7 @@ allOf:
         compatible:
           enum:
             - apple,d2186-pmic-gpio
+            - apple,d2255-pmic-gpio
             - apple,d2333-pmic-gpio
     then:
       properties:
