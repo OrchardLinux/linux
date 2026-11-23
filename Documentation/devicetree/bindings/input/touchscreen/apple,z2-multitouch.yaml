@@ -23,7 +23,11 @@ properties:
       - apple,j81-touchscreen
       - apple,j85-touchscreen
       - apple,j96-touchscreen
+      - apple,j120-touchscreen
+      - apple,j121-touchscreen
       - apple,j172-touchscreen
+      - apple,j207-touchscreen
+      - apple,j208-touchscreen
       - apple,d11-touchscreen
       - apple,d111-touchscreen
       - apple,d21-touchscreen
@@ -161,6 +165,37 @@ required:
   - touchscreen-size-y
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          enum:
+            - apple,j120-touchscreen
+            - apple,j121-touchscreen
+            - apple,j207-touchscreen
+            - apple,j208-touchscreen
+    then:
+      properties:
+        pinctrl-names:
+          items:
+            - const: display-sync-active
+            - const: display-sync-inactive
+        power-ana-gpios: false
+        display-sync-gpios: false
+        display-sync1-gpios: false
+        hv-supply: false
+        core-supply: false
+        attn-gpios: false
+        apple,z2-bpw16-min-len: false
+        apple,z2-no-init-ack: false
+      required:
+        - clocks
+        - ana-supply
+        - power-ldo-gpios
+        - pinctrl-0
+        - pinctrl-1
+        - pinctrl-names
+        - spi-cpha
+        - spi-cpol
   - $ref: touchscreen.yaml#
   - $ref: /schemas/spi/spi-peripheral-props.yaml#
   - if:
@@ -292,6 +327,10 @@ allOf:
             - apple,j81-touchscreen
             - apple,j85-touchscreen
             - apple,j96-touchscreen
+            - apple,j120-touchscreen
+            - apple,j121-touchscreen
+            - apple,j207-touchscreen
+            - apple,j208-touchscreen
             - apple,n61-touchscreen
             - apple,n102-touchscreen
             - apple,n66-touchscreen
