@@ -222,6 +222,8 @@ struct apple_aop_hw {
 	bool nonce;
 	/* AOPt, SOC_, SOCR, WrAd, STKG and nCal boot arguments */
 	bool soc_bootargs;
+	/* Only the AOPt boot argument, from "apple,aop-target" */
+	bool target_bootarg;
 };
 
 struct apple_aop {
@@ -368,10 +370,20 @@ static int apple_aop_load(struct apple_aop *aop, u64 ecid)
 	struct device_node *np = aop->dev->of_node;
 	u8 prng[32], nonce[8], guard[4], ncal = 0;
 	__le64 ecid_le = cpu_to_le64(ecid), ext_le, wrapper_le;
-	__le32 target_le, chip_le, revision_le;
+	__le32 target_le = 0, chip_le, revision_le;
 	unsigned int count = 0;
+	bool has_target = aop->hw->target_bootarg &&
+			  of_property_present(np, "apple,aop-target");
+	u32 target;
 	u8 *image;
 	int ret;
+
+	if (has_target) {
+		ret = of_property_read_u32(np, "apple,aop-target", &target);
+		if (ret)
+			return dev_err_probe(aop->dev, ret, "invalid AOP target\n");
+		target_le = cpu_to_le32(target);
+	}
 
 	ret = of_property_read_string_index(np, "firmware-name", 0, &main_name);
 	if (!ret)
@@ -436,6 +448,10 @@ static int apple_aop_load(struct apple_aop *aop, u64 ecid)
 				      &revision_le, sizeof(revision_le));
 		apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_STKG, guard, sizeof(guard));
 	}
+
+	if (has_target)
+		apple_aop_add_bootarg(args, &count, APPLE_AOP_BOOTARG_AOPT,
+				      &target_le, sizeof(target_le));
 
 	ret = apple_aop_patch_bootargs(aop, image, main_fw->size, args, count);
 	if (ret)
@@ -521,6 +537,12 @@ static void apple_aop_register_service(struct work_struct *work)
 	char name[32];
 
 	np = of_get_child_by_name(aop->dev->of_node, rw->service.name);
+	/* Device tree node names use '-' where a firmware may use '_'. */
+	if (!np && strchr(rw->service.name, '_')) {
+		strscpy(name, rw->service.name, sizeof(name));
+		strreplace(name, '_', '-');
+		np = of_get_child_by_name(aop->dev->of_node, name);
+	}
 	if (!np || !of_device_is_available(np))
 		goto out;
 
@@ -1136,9 +1158,19 @@ static const struct apple_aop_hw apple_aop_t8010_hw = {
 	.nonce = true,
 };
 
+/*
+ * The A10X runs the A10's loader; its firmware (ipad7aop) also takes the
+ * AOP target from the ADT's iop-aop-nub (1 on the iPad Pro 2).
+ */
+static const struct apple_aop_hw apple_aop_t8011_hw = {
+	.nonce = true,
+	.target_bootarg = true,
+};
+
 static const struct of_device_id apple_aop_of_match[] = {
 	{ .compatible = "apple,s8000-aop", .data = &apple_aop_s8000_hw },
 	{ .compatible = "apple,t8010-aop", .data = &apple_aop_t8010_hw },
+	{ .compatible = "apple,t8011-aop", .data = &apple_aop_t8011_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_aop_of_match);
