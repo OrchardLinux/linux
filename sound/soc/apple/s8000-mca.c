@@ -265,6 +265,14 @@ struct s8000_mca_hw {
 	unsigned int sync_bits;		/* 0: half a frame */
 	u32 stream_irqs;		/* error causes open while TX is prepared */
 	/*
+	 * Leave the interrupt line alone. On the iPad mini 2 (J85), A7 MCA1's
+	 * line stayed asserted with both version 1 enables clear and no known
+	 * cause in the status register: 100000 unhandled interrupts during
+	 * the first prepare, which starved the touchscreen's SPI firmware
+	 * upload.
+	 */
+	bool no_irq;
+	/*
 	 * Divisor of every sample on its way to the DMA buffer, 1 for none.
 	 * A board without volume hardware bounds its output here, where no
 	 * client can bypass it; the PCM then has no mmap access.
@@ -1052,7 +1060,8 @@ static int mca_runtime_suspend(struct device *dev)
 {
 	struct s8000_mca *mca = dev_get_drvdata(dev);
 
-	disable_irq(mca->irq);
+	if (!mca->hw->no_irq)
+		disable_irq(mca->irq);
 	mca_irq_set_mask(mca, MCA_IRQ_ALL);
 	return 0;
 }
@@ -1070,7 +1079,8 @@ static int mca_runtime_resume(struct device *dev)
 	mca->irq_mask = MCA_IRQ_ALL;
 	mca_irq_set_mask(mca, MCA_IRQ_ALL);
 	mca_irq_ack(mca, MCA_IRQ_ALL);
-	enable_irq(mca->irq);
+	if (!mca->hw->no_irq)
+		enable_irq(mca->irq);
 	return 0;
 }
 
@@ -1214,14 +1224,17 @@ static int s8000_mca_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	mca->irq = platform_get_irq(pdev, 0);
-	if (mca->irq < 0)
-		return mca->irq;
-	/* enabled by runtime resume, once the hardware mask is set */
-	ret = devm_request_irq(dev, mca->irq, mca_irq, IRQF_NO_AUTOEN,
-			       dev_name(dev), mca);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to request IRQ\n");
+	if (!mca->hw->no_irq) {
+		mca->irq = platform_get_irq(pdev, 0);
+		if (mca->irq < 0)
+			return mca->irq;
+		/* enabled by runtime resume, once the hardware mask is set */
+		ret = devm_request_irq(dev, mca->irq, mca_irq, IRQF_NO_AUTOEN,
+				       dev_name(dev), mca);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to request IRQ\n");
+	}
 
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
@@ -1470,8 +1483,53 @@ static const struct s8000_mca_hw s5l8960x_mca_hw = {
 	.sio_trigger = 0xac,
 };
 
+/*
+ * S5L8960X (A7) MCA1 TX, the speaker link of the iPad mini 2 (J85), from
+ * the ADT's /arm-io/mca1/audio-speaker0 iisConfig (iOS 12.5.8 16H88):
+ *
+ *   10 12 00 00 08 00 01 00  00 1b b7 00 00 00 10 00
+ *   30 00 01 00 03 00 00 00  ff 00 00 00 02 08 10 10  00 00 00 00
+ *
+ * The MCA is a consumer (iisConfig[0] bit 0 clear): the primary CS35L19
+ * amplifier drives the frame, from the 12 MHz MCLK this MCA outputs
+ * (iisConfig[0] bit 4, bytes 8-11 = 12000000; control word 0x58 as on
+ * S8000 and J72). Format flags 0x12 as on J81 (DSP A, one bit of data
+ * delay: TX_CFG 0x109, and no clock edge bit), 8 slots of 16 bits with no
+ * fixed frame length (bytes 0xc-0xd zero) and a 16-bit sync pulse, TX in
+ * slots 0-1 (one per amplifier). No POL bit: format flag bit 0 equals the
+ * (consumer) role. The SmartIO shim words are the ADT's dma-channels (FIFO
+ * 0xcc, trigger 0xac), the same as on J81; TX/RX_CTL 0xf as on MCA0.
+ *
+ * As on J71b and J81, full scale is bounded to -12 dB here, where no client
+ * can bypass it: Linux has no speaker protection.
+ */
+static const struct s8000_mca_hw s5l8960x_tdm_mca_hw = {
+	.version = 1,
+	.no_irq = true,
+	.regs = &mca_v1_regs,
+	.dai_format = SND_SOC_DAIFMT_DSP_A,
+	.v1_ctl = MCA_V1_XX_CTL_A7,
+	.channels = 2,
+	.slots = 8,
+	.tx_slots = 0x3,
+	.tx_cfg = 0x109,
+	.rx_cfg = 0x00b,
+	.rx_slots = 0xff,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.sync_bits = 16,
+	.attenuation = 4,
+	.mclk_ctl = 0x58,
+	.mclk_rate = 12000000,
+	.sio_xfer16 = 0x21,
+	.sio_xfer32 = 0x22,
+	.sio_timeout = 0,
+	.sio_fifo = 0xcc,
+	.sio_trigger = 0xac,
+};
+
 static const struct of_device_id s8000_mca_of_match[] = {
 	{ .compatible = "apple,s5l8960x-mca", .data = &s5l8960x_mca_hw },
+	{ .compatible = "apple,s5l8960x-mca-tdm", .data = &s5l8960x_tdm_mca_hw },
 	{ .compatible = "apple,s8000-mca", .data = &s8000_mca_hw },
 	{ .compatible = "apple,s8000-mca-tdm", .data = &s8000_tdm_mca_hw },
 	{ .compatible = "apple,t7001-mca", .data = &t7001_mca_hw },
