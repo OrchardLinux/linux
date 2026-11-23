@@ -10,7 +10,8 @@
  * word to halt it. The calls are wrapped audio calls, as on the M1's AOP.
  *
  * The firmware talks to its devices only after they were attached, so the
- * driver attaches "pdm0" when it binds.
+ * driver attaches "pdm0" when it binds on A10. A10X firmware instead
+ * accepts a direct clock command with a source index and a rate in Hz.
  */
 
 #include <linux/clk-provider.h>
@@ -19,7 +20,7 @@
 #include <linux/platform_device.h>
 #include <linux/soc/apple/aop.h>
 
-#define AOP_AUDIO_WRAPPED_CALL		0x20
+#define AOP_AUDIO_COMMAND		0x20
 #define AOP_AUDIO_CALL_ATTACH		0xc3000002
 #define AOP_AUDIO_CALL_SET_PROP		0xc3000005
 
@@ -27,6 +28,15 @@
 #define AOP_AUDIO_PROP_PDM_CLOCK	201
 #define AOP_AUDIO_PDM_CLOCK_START	0x78693020	/* 'xi0 ' */
 #define AOP_AUDIO_PDM_CLOCK_STOP	0x6f666620	/* 'off ' */
+
+#define AOP_T8011_CLOCK_DISABLE		0
+#define AOP_T8011_CLOCK_XIO		1
+
+struct aop_t8011_clock_config {
+	__le32 reserved;	/* EPIC prefix before the clock payload */
+	__le32 source;
+	__le32 rate;
+};
 
 struct aop_audio_call_hdr {
 	__le32 zero0;
@@ -56,6 +66,7 @@ struct aop_audio {
 	struct apple_aop_service service;
 	struct clk_hw hw;
 	unsigned long rate;
+	bool direct_clock;
 };
 
 static void aop_audio_hdr(struct aop_audio_call_hdr *hdr, u32 type, size_t size)
@@ -72,7 +83,7 @@ static int aop_audio_call(struct aop_audio *audio, const void *call, size_t size
 {
 	int ret;
 
-	ret = apple_aop_call(&audio->service, AOP_AUDIO_WRAPPED_CALL, call, size,
+	ret = apple_aop_call(&audio->service, AOP_AUDIO_COMMAND, call, size,
 			     NULL, 0);
 	if (ret > 0) {
 		dev_err(audio->dev, "%s: firmware returned %#x\n", what, ret);
@@ -92,11 +103,21 @@ static int aop_audio_pdm_clock(struct aop_audio *audio, u32 mode, u32 rate)
 		.mode = cpu_to_le32(mode),
 		.rate = cpu_to_le32(rate),
 	};
+	const char *what = mode == AOP_AUDIO_PDM_CLOCK_STOP ?
+			   "stop PDM clock" : "start PDM clock";
+
+	if (audio->direct_clock) {
+		struct aop_t8011_clock_config config = {
+			.source = cpu_to_le32(rate ? AOP_T8011_CLOCK_XIO :
+					      AOP_T8011_CLOCK_DISABLE),
+			.rate = cpu_to_le32(rate),
+		};
+
+		return aop_audio_call(audio, &config, sizeof(config), what);
+	}
 
 	aop_audio_hdr(&call.hdr, AOP_AUDIO_CALL_SET_PROP, sizeof(call));
-	return aop_audio_call(audio, &call, sizeof(call),
-			      mode == AOP_AUDIO_PDM_CLOCK_STOP ? "stop PDM clock" :
-								 "start PDM clock");
+	return aop_audio_call(audio, &call, sizeof(call), what);
 }
 
 static struct aop_audio *to_aop_audio(struct clk_hw *hw)
@@ -124,7 +145,6 @@ static unsigned long aop_audio_clk_recalc_rate(struct clk_hw *hw,
 	return to_aop_audio(hw)->rate;
 }
 
-/* The firmware derives the rate itself; any PDM rate is passed on. */
 static int aop_audio_clk_determine_rate(struct clk_hw *hw,
 					struct clk_rate_request *req)
 {
@@ -170,11 +190,16 @@ static int aop_audio_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	audio->dev = dev;
 	audio->service = *service;
+	/* The A10X firmware takes the clock as a direct command. */
+	audio->direct_clock = of_device_is_compatible(dev->of_node,
+						       "apple,t8011-aop-audio");
 
-	aop_audio_hdr(&attach.hdr, AOP_AUDIO_CALL_ATTACH, sizeof(attach));
-	ret = aop_audio_call(audio, &attach, sizeof(attach), "attach pdm0");
-	if (ret)
-		return ret;
+	if (!audio->direct_clock) {
+		aop_audio_hdr(&attach.hdr, AOP_AUDIO_CALL_ATTACH, sizeof(attach));
+		ret = aop_audio_call(audio, &attach, sizeof(attach), "attach pdm0");
+		if (ret)
+			return ret;
+	}
 
 	init.name = devm_kasprintf(dev, GFP_KERNEL, "%s-pdm", dev_name(dev));
 	if (!init.name)
