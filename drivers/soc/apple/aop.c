@@ -1118,7 +1118,11 @@ err_halt:
 		apple_rtkit_free(aop->rtk);
 		apple_aop_free_buffers(aop);
 	} else {
-		dev_err(dev, "failed to halt; keeping its memory\n");
+		/* RTKit still refers to the devm state: retain the bound device too. */
+		aop->removing = true;
+		platform_set_drvdata(pdev, aop);
+		dev_crit(dev, "failed to halt; retaining bound device until reboot\n");
+		return 0;
 	}
 	return ret;
 
