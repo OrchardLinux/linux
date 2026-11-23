@@ -369,13 +369,15 @@ static int cs35l19_i2c_probe(struct i2c_client *client)
 	ret = regmap_bulk_read(cs->regmap, CS35L19_DEVID_AB, id, 3);
 	if (ret)
 		return dev_err_probe(dev, ret, "no answer\n");
-	if (id[0] != 0x35 || id[1] != 0xa1 || (id[2] & 0xf0) != 0x90)
-		return dev_err_probe(dev, -ENODEV, "device ID %02x%02x%02x, not a CS35L19\n",
+	/* iOS's AppleCS35L19Amp drives the CS35L21 (35 A2 1x) the same way. */
+	if (id[0] != 0x35 || !((id[1] == 0xa1 && (id[2] & 0xf0) == 0x90) ||
+			       (id[1] == 0xa2 && (id[2] & 0xf0) == 0x10)))
+		return dev_err_probe(dev, -ENODEV, "device ID %02x%02x%02x, not a CS35L19 or CS35L21\n",
 				     id[0], id[1], id[2]);
 	ret = regmap_read(cs->regmap, CS35L19_REV_ID, &cs->rev);
 	if (ret)
 		return ret;
-	dev_info(dev, "CS35L19 revision %02x\n", cs->rev);
+	dev_info(dev, "CS35L%s revision %02x\n", id[1] == 0xa2 ? "21" : "19", cs->rev);
 
 	return devm_snd_soc_register_component(dev, &cs35l19_component,
 					       &cs35l19_dai, 1);
