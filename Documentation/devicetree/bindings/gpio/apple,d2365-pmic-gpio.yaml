@@ -19,6 +19,11 @@ description: |
   currently supported; direction switching and PMU event interrupts are not.
   Boards must reserve lines that must remain under firmware control.
 
+  The August D2400 used with the Apple A10X has 16 GPIOs whose input
+  levels are read as on the D2365; its line configuration is not known, so
+  they are inputs as the boot firmware set them up. It latches 256 PMU
+  events, GPIO line N being event 0x30 + N.
+
   The D2207 and D2365 also latch 112 and 240 PMU events respectively
   (charger, ADC, GPIO edges and others) in one read-to-clear block and
   signal them on a single active-low line to the AP. As an interrupt
@@ -30,8 +35,9 @@ description: |
   edge flags are accepted.
 
   The Dialog D2089 PMIC used with the Apple A7 latches the same 112 events
-  in the same block as the D2207. Only that event controller is described:
-  its GPIO lines and the events they raise are not, so the node is no GPIO
+  in the same block as the D2207, and the D2355 charger PMU used with the
+  Apple A10X latches 80. Only those event controllers are described: their
+  GPIO lines and the events they raise are not, so the node is no GPIO
   controller.
 
   Interrupt 112 (D2089, D2207) or 240 (D2365), one past the last event, is
@@ -48,7 +54,9 @@ properties:
       - apple,d2207-pmic-gpio
       - apple,d2255-pmic-gpio
       - apple,d2333-pmic-gpio
+      - apple,d2355-pmic-gpio
       - apple,d2365-pmic-gpio
+      - apple,d2400-pmic-gpio
       - apple,d2401-pmic-gpio
 
   gpio-controller: true
@@ -96,7 +104,9 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,d2089-pmic-gpio
+          enum:
+            - apple,d2089-pmic-gpio
+            - apple,d2355-pmic-gpio
     then:
       properties:
         gpio-controller: false
@@ -137,7 +147,9 @@ allOf:
   - if:
       properties:
         compatible:
-          const: apple,d2365-pmic-gpio
+          enum:
+            - apple,d2365-pmic-gpio
+            - apple,d2400-pmic-gpio
     then:
       properties:
         apple,wake-events:
