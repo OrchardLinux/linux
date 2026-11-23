@@ -45,6 +45,7 @@
 #define W1_UART_HDQ_ZERO			0xc0
 #define W1_UART_HDQ_RX_ONE_MIN		0xf0
 #define W1_UART_HDQ_FAMILY		0x01
+#define W1_UART_HDQ_RAW_MAX		24
 
 enum w1_uart_mode {
 	W1_UART_MODE_1WIRE,
@@ -91,6 +92,8 @@ struct w1_uart_config {
  * @hdq_rx_bit: number of accepted echo and response symbols
  * @hdq_receiving: whether an HDQ transaction is receiving symbols
  * @hdq_response_valid: whether @hdq_response is ready for the W1 client
+ * @hdq_raw: first symbols received in the current HDQ cycle, for debugging
+ * @hdq_raw_len: number of symbols in @hdq_raw
  */
 struct w1_uart_device {
 	bool hdq_faulted;
@@ -125,6 +128,8 @@ struct w1_uart_device {
 	bool hdq_response_valid;
 	bool voltage_diagnostic;
 	unsigned long diagnostic_attempted;
+	u8 hdq_raw[W1_UART_HDQ_RAW_MAX];
+	u8 hdq_raw_len;
 };
 
 /**
@@ -405,6 +410,7 @@ static int w1_uart_hdq_xfer_once(struct w1_uart_device *w1dev)
 	spin_lock_irqsave(&w1dev->hdq_rx_lock, flags);
 	w1dev->hdq_response = 0;
 	w1dev->hdq_rx_bit = 0;
+	w1dev->hdq_raw_len = 0;
 	w1dev->hdq_receiving = true;
 	w1dev->hdq_response_valid = false;
 	spin_unlock_irqrestore(&w1dev->hdq_rx_lock, flags);
@@ -440,6 +446,18 @@ static int w1_uart_hdq_xfer_once(struct w1_uart_device *w1dev)
 	timeout = wait_for_completion_timeout(&w1dev->rx_byte_received,
 					      timeout);
 	if (!timeout || !w1_uart_hdq_wait_budget(w1dev, HZ)) {
+		u8 raw[W1_UART_HDQ_RAW_MAX];
+		u8 len, bit;
+
+		spin_lock_irqsave(&w1dev->hdq_rx_lock, flags);
+		len = w1dev->hdq_raw_len;
+		bit = w1dev->hdq_rx_bit;
+		memcpy(raw, w1dev->hdq_raw, len);
+		spin_unlock_irqrestore(&w1dev->hdq_rx_lock, flags);
+		/* What the line gave back: no echo, a bent echo, or no answer */
+		dev_dbg(&serdev->dev,
+			"HDQ cycle: %u of %u symbols accepted, %u received: %*ph\n",
+			bit, W1_UART_HDQ_RX_BITS, len, len, raw);
 		ret = -ETIMEDOUT;
 		goto cancel_receive;
 	}
@@ -590,6 +608,9 @@ static size_t w1_uart_serdev_receive_buf(struct serdev_device *serdev,
 	if (w1dev->mode == W1_UART_MODE_HDQ) {
 		spin_lock_irqsave(&w1dev->hdq_rx_lock, flags);
 		for (i = 0; i < count && w1dev->hdq_receiving; i++) {
+			if (w1dev->hdq_raw_len < W1_UART_HDQ_RAW_MAX)
+				w1dev->hdq_raw[w1dev->hdq_raw_len++] = buf[i];
+
 			if (w1dev->hdq_rx_bit < W1_UART_HDQ_BITS_PER_BYTE &&
 			    buf[i] != w1dev->hdq_command[w1dev->hdq_rx_bit]) {
 				w1dev->hdq_rx_bit =
