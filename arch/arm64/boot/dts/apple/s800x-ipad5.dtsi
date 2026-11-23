@@ -392,18 +392,9 @@
 	status = "okay";
 };
 
-&pcie0_dart0 {
-	status = "okay";
-};
-
-&pcie0_dart1 {
-	status = "okay";
-};
-
 &pcie0 {
 	pinctrl-0 = <&wifi_clkreq_pins>;
 	pinctrl-names = "default";
-	status = "okay";
 
 	/* Wi-Fi. PERST# from the ADT pci-bridge1 function-perst. */
 	pci@1,0 {

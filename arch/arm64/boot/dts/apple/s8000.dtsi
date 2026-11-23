@@ -82,7 +82,6 @@
 		apple,error-reflector = /bits/ 64 <0x20fffc000>;
 		apple,fetch-config = <0x000e0303>;
 		apple,diag-config = <0x00000100>;
-		status = "disabled";
 	};
 
 	pcie0_dart1: iommu@602008000 {
@@ -95,7 +94,6 @@
 		apple,error-reflector = /bits/ 64 <0x20fffc000>;
 		apple,fetch-config = <0x000e0303>;
 		apple,diag-config = <0x00000100>;
-		status = "disabled";
 	};
 
 	/*
@@ -159,7 +157,6 @@
 				<&ps_pcie_link2>, <&ps_pcie_link3>;
 		power-domain-names = "core", "aux", "ref", "link0", "link1",
 				     "link2", "link3";
-		status = "disabled";
 
 		/*
 		 * Storage. PERST# from the ADT pci-bridge0 function-perst;

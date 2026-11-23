@@ -20,19 +20,6 @@
 	};
 };
 
-&pcie0_dart0 {
-	status = "okay";
-};
-
-&pcie0_dart1 {
-	status = "okay";
-};
-
-/* Storage only: the Wi-Fi port (pci-bridge1) isn't described yet. */
-&pcie0 {
-	status = "okay";
-};
-
 &i2c2 {
 	status = "okay";
 
