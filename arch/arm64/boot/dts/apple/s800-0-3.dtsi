@@ -307,6 +307,18 @@
 			status = "disabled";
 		};
 
+		serial1: serial@20a0c4000 {
+			compatible = "apple,s8000-uart", "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0c4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 193 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart1>;
+		};
+
 		/*
 		 * uart2 carries the ADT's "wlan" node (wlan-pcie-uart,bcm4355):
 		 * the platform-control function of the PCIe Wi-Fi module.
@@ -328,6 +340,20 @@
 			clocks = <&clkref>, <&clkref>;
 			clock-names = "uart", "clk_uart_baud0";
 			power-domains = <&ps_uart3>;
+			status = "disabled";
+		};
+
+		/*
+		 * The A9 iPhones put the ADT's "wlan" node (wlan-pcie-uart,
+		 * bcm4350/bcm4345) on uart4 instead. This node is that role,
+		 * not the plain UART, so the boards that have it enable it:
+		 * the iPads have their Wi-Fi control on uart2 and only an
+		 * unused NFC node on uart4.
+		 */
+		wlan_uart4: wlan-platform-control@20a0d0000 {
+			compatible = "apple,t8010-wlan-uart-provider";
+			reg = <0x2 0x0a0d0000 0x0 0x4000>;
+			power-domains = <&ps_uart4>;
 			status = "disabled";
 		};
 
