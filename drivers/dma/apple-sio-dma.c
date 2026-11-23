@@ -478,6 +478,13 @@ static void sio_dma_stop_work(struct work_struct *work)
 	bool busy, issued;
 	int ret;
 
+	/*
+	 * A submission already outside vc.lock can still publish a request or
+	 * roll back its block after an allocation failure. Quiesce it before
+	 * draining callbacks and releasing the active descriptor.
+	 */
+	cancel_work_sync(&chan->submit_work);
+
 	spin_lock_irqsave(&chan->vc.lock, flags);
 	busy = chan->inflight;
 	spin_unlock_irqrestore(&chan->vc.lock, flags);
