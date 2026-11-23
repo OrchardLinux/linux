@@ -132,7 +132,7 @@
 #define D2365_EVENT_BYTES	30
 #define D2365_GPIO_EVENT	0x30
 
-#define APPLE_PMIC_EVENT_BYTES_MAX	30
+#define APPLE_PMIC_EVENT_BYTES_MAX	32
 #define APPLE_PMIC_EVENTS_MAX		(APPLE_PMIC_EVENT_BYTES_MAX * 8)
 /* The events plus the line interrupt, hwirq nevents. */
 #define APPLE_PMIC_IRQS_MAX		(APPLE_PMIC_EVENTS_MAX + 1)
@@ -159,6 +159,8 @@ struct apple_pmic_gpio_info {
 	unsigned int function_mask;
 	/* Some PMICs only have a verified, boot-configured output mode. */
 	bool preserve_boot_direction;
+	/* No known configuration registers: inputs read at input_base only. */
+	bool input_only;
 	unsigned int output_update_mask;
 	unsigned int (*config_reg)(unsigned int offset);
 	const struct apple_pmic_event_info *events;
@@ -943,6 +945,9 @@ static int apple_pmic_gpio_get_direction(struct gpio_chip *chip,
 	unsigned int value;
 	int ret;
 
+	if (info->input_only)
+		return GPIO_LINE_DIRECTION_IN;
+
 	ret = regmap_read(gpio->regmap, info->config_reg(offset), &value);
 	if (ret)
 		return ret;
@@ -966,6 +971,8 @@ static int apple_pmic_gpio_direction_input(struct gpio_chip *chip,
 	struct apple_pmic_gpio *gpio = gpiochip_get_data(chip);
 	const struct apple_pmic_gpio_info *info = gpio->info;
 
+	if (info->input_only)
+		return 0;
 	if (info->preserve_boot_direction)
 		return -EOPNOTSUPP;
 
@@ -981,6 +988,8 @@ static int apple_pmic_gpio_direction_output(struct gpio_chip *chip,
 	struct apple_pmic_gpio *gpio = gpiochip_get_data(chip);
 	const struct apple_pmic_gpio_info *info = gpio->info;
 
+	if (info->input_only)
+		return -EOPNOTSUPP;
 	if (info->preserve_boot_direction)
 		return apple_pmic_gpio_set_boot_output(gpio, offset, value);
 
@@ -998,6 +1007,8 @@ static int apple_pmic_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	unsigned int value;
 	int ret;
 
+	if (info->input_only)
+		goto read_input;
 	ret = regmap_read(gpio->regmap, info->config_reg(offset), &value);
 	if (ret)
 		return ret;
@@ -1008,6 +1019,7 @@ static int apple_pmic_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	if ((value & info->direction_mask) != info->input_mode)
 		return -EINVAL;
 
+read_input:
 	ret = regmap_read(gpio->regmap, info->input_base + offset / 8,
 			  &value);
 	if (ret)
@@ -1022,6 +1034,8 @@ static int apple_pmic_gpio_set(struct gpio_chip *chip, unsigned int offset,
 	struct apple_pmic_gpio *gpio = gpiochip_get_data(chip);
 	const struct apple_pmic_gpio_info *info = gpio->info;
 
+	if (info->input_only)
+		return -EOPNOTSUPP;
 	if (info->preserve_boot_direction)
 		return apple_pmic_gpio_set_boot_output(gpio, offset, value);
 
@@ -1144,6 +1158,40 @@ static const struct apple_pmic_event_info d2365_event_info = {
 	.gpio_event = D2365_GPIO_EVENT,
 };
 
+static const struct apple_pmic_event_info d2355_event_info = {
+	.status_base = 0x060,
+	.mask_base = 0x0a0,
+	.bytes = 10,
+};
+
+/* The D2355 charger PMU: events only, as on the D2089. */
+static const struct apple_pmic_gpio_info d2355_gpio_info = {
+	.label = "d2355-pmic-gpio",
+	.events = &d2355_event_info,
+};
+
+/* GPIO N is event 0x30 + N, as on the D2365 (ADT /buttons hall sensors). */
+static const struct apple_pmic_event_info d2400_event_info = {
+	.status_base = 0x140,
+	.mask_base = 0x1c0,
+	.bytes = 32,
+	.gpio_event = 0x30,
+};
+
+/*
+ * D2400: the input levels at 0x186, eight lines per byte, as on the D2333
+ * and D2365. Its configuration registers are not known, so the lines are
+ * inputs as the boot loader left them (the Smart Cover hall sensors on
+ * GPIO 0 and 10 of the iPad Pro 2 boards, ADT /buttons).
+ */
+static const struct apple_pmic_gpio_info d2400_gpio_info = {
+	.label = "d2400-pmic-gpio",
+	.ngpio = 16,
+	.input_base = 0x186,
+	.input_only = true,
+	.events = &d2400_event_info,
+};
+
 static const struct apple_pmic_gpio_info d2365_gpio_info = {
 	.label = "d2365-pmic-gpio",
 	.ngpio = 24,
@@ -1186,6 +1234,14 @@ static const struct of_device_id d2365_gpio_of_match[] = {
 	{
 		.compatible = "apple,d2186-pmic-gpio",
 		.data = &d2186_gpio_info,
+	},
+	{
+		.compatible = "apple,d2355-pmic-gpio",
+		.data = &d2355_gpio_info,
+	},
+	{
+		.compatible = "apple,d2400-pmic-gpio",
+		.data = &d2400_gpio_info,
 	},
 	{
 		.compatible = "apple,d2401-pmic-gpio",
