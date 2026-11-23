@@ -177,6 +177,75 @@ int btbcm_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
 }
 EXPORT_SYMBOL_GPL(btbcm_set_bdaddr);
 
+/* Taurus calibration uses fixed-size, zero-padded vendor command packets. */
+int btbcm_send_calibration(struct hci_dev *hdev, const void *data, size_t size)
+{
+	struct {
+		u8 type;
+		__le16 blocks_left;
+		u8 data[230];
+	} __packed cmd;
+	const u8 *cursor = data;
+	size_t blocks, len;
+	struct sk_buff *skb;
+	int err;
+
+	if (!data || !size)
+		return -EINVAL;
+
+	/* The remaining-block count on the wire has only 16 bits. */
+	if (size > sizeof(cmd.data) * ((size_t)U16_MAX + 1))
+		return -E2BIG;
+
+	blocks = DIV_ROUND_UP(size, sizeof(cmd.data));
+	while (blocks) {
+		len = min(size, sizeof(cmd.data));
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.type = 3;
+		cmd.blocks_left = cpu_to_le16(--blocks);
+		memcpy(cmd.data, cursor, len);
+
+		skb = __hci_cmd_sync(hdev, 0xfd97, sizeof(cmd), &cmd,
+				     HCI_INIT_TIMEOUT);
+		if (IS_ERR(skb))
+			return PTR_ERR(skb);
+
+		/* Some firmware returns a zero-extended status reply. */
+		if ((skb->len != 1 && skb->len != 2) ||
+		    skb->data[0] || (skb->len == 2 && skb->data[1])) {
+			err = (skb->len == 1 || skb->len == 2) && skb->data[0] ?
+				-bt_to_errno(skb->data[0]) : -EIO;
+			kfree_skb(skb);
+			return err;
+		}
+		kfree_skb(skb);
+		cursor += len;
+		size -= len;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(btbcm_send_calibration);
+
+/* Legacy controllers accept the regulatory table in one vendor command. */
+int btbcm_send_regulatory(struct hci_dev *hdev, const void *data, size_t size)
+{
+	struct sk_buff *skb;
+	int err = 0;
+
+	if (!data || !size || size > U8_MAX)
+		return -EINVAL;
+
+	skb = __hci_cmd_sync(hdev, 0xfd98, size, data, HCI_INIT_TIMEOUT);
+	if (IS_ERR(skb))
+		return PTR_ERR(skb);
+	if (skb->len != 1 || skb->data[0])
+		err = skb->len == 1 ? -bt_to_errno(skb->data[0]) : -EIO;
+	kfree_skb(skb);
+	return err;
+}
+EXPORT_SYMBOL_GPL(btbcm_send_regulatory);
+
 int btbcm_read_pcm_int_params(struct hci_dev *hdev,
 			      struct bcm_set_pcm_int_params *params)
 {
