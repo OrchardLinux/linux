@@ -1254,11 +1254,28 @@ static const struct apple_sio_hw apple_sio_s5l8960x_hw = {
 	.num_dma_ranges = ARRAY_SIZE(apple_sio_s5l8960x_dma_ranges),
 };
 
+/*
+ * The A10X's audio endpoints (ADT dma-channels of the iPad Pro 2 boards):
+ * MCA2 transmit and receive, MCA4 transmit, PDM receive.
+ */
+static const struct apple_sio_dma_range apple_sio_t8011_dma_ranges[] = {
+	{ 0x2c, 0x2d },
+	{ 0x30, 0x30 },
+	{ 0x5b, 0x5b },
+};
+
+static const struct apple_sio_hw apple_sio_t8011_hw = {
+	.regs = &apple_sio_regs_v2,
+	.dma_ranges = apple_sio_t8011_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_t8011_dma_ranges),
+};
+
 static const struct of_device_id apple_sio_of_match[] = {
 	{ .compatible = "apple,s5l8960x-sio", .data = &apple_sio_s5l8960x_hw },
 	{ .compatible = "apple,t7000-sio", .data = &apple_sio_t7000_hw },
 	{ .compatible = "apple,s8000-sio", .data = &apple_sio_s8000_hw },
 	{ .compatible = "apple,t8010-sio", .data = &apple_sio_t8010_hw },
+	{ .compatible = "apple,t8011-sio", .data = &apple_sio_t8011_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_sio_of_match);
@@ -1279,5 +1296,6 @@ MODULE_FIRMWARE("apple/s5l8960x-smartio.bin");
 MODULE_FIRMWARE("apple/t7000-smartio.bin");
 MODULE_FIRMWARE("apple/s8000-smartio.bin");
 MODULE_FIRMWARE("apple/t8010-smartio.bin");
-MODULE_DESCRIPTION("Apple S5L8960X/T7000/S8000/T8010 SmartIO coprocessor driver");
+MODULE_FIRMWARE("apple/t8011-smartio.bin");
+MODULE_DESCRIPTION("Apple S5L8960X/T7000/S8000/T8010/T8011 SmartIO coprocessor driver");
 MODULE_LICENSE("Dual MIT/GPL");
