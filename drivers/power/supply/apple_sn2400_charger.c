@@ -85,6 +85,10 @@ struct sn2400_charger {
 	enum sn2400_foldback_state state;
 	unsigned int max_input_ua;
 	unsigned int session_max_input_ua;
+	/* What the USB host allows (dwc2 vbus_draw); 0 = no USB session */
+	unsigned int usb_grant_ua;
+	/* The cap the probe stopped at; 0 when VBUS droop stopped it */
+	unsigned int settle_cap_ua;
 	unsigned int max_charge_ua;
 	unsigned int target_limit_ua;
 	unsigned int input_limit_ua;
@@ -276,6 +280,21 @@ static bool sn2400_vbus_drooped(struct sn2400_charger *charger, int vbus_uv)
 		charger->vbus_noload_uv - vbus_uv > SN2400_MAX_VBUS_DROOP_UV;
 }
 
+/*
+ * A USB host session caps the input at what the host allows (500 mA from a
+ * USB 2.0 port, more after an Apple host's grant). Without a session, a wall
+ * adapter, the VBUS-droop foldback alone finds the limit.
+ */
+static unsigned int sn2400_input_cap(struct sn2400_charger *charger)
+{
+	unsigned int grant = READ_ONCE(charger->usb_grant_ua);
+
+	if (!grant)
+		return charger->session_max_input_ua;
+
+	return min(charger->session_max_input_ua, grant);
+}
+
 static int sn2400_raise_input_limit(struct sn2400_charger *charger,
 				    unsigned int *input_limit_ua)
 {
@@ -283,7 +302,7 @@ static int sn2400_raise_input_limit(struct sn2400_charger *charger,
 	int ret;
 
 	requested = min(charger->target_limit_ua + SN2400_INPUT_STEP_UA,
-			charger->session_max_input_ua);
+			sn2400_input_cap(charger));
 	ret = sn2400_set_input_limit(charger, requested, input_limit_ua);
 	if (!ret)
 		charger->target_limit_ua = requested;
@@ -351,6 +370,22 @@ static void sn2400_charger_work(struct work_struct *work)
 		charger->session_max_input_ua = charger->max_input_ua;
 	charger->vbus_absent = false;
 
+	/* The USB host lowered what it allows: follow it at once. */
+	if (READ_ONCE(charger->usb_grant_ua) &&
+	    charger->state != SN2400_FOLDBACK_IDLE &&
+	    charger->state != SN2400_FOLDBACK_NOLOAD &&
+	    charger->target_limit_ua > sn2400_input_cap(charger)) {
+		ret = sn2400_set_input_limit(charger, sn2400_input_cap(charger),
+					     &input_limit_ua);
+		if (ret)
+			goto fail_safe;
+		charger->target_limit_ua = sn2400_input_cap(charger);
+		charger->state = SN2400_FOLDBACK_PROBE;
+		next_poll_ms = SN2400_FAST_POLL_MS;
+		sn2400_cache(charger, 0, status, 0, 0, input_limit_ua);
+		goto out_schedule;
+	}
+
 	switch (charger->state) {
 	case SN2400_FOLDBACK_IDLE:
 		ret = sn2400_disable_input(charger);
@@ -365,7 +400,7 @@ static void sn2400_charger_work(struct work_struct *work)
 		if (ret)
 			goto fail_safe;
 		charger->vbus_noload_uv = vbus_uv;
-		charger->target_limit_ua = min(charger->session_max_input_ua,
+		charger->target_limit_ua = min(sn2400_input_cap(charger),
 					       SN2400_INPUT_START_UA);
 		ret = sn2400_set_input_limit(charger, charger->target_limit_ua,
 					     &input_limit_ua);
@@ -384,7 +419,8 @@ static void sn2400_charger_work(struct work_struct *work)
 			goto fail_safe;
 		if (sn2400_vbus_drooped(charger, vbus_uv)) {
 			charger->state = SN2400_FOLDBACK_DEBOUNCE;
-		} else if (input_limit_ua >= charger->session_max_input_ua) {
+		} else if (input_limit_ua >= sn2400_input_cap(charger)) {
+			charger->settle_cap_ua = sn2400_input_cap(charger);
 			charger->state = SN2400_FOLDBACK_SETTLE;
 		} else {
 			ret = sn2400_raise_input_limit(charger, &input_limit_ua);
@@ -405,6 +441,7 @@ static void sn2400_charger_work(struct work_struct *work)
 			ret = sn2400_lower_input_limit(charger, &input_limit_ua);
 			if (ret)
 				goto fail_safe;
+			charger->settle_cap_ua = 0;
 			charger->state = input_limit_ua ?
 				SN2400_FOLDBACK_SETTLE : SN2400_FOLDBACK_NOLOAD;
 		} else {
@@ -424,9 +461,22 @@ static void sn2400_charger_work(struct work_struct *work)
 			ret = sn2400_lower_input_limit(charger, &input_limit_ua);
 			if (ret)
 				goto fail_safe;
+			charger->settle_cap_ua = 0;
 			if (!input_limit_ua)
 				charger->state = SN2400_FOLDBACK_NOLOAD;
+		} else if (charger->settle_cap_ua) {
+			/*
+			 * The probe stopped at the cap, not at a droop. If the
+			 * USB host has since allowed more (100 mA unconfigured,
+			 * then bMaxPower), probe on up to it. The host's limit
+			 * says nothing about the source: do not learn it.
+			 */
+			if (sn2400_input_cap(charger) > charger->settle_cap_ua) {
+				charger->state = SN2400_FOLDBACK_PROBE;
+				next_poll_ms = SN2400_FAST_POLL_MS;
+			}
 		} else if (charger->target_limit_ua) {
+			/* VBUS droop found this source's limit: keep it. */
 			charger->session_max_input_ua =
 				min(charger->session_max_input_ua,
 				    charger->target_limit_ua);
@@ -541,6 +591,9 @@ static int sn2400_charger_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
 		val->intval = charger->max_charge_ua;
 		break;
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		val->intval = charger->usb_grant_ua;
+		break;
 	default:
 		ret = -EINVAL;
 		break;
@@ -557,7 +610,40 @@ static const enum power_supply_property sn2400_charger_properties[] = {
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 };
+
+/*
+ * The USB device controller reports what the host allows (usb-psy-name):
+ * 0 without a session, 100 mA unconfigured, bMaxPower when configured, more
+ * after an Apple host's grant. Kernel only; sysfs keeps it read-only. A
+ * read-only charger only records it.
+ */
+static int sn2400_charger_set_property(struct power_supply *psy,
+				       enum power_supply_property property,
+				       const union power_supply_propval *val)
+{
+	struct sn2400_charger *charger = power_supply_get_drvdata(psy);
+	unsigned int grant;
+
+	if (property != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
+		return -EINVAL;
+
+	grant = max(val->intval, 0);
+	mutex_lock(&charger->lock);
+	if (charger->usb_grant_ua == grant) {
+		mutex_unlock(&charger->lock);
+		return 0;
+	}
+	WRITE_ONCE(charger->usb_grant_ua, grant);
+	dev_dbg(charger->dev, "USB host allows %u mA\n", grant / 1000);
+	if (charger->control && !charger->stopped)
+		mod_delayed_work(system_percpu_wq, &charger->work, 0);
+	mutex_unlock(&charger->lock);
+
+	power_supply_changed(psy);
+	return 0;
+}
 
 static const struct power_supply_desc sn2400_charger_desc = {
 	.name = "usb",
@@ -565,6 +651,7 @@ static const struct power_supply_desc sn2400_charger_desc = {
 	.properties = sn2400_charger_properties,
 	.num_properties = ARRAY_SIZE(sn2400_charger_properties),
 	.get_property = sn2400_charger_get_property,
+	.set_property = sn2400_charger_set_property,
 };
 
 static int sn2400_charger_stop(struct sn2400_charger *charger)
