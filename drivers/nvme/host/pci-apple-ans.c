@@ -108,6 +108,8 @@ static const struct of_device_id nvme_pci_apple_ans_hosts[] = {
 	{ .compatible = "apple,s8000-pcie", .data = &apple_ans_host_s8003 },
 	{ .compatible = "apple,s8003-pcie", .data = &apple_ans_host_s8003 },
 	{ .compatible = "apple,t8010-pcie", .data = &apple_ans_host_t8010 },
+	/* The A10X storage port carries the A10's ANS controller. */
+	{ .compatible = "apple,t8011-pcie", .data = &apple_ans_host_t8010 },
 	{ }
 };
 
