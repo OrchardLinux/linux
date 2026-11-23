@@ -593,7 +593,14 @@ apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 	request->status = -EINPROGRESS;
 	request->active = true;
 
-	ret = xa_insert(&sio->pending, request->key, request, gfp);
+	/* Setup replies submit requests from hard IRQ context. */
+	if (atomic) {
+		xa_lock_irqsave(&sio->pending, flags);
+		ret = __xa_insert(&sio->pending, request->key, request, gfp);
+		xa_unlock_irqrestore(&sio->pending, flags);
+	} else {
+		ret = xa_insert_irq(&sio->pending, request->key, request, gfp);
+	}
 	if (ret) {
 		apple_sio_tag_free(sio, endpoint, tag);
 		apple_sio_async_put(request);
@@ -1050,7 +1057,7 @@ static int apple_sio_probe(struct platform_device *pdev)
 	mutex_init(&sio->tx_lock);
 	spin_lock_init(&sio->tx_hw_lock);
 	spin_lock_init(&sio->tag_lock);
-	xa_init(&sio->pending);
+	xa_init_flags(&sio->pending, XA_FLAGS_LOCK_IRQ);
 	spin_lock_init(&sio->desc0_lock);
 	platform_set_drvdata(pdev, sio);
 
