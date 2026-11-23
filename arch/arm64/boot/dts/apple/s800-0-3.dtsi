@@ -102,6 +102,71 @@
 		};
 
 		/*
+		 * ADT disp0 ("adbe0,s8000"), the same on every A9 board, as is
+		 * dart-disp0. The pipe reads through dart-disp0, which iBoot leaves
+		 * in bypass. The board files add the panel link: its power domain,
+		 * and on eDP boards the DisplayPort transmitter's window.
+		 */
+		disp0: display-controller@206200000 {
+			compatible = "apple,s8000-display-pipe";
+			reg = <0x2 0x06200000 0x0 0x100000>,
+			      <0x2 0x06400000 0x0 0x8000>,
+			      <0x2 0x06440000 0x0 0x8000>,
+			      <0x2 0x06480000 0x0 0x8000>,
+			      <0x2 0x064c0000 0x0 0x8000>,
+			      <0x2 0x06500000 0x0 0x1c>,
+			      <0x2 0x06304000 0x0 0x4000>,
+			      <0x2 0x06300000 0x0 0x4000>;
+			reg-names = "adp", "disp-a", "disp-b", "disp-c", "disp-d",
+				    "side", "dart0", "dart1";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 140 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 143 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 144 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 145 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 146 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_disp0>;
+
+			/*
+			 * The pipe's reads as a DMA master behind dart-disp0: every
+			 * stream of its DART. Used for verified translated
+			 * scanout; it then enables the DART below and
+			 * creates this device itself, after mapping the live boot
+			 * framebuffer, so translation never starts under an unmapped
+			 * fetch.
+			 */
+			scanout {
+				iommus = <&disp0_dart 0>, <&disp0_dart 1>,
+					 <&disp0_dart 2>, <&disp0_dart 3>;
+				apple,dart-deferred-attach;
+			};
+		};
+
+		/*
+		 * ADT dart-disp0: the DART and its SMMU front end. iOS enables
+		 * each stream in both windows; only the DART owns tables and TLB
+		 * commands. The pipe maps dart1 without requesting it, so this
+		 * node owns the SMMU resource. Disabled until the display driver prepares
+		 * its live mapping and verifies translated scanout.
+		 */
+		disp0_dart: iommu@206304000 {
+			compatible = "apple,s8000-dart", "apple,s5l8960x-dart";
+			reg = <0x2 0x06304000 0x0 0x4000>,
+			      <0x2 0x06300000 0x0 0x4000>;
+			reg-names = "dart", "smmu";
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 141 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 142 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "dart", "smmu";
+			power-domains = <&ps_disp0>;
+			apple,error-reflector = /bits/ 64 <0x20fffc000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x00000100>;
+			status = "disabled";
+		};
+
+		/*
 		 * The GPU: a PowerVR Rogue core (GT7600) behind Apple's Fender
 		 * block, with Apple's firmware on the core's own processor. The
 		 * IPSW device trees of every A9 board give it the same registers,

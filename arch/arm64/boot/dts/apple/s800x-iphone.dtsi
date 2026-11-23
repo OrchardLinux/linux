@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Touchscreen and ambient light sensor of the A9 iPhones
+ * Touchscreen, ambient light sensor and panel link of the A9 iPhones
  *
  * The IPSW device trees of N66, N66m, N71, N71m, N69 and N69u wire both
  * the same way: the touch controller on SPI2 with the same GPIOs, bit
@@ -67,4 +67,9 @@
 
 &touchclk {
 	status = "okay";
+};
+
+/* The panel link is MIPI DSI (ADT mipi-dsim), as the boot framebuffer has it */
+&disp0 {
+	power-domains = <&ps_disp0>, <&ps_mipi_dsi>;
 };
