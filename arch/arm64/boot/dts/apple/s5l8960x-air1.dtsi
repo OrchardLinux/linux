@@ -222,3 +222,20 @@
 		device-ready-gpios = <&pinctrl 164 GPIO_ACTIVE_HIGH>;
 	};
 };
+
+/*
+ * The battery gauge on UART5's HDQ line: a BQ27540 by Apple's device tree
+ * (/arm-io/uart5/gas-gauge), the same on every A7 iPad. It runs the gauge
+ * firmware profile measured on the J72.
+ */
+&serial5 {
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		fuel-gauge {
+			compatible = "apple,j72-bq27545", "ti,bq27545-hdq";
+		};
+	};
+};
