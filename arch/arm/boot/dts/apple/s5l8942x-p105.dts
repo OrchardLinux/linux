@@ -699,7 +699,8 @@
 		 * known -- a NAND reset drops the PPN to SDR and only a reboot
 		 * through iBEC gets DDR back.
 		 *
-		 * Read-only.  See docs/research/p105-nand.md. */
+		 * See docs/research/p105-nand.md.
+		 */
 		nand: flash-controller@1200000 {
 			compatible = "apple,s5l8940x-fmi";
 			reg = <0x1200000 0x1000>,	/* FMI0 */
