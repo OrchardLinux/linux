@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Touchscreen, ambient light sensor and panel link of the A9 iPhones
+ * Touchscreen, ambient light sensor, panel link and D2255 GPIOs of the A9
+ * iPhones
  *
  * The IPSW device trees of N66, N66m, N71, N71m, N69 and N69u wire both
  * the same way: the touch controller on SPI2 with the same GPIOs, bit
@@ -33,6 +34,18 @@
 		touch_core: regulator-touch-core {
 			compatible = "apple,antigua-touch-core-regulator";
 			regulator-name = "touch-core";
+		};
+
+		/*
+		 * Every A9 iPhone's D2255 (pmu,d2255) switches Bluetooth power
+		 * on line 8 and Wi-Fi REG_ON on line 10; the other lines stay
+		 * as iBoot left them.
+		 */
+		pmu_gpio: gpio {
+			compatible = "apple,d2255-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0 8>, <9 1>, <11 10>;
 		};
 	};
 };
