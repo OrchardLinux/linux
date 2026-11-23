@@ -31,6 +31,18 @@ properties:
     description:
       Maximum USB input current that the foldback policy may request.
 
+  apple,read-only:
+    type: boolean
+    description:
+      Only read the charger and leave it as the bootloader programmed it. For
+      boards whose charging policy has not been tested yet.
+
+  apple,keep-charge-limit:
+    type: boolean
+    description:
+      Leave the battery charge-current limit as the bootloader set it, for
+      boards whose iOS driver never programs it.
+
   mux-states:
     maxItems: 1
 
