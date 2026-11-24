@@ -12,6 +12,31 @@
 / {
 	chassis-type = "tablet";
 
+	aliases {
+		als0 = &als;
+		bluetooth0 = &bluetooth;
+		touchscreen0 = &touchscreen;
+		wifi0 = &wifi;
+	};
+
+	/*
+	 * The speaker amplifiers: one logical codec models the MAX98357A bank's
+	 * shared SD_MODE line.
+	 */
+	/* The two built-in PDM microphones */
+	dmics: audio-codec {
+		compatible = "dmic-codec";
+		#sound-dai-cells = <0>;
+		num-channels = <2>;
+	};
+
+	speaker_amps: amplifier {
+		compatible = "maxim,max98357a";
+		#sound-dai-cells = <0>;
+		maxim,tdm;
+		sdmode-gpios = <&pinctrl_ap 20 GPIO_ACTIVE_HIGH>;
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -41,10 +66,118 @@
 			linux,code = <KEY_VOLUMEUP>;
 		};
 	};
+
+	/*
+	 * Smart Cover hall sensors: PMIC GPIO 0 ("halleffect") and 10
+	 * ("halleffect1") in the ADT /buttons node. Both read low while the
+	 * cover is closed (measured on a J71b). Reported as
+	 * SW_MACHINE_COVER, not as a lid switch, so that closing the cover
+	 * doesn't suspend the system. Each line is its own device, so that
+	 * one the PMIC keeps for itself can't take the other down.
+	 */
+	smart-cover {
+		compatible = "gpio-keys-polled";
+		poll-interval = <50>;
+		label = "iPad Smart Cover";
+
+		cover-switch {
+			label = "Smart Cover (PMIC GPIO 0)";
+			gpios = <&pmu_gpio 0 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_MACHINE_COVER>;
+			debounce-interval = <50>;
+		};
+	};
+
+	battery_info: battery {
+		compatible = "simple-battery";
+		charge-full-design-microamp-hours = <8827000>;
+	};
+
+	spi3_nclk: clock-spi3-nclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <61538461>;
+		clock-output-names = "spi3-nclk";
+	};
+
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&pmu_gpio 14 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <100000>;
+	};
+
+	/*
+	 * Link 0 is the speaker link in the iOS TDM mode: eight 16-bit slots
+	 * with MCA2 as clock provider. Link 1 is the headphone jack: stereo I2S
+	 * from MCA4 as clock provider to the CS42L83, which runs its PLL from
+	 * SCLK. The codec is also an auxiliary device, so the card creates its
+	 * jack. Each board names its card.
+	 */
+	speakers: sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,widgets = "Speaker", "Speakers",
+					    "Headphone", "Headphones";
+		simple-audio-card,routing = "Speakers", "Speaker",
+					    "Headphones", "Jack HP";
+		simple-audio-card,pin-switches = "Speakers", "Headphones";
+		simple-audio-card,aux-devs = <&jack_codec>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		simple-audio-card,dai-link@0 {
+			reg = <0>;
+			format = "dsp_a";
+			bitclock-master = <&speaker_cpu>;
+			frame-master = <&speaker_cpu>;
+
+			speaker_cpu: cpu {
+				sound-dai = <&mca2>;
+			};
+
+			codec {
+				sound-dai = <&speaker_amps>;
+			};
+		};
+
+		simple-audio-card,dai-link@1 {
+			reg = <1>;
+			format = "i2s";
+			bitclock-master = <&jack_cpu>;
+			frame-master = <&jack_cpu>;
+
+			jack_cpu: cpu {
+				sound-dai = <&mca4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+
+	/* The microphones, recorded by the PDM controller. Each board names it. */
+	microphones: sound-microphones {
+		compatible = "simple-audio-card";
+
+		simple-audio-card,cpu {
+			sound-dai = <&pdm>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&dmics>;
+		};
+	};
 };
 
 &framebuffer0 {
 	power-domains = <&ps_disp0_fe &ps_disp0_be &ps_dp>;
+};
+
+&disp0 {
+	status = "okay";
 };
 
 &hurricane_opp09 {
@@ -58,17 +191,84 @@
 &i2c0 {
 	status = "okay";
 
+	tristar: port-controller@1a {
+		compatible = "nxp,cbtl1610";
+		reg = <0x1a>;
+	};
+
+	/*
+	 * The headphone jack codec, /arm-io/i2c0/audio-codec in the ADT: reset
+	 * on AP GPIO 25, interrupt on AP GPIO 71. Its function-aop_mclk (AOP
+	 * GPIO 36) is left to the AOP: the codec takes its clock from SCLK.
+	 * Tip sense is inverted as on Apple's other CS42L83 boards (plug
+	 * detection checked on a J171).
+	 */
+	jack_codec: audio-codec@48 {
+		compatible = "cirrus,cs42l83";
+		reg = <0x48>;
+		reset-gpios = <&pinctrl_ap 25 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 71 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		cirrus,ts-inv = <1>;
+		sound-name-prefix = "Jack";
+	};
+
 	d2365_pmic: pmic@3c {
 		compatible = "apple,angel-pmic", "apple,i2c-pmic";
 		reg = <0x3c>;
 		#address-cells = <1>;
 		#size-cells = <1>;
 
+		pmu_gpio: gpio {
+			compatible = "apple,d2365-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-reserved-ranges = <1 9>, <11 2>, <15 9>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&pinctrl_ap 38 IRQ_TYPE_LEVEL_LOW>;
+			/* Smart Cover front hall sensor (line 0): wake only. */
+			apple,wake-events = <0x30>;
+		};
+
 		rtc@500 {
 			compatible = "apple,angel-pmic-rtc", "apple,antigua-pmic-rtc";
 			reg = <0x500 0x10>;
 			nvmem-cells = <&rtc_offset>;
 			nvmem-cell-names = "rtc_offset";
+			interrupt-parent = <&pmu_gpio>;
+			interrupts = <16 IRQ_TYPE_EDGE_RISING>;
+			wakeup-source;
+		};
+
+		tristar_charger: charger@180 {
+			compatible = "apple,j71b-tristar-charger", "apple,tristar-charger";
+			reg = <0x180 0x10>, <0xa00 0x04>, <0x4000 0x03>;
+			reg-names = "status", "control", "adc";
+			interrupt-parent = <&pmu_gpio>;
+			/*
+			 * The PMU line, ADC done, then the events the iPadOS
+			 * charger subscribes to, except RTC event 16, which
+			 * belongs to the RTC alarm.
+			 */
+			interrupts = <240 IRQ_TYPE_EDGE_RISING>,
+				     <176 IRQ_TYPE_EDGE_RISING>,
+				     <40 IRQ_TYPE_EDGE_RISING>,
+				     <41 IRQ_TYPE_EDGE_RISING>,
+				     <42 IRQ_TYPE_EDGE_RISING>,
+				     <43 IRQ_TYPE_EDGE_RISING>,
+				     <72 IRQ_TYPE_EDGE_RISING>,
+				     <77 IRQ_TYPE_EDGE_RISING>;
+			apple,tristar = <&tristar>;
+			apple,usb-role-switch = <&usb_role>;
+			input-current-limit-microamp = <2400000>;
+
+			/* The charger decides when USB data may come on. */
+			port {
+				tristar_charger_usb: endpoint {
+					remote-endpoint = <&usbdev_role>;
+				};
+			};
 		};
 
 		nvmem@5000 {
@@ -86,4 +286,251 @@
 			};
 		};
 	};
+};
+
+/*
+ * The ambient light sensor, as in Apple's device tree of the iPad 6 and
+ * iPad 7 (i2c2 als1, als,ct819 at 0x39, GPIO 27 level-low).
+ */
+&i2c2 {
+	status = "okay";
+
+	/* m1n1 adds apple,als-calibration from the ADT */
+	als: light-sensor@39 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x39>;
+		interrupts-extended = <&pinctrl_ap 27 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
+/* The iPad 6 models (J71b, J72b) use the same AOP firmware (ipad7baop). */
+&aop {
+	firmware-name = "apple/aop-ipad7b.bin", "apple/aop-ipad7b-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+/*
+ * Given the unit's factory calibration (from m1n1), the AOP reports upright
+ * as y = -1 g, as the iPad 5's does and as desktops (iio-sensor-proxy) take
+ * it: no rotation. Measured on a J71b: upright y = -0.93 g.
+ */
+&aop_accel {
+	mount-matrix = "1", "0", "0",
+		       "0", "1", "0",
+		       "0", "0", "1";
+};
+
+/* The PMIC powers the iPad 6 and iPad 7 off; the charger can keep it on. */
+&d2365_pmic {
+	poweroff {
+		compatible = "apple,d2365-poweroff";
+		power-supplies = <&tristar_charger>;
+	};
+};
+
+&i2s_switch {
+	status = "okay";
+};
+
+&mca2 {
+	apple,i2s-switch = <&i2s_switch 2 2>;
+	status = "okay";
+};
+
+&pdm {
+	status = "okay";
+};
+
+&aop_i2s_switch {
+	status = "okay";
+};
+
+&aop_i2s_oe {
+	status = "okay";
+};
+
+&mca4 {
+	apple,i2s-switch = <&i2s_switch 4 4>;
+	/*
+	 * The CS42L83 sits on AOP pads 32-35 behind the AOP's i2s-switch: ADT
+	 * mca4 function-i2s_route_aop 'mca1' to 'pin0' and aop-i2s-switch
+	 * aop_i2s_oe_reg_val 0xf, identical on J71b, J72b, J171 and J172.
+	 * Only with these words set do the AOP pads carry the link (J171).
+	 */
+	apple,aop-i2s-route = <&aop_i2s_switch 0x0 0x00010101>,
+			      <&aop_i2s_switch 0xc 0x00080818>,
+			      <&aop_i2s_oe 0x0 0xf>;
+	status = "okay";
+};
+
+&nco {
+	status = "okay";
+};
+
+/*
+ * The NCO reference rate as a running J71b's ADT gives it. The IPSW ADTs leave
+ * it for iBoot to fill in, so the other boards are assumed to share it.
+ */
+&nco_clkref {
+	clock-frequency = <800000000>;
+};
+
+&pcie0 {
+	iommu-map = <0x100 &pcie0_dart0 0 0x0 0x80000000 0x0 0x3c000000 1>,
+		    <0x200 &pcie0_dart3 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	pinctrl-0 = <&wifi_clkreq>;
+	pinctrl-names = "default";
+
+	pci@3,0 {
+		device_type = "pci";
+		reg = <0x1800 0x0 0x0 0x0 0x0>;
+		bus-range = <2 2>;
+		max-link-speed = <1>;
+		apple,manual-availability-iommu = <&pcie0_dart3 0>;
+		apple,link-retry-after-power-cycle;
+		apple,hardware-trained-phy-lane;
+		apple,endpoint-power-after-link-setup;
+		apple,inherited-perst-before-link-setup;
+		reset-gpios = <&pinctrl_ap 15 GPIO_ACTIVE_LOW>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi: wifi@0,0 {
+			compatible = "pci14e4,43dc";
+			reg = <0x20000 0x0 0x0 0x0 0x0>;
+			interrupts-extended = <&pinctrl_ap 147 IRQ_TYPE_EDGE_FALLING>;
+			interrupt-names = "host-wake";
+			apple,wlan-uart = <&wlan_uart2>;
+			device-wake-gpios = <&pinctrl_ap 23 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+			brcm,ccode-map-trivial;
+		};
+	};
+};
+
+&pcie0_dart3 {
+	status = "okay";
+};
+
+&pinctrl_ap {
+	battery_swi_pins: battery-swi-pins {
+		pinmux = <APPLE_PINMUX(173, 1)>;
+	};
+
+	bluetooth_uart3_pins: bluetooth-uart3-pins {
+		pinmux = <APPLE_PINMUX(134, 1)>,
+			 <APPLE_PINMUX(135, 1)>,
+			 <APPLE_PINMUX(136, 1)>,
+			 <APPLE_PINMUX(137, 1)>;
+	};
+
+	wifi_clkreq: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(19, 1)>;
+	};
+
+	wlan_uart2_pins: wlan-uart2-pins {
+		pinmux = <APPLE_PINMUX(148, 1)>,
+			 <APPLE_PINMUX(150, 1)>;
+	};
+};
+
+&serial3 {
+	pinctrl-0 = <&bluetooth_uart3_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "apple,j71b-bcm4355c1-bt",
+			     "brcm,bcm4355c1-bt";
+		current-speed = <115200>;
+		max-speed = <3000000>;
+		shutdown-gpios = <&pmu_gpio 13 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl_ap 88 GPIO_ACTIVE_HIGH>;
+		apple,wlan = <&wifi>;
+	};
+};
+
+&serial5 {
+	pinctrl-0 = <&battery_swi_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		battery: fuel-gauge {
+			compatible = "ti,bq27540-hdq";
+			monitored-battery = <&battery_info>;
+		};
+	};
+};
+
+&spi3 {
+	clocks = <&spi3_nclk>;
+	cs-gpios = <&pinctrl_ap 85 GPIO_ACTIVE_LOW>;
+	dmas = <&sio 0x1a>;
+	dma-names = "tx";
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,j71b-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+		spi-cpol;
+		spi-cpha;
+		apple,z2-bpw16-min-len = <17>;
+		apple,z2-no-init-ack;
+		interrupts-extended = <&pinctrl_ap 21 IRQ_TYPE_EDGE_FALLING>;
+		power-ldo-gpios = <&pinctrl_ap 29 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&pinctrl_ap 31 GPIO_ACTIVE_LOW>;
+		power-ana-gpios = <&pinctrl_ap 145 GPIO_ACTIVE_HIGH>;
+		clocks = <&touchclk>;
+		touchscreen-size-x = <1536>;
+		touchscreen-size-y = <2048>;
+	};
+};
+
+&sio {
+	status = "okay";
+};
+
+/*
+ * The Lightning charger sets the data role: USB data stays off until the
+ * source is identified. It is told what the USB host allows.
+ */
+&usbdev {
+	usb-psy-name = "lightning";
+	usb-role-switch;
+
+	port {
+		usbdev_role: endpoint {
+			remote-endpoint = <&tristar_charger_usb>;
+		};
+	};
+};
+
+/* Lightning host role: accessory power from LDO5, ACC routing by the Tristar. */
+&usb_role {
+	apple,pmic = <&d2365_pmic>;
+	apple,tristar = <&tristar>;
+	status = "okay";
+};
+
+&wlan_uart2 {
+	pinctrl-0 = <&wlan_uart2_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+/* The adopted DisplayPort panel link cannot be restored after power loss. */
+&ps_dp {
+	apple,always-on;
+	apple,manual-pm;
 };

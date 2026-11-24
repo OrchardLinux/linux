@@ -50,6 +50,18 @@
 		clock-output-names = "spi3-nclk";
 	};
 
+	/*
+	 * The NCO's reference: the ADT's clock-frequencies entry for the
+	 * NCO's first clock-id (269), 800 MHz on the n66. A board whose ADT
+	 * says otherwise overrides it.
+	 */
+	nco_clkref: clock-ref-nco {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <800000000>;
+		clock-output-names = "nco_ref";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -99,6 +111,71 @@
 			compatible = "apple,s8000-cluster-cpufreq", "apple,t8103-cluster-cpufreq", "apple,cluster-cpufreq";
 			reg = <0x2 0x02220000 0 0x1000>;
 			#performance-domain-cells = <0>;
+		};
+
+		/*
+		 * ADT disp0 ("adbe0,s8000"), the same on every A9 board, as is
+		 * dart-disp0. The pipe reads through dart-disp0, which iBoot leaves
+		 * in bypass. The board files add the panel link: its power domain,
+		 * and on eDP boards the DisplayPort transmitter's window.
+		 */
+		disp0: display-controller@206200000 {
+			compatible = "apple,s8000-display-pipe";
+			reg = <0x2 0x06200000 0x0 0x100000>,
+			      <0x2 0x06400000 0x0 0x8000>,
+			      <0x2 0x06440000 0x0 0x8000>,
+			      <0x2 0x06480000 0x0 0x8000>,
+			      <0x2 0x064c0000 0x0 0x8000>,
+			      <0x2 0x06500000 0x0 0x1c>,
+			      <0x2 0x06304000 0x0 0x4000>,
+			      <0x2 0x06300000 0x0 0x4000>;
+			reg-names = "adp", "disp-a", "disp-b", "disp-c", "disp-d",
+				    "side", "dart0", "dart1";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 140 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 143 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 144 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 145 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 146 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_disp0>;
+
+			/*
+			 * The pipe's reads as a DMA master behind dart-disp0: every
+			 * stream of its DART. Used for verified translated
+			 * scanout; it then enables the DART below and
+			 * creates this device itself, after mapping the live boot
+			 * framebuffer, so translation never starts under an unmapped
+			 * fetch.
+			 */
+			scanout {
+				iommus = <&disp0_dart 0>, <&disp0_dart 1>,
+					 <&disp0_dart 2>, <&disp0_dart 3>;
+				apple,dart-deferred-attach;
+			};
+		};
+
+		/*
+		 * ADT dart-disp0: the DART and its SMMU front end. iOS enables
+		 * each stream in both windows; only the DART owns tables and TLB
+		 * commands. The pipe maps dart1 without requesting it, so this
+		 * node owns the SMMU resource. Disabled until the display driver prepares
+		 * its live mapping and verifies translated scanout.
+		 */
+		disp0_dart: iommu@206304000 {
+			compatible = "apple,s8000-dart", "apple,s5l8960x-dart";
+			reg = <0x2 0x06304000 0x0 0x4000>,
+			      <0x2 0x06300000 0x0 0x4000>;
+			reg-names = "dart", "smmu";
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 141 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 142 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "dart", "smmu";
+			power-domains = <&ps_disp0>;
+			apple,error-reflector = /bits/ 64 <0x20fffc000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x00000100>;
+			status = "disabled";
 		};
 
 		/*
@@ -195,6 +272,30 @@
 			status = "disabled";
 		};
 
+		/*
+		 * ADT /arm-io/mca2: the speaker TDM link of the iPhone 6s and 6s
+		 * Plus (pad 2), SmartIO endpoint 0x2c, bitclock from NCO 2. The
+		 * compatible names that link's setup, so the boards that have
+		 * the link enable it.
+		 */
+		mca2: mca@20a0a8000 {
+			compatible = "apple,s8000-mca-tdm";
+			reg = <0x2 0x0a0a8000 0x0 0x4000>,
+			      <0x2 0x0a002008 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 203 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca2>;
+			clocks = <&nco 2>;
+			clock-names = "bitclk";
+			dmas = <&sio 0x2c>;
+			dma-names = "tx";
+			#clock-cells = <0>;
+			clock-output-names = "mca2-mclk";
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@20a0c0000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x0a0c0000 0x0 0x4000>;
@@ -206,6 +307,18 @@
 			clock-names = "uart", "clk_uart_baud0";
 			power-domains = <&ps_uart0>;
 			status = "disabled";
+		};
+
+		serial1: serial@20a0c4000 {
+			compatible = "apple,s8000-uart", "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0c4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 193 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart1>;
 		};
 
 		/*
@@ -229,6 +342,20 @@
 			clocks = <&clkref>, <&clkref>;
 			clock-names = "uart", "clk_uart_baud0";
 			power-domains = <&ps_uart3>;
+			status = "disabled";
+		};
+
+		/*
+		 * The A9 iPhones put the ADT's "wlan" node (wlan-pcie-uart,
+		 * bcm4350/bcm4345) on uart4 instead. This node is that role,
+		 * not the plain UART, so the boards that have it enable it:
+		 * the iPads have their Wi-Fi control on uart2 and only an
+		 * unused NFC node on uart4.
+		 */
+		wlan_uart4: wlan-platform-control@20a0d0000 {
+			compatible = "apple,t8010-wlan-uart-provider";
+			reg = <0x2 0x0a0d0000 0x0 0x4000>;
+			power-domains = <&ps_uart4>;
 			status = "disabled";
 		};
 
@@ -270,7 +397,7 @@
 			power-domains = <&ps_i2c1>;
 			#address-cells = <1>;
 			#size-cells = <0>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		i2c2: i2c@20a112000 {
@@ -303,7 +430,7 @@
 			firmware-name = "apple/s8000-smartio.bin";
 			dma-channels = <64>;
 			#dma-cells = <1>;
-			status = "disabled";
+			status = "okay";
 		};
 
 		bus@20c000000 {
@@ -401,6 +528,15 @@
 				clock-frequency = <32768>;
 				status = "disabled";
 			};
+		};
+
+		/* ADT /arm-io/nco: nco,s8000, five channels 0x4000 apart */
+		nco: clock-controller@20e044000 {
+			compatible = "apple,s8000-nco", "apple,t8010-nco";
+			reg = <0x2 0x0e044000 0x0 0x14000>;
+			clocks = <&nco_clkref>;
+			#clock-cells = <1>;
+			status = "okay";
 		};
 
 		pmgr_misc: power-management@20e068000 {

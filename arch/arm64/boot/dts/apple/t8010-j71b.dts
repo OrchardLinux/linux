@@ -12,3 +12,19 @@
 	compatible = "apple,j71b", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPad 6 (Wi-Fi)";
 };
+
+&speakers {
+	simple-audio-card,name = "J71b Speakers";
+};
+
+&microphones {
+	simple-audio-card,name = "J71b Microphones";
+};
+
+&wifi {
+	brcm,board-type = "apple,j71b";
+};
+
+&touchscreen {
+	firmware-name = "apple/j71b-fwstart.z2fw";
+};

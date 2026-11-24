@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Touchscreen and ambient light sensor of the A9 iPhones
+ * Touchscreen, ambient light sensor, panel link and D2255 GPIOs of the A9
+ * iPhones
  *
  * The IPSW device trees of N66, N66m, N71, N71m, N69 and N69u wire both
  * the same way: the touch controller on SPI2 with the same GPIOs, bit
@@ -13,6 +14,7 @@
 		als0 = &als;	/* the loader copies the ADT's alsCalibration here */
 		spi2 = &spi2;
 		touchscreen0 = &touchscreen;	/* the loader copies the ADT calibration */
+		serial5 = &serial5;	/* the gauge's HDQ UART: a fixed port, as on the iPad 5 */
 	};
 };
 
@@ -33,6 +35,18 @@
 		touch_core: regulator-touch-core {
 			compatible = "apple,antigua-touch-core-regulator";
 			regulator-name = "touch-core";
+		};
+
+		/*
+		 * Every A9 iPhone's D2255 (pmu,d2255) switches Bluetooth power
+		 * on line 8 and Wi-Fi REG_ON on line 10; the other lines stay
+		 * as iBoot left them.
+		 */
+		pmu_gpio: gpio {
+			compatible = "apple,d2255-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-reserved-ranges = <0 8>, <9 1>, <11 10>;
 		};
 	};
 };
@@ -67,4 +81,113 @@
 
 &touchclk {
 	status = "okay";
+};
+
+/* The panel link is MIPI DSI (ADT mipi-dsim), as the boot framebuffer has it */
+&disp0 {
+	power-domains = <&ps_disp0>, <&ps_mipi_dsi>;
+};
+
+/*
+ * Battery and charger, the same on the iPhone 6s, 6s Plus and SE (iOS
+ * 15.8.8 DeviceTree.n66ap, n71ap, n69uap): an SN2400 charger at i2c1 0x75
+ * owns the battery's HDQ line, and the bq27540 gauge answers on uart5
+ * (function-battery_swi, AP GPIO 2), as on the iPhone 7. Each model sets
+ * its own charge current: the first entry of its ADT charger charge-limits.
+ */
+/ {
+	battery_info: battery {
+		compatible = "simple-battery";
+		/*
+		 * The charger's input follows the battery temperature: off
+		 * outside 0..45 C, reduced outside 10..40 C. The ADT gives no
+		 * limits; these are the usual ones for Li-ion cells, inside
+		 * the JEITA charging guideline (no charge below 0 C, reduced
+		 * current from 0 to 10 C, normal from 10 to 45 C), with 40 to
+		 * 45 C also reduced as a margin.
+		 */
+		operating-range-celsius = <0 45>;
+		alert-celsius = <10 40>;
+	};
+};
+
+&i2c1 {
+	status = "okay";
+
+	charger@75 {
+		compatible = "apple,sn2400";
+		reg = <0x75>;
+
+		sn2400_charger: charger {
+			compatible = "apple,sn2400-charger";
+			monitored-battery = <&battery_info>;
+			/* ADT charger usb-input-limit-max */
+			input-current-limit-microamp = <2000000>;
+			mux-states = <&hdq_mux 0>;
+			mux-state-names = "hdq";
+		};
+
+		hdq_mux: hdq-mux {
+			compatible = "apple,sn2400-hdq-mux";
+			#mux-state-cells = <1>;
+		};
+	};
+};
+
+&pinctrl_ap {
+	battery_swi_pins: battery-swi-pins {
+		pinmux = <APPLE_PINMUX(2, 1)>;
+	};
+};
+
+&serial5 {
+	pinctrl-0 = <&battery_swi_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+		mux-states = <&hdq_mux 1>;
+		mux-state-names = "hdq";
+
+		fuel-gauge {
+			compatible = "ti,bq27540-hdq";
+			monitored-battery = <&battery_info>;
+		};
+	};
+};
+
+/*
+ * Apple's A9 iPhone AOP firmware (aopfw-s8000aop) serves the accelerometer,
+ * gyroscope and pressure sensor.
+ */
+&aop {
+	firmware-name = "apple/aop-s8000.bin", "apple/aop-s8000-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+/*
+ * Measured on an iPhone 6s Plus: the firmware reports on the device's axes
+ * (x right, y up, z out of the screen) with the accelerometer giving
+ * gravity's sign, as on the iPad 5, so the matrices hold for every A9 iPhone.
+ */
+&aop_accel {
+	mount-matrix = "1", "0", "0",
+		       "0", "1", "0",
+		       "0", "0", "-1";
+};
+
+&aop_gyro {
+	mount-matrix = "1", "0", "0",
+		       "0", "1", "0",
+		       "0", "0", "1";
+};
+
+/* The USB device controller tells the SN2400 driver what the USB host allows. */
+&usbdev {
+	usb-psy-name = "usb";
 };

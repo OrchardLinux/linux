@@ -12,3 +12,64 @@
 	compatible = "apple,d10", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPhone 7 (Qualcomm)";
 };
+
+/*
+ * The D10 has the touch controller, battery gauge and Wi-Fi power
+ * sequence of the iPhone 7 Plus with the same baseband (D11), whose driver
+ * entries are the fallback.
+ */
+&fuel_gauge {
+	compatible = "apple,d10-bq27545",
+	             "apple,d11-bq27545",
+	             "ti,bq27545-hdq";
+};
+
+&pcie0 {
+	iommu-map = <0x100 &pcie0_dart0 0 0x0 0x80000000 0x0 0x3c000000 1>,
+		    <0x200 &pcie0_dart3 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	pinctrl-0 = <&wifi_clkreq>;
+	pinctrl-names = "default";
+
+	pci@3,0 {
+		device_type = "pci";
+		reg = <0x1800 0x0 0x0 0x0 0x0>;
+		bus-range = <2 2>;
+		max-link-speed = <1>;
+		apple,manual-availability-iommu = <&pcie0_dart3 0>;
+		reset-gpios = <&pinctrl_ap 15 GPIO_ACTIVE_LOW>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi0: wifi@0,0 {
+			compatible = "apple,d10-bcm4355-wifi",
+			             "apple,d11-bcm4355-wifi",
+			             "pci14e4,43dc";
+			reg = <0x20000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl_ap 88 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+			apple,antenna-sku = "XX";
+			brcm,board-type = "apple,kristoff";
+			brcm,ccode-map-trivial;
+		};
+	};
+};
+
+&pcie0_dart3 {
+	status = "okay";
+};
+
+&pinctrl_ap {
+	wifi_clkreq: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(19, 1)>;
+	};
+};
+
+&touchscreen {
+	compatible = "apple,d10-touchscreen",
+	             "apple,d11-touchscreen";
+	firmware-name = "apple/dfrmtfw-d10-c1f5d-2.bin";
+	touchscreen-size-x = <750>;
+	touchscreen-size-y = <1334>;
+};

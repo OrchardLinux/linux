@@ -17,3 +17,8 @@
 &touchscreen {
 	firmware-name = "apple/j72s-fwstart.z2fw";
 };
+
+/* ADT uart2/wlan module-instance */
+&wifi {
+	brcm,board-type = "apple,fearb";
+};

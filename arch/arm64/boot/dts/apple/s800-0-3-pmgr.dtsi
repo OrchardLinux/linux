@@ -729,6 +729,7 @@
 		#reset-cells = <0>;
 		label = "aop_gpio";
 		power-domains = <&ps_aop>;
+		apple,always-on; /* The running AOP firmware uses its GPIOs */
 	};
 
 	ps_aop_cpu: power-controller@80040 {

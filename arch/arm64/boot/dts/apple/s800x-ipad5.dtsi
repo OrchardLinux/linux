@@ -2,10 +2,8 @@
 /*
  * Apple iPad 5 common device tree
  *
- * J71s, J72s, J71t and J72t are wired the same; only J72t's Wi-Fi module
- * differs. Storage and Wi-Fi sit behind the PCIe root complex, which is
- * described for the S8003 only: the S8003 boards define S800X_IPAD5_PCIE
- * before including this file.
+ * J71s, J72s, J71t and J72t are wired the same; only the cellular models'
+ * Wi-Fi module differs.
  *
  * Copyright (c) 2022, Konrad Dybcio <konradybcio@kernel.org>
  */
@@ -216,6 +214,13 @@
 				     <77 IRQ_TYPE_EDGE_RISING>;
 			apple,tristar = <&tristar>;
 			input-current-limit-microamp = <2400000>;
+
+			/* The charger decides when USB data may come on. */
+			port {
+				tristar_charger_usb: endpoint {
+					remote-endpoint = <&usbdev_role>;
+				};
+			};
 		};
 
 		rtc@500 {
@@ -319,10 +324,6 @@
 	};
 };
 
-&sio {
-	status = "okay";
-};
-
 &spi1 {
 	/* ADT function-spi_cs0 */
 	cs-gpios = <&pinctrl_ap 16 GPIO_ACTIVE_LOW>;
@@ -382,12 +383,6 @@
 	status = "okay";
 };
 
-&vxd {
-	status = "okay";
-};
-
-#ifdef S800X_IPAD5_PCIE
-
 / {
 	aliases {
 		wifi0 = &wifi;
@@ -402,18 +397,6 @@
 		startup-delay-us = <100000>;
 		off-on-delay-us = <100000>;
 	};
-};
-
-/*
- * ADT displayport function-lcd_ldo = PMU GPIO 22: the panel supply, off in
- * system sleep as on iOS. Neither it nor the backlight holds up the
- * pipe's probe; the driver looks them up before the first sleep.
- */
-&disp0 {
-	apple,lcd-ldo-gpios = <&pmu_gpio 22 GPIO_ACTIVE_HIGH>;
-	backlight = <&dwi_bl>;
-	post-init-providers = <&pmu_gpio>, <&dwi_bl>;
-	status = "okay";
 };
 
 &pcie0 {
@@ -473,9 +456,42 @@
 	status = "okay";
 };
 
-#endif /* S800X_IPAD5_PCIE */
+/*
+ * The panel link is eDP (ADT displayport): the pipe holds the dp domain and
+ * gets the DisplayPort transmitter's window (0x206700000). ADT displayport
+ * function-lcd_ldo = PMU GPIO 22: the panel supply, off in system sleep as
+ * on iOS. Neither it nor the backlight holds up the pipe's probe; the driver
+ * looks them up before the first sleep.
+ */
+&disp0 {
+	reg = <0x2 0x06200000 0x0 0x100000>,
+	      <0x2 0x06400000 0x0 0x8000>,
+	      <0x2 0x06440000 0x0 0x8000>,
+	      <0x2 0x06480000 0x0 0x8000>,
+	      <0x2 0x064c0000 0x0 0x8000>,
+	      <0x2 0x06500000 0x0 0x1c>,
+	      <0x2 0x06304000 0x0 0x4000>,
+	      <0x2 0x06300000 0x0 0x4000>,
+	      <0x2 0x06700000 0x0 0x1000>;
+	reg-names = "adp", "disp-a", "disp-b", "disp-c", "disp-d",
+		    "side", "dart0", "dart1", "dp";
+	power-domains = <&ps_disp0>, <&ps_dp>;
+	apple,lcd-ldo-gpios = <&pmu_gpio 22 GPIO_ACTIVE_HIGH>;
+	backlight = <&dwi_bl>;
+	post-init-providers = <&pmu_gpio>, <&dwi_bl>;
+};
 
-/* Tell the Lightning charger what the USB host allows. */
+/*
+ * The Lightning charger sets the data role: USB data stays off until the
+ * source is identified. It is told what the USB host allows.
+ */
 &usbdev {
 	usb-psy-name = "lightning";
+	usb-role-switch;
+
+	port {
+		usbdev_role: endpoint {
+			remote-endpoint = <&tristar_charger_usb>;
+		};
+	};
 };
