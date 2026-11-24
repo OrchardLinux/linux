@@ -354,8 +354,17 @@ static int apple_gpio_irq_set_type(struct irq_data *data, unsigned int type)
 	if (irqtype == REG_GPIOx_IN_IRQ_OFF)
 		return -EINVAL;
 
-	apple_gpio_set_reg(pctl, data->hwirq, REG_GPIOx_MODE,
-			   FIELD_PREP(REG_GPIOx_MODE, irqtype));
+	/*
+	 * The pin's mode field is also its interrupt mask: IN_IRQ_OFF is the
+	 * masked state. Writing the trigger mode into a masked pin would arm it
+	 * behind the IRQ core's back, and since mask_irq() skips the hardware
+	 * for an interrupt it already believes masked, a level interrupt then
+	 * fires forever. Only arm the pin when it is unmasked;
+	 * apple_gpio_irq_unmask() applies the stored trigger type otherwise.
+	 */
+	if (!irqd_irq_masked(data))
+		apple_gpio_set_reg(pctl, data->hwirq, REG_GPIOx_MODE,
+				   FIELD_PREP(REG_GPIOx_MODE, irqtype));
 
 	if (type & IRQ_TYPE_LEVEL_MASK)
 		irq_set_handler_locked(data, handle_level_irq);
