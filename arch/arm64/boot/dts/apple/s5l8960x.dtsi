@@ -96,6 +96,30 @@
 		nonposted-mmio;
 		ranges;
 
+		/*
+		 * The G6430 (Apple's G3). Registers, interrupts and power
+		 * gate as Apple's device trees give them (sgx, gpu,s5l8960x):
+		 * the fifth interrupt is the firmware's, the second
+		 * meta-sw-interrupt tuple. On for the boards it was run on.
+		 */
+		gpu: gpu@201000000 {
+			compatible = "apple,s5l8960x-gpu";
+			reg = <0x2 0x01000000 0x0 0x100000>,
+			      <0x2 0x01e00000 0x0 0x100000>,
+			      <0x2 0x0e000000 0x0 0x40000>,
+			      <0x2 0x01f00000 0x0 0x81000>;
+			reg-names = "rgx", "fender", "pmgr", "bridges";
+			power-domains = <&ps_gfx>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 84 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 85 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 86 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 87 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 88 IRQ_TYPE_LEVEL_HIGH>;
+			firmware-name = "apple/gfx-s5l8960x.bin";
+			status = "disabled";
+		};
+
 		cpufreq: performance-controller@202220000 {
 			compatible = "apple,s5l8960x-cluster-cpufreq";
 			reg = <0x2 0x02220000 0 0x1000>;

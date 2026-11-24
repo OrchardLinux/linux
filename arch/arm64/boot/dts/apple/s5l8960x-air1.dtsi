@@ -101,6 +101,11 @@
 	};
 };
 
+/* The G6430: firmware boot, commands and runtime PM run on the J71 */
+&gpu {
+	status = "okay";
+};
+
 &framebuffer0 {
 	power-domains = <&ps_disp0 &ps_dp>;
 };
