@@ -86,6 +86,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_CS42L52
 	imply SND_SOC_CS42L56
 	imply SND_SOC_CS42L73
+	imply SND_SOC_CS42L81
 	imply SND_SOC_CS42L84
 	imply SND_SOC_CS4234
 	imply SND_SOC_CS4265
@@ -150,6 +151,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_MAX98504
 	imply SND_SOC_MAX98520
 	imply SND_SOC_MAX9867
+	imply SND_SOC_MAX98721
 	imply SND_SOC_MAX98925
 	imply SND_SOC_MAX98926
 	imply SND_SOC_MAX98927
@@ -802,6 +804,15 @@ config SND_SOC_CS35L32
 	tristate "Cirrus Logic CS35L32 CODEC"
 	depends on I2C
 
+config SND_SOC_CS35L19
+	tristate "Cirrus Logic CS35L19 speaker amplifier"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  The boosted class-D speaker amplifier of the iPad mini 1 and 2
+	  and, as the CS35L21, of the iPhone 6s and 6s Plus: a sibling of
+	  the CS35L33, with Apple's power-on sequence.
+
 config SND_SOC_CS35L33
 	tristate "Cirrus Logic CS35L33 CODEC"
 	depends on I2C
@@ -1031,6 +1042,16 @@ config SND_SOC_CS42L56
 config SND_SOC_CS42L73
 	tristate "Cirrus Logic CS42L73 CODEC"
 	depends on I2C
+
+config SND_SOC_CS42L81
+	tristate "Cirrus Logic CS42L81 CODEC"
+	depends on SPI_MASTER
+	select REGMAP
+	help
+	  Enable support for the Cirrus Logic CS42L81, an Apple-specific
+	  audio codec controlled over SPI. It has integrated speaker
+	  drivers, a headphone driver and digital microphone inputs, and is
+	  used in the Apple A9 iPad 5 together with the S8000 MCA.
 
 config SND_SOC_CS42L83
 	tristate "Cirrus Logic CS42L83 CODEC"
@@ -1447,6 +1468,15 @@ config SND_SOC_MAX98504
 config SND_SOC_MAX9867
 	tristate "Maxim MAX9867 CODEC"
 	depends on I2C
+
+config SND_SOC_MAX98721
+	tristate "Maxim MAX98721 speaker amplifier"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Enable support for the Maxim MAX98721 boosted class-D speaker
+	  amplifier, as used in the Apple iPad Air 2. It is driven as a TDM
+	  consumer with the register map of the MAX98925.
 
 config SND_SOC_MAX98925
 	tristate

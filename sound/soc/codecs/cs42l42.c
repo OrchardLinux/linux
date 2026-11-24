@@ -586,8 +586,19 @@ static int cs42l42_set_jack(struct snd_soc_component *component, struct snd_soc_
 	return 0;
 }
 
+/*
+ * What the codec reports, so that a generic card that lists the codec as an
+ * auxiliary device (simple-audio-card,aux-devs) creates its jack.
+ */
+static int cs42l42_get_jack_type(struct snd_soc_component *component)
+{
+	return SND_JACK_HEADSET | SND_JACK_BTN_0 | SND_JACK_BTN_1 |
+	       SND_JACK_BTN_2 | SND_JACK_BTN_3;
+}
+
 const struct snd_soc_component_driver cs42l42_soc_component = {
 	.set_jack		= cs42l42_set_jack,
+	.get_jack_type		= cs42l42_get_jack_type,
 	.dapm_widgets		= cs42l42_dapm_widgets,
 	.num_dapm_widgets	= ARRAY_SIZE(cs42l42_dapm_widgets),
 	.dapm_routes		= cs42l42_audio_map,
@@ -1089,8 +1100,19 @@ int cs42l42_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 							       (regval & 1),
 							       CS42L42_PLL_LOCK_POLL_US,
 							       CS42L42_PLL_LOCK_TIMEOUT_US);
-				if (ret < 0)
-					dev_warn(component->dev, "PLL failed to lock: %d\n", ret);
+				if (ret < 0) {
+					/*
+					 * Without SCLK the PLL never locks. Keep the
+					 * internal oscillator: switching to the PLL
+					 * or marking SCLK present would leave the
+					 * codec without a clock, and its control port
+					 * would then hold up the I2C bus it shares.
+					 */
+					dev_err(component->dev, "PLL failed to lock: %d\n", ret);
+					snd_soc_component_update_bits(component, CS42L42_PLL_CTL1,
+								      CS42L42_PLL_START_MASK, 0);
+					return ret;
+				}
 
 				/* PLL must be running to drive glitchless switch logic */
 				snd_soc_component_update_bits(component,

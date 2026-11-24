@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,t8010-pdm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8010 and T8011 PDM microphone controller
+
+maintainers:
+  - Henrik Klee <henrik@goat-code.com>
+
+description:
+  The PDM microphone controller of the Apple A10 records the built-in
+  PDM microphones. T8011 uses a different SmartIO FIFO and trigger pair.
+  Each microphone has a HiFi decimator that filters its
+  bit stream down to PCM; the controller hands the samples to SmartIO
+  DMA. The PDM clock comes from the Always-On Processor's audio service.
+
+allOf:
+  - $ref: dai-common.yaml#
+
+properties:
+  compatible:
+    enum:
+      - apple,t8010-pdm
+      - apple,t8011-pdm
+
+  reg:
+    minItems: 2
+    items:
+      - description: Controller registers
+      - description: Decimator of the first microphone
+      - description: Decimator of the second microphone
+
+  reg-names:
+    minItems: 2
+    items:
+      - const: pdm
+      - const: dec0
+      - const: dec1
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    items:
+      - description: PDM microphone clock
+
+  power-domains:
+    maxItems: 1
+
+  dmas:
+    maxItems: 1
+
+  dma-names:
+    const: rx
+
+  "#sound-dai-cells":
+    const: 0
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - clocks
+  - power-domains
+  - dmas
+  - dma-names
+  - "#sound-dai-cells"
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        pdm@20a0b4000 {
+            compatible = "apple,t8010-pdm";
+            reg = <0x2 0x0a0b4000 0x0 0x1000>,
+                  <0x2 0x0a120000 0x0 0x4000>,
+                  <0x2 0x0a124000 0x0 0x4000>;
+            reg-names = "pdm", "dec0", "dec1";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 238 IRQ_TYPE_LEVEL_HIGH>;
+            clocks = <&aop_audio>;
+            power-domains = <&ps_hfd0>;
+            dmas = <&sio 0x5b>;
+            dma-names = "rx";
+            #sound-dai-cells = <0>;
+        };
+    };

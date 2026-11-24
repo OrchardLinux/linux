@@ -1,0 +1,191 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,s8000-mca.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S5L8960X/T7001/S8000/T8010 MCA I2S controller
+
+maintainers:
+  - Berkay Kösebay <brkosebay@users.noreply.github.com>
+
+description: |
+  The "mca-version 4" serializer of the Apple A9. Each MCA has a register
+  window and a 32-bit MCLK control word, which the driver exports as the
+  clock feeding the codec's MCLK. Its pads are connected to the outside
+  through the i2s-switch, a routing block shared by all MCAs. Samples are
+  moved by SmartIO DMA. T8010 uses the same register layout (version 5),
+  with an AP NCO bitclock: apple,t8010-mca is the playback-only digital
+  speaker link (TDM), apple,t8010-mca-i2s the playback-only stereo I2S link
+  to the headphone codec. apple,s8000-mca-tdm is an A9 MCA driving its own
+  clocks from an AP NCO channel, the playback-only speaker link (TDM) of the
+  iPhone 6s Plus. The MCAs are the same block; the compatible names
+  the link setup iOS programs into it. The T7001 (A8X) MCA is the older
+  "mca-version 1" register layout with the same fields: apple,t7001-mca is
+  the playback-only speaker link (TDM) of the iPad Air 2, clocked from an AP
+  NCO channel running at twice the bit clock. The S5L8960X (A7) MCA is
+  version 1 as well: apple,s5l8960x-mca is the playback-only I2S link of the
+  iPad Air to its codec, which provides the bit and frame clocks as on the
+  A9; apple,s5l8960x-mca-tdm the playback-only speaker link (TDM) of the
+  iPad mini 2, a consumer of the clocks of its amplifiers, to which it
+  supplies MCLK.
+  The T8011 speaker link appends padding clocks after its 16-bit slots.
+
+allOf:
+  - $ref: dai-common.yaml#
+  - if:
+      properties:
+        compatible:
+          enum:
+            - apple,s8000-mca-tdm
+            - apple,t7001-mca
+            - apple,t8010-mca
+            - apple,t8010-mca-i2s
+            - apple,t8011-mca
+    then:
+      properties:
+        dmas:
+          maxItems: 1
+        dma-names:
+          maxItems: 1
+      required:
+        - clocks
+        - clock-names
+    else:
+      properties:
+        clocks: false
+        clock-names: false
+
+properties:
+  compatible:
+    enum:
+      - apple,s5l8960x-mca
+      - apple,s5l8960x-mca-tdm
+      - apple,s8000-mca
+      - apple,s8000-mca-tdm
+      - apple,t7001-mca
+      - apple,t8010-mca
+      - apple,t8010-mca-i2s
+      - apple,t8011-mca
+
+  clocks:
+    maxItems: 1
+    description:
+      AP NCO channel supplying the bitclock (T7001, T8010 and T8011). On T7001 the
+      MCA divides it by two.
+
+  clock-names:
+    const: bitclk
+
+  reg:
+    items:
+      - description: MCA registers
+      - description: MCLK control word
+
+  reg-names:
+    items:
+      - const: mca
+      - const: mclk
+
+  interrupts:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  dmas:
+    minItems: 1
+    items:
+      - description: SmartIO transmit (playback) endpoint
+      - description: SmartIO receive (capture) endpoint
+
+  dma-names:
+    minItems: 1
+    items:
+      - const: tx
+      - const: rx
+
+  '#sound-dai-cells':
+    const: 0
+
+  port:
+    $ref: audio-graph-port.yaml#
+    unevaluatedProperties: false
+    description:
+      The link to the codecs when an audio-graph-card2 card uses this MCA.
+
+  '#clock-cells':
+    const: 0
+
+  clock-output-names:
+    maxItems: 1
+
+  apple,i2s-switch:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: phandle of the i2s-switch syscon
+          - description: index of this MCA's node in the switch (audN)
+            maximum: 4
+          - description: index of the pad the codec is wired to (pinN)
+            maximum: 4
+    description:
+      The i2s-switch route between this MCA and the pad its codec is
+      connected to. The route is programmed while a stream is prepared.
+
+  apple,aop-i2s-route:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 4
+    items:
+      - items:
+          - description: phandle of an AOP i2s-switch syscon
+          - description: register offset
+          - description: value
+    description:
+      Writes that pass this MCA's link on through the AOP's i2s-switch, for
+      a codec wired to AOP pads. They are written when a stream starts and
+      left in place.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - power-domains
+  - dmas
+  - dma-names
+  - '#sound-dai-cells'
+  - '#clock-cells'
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      i2s_switch: syscon@20a003000 {
+        compatible = "apple,s8000-i2s-switch", "syscon";
+        reg = <0x2 0x0a003000 0x0 0x1000>;
+      };
+
+      mca@20a0a0000 {
+        compatible = "apple,s8000-mca";
+        reg = <0x2 0x0a0a0000 0x0 0x4000>,
+              <0x2 0x0a002000 0x0 0x4>;
+        reg-names = "mca", "mclk";
+        interrupt-parent = <&aic>;
+        interrupts = <AIC_IRQ 201 IRQ_TYPE_LEVEL_HIGH>;
+        power-domains = <&ps_mca0>;
+        dmas = <&sio 0x28>, <&sio 0x29>;
+        dma-names = "tx", "rx";
+        apple,i2s-switch = <&i2s_switch 0 0>;
+        #clock-cells = <0>;
+        clock-output-names = "mca0-mclk";
+        #sound-dai-cells = <0>;
+      };
+    };
