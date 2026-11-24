@@ -228,7 +228,7 @@
 					      <&d2355_events 53 IRQ_TYPE_EDGE_RISING>;
 			apple,tristar = <&tristar>;
 			apple,adc-pmic = <&august_pmic>;
-			firmware-name = "apple/j120/usb-input-limit-calibration-hv.bin";
+			/* The boot loader adds this unit's ADT calibration table. */
 			/* A conservative window, not Apple's production limits. */
 			apple,pack-limits = <150 350 3400000 4200000 (-2000000) 2000000>;
 			/* 1.5 A only while the Lightning VBUS reads 4.75-5.5 V. */
