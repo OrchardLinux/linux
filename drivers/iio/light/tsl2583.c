@@ -302,7 +302,7 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 	struct device *dev = &chip->client->dev;
 	struct apple_als_calibration *cal = &chip->cal;
 	const u8 *record;
-	size_t len;
+	size_t len, rec_len;
 	u32 checksum = 0;
 	u8 *data;
 	int gain_index;
@@ -319,16 +319,28 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 				     "failed to read LSCI calibration\n");
 	}
 
-	if (len < APPLE_ALS_CAL_HEADER_SIZE + info->cal_record_size ||
-	    len & 1 || data[1] != info->cal_version || data[2] != 1 ||
+	/*
+	 * The header gives the record's length. The copy can be longer, padded
+	 * with zeros: the iPad mini 2's 200-byte alsCalibration holds a 72-byte
+	 * LSCI v2 record.
+	 */
+	if (len < APPLE_ALS_CAL_HEADER_SIZE + info->cal_record_size) {
+		dev_err(dev, "invalid LSCI v%u calibration header\n",
+			info->cal_version);
+		goto invalid;
+	}
+	rec_len = get_unaligned_le16(data + 4);
+	if (rec_len < APPLE_ALS_CAL_HEADER_SIZE + info->cal_record_size ||
+	    rec_len > len || rec_len & 1 ||
+	    data[1] != info->cal_version || data[2] != 1 ||
 	    data[3] != APPLE_ALS_CAL_HEADER_SIZE ||
-	    get_unaligned_le16(data + 4) != len) {
+	    memchr_inv(data + rec_len, 0, len - rec_len)) {
 		dev_err(dev, "invalid LSCI v%u calibration header\n",
 			info->cal_version);
 		goto invalid;
 	}
 
-	for (i = 0; i < len; i += 2)
+	for (i = 0; i < rec_len; i += 2)
 		checksum += get_unaligned_le16(data + i);
 	if ((u16)checksum != U16_MAX) {
 		dev_err(dev, "invalid LSCI calibration checksum\n");
