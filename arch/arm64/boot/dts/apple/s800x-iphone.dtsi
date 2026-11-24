@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Touchscreen and ambient light sensor of the A9 iPhones
+ *
+ * The IPSW device trees of N66, N66m, N71, N71m, N69 and N69u wire both
+ * the same way: the touch controller on SPI2 with the same GPIOs, bit
+ * period and supplies, the light sensor at 0x29 on I2C2. The model files
+ * name the controller, its firmware and size, and the sensor.
+ */
+
+/ {
+	aliases {
+		als0 = &als;	/* the loader copies the ADT's alsCalibration here */
+		spi2 = &spi2;
+		touchscreen0 = &touchscreen;	/* the loader copies the ADT calibration */
+	};
+};
+
+&i2c0 {
+	/* ADT display-pmu,chestnut @0x27: touch power_ana = dpLE(0x302) */
+	display-pmu@27 {
+		compatible = "apple,chestnut-pmic";
+		reg = <0x27>;
+
+		touch_ana: regulator-touch-hv {
+			compatible = "apple,chestnut-touch-hv-regulator";
+			regulator-name = "touch-analog";
+		};
+	};
+
+	pmic@74 {
+		/* ADT multi-touch power_ldo = pmuL(0x219) */
+		touch_core: regulator-touch-core {
+			compatible = "apple,antigua-touch-core-regulator";
+			regulator-name = "touch-core";
+		};
+	};
+};
+
+&i2c2 {
+	status = "okay";
+
+	/* ADT i2c2/als @0x29, interrupt AP GPIO 131 */
+	als: light-sensor@29 {
+		reg = <0x29>;
+		interrupts-extended = <&pinctrl_ap 131 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
+/* ADT /arm-io/spi2/multi-touch */
+&spi2 {
+	cs-gpios = <&pinctrl_ap 44 GPIO_ACTIVE_LOW>;	/* function-enable_cs */
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		reg = <0>;
+		spi-max-frequency = <8064516>;		/* ADT 124 ns bit period */
+		interrupts-extended = <&pinctrl_ap 142 IRQ_TYPE_EDGE_FALLING>;
+		attn-gpios = <&pinctrl_ap 142 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&pinctrl_ap 75 GPIO_ACTIVE_LOW>;	/* function-reset */
+		ana-supply = <&touch_ana>;
+		core-supply = <&touch_core>;
+		clocks = <&touchclk>;
+		touchscreen-inverted-y;
+	};
+};
+
+&touchclk {
+	status = "okay";
+};

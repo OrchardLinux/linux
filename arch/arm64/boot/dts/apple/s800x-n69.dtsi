@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iPhone SE (N69, N69u): what the Samsung and TSMC models share
+ */
+
+#include "s800x-se.dtsi"
+
+/* ADT i2c2/als: als,ct819 */
+&als {
+	compatible = "apple,ct819", "amstaos,tsl2581";
+};
+
+/* ADT multi-touch,n69; AppleMultitouchN1SPI personality C1F57 */
+&touchscreen {
+	compatible = "apple,n69-touchscreen";
+	firmware-name = "apple/n69-fwstart.z2fw";
+	touchscreen-size-x = <640>;
+	touchscreen-size-y = <1136>;
+};
