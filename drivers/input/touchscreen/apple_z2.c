@@ -252,8 +252,16 @@ struct apple_z2 {
 	struct gpio_desc *attn_gpio;
 	struct delayed_work rearm_work;
 	struct delayed_work j72_work;
+	struct delayed_work j72_reset_work;
 	struct apple_z2_j72_recovery j72_recovery;
+	struct apple_z2_j72_recovery j72_resets;
 	unsigned int j72_bad_frames;
+	unsigned int j72_layout_drops;
+	unsigned int j72_reset_attempt;
+	unsigned int j72_reset_count;
+	unsigned long j72_bad_since;
+	struct apple_z2_j72_fault j72_fault;
+	struct apple_z2_j72_fault j72_bad;
 	unsigned long j72_last_frame;
 	bool j72_contacts_active;
 	int j72_layout_error;
@@ -347,6 +355,21 @@ static bool apple_z2_uses_n1(const struct apple_z2 *z2)
 	return apple_z2_is_j71t(z2) || apple_z2_is_j72(z2);
 }
 
+/* Record the check that failed, for the line logged if the controller fails. */
+static void apple_z2_j72_note(struct apple_z2 *z2, const char *why,
+			      unsigned int a, unsigned int b,
+			      const u8 *raw, size_t len)
+{
+	struct apple_z2_j72_fault *f = &z2->j72_fault;
+
+	f->why = why;
+	f->a = a;
+	f->b = b;
+	f->len = min(len, sizeof(f->raw));
+	if (f->len)
+		memcpy(f->raw, raw, f->len);
+}
+
 /* J72 requires byte-wise timing and a complete transfer before any decode. */
 static int apple_z2_spi_transfer(struct apple_z2 *z2,
 				 struct spi_transfer *xfers, unsigned int count)
@@ -369,8 +392,11 @@ static int apple_z2_spi_transfer(struct apple_z2 *z2,
 	error = spi_sync(z2->spidev, &message);
 	if (!error && message.actual_length != expected)
 		error = -EIO;
-	if (error)
+	if (error) {
 		z2->j72_spi_error = error;
+		apple_z2_j72_note(z2, "spi", expected, message.actual_length,
+				  NULL, 0);
+	}
 	return error;
 }
 
@@ -4707,6 +4733,7 @@ static int apple_z2_j72_get_report(struct apple_z2 *z2, u8 id, u16 len)
 		    apple_z2_j72_checksum(z2->rx_buf, wire))
 			return 0;
 	}
+	apple_z2_j72_note(z2, "get-report", id, len, z2->rx_buf, wire);
 	return -EBADMSG;
 }
 
@@ -4746,8 +4773,12 @@ static int apple_z2_j72_device_info(struct apple_z2 *z2)
 		return error;
 	if (z2->rx_buf[0] != 0xe2 || z2->rx_buf[2] != 1 ||
 	    get_unaligned_le16(z2->rx_buf + 3) != APPLE_Z2_J72_MAX_PAYLOAD ||
-	    !apple_z2_j72_checksum(z2->rx_buf, 16))
+	    !apple_z2_j72_checksum(z2->rx_buf, 16)) {
+		apple_z2_j72_note(z2, "device-info", APPLE_Z2_J72_MAX_PAYLOAD,
+				  get_unaligned_le16(z2->rx_buf + 3),
+				  z2->rx_buf, 16);
 		return -EPROTO;
+	}
 	return 0;
 }
 
@@ -4760,11 +4791,18 @@ static int apple_z2_j72_health(struct apple_z2 *z2)
 		error = apple_z2_j72_get_report(z2, 0x7f, 4);
 	if (error)
 		return error;
-	if (memchr_inv(z2->rx_buf + 3, 0, 4))
+	if (memchr_inv(z2->rx_buf + 3, 0, 4)) {
+		apple_z2_j72_note(z2, "health-7f", 0,
+				  get_unaligned_le32(z2->rx_buf + 3),
+				  z2->rx_buf, 16);
 		return -EPROTO;
+	}
 	error = apple_z2_j72_get_report(z2, 0xc8, 1);
-	if (!error && z2->rx_buf[3] != 0x19)
+	if (!error && z2->rx_buf[3] != 0x19) {
+		apple_z2_j72_note(z2, "health-c8", 0x19, z2->rx_buf[3],
+				  z2->rx_buf, 16);
 		error = -EPROTO;
+	}
 	return error;
 }
 
@@ -4822,6 +4860,10 @@ static int apple_z2_j72_emit(struct apple_z2 *z2, const u8 *body, size_t len)
 		return error;
 	z2->j72_contacts_active = false;
 	for (i = 0; i < count; i++) {
+		/* State 6 used to be refused; note that it does occur. */
+		if (contacts[i].state == 6)
+			dev_info_once(&z2->spidev->dev,
+				      "J72 contact state 6 seen\n");
 		slot = input_mt_get_slot_by_key(z2->input_dev, contacts[i].id);
 		if (slot < 0)
 			continue;
@@ -4844,11 +4886,28 @@ static int apple_z2_j72_emit(struct apple_z2 *z2, const u8 *body, size_t len)
 	return 0;
 }
 
-/* One complete EB exchange; only a validated reply consumes the queue tag. */
+/* Enough of a refused report to tell its layout: header, then id/state pairs. */
+static void apple_z2_j72_log_layout(struct apple_z2 *z2, int error,
+				    const u8 *body, size_t len)
+{
+	u8 states[2 * APPLE_Z2_J72_MAX_CONTACTS];
+	unsigned int i, n = 0;
+
+	for (i = 0; i < APPLE_Z2_J72_MAX_CONTACTS && 24 + i * 30 + 2 <= len; i++) {
+		states[n++] = body[24 + i * 30];
+		states[n++] = body[24 + i * 30 + 1];
+	}
+	dev_warn_ratelimited(&z2->spidev->dev,
+			     "J72 dropped a touch report (%d): %*ph contacts %*ph\n",
+			     error, (int)min_t(size_t, len, 24), body, n, states);
+}
+
+/* One complete EB exchange; only a checksum-valid reply consumes the queue tag. */
 static int apple_z2_j72_read_frame(struct apple_z2 *z2)
 {
 	struct spi_transfer xfer = { .tx_buf = z2->tx_buf, .rx_buf = z2->rx_buf };
 	unsigned int retry, wire;
+	const char *why;
 	u16 length;
 	u8 tag = z2->index_parity + 1;
 	int error;
@@ -4863,8 +4922,12 @@ static int apple_z2_j72_read_frame(struct apple_z2 *z2)
 	if (error)
 		return error;
 	error = apple_z2_j72_length(z2->rx_buf, &length);
-	if (error)
+	if (error) {
+		if (error != -EAGAIN)
+			apple_z2_j72_note(z2, "eb-length", tag, -error,
+					  z2->rx_buf, 16);
 		return error;
+	}
 	if (!length) {
 		z2->index_parity ^= 1;
 		return 0;
@@ -4884,17 +4947,103 @@ static int apple_z2_j72_read_frame(struct apple_z2 *z2)
 		if (!retry && wire >= 16 && z2->rx_buf[0] == 0xe1 &&
 		    !apple_z2_j72_length(z2->rx_buf, &length) && length >= 2)
 			continue;
-		if (!apple_z2_j72_packet(z2->rx_buf, wire))
+		why = apple_z2_j72_packet_fault(z2->rx_buf, wire);
+		if (why) {
+			apple_z2_j72_note(z2, why, wire,
+					  get_unaligned_le16(z2->rx_buf + 2),
+					  z2->rx_buf, wire);
 			return -EBADMSG;
+		}
+		/* A checksum-valid report consumes its tag even when refused. */
+		z2->index_parity ^= 1;
 		error = apple_z2_j72_emit(z2, z2->rx_buf + 5, wire - 7);
 		if (error) {
 			z2->j72_layout_error = error;
-			return error;
+			apple_z2_j72_log_layout(z2, error, z2->rx_buf + 5, wire - 7);
 		}
-		z2->index_parity ^= 1;
-		return 0;
+		return error;
 	}
+	apple_z2_j72_note(z2, "eb-requeued", length, tag, z2->rx_buf, 16);
 	return -EBADMSG;
+}
+
+/*
+ * io_lock is held and the controller has failed: release every contact, power
+ * it off and boot it again from apple_z2_j72_reset_work(), at most
+ * APPLE_Z2_J72_RECOVERIES times a minute. Past that, touch stays stopped
+ * until the next resume or rebind, as before.
+ */
+static void apple_z2_j72_fail_locked(struct apple_z2 *z2, int error)
+{
+	const struct apple_z2_j72_fault *f = &z2->j72_fault, *bad = &z2->j72_bad;
+	u64 now = div_u64(ktime_get_ns(), NSEC_PER_MSEC);
+	char what[80];
+
+	apple_z2_release_contacts(z2);
+	z2->j72_contacts_active = false;
+	z2->booted = false;
+	apple_z2_j72_power_off(z2);
+	apple_z2_reset_protocol(z2);
+	if (z2->stopping)
+		return;
+	if (!apple_z2_j72_recovery_admit(&z2->j72_resets, now)) {
+		z2->stopping = true;
+		scnprintf(what, sizeof(what),
+			  "J72 touch stopped after error %d (layout %d)",
+			  error, z2->j72_layout_error);
+	} else {
+		z2->j72_reset_attempt++;
+		scnprintf(what, sizeof(what),
+			  "J72 touch error %d; resetting the controller (attempt %u)",
+			  error, z2->j72_reset_attempt);
+	}
+	/*
+	 * One line per reset, at most APPLE_Z2_J72_RECOVERIES a minute: the
+	 * failed check with its two values and reply, then the last refused
+	 * frame, which a failed health check follows.
+	 */
+	dev_printk(z2->stopping ? KERN_ERR : KERN_WARNING, &z2->spidev->dev,
+		   "%s: %s %#x %#x [%*ph]; %u bad frames in %u ms, last %s %#x %#x [%*ph]\n",
+		   what, f->why ?: "?", f->a, f->b, f->len, f->raw,
+		   z2->j72_bad_frames,
+		   z2->j72_bad_frames ?
+			jiffies_to_msecs(jiffies - z2->j72_bad_since) : 0,
+		   bad->why ?: "-", bad->a, bad->b, bad->len, bad->raw);
+	if (!z2->stopping)
+		schedule_delayed_work(&z2->j72_reset_work,
+				      msecs_to_jiffies(APPLE_Z2_J72_RESET_DELAY_MS));
+}
+
+/* Boot outside io_lock, as probe and resume do: the boot takes it itself. */
+static void apple_z2_j72_reset_work(struct work_struct *work)
+{
+	struct apple_z2 *z2 = container_of(to_delayed_work(work), struct apple_z2,
+					   j72_reset_work);
+	int error;
+
+	mutex_lock(&z2->io_lock);
+	if (z2->stopping || z2->booted) {
+		mutex_unlock(&z2->io_lock);
+		return;
+	}
+	z2->j72_fault.why = NULL;
+	mutex_unlock(&z2->io_lock);
+
+	error = apple_z2_boot(z2);
+
+	mutex_lock(&z2->io_lock);
+	if (error && !z2->j72_fault.why)
+		apple_z2_j72_note(z2, "boot", 0, 0, NULL, 0);
+	if (!error) {
+		z2->j72_reset_count++;
+		dev_info(&z2->spidev->dev,
+			 "J72 touch restarted after attempt %u (%u resets since probe)\n",
+			 z2->j72_reset_attempt, z2->j72_reset_count);
+		z2->j72_reset_attempt = 0;
+	} else {
+		apple_z2_j72_fail_locked(z2, error);
+	}
+	mutex_unlock(&z2->io_lock);
 }
 
 static void apple_z2_j72_work(struct work_struct *work)
@@ -4907,46 +5056,75 @@ static void apple_z2_j72_work(struct work_struct *work)
 	if (z2->stopping || !z2->booted)
 		goto unlock;
 	z2->j72_spi_error = 0;
+	z2->j72_layout_error = 0;
+	z2->j72_fault.why = NULL;
 	error = apple_z2_j72_read_frame(z2);
-	if (z2->j72_spi_error || z2->j72_layout_error)
+	if (z2->j72_spi_error)
 		goto failed;
+	if (z2->j72_layout_error) {
+		/*
+		 * The report arrived whole and checksummed, only its content
+		 * was refused: skip it and let the next report set the slots.
+		 * A run of refused reports resets the controller.
+		 */
+		if (++z2->j72_layout_drops >= APPLE_Z2_J72_LAYOUT_DROPS) {
+			apple_z2_j72_note(z2, "layout", z2->j72_layout_drops,
+					  -z2->j72_layout_error, NULL, 0);
+			goto failed;
+		}
+		error = -EAGAIN;
+	} else if (!error) {
+		z2->j72_layout_drops = 0;
+	}
 	/* A silent or unrelated valid control response retains tag and budget. */
-	if (error == -EBADMSG || error == -EMSGSIZE)
-		z2->j72_bad_frames++;
-	else if (error && error != -EAGAIN)
+	if (error == -EBADMSG || error == -EMSGSIZE) {
+		if (!z2->j72_bad_frames++)
+			z2->j72_bad_since = jiffies;
+		z2->j72_bad = z2->j72_fault;
+	} else if (error && error != -EAGAIN) {
 		goto failed;
-	else if (!error)
+	} else if (!error) {
 		z2->j72_bad_frames = 0;
+	}
 	if (z2->j72_bad_frames >= 3) {
 		apple_z2_release_contacts(z2);
 		z2->j72_contacts_active = false;
 		now = div_u64(ktime_get_ns(), NSEC_PER_MSEC);
 		if (!apple_z2_j72_recovery_admit(&z2->j72_recovery, now)) {
+			apple_z2_j72_note(z2, "bad-frame-budget",
+					  z2->j72_recovery.count, 0, NULL, 0);
 			error = -EOVERFLOW;
 			goto failed;
 		}
 		z2->wake_valid = false;
+		z2->j72_fault.why = NULL;
 		error = apple_z2_j72_health(z2);
 		if (error)
 			goto failed;
+		dev_dbg(&z2->spidev->dev,
+			"J72 health passed after %u bad frames, last %s %#x %#x [%*ph]\n",
+			z2->j72_bad_frames, z2->j72_bad.why ?: "-", z2->j72_bad.a,
+			z2->j72_bad.b, z2->j72_bad.len, z2->j72_bad.raw);
 		z2->j72_bad_frames = 0;
 	}
 	if (z2->j72_contacts_active &&
 	    time_after(jiffies, z2->j72_last_frame + msecs_to_jiffies(250))) {
 		error = -ETIMEDOUT;
-		goto failed;
+		if (!z2->j72_layout_drops) {
+			apple_z2_j72_note(z2, "stale-contacts",
+					  jiffies_to_msecs(jiffies - z2->j72_last_frame),
+					  0, NULL, 0);
+			goto failed;
+		}
+		/* The last report, maybe the lift, was refused: release only. */
+		apple_z2_release_contacts(z2);
+		z2->j72_contacts_active = false;
 	}
 	schedule_delayed_work(&z2->j72_work, msecs_to_jiffies(25));
 	goto unlock;
 
 failed:
-	dev_err(&z2->spidev->dev, "J72 touch stopped after error %d (layout %d)\n",
-		error, z2->j72_layout_error);
-	apple_z2_release_contacts(z2);
-	z2->j72_contacts_active = false;
-	z2->booted = false;
-	z2->stopping = true;
-	apple_z2_j72_power_off(z2);
+	apple_z2_j72_fail_locked(z2, error);
 unlock:
 	mutex_unlock(&z2->io_lock);
 }
@@ -4961,12 +5139,15 @@ static int apple_z2_j72_finish_boot(struct apple_z2 *z2)
 	mutex_lock(&z2->io_lock);
 	z2->index_parity = 0;
 	z2->j72_bad_frames = 0;
+	z2->j72_layout_drops = 0;
 	z2->j72_layout_error = 0;
 	z2->j72_contacts_active = false;
 	memset(&z2->j72_recovery, 0, sizeof(z2->j72_recovery));
 	error = apple_z2_j72_init_reports(z2);
+	/* Stopped while this boot ran (suspend, unbind, given up): stay off. */
+	if (!error && z2->stopping)
+		error = -ESHUTDOWN;
 	if (!error) {
-		z2->stopping = false;
 		z2->booted = true;
 		z2->j72_last_frame = jiffies;
 		schedule_delayed_work(&z2->j72_work, msecs_to_jiffies(25));
@@ -5345,6 +5526,7 @@ static int apple_z2_probe(struct spi_device *spi)
 	INIT_DELAYED_WORK(&z2->rearm_work, info->recover_control_stall ?
 			  apple_z2_control_rearm_work : apple_z2_n1_rearm_work);
 	INIT_DELAYED_WORK(&z2->j72_work, apple_z2_j72_work);
+	INIT_DELAYED_WORK(&z2->j72_reset_work, apple_z2_j72_reset_work);
 	INIT_WORK(&z2->resume_work, apple_z2_resume_work);
 	INIT_DELAYED_WORK(&z2->stop_work, apple_z2_k1_runtime_stop);
 	spi_set_drvdata(spi, z2);
@@ -5628,8 +5810,11 @@ static void apple_z2_stop(struct apple_z2 *z2)
 		z2->stopping = true;
 		mutex_unlock(&z2->io_lock);
 		cancel_delayed_work_sync(&z2->rearm_work);
-		if (apple_z2_is_j72(z2))
+		if (apple_z2_is_j72(z2)) {
+			/* A reset boot in flight sees stopping and powers off. */
+			cancel_delayed_work_sync(&z2->j72_reset_work);
 			cancel_delayed_work_sync(&z2->j72_work);
+		}
 	}
 
 	if (apple_z2_is_k1(z2)) {
@@ -5760,7 +5945,7 @@ static void __maybe_unused apple_z2_complete(struct device *dev)
 	if (!z2->boot_due)
 		return;
 	z2->boot_due = false;
-	queue_work(system_unbound_wq, &z2->resume_work);
+	queue_work(system_dfl_wq, &z2->resume_work);
 }
 
 static const struct dev_pm_ops apple_z2_pm = {
