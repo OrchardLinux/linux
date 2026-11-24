@@ -1975,6 +1975,24 @@ endif # ARMV8_DEPRECATED
 
 endif # COMPAT
 
+config ARM64_CRC32_EMULATION
+	bool "Emulate the CRC32 instructions on CPUs without them"
+	select CRC32
+	default y
+	help
+	  The CRC32 instructions are optional in ARMv8.0 and mandatory from
+	  ARMv8.1. A few ARMv8.0 cores lack them, such as the Apple A7, A8
+	  and A9. Some user space is built for armv8-a+crc and executes them
+	  without checking HWCAP_CRC32, and is killed with SIGILL on such a
+	  core.
+
+	  Say Y to emulate them for 64-bit tasks on such cores instead. Each
+	  emulated instruction costs a trap into the kernel. HWCAP_CRC32 stays
+	  clear, so code that checks for the instructions keeps using its own
+	  fallback. On cores that have the instructions this does nothing.
+
+	  If unsure, say Y
+
 menu "ARMv8.1 architectural features"
 
 config ARM64_HW_AFDBM

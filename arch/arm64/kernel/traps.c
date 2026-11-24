@@ -8,6 +8,7 @@
 
 #include <linux/bug.h>
 #include <linux/context_tracking.h>
+#include <linux/crc32.h>
 #include <linux/signal.h>
 #include <linux/kallsyms.h>
 #include <linux/kprobes.h>
@@ -453,6 +454,44 @@ void arm64_notify_segfault(unsigned long addr)
 	force_signal_inject(SIGSEGV, code, addr, 0);
 }
 
+/*
+ * CRC32{B,H,W,X} and CRC32C{B,H,W,X}: sf 0 0 11010110 Rm 010 C sz Rn Rd. The
+ * accumulator is Wn, the data is the low 1 << sz bytes of Rm in little-endian
+ * order, and the result in Wd is the bit-reflected CRC without inversion,
+ * which is what crc32_le() and crc32c() compute.
+ */
+#define CRC32_INSN_MASK		0x7fe0e000
+#define CRC32_INSN_VALUE	0x1ac04000
+
+static bool try_emulate_crc32(struct pt_regs *regs, u32 insn)
+{
+	unsigned int sz = (insn >> 10) & 3;
+	unsigned int rd = insn & 0x1f;
+	unsigned int rn = (insn >> 5) & 0x1f;
+	unsigned int rm = (insn >> 16) & 0x1f;
+	bool castagnoli = insn & BIT(12);
+	bool sf = insn & BIT(31);
+	__le64 data;
+	u32 acc;
+
+	if (!IS_ENABLED(CONFIG_ARM64_CRC32_EMULATION) ||
+	    cpu_have_named_feature(CRC32) || compat_user_mode(regs))
+		return false;
+
+	/* Only the 64-bit form takes an X register, and only for sz == 3. */
+	if ((insn & CRC32_INSN_MASK) != CRC32_INSN_VALUE || sf != (sz == 3))
+		return false;
+
+	acc = pt_regs_read_reg(regs, rn);
+	data = cpu_to_le64(pt_regs_read_reg(regs, rm));
+	acc = castagnoli ? crc32c(acc, &data, 1 << sz) :
+			   crc32_le(acc, &data, 1 << sz);
+	pt_regs_write_reg(regs, rd, acc);
+
+	arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
+	return true;
+}
+
 void do_el0_undef(struct pt_regs *regs, unsigned long esr)
 {
 	u32 insn;
@@ -468,6 +507,9 @@ void do_el0_undef(struct pt_regs *regs, unsigned long esr)
 		return;
 
 	if (try_emulate_armv8_deprecated(regs, insn))
+		return;
+
+	if (try_emulate_crc32(regs, insn))
 		return;
 
 out_err:
