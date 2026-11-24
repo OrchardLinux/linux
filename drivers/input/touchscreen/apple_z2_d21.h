@@ -4838,6 +4838,11 @@ static int apple_z2_d21_upload_firmware(struct apple_z2_d21 *z2)
 			error = apple_z2_d21_wait_ready_irq(z2, timeout_ms);
 			if (error)
 				return error;
+			if (apple_z2_d21_is_d21(z2)) {
+				/* Keep ATN masked through the rest of boot. */
+				apple_z2_d21_irq_off(z2);
+				z2->upload_irq_masked = true;
+			}
 			if (apple_z2_d21_is_j172(z2)) {
 				apple_z2_d21_irq_off(z2);
 				error = apple_z2_d21_read_device_info_locked(z2);
@@ -4871,6 +4876,10 @@ static int apple_z2_d21_upload_firmware(struct apple_z2_d21 *z2)
 		if (!error) {
 			z2->booted = true;
 			error = apple_z2_d21_read_packet(z2);
+			if (!error) {
+				z2->upload_irq_masked = false;
+				apple_z2_d21_irq_on(z2);
+			}
 		}
 		mutex_unlock(&z2->io_lock);
 		if (!error && d21_poll_hz) {
