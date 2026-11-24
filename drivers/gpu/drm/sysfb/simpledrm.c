@@ -610,8 +610,8 @@ static void simpledrm_h9g_init(struct simpledrm_device *sdev)
 	u16 subframes;
 	int ret = -ENODEV;
 
-	if (!of_machine_is_compatible("apple,j120") ||
-	    sysfb->fb_mode.hdisplay != 2048 || sysfb->fb_mode.vdisplay != 2732)
+	/* The 12.9-inch iPad Pro 2 panel behind an A10X H9G display pipe */
+	if (sysfb->fb_mode.hdisplay != 2048 || sysfb->fb_mode.vdisplay != 2732)
 		return;
 	display = of_parse_phandle(dev->of_node, "display", 0);
 	if (!display)
@@ -654,8 +654,6 @@ static enum drm_mode_status simpledrm_mode_valid(struct drm_crtc *crtc,
 	struct drm_sysfb_device *sysfb = to_drm_sysfb_device(crtc->dev);
 	struct simpledrm_device *sdev = container_of(sysfb, struct simpledrm_device, sysfb);
 
-	if (!sdev->h9g)
-		return drm_sysfb_crtc_helper_mode_valid(crtc, mode);
 	if (drm_mode_equal(mode, &sysfb->fb_mode) || drm_mode_equal(mode, &sdev->h9g_fast_mode))
 		return MODE_OK;
 	return MODE_BAD;
@@ -668,8 +666,6 @@ static void simpledrm_atomic_enable(struct drm_crtc *crtc, struct drm_atomic_com
 	const struct drm_crtc_state *new_state = drm_atomic_get_new_crtc_state(state, crtc);
 	u16 subframes;
 
-	if (!sdev->h9g)
-		return;
 	subframes = drm_mode_equal(&new_state->mode, &sdev->h9g_fast_mode) ?
 		    0 : sdev->h9g_boot_subframes;
 	if (!simpledrm_h9g_write(sdev, subframes))
@@ -683,8 +679,6 @@ static int simpledrm_get_modes(struct drm_connector *connector)
 	struct drm_display_mode *fast;
 	int count = drm_sysfb_connector_helper_get_modes(connector);
 
-	if (!sdev->h9g)
-		return count;
 	fast = drm_mode_duplicate(connector->dev, &sdev->h9g_fast_mode);
 	if (!fast)
 		return count;
@@ -708,6 +702,11 @@ static const struct drm_plane_funcs simpledrm_primary_plane_funcs = {
 };
 
 static const struct drm_crtc_helper_funcs simpledrm_crtc_helper_funcs = {
+	DRM_SYSFB_CRTC_HELPER_FUNCS,
+};
+
+/* Only a display with an adopted H9G boot scanout offers its 120 Hz mode. */
+static const struct drm_crtc_helper_funcs simpledrm_h9g_crtc_helper_funcs = {
 	.mode_valid = simpledrm_mode_valid,
 	.atomic_check = drm_sysfb_crtc_helper_atomic_check,
 	.atomic_enable = simpledrm_atomic_enable,
@@ -723,6 +722,10 @@ static const struct drm_encoder_funcs simpledrm_encoder_funcs = {
 };
 
 static const struct drm_connector_helper_funcs simpledrm_connector_helper_funcs = {
+	DRM_SYSFB_CONNECTOR_HELPER_FUNCS,
+};
+
+static const struct drm_connector_helper_funcs simpledrm_h9g_connector_helper_funcs = {
 	.get_modes = simpledrm_get_modes,
 };
 
@@ -977,7 +980,8 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 					&simpledrm_crtc_funcs, NULL);
 	if (ret)
 		return ERR_PTR(ret);
-	drm_crtc_helper_add(crtc, &simpledrm_crtc_helper_funcs);
+	drm_crtc_helper_add(crtc, sdev->h9g ? &simpledrm_h9g_crtc_helper_funcs :
+					      &simpledrm_crtc_helper_funcs);
 
 	/* Encoder */
 
@@ -995,7 +999,8 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 				 DRM_MODE_CONNECTOR_Unknown);
 	if (ret)
 		return ERR_PTR(ret);
-	drm_connector_helper_add(connector, &simpledrm_connector_helper_funcs);
+	drm_connector_helper_add(connector, sdev->h9g ? &simpledrm_h9g_connector_helper_funcs :
+							&simpledrm_connector_helper_funcs);
 	drm_connector_set_panel_orientation_with_quirk(connector, orientation,
 						       width, height);
 
