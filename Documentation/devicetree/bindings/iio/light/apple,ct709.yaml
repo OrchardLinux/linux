@@ -11,7 +11,7 @@ maintainers:
 
 description:
   The CT709 measures clear, red, green and blue light intensity over I2C.
-  The J120 board uses two independently addressed sensors.
+  The iPad Pro 2 boards have two independently addressed sensors.
 
 properties:
   compatible:
@@ -29,6 +29,13 @@ properties:
       device tree alsCalibration property. On J120 the eight-byte header and
       two 3344-byte orientation records can be followed by padding. The
       property on the als0 node contains records for both sensors.
+
+  apple,als-orientation:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The orientation index of this sensor's record in the factory
+      calibration (byte 2 of each record). Without it the sensor reports
+      raw channels only.
 
 required:
   - compatible

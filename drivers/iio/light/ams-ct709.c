@@ -147,16 +147,23 @@ static const struct iio_chan_spec ct709_channels[] = {
 	{ .type = IIO_LIGHT, .info_mask_separate = BIT(IIO_CHAN_INFO_PROCESSED) },
 };
 static const struct iio_info ct709_info = {.read_raw = ct709_read_raw};
-/* J120 stores both orientations in the factory record on the als0 node. */
+/*
+ * Apple stores the records of every CT709 on a bus in one factory
+ * calibration, copied by the boot loader to the als0 node; each sensor's
+ * apple,als-orientation names its record.
+ */
 static bool ct709_read_calibration(struct i2c_client *client,
 				   struct ct709_lux_cal *cal)
 {
 	struct device_node *owner;
 	const u8 *blob, *record;
-	unsigned int orientation, other, i;
+	u32 orientation;
+	unsigned int i;
 	int len;
 
-	if (!client->dev.of_node || !of_machine_is_compatible("apple,j120"))
+	if (!client->dev.of_node ||
+	    of_property_read_u32(client->dev.of_node, "apple,als-orientation",
+				 &orientation))
 		return false;
 	owner = of_find_node_by_path("als0");
 	if (!owner)
@@ -168,10 +175,6 @@ static bool ct709_read_calibration(struct i2c_client *client,
 	if (!blob || len < 6696 || memcmp(blob, "\x02\x01\x02\x08", 4) ||
 	    get_unaligned_le16(blob + 4) != 6696)
 		goto out;
-	if (client->addr != 0x29 && client->addr != 0x39)
-		goto out;
-	orientation = client->addr == 0x29 ? 6 : 5;
-	other = orientation == 6 ? 5 : 6;
 	record = NULL;
 	for (i = 0; i < 2; i++) {
 		const u8 *p = blob + 8 + 3344 * i;
@@ -179,9 +182,10 @@ static bool ct709_read_calibration(struct i2c_client *client,
 		if (p[0] != 2 || p[1] != 1 || p[3] != 1 ||
 		    get_unaligned_le32(p + 4) != 3344 || p[0x68] != 3)
 			goto out;
+		/* Exactly one record per orientation */
 		if (p[2] == orientation && !record)
 			record = p;
-		else if (p[2] != other)
+		else if (p[2] == orientation)
 			goto out;
 	}
 	if (record && !ct709_lux_parse(record, 3344, cal)) {
