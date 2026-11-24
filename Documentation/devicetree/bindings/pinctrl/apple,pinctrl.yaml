@@ -18,6 +18,10 @@ properties:
   compatible:
     oneOf:
       - items:
+          - const: apple,t8011-pinctrl
+          - const: apple,s8000-pinctrl
+          - const: apple,pinctrl
+      - items:
           - enum:
               - apple,t6020-pinctrl
               - apple,t6030-pinctrl

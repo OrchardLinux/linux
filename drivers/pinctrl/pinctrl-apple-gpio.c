@@ -30,9 +30,19 @@
 #include "core.h"
 #include "pinmux.h"
 
+struct apple_gpio_soc_data {
+	/*
+	 * S8000 platform-function modes (iOS GPIO driver): routing a pin to
+	 * a peripheral also clears bit 4, and selecting the GPIO function
+	 * puts the pin in output mode.
+	 */
+	bool s8000_mux;
+};
+
 struct apple_gpio_pinctrl {
 	struct device *dev;
 	struct pinctrl_dev *pctldev;
+	const struct apple_gpio_soc_data *soc;
 
 	void __iomem *base;
 	struct regmap *map;
@@ -52,6 +62,7 @@ struct apple_gpio_pinctrl {
 #define REG_GPIOx_IN_IRQ_DN  5
 #define REG_GPIOx_IN_IRQ_ANY 6
 #define REG_GPIOx_IN_IRQ_OFF 7
+#define REG_GPIOx_S8000_MUX  BIT(4)
 #define REG_GPIOx_PERIPH     GENMASK(6, 5)
 #define REG_GPIOx_PULL       GENMASK(8, 7)
 #define REG_GPIOx_PULL_OFF   0
@@ -181,10 +192,24 @@ static int apple_gpio_pinmux_set(struct pinctrl_dev *pctldev, unsigned int func,
 				 unsigned int group)
 {
 	struct apple_gpio_pinctrl *pctl = pinctrl_dev_get_drvdata(pctldev);
+	u32 mask = REG_GPIOx_PERIPH | REG_GPIOx_INPUT_ENABLE;
+	u32 value = FIELD_PREP(REG_GPIOx_PERIPH, func) | REG_GPIOx_INPUT_ENABLE;
 
-	apple_gpio_set_reg(
-		pctl, group, REG_GPIOx_PERIPH | REG_GPIOx_INPUT_ENABLE,
-		FIELD_PREP(REG_GPIOx_PERIPH, func) | REG_GPIOx_INPUT_ENABLE);
+	/*
+	 * This reproduces iOS' masks for the iPad 5 touch display sync:
+	 * peripheral route 2 writes mask 0x270 / value 0x240, the GPIO
+	 * function mask 0x27e / value 0x202. The pin's data and pull fields
+	 * are kept.
+	 */
+	if (pctl->soc && pctl->soc->s8000_mux) {
+		mask |= REG_GPIOx_S8000_MUX;
+		if (!func) {
+			mask |= REG_GPIOx_MODE;
+			value |= FIELD_PREP(REG_GPIOx_MODE, REG_GPIOx_OUT);
+		}
+	}
+
+	apple_gpio_set_reg(pctl, group, mask, value);
 
 	return 0;
 }
@@ -329,8 +354,17 @@ static int apple_gpio_irq_set_type(struct irq_data *data, unsigned int type)
 	if (irqtype == REG_GPIOx_IN_IRQ_OFF)
 		return -EINVAL;
 
-	apple_gpio_set_reg(pctl, data->hwirq, REG_GPIOx_MODE,
-			   FIELD_PREP(REG_GPIOx_MODE, irqtype));
+	/*
+	 * The pin's mode field is also its interrupt mask: IN_IRQ_OFF is the
+	 * masked state. Writing the trigger mode into a masked pin would arm it
+	 * behind the IRQ core's back, and since mask_irq() skips the hardware
+	 * for an interrupt it already believes masked, a level interrupt then
+	 * fires forever. Only arm the pin when it is unmasked;
+	 * apple_gpio_irq_unmask() applies the stored trigger type otherwise.
+	 */
+	if (!irqd_irq_masked(data))
+		apple_gpio_set_reg(pctl, data->hwirq, REG_GPIOx_MODE,
+				   FIELD_PREP(REG_GPIOx_MODE, irqtype));
 
 	if (type & IRQ_TYPE_LEVEL_MASK)
 		irq_set_handler_locked(data, handle_level_irq);
@@ -367,7 +401,12 @@ static const struct irq_chip apple_gpio_irqchip = {
 	.irq_mask		= apple_gpio_irq_mask,
 	.irq_unmask		= apple_gpio_irq_unmask,
 	.irq_set_type		= apple_gpio_irq_set_type,
-	.flags			= IRQCHIP_IMMUTABLE,
+	/*
+	 * Nothing to arm: the bank interrupts are chained to the AIC, which
+	 * stays up in suspend-to-idle, and any of them wakes the CPU. Without
+	 * this, enable_irq_wake() fails and so does gpio-keys' suspend.
+	 */
+	.flags			= IRQCHIP_IMMUTABLE | IRQCHIP_SKIP_SET_WAKE,
 	GPIOCHIP_IRQ_RESOURCE_HELPERS,
 };
 
@@ -397,19 +436,20 @@ static int apple_gpio_register(struct apple_gpio_pinctrl *pctl)
 		gpio_irq_chip_set_chip(girq, &apple_gpio_irqchip);
 		girq->parent_handler = apple_gpio_irq_handler;
 
-		girq->parents = kmalloc_array(girq->num_parents,
+		girq->parents = devm_kcalloc(pctl->dev, girq->num_parents,
 					      sizeof(*girq->parents),
 					      GFP_KERNEL);
-		irq_data = kmalloc_objs(*irq_data, girq->num_parents);
+		irq_data = devm_kcalloc(pctl->dev, girq->num_parents,
+					 sizeof(*irq_data), GFP_KERNEL);
 		if (!girq->parents || !irq_data) {
 			ret = -ENOMEM;
-			goto out_free_irq_data;
+			goto out_return;
 		}
 
 		for (i = 0; i < girq->num_parents; i++) {
 			ret = platform_get_irq(to_platform_device(pctl->dev), i);
 			if (ret < 0)
-				goto out_free_irq_data;
+				goto out_return;
 
 			girq->parents[i] = ret;
 			pctl->irqgrps[i] = i;
@@ -424,9 +464,7 @@ static int apple_gpio_register(struct apple_gpio_pinctrl *pctl)
 
 	ret = devm_gpiochip_add_data(pctl->dev, &pctl->gpio_chip, pctl);
 
-out_free_irq_data:
-	kfree(girq->parents);
-	kfree(irq_data);
+out_return:
 
 	return ret;
 }
@@ -455,6 +493,7 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	if (!pctl)
 		return -ENOMEM;
 	pctl->dev = &pdev->dev;
+	pctl->soc = of_device_get_match_data(&pdev->dev);
 	pctl->gpio_chip.irq.num_parents = nirqs;
 	dev_set_drvdata(&pdev->dev, pctl);
 
@@ -521,7 +560,12 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	return apple_gpio_register(pctl);
 }
 
+static const struct apple_gpio_soc_data apple_gpio_s8000_data = {
+	.s8000_mux = true,
+};
+
 static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
+	{ .compatible = "apple,s8000-pinctrl", .data = &apple_gpio_s8000_data },
 	{ .compatible = "apple,t8103-pinctrl", },
 	{ .compatible = "apple,pinctrl", },
 	{ }
