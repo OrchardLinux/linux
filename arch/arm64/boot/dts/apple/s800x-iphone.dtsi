@@ -98,6 +98,13 @@
 / {
 	battery_info: battery {
 		compatible = "simple-battery";
+		/*
+		 * The charger's input follows the battery temperature: off
+		 * outside 0..45 C, reduced outside 10..40 C. The ADT gives no
+		 * limits; these are the usual ones for Li-ion cells.
+		 */
+		operating-range-celsius = <0 45>;
+		alert-celsius = <10 40>;
 	};
 };
 
