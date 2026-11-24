@@ -150,6 +150,16 @@
 	battery_info: battery {
 		compatible = "simple-battery";
 		constant-charge-current-max-microamp = <1950000>;
+		/*
+		 * The charger's input follows the battery temperature: off
+		 * outside 0..45 C, reduced outside 10..40 C. The ADT gives no
+		 * limits; these are the usual ones for Li-ion cells, inside
+		 * the JEITA charging guideline (no charge below 0 C, reduced
+		 * current from 0 to 10 C, normal from 10 to 45 C), with 40 to
+		 * 45 C also reduced as a margin.
+		 */
+		operating-range-celsius = <0 45>;
+		alert-celsius = <10 40>;
 	};
 
 	wlan_vdd: regulator-wlan-vdd {
