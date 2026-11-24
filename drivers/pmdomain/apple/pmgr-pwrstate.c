@@ -58,6 +58,8 @@ struct apple_pmgr_ps {
 	u32 min_state;
 	bool has_genpd;
 	bool manual_pm;
+	/* Read the reset back; checked on the A10X only so far */
+	bool verify_reset;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -201,6 +203,9 @@ static int apple_pmgr_reset_verify(struct apple_pmgr_ps *ps, bool asserted)
 	u32 val;
 	int ret;
 
+	if (!ps->verify_reset)
+		return 0;
+
 	ret = regmap_read(ps->regmap, ps->offset, &val);
 	if (ret)
 		return ret;
@@ -324,6 +329,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	ps->dev = dev;
 	ps->regmap = regmap;
+	ps->verify_reset = of_machine_is_compatible("apple,t8011");
 	spin_lock_init(&ps->lock);
 
 	ret = of_property_read_string(node, "label", &name);
