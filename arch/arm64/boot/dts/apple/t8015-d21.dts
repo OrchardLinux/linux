@@ -60,3 +60,12 @@
 		touchscreen-size-y = <1920>;
 	};
 };
+
+/*
+ * The D21 ADT's function-clock_enable asks for a 32768 Hz touch reference
+ * (KLCT 0x08, 0x64, 0x8000); the controller firmware's FLL setup assumes
+ * it. The t8015 default is the iPhone X's 24 MHz.
+ */
+&touchclk {
+	clock-frequency = <32768>;
+};
