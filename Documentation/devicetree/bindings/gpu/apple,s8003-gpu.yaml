@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpu/apple,s8003-gpu.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S8000/S8003 (A9) and T7000 (A8) GPU
+
+maintainers:
+  - Berkay Kösebay <brkosebay@users.noreply.github.com>
+
+description: |
+  The A9's GPU is a PowerVR Rogue core (GT7600, Apple's G5P) behind Apple's
+  "Fender" power and control block. Apple's firmware runs on the core's own
+  META processor; the host loads it. The node has the shape of the A10's
+  (apple,t8010-gpu), without that chip's coprocessor and mailbox.
+
+  The A8's GPU (GX6450, Apple's G4P) runs the same family of firmware the
+  same way. Its driver powers the GPU itself, in the order Apple's kernel
+  does: the power manager's GPU power state, its PLL and two of its global
+  enables, and the two bus bridges in front of the GPU, so the node names
+  those registers instead of a power domain.
+
+properties:
+  compatible:
+    oneOf:
+      - enum:
+          - apple,s8003-gpu
+          - apple,t7000-gpu
+      - items:
+          - const: apple,s8000-gpu
+          - const: apple,s8003-gpu
+
+  reg:
+    minItems: 2
+    items:
+      - description: The Rogue core's registers
+      - description: Fender
+      - description: The power manager's registers (A8)
+      - description: The GPU's two bus bridges (A8)
+
+  reg-names:
+    minItems: 2
+    items:
+      - const: rgx
+      - const: fender
+      - const: pmgr
+      - const: bridges
+
+  interrupts:
+    items:
+      - description: GPU interrupt 0
+      - description: GPU interrupt 1
+      - description: GPU interrupt 2
+      - description: GPU interrupt 3
+      - description:
+          The firmware's interrupt to the host, a software interrupt of the
+          interrupt controller. The firmware raises it through that
+          controller's registers, so the host tells it their address and
+          the interrupt's number.
+
+  power-domains:
+    maxItems: 1
+
+  operating-points-v2: true
+
+  firmware-name:
+    maxItems: 1
+    description:
+      The firmware file, Apple's META LDR image from the device's own
+      kernelcache.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t7000-gpu
+    then:
+      properties:
+        reg:
+          minItems: 4
+        reg-names:
+          minItems: 4
+        power-domains: false
+    else:
+      properties:
+        reg:
+          maxItems: 2
+        reg-names:
+          maxItems: 2
+      required:
+        - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        gpu@201000000 {
+            compatible = "apple,s8003-gpu";
+            reg = <0x2 0x01000000 0x0 0x100000>,
+                  <0x2 0x01e00000 0x0 0x100000>;
+            reg-names = "rgx", "fender";
+            power-domains = <&ps_gfx>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 170 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 171 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 172 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 173 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 174 IRQ_TYPE_LEVEL_HIGH>;
+            firmware-name = "apple/gfx-s8003.bin";
+        };
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        gpu@201000000 {
+            compatible = "apple,t7000-gpu";
+            reg = <0x2 0x01000000 0x0 0x100000>,
+                  <0x2 0x01e00000 0x0 0x100000>,
+                  <0x2 0x0e000000 0x0 0x40000>,
+                  <0x2 0x01f00000 0x0 0x81000>;
+            reg-names = "rgx", "fender", "pmgr", "bridges";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 134 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 135 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 136 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 137 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 138 IRQ_TYPE_LEVEL_HIGH>;
+            firmware-name = "apple/gfx-t7000.bin";
+        };
+    };

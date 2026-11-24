@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_device.h"
+#include "pvr_gem.h"
 #include "pvr_device_info.h"
 
 #include "pvr_fw.h"
@@ -11,6 +13,7 @@
 #include "pvr_stream.h"
 #include "pvr_vm.h"
 
+#include <drm/drm_managed.h>
 #include <drm/drm_print.h>
 
 #include <linux/bitfield.h>
@@ -101,7 +104,11 @@ static int pvr_device_clk_init(struct pvr_device *pvr_dev)
 	struct clk *sys_clk;
 	struct clk *mem_clk;
 
-	core_clk = devm_clk_get(drm_dev->dev, "core");
+	/* Apple's GPU clocks follow its power domain; there is no core clock. */
+	if (pvr_dev->device_data->apple_fw)
+		core_clk = devm_clk_get_optional(drm_dev->dev, "core");
+	else
+		core_clk = devm_clk_get(drm_dev->dev, "core");
 	if (IS_ERR(core_clk))
 		return dev_err_probe(drm_dev->dev, PTR_ERR(core_clk),
 				     "failed to get core clock\n");
@@ -533,6 +540,9 @@ pvr_gpu_support_level(const struct pvr_gpu_id *gpu_id)
 	case PVR_PACKED_BVNC(33, 15, 11, 3):
 	case PVR_PACKED_BVNC(36, 52, 104, 182):
 	case PVR_PACKED_BVNC(36, 53, 104, 796):
+	case PVR_PACKED_BVNC(13, 10, 6, 2):	/* Apple A10 (T8010) */
+	case PVR_PACKED_BVNC(9, 15, 6, 2):	/* Apple A9 (S8003) */
+	case PVR_PACKED_BVNC(3, 10, 4, 5):	/* Apple A8 (T7000) */
 		return PVR_GPU_SUPPORTED;
 
 	default:
@@ -596,7 +606,13 @@ pvr_load_gpu_id(struct pvr_device *pvr_dev)
 	struct pvr_gpu_id *gpu_id = &pvr_dev->gpu_id;
 
 	if (!pvr_gpuid_override || !pvr_gpuid_override[0]) {
-		pvr_gpuid_decode_reg(pvr_dev, gpu_id);
+		/* An Apple chip may read its ID its own way */
+		int err = pvr_apple_read_gpu_id(pvr_dev, gpu_id);
+
+		if (err == -ENOENT)
+			pvr_gpuid_decode_reg(pvr_dev, gpu_id);
+		else if (err)
+			return err;
 	} else {
 		drm_warn(from_pvr_device(pvr_dev),
 			 "Using custom GPU ID (BVNC) provided by the user!");
@@ -646,6 +662,34 @@ pvr_set_dma_info(struct pvr_device *pvr_dev)
 	return 0;
 }
 
+/*
+ * Apple A10: static device information instead of an IMG firmware header,
+ * then Apple's firmware init in place of pvr_fw_init().
+ */
+static int
+pvr_device_gpu_init_apple(struct pvr_device *pvr_dev)
+{
+	int err;
+
+	pvr_apple_device_info_init(pvr_dev);
+	pvr_stream_create_musthave_masks(pvr_dev);
+
+	err = pvr_set_dma_info(pvr_dev);
+	if (err)
+		return err;
+
+	pvr_dev->kernel_vm_ctx = pvr_vm_create_context(pvr_dev, false);
+	if (IS_ERR(pvr_dev->kernel_vm_ctx))
+		return PTR_ERR(pvr_dev->kernel_vm_ctx);
+
+	err = pvr_apple_fw_init(pvr_dev);
+	if (err) {
+		pvr_vm_context_put(pvr_dev->kernel_vm_ctx);
+		pvr_dev->kernel_vm_ctx = NULL;
+	}
+	return err;
+}
+
 /**
  * pvr_device_gpu_init() - GPU-specific initialization for a PowerVR device
  * @pvr_dev: Target PowerVR device.
@@ -673,6 +717,9 @@ pvr_device_gpu_init(struct pvr_device *pvr_dev)
 	err = pvr_load_gpu_id(pvr_dev);
 	if (err)
 		return err;
+
+	if (pvr_device_is_apple(pvr_dev))
+		return pvr_device_gpu_init_apple(pvr_dev);
 
 	err = pvr_request_firmware(pvr_dev);
 	if (err)
@@ -725,6 +772,13 @@ err_vm_ctx_put:
 static void
 pvr_device_gpu_fini(struct pvr_device *pvr_dev)
 {
+	if (pvr_device_is_apple(pvr_dev)) {
+		pvr_apple_fw_fini(pvr_dev);
+		WARN_ON(!pvr_vm_context_put(pvr_dev->kernel_vm_ctx));
+		pvr_dev->kernel_vm_ctx = NULL;
+		return;
+	}
+
 	pvr_fw_fini(pvr_dev);
 
 	if (pvr_dev->fw_dev.processor_type != PVR_FW_PROCESSOR_TYPE_MIPS) {
@@ -759,8 +813,16 @@ pvr_device_init(struct pvr_device *pvr_dev)
 	struct device *dev = drm_dev->dev;
 	int err;
 
+	err = drmm_mutex_init(drm_dev, &pvr_dev->submit_order);
+	if (err)
+		return err;
+
 	/* Get the platform-specific data based on the compatible string. */
 	pvr_dev->device_data = of_device_get_match_data(dev);
+
+	err = pvr_gem_shrinker_init(pvr_dev);
+	if (err)
+		return err;
 
 	/* Enable and initialize clocks required for the device to operate. */
 	err = pvr_device_clk_init(pvr_dev);
@@ -786,9 +848,12 @@ pvr_device_init(struct pvr_device *pvr_dev)
 	if (err)
 		goto err_pm_runtime_put;
 
-	err = pvr_device_irq_init(pvr_dev);
-	if (err)
-		goto err_device_gpu_fini;
+	/* Apple's RGX interrupt goes to the firmware coprocessor, not to us. */
+	if (!pvr_device_is_apple(pvr_dev)) {
+		err = pvr_device_irq_init(pvr_dev);
+		if (err)
+			goto err_device_gpu_fini;
+	}
 
 	pm_runtime_put(dev);
 
@@ -810,11 +875,14 @@ err_pm_runtime_put:
 void
 pvr_device_fini(struct pvr_device *pvr_dev)
 {
+	pvr_gem_shrinker_fini(pvr_dev);
+
 	/*
 	 * Deinitialization stages are performed in reverse order compared to
 	 * the initialization stages in pvr_device_init().
 	 */
-	pvr_device_irq_fini(pvr_dev);
+	if (!pvr_device_is_apple(pvr_dev))
+		pvr_device_irq_fini(pvr_dev);
 	pvr_device_gpu_fini(pvr_dev);
 }
 

@@ -189,4 +189,7 @@ int apple_rtkit_poll(struct apple_rtkit *rtk);
  */
 u8 apple_rtkit_app_ep_to_ep(struct apple_rtkit *rtk, u8 app_ep);
 
+/* Terminal only: bounded requests, no callback join or buffer release. */
+int apple_rtkit_shutdown_terminal(struct apple_rtkit *rtk);
+
 #endif /* _LINUX_APPLE_RTKIT_H_ */

@@ -31,6 +31,7 @@ struct pvr_job {
 	/** @base: drm_sched_job object. */
 	struct drm_sched_job base;
 
+
 	/** @ref_count: Refcount for job. */
 	struct kref ref_count;
 
@@ -65,6 +66,9 @@ struct pvr_job {
 
 	/** @pvr_dev: Device pointer. */
 	struct pvr_device *pvr_dev;
+
+	/** @apple_armed: Apple: when the job was armed at submit (statistics). */
+	ktime_t apple_armed;
 
 	/** @ctx: Pointer to owning context. */
 	struct pvr_context *ctx;

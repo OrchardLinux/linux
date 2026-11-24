@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_free_list.h"
 #include "pvr_hwrt.h"
 #include "pvr_gem.h"
@@ -10,7 +11,9 @@
 #include <drm/drm_gem.h>
 #include <linux/bitops.h>
 #include <linux/math.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/wait_bit.h>
 #include <linux/xarray.h>
 #include <uapi/drm/pvr_drm.h>
 
@@ -43,10 +46,14 @@ hwrt_init_kernel_structure(struct pvr_file *pvr_file,
 			   struct pvr_hwrt_dataset *hwrt)
 {
 	struct pvr_device *pvr_dev = pvr_file->pvr_dev;
+	u32 local_pages;
 	int err;
 
 	hwrt->pvr_dev = pvr_dev;
 	hwrt->max_rts = args->layers;
+	hwrt->width = args->width;
+	hwrt->height = args->height;
+	hwrt->samples = args->samples;
 
 	/* Get pointers to the free lists */
 	for (int i = 0; i < ARRAY_SIZE(hwrt->free_lists); i++) {
@@ -57,8 +64,16 @@ hwrt_init_kernel_structure(struct pvr_file *pvr_file,
 		}
 	}
 
-	if (hwrt->free_lists[ROGUE_FW_LOCAL_FREELIST]->current_pages <
-	    pvr_get_free_list_min_pages(pvr_dev)) {
+	/*
+	 * On a chip that allocates the parameter manager's pages itself, a
+	 * free list never holds pages (pvr_apple_free_list_has_pages()); its
+	 * initial size is how many a render may take.
+	 */
+	local_pages = hwrt->free_lists[ROGUE_FW_LOCAL_FREELIST]->current_pages;
+	if (pvr_device_is_apple(pvr_dev) && !pvr_apple_free_list_has_pages(pvr_dev))
+		local_pages = hwrt->free_lists[ROGUE_FW_LOCAL_FREELIST]->initial_num_pages;
+
+	if (local_pages < pvr_get_free_list_min_pages(pvr_dev)) {
 		err = -EINVAL;
 		goto err_put_free_lists;
 	}
@@ -86,7 +101,8 @@ hwrt_fini_kernel_structure(struct pvr_hwrt_dataset *hwrt)
 static void
 hwrt_fini_common_fw_structure(struct pvr_hwrt_dataset *hwrt)
 {
-	pvr_fw_object_destroy(hwrt->common_fw_obj);
+	if (hwrt->common_fw_obj)
+		pvr_fw_object_destroy(hwrt->common_fw_obj);
 }
 
 static int
@@ -335,6 +351,10 @@ hwrt_init_common_fw_structure(struct pvr_file *pvr_file,
 
 	hwrt->common.rgn_header_size = args->region_header_size;
 
+	/* Apple's firmware takes these values in each job's register block. */
+	if (pvr_device_is_apple(pvr_dev))
+		return 0;
+
 	err = pvr_fw_object_create(pvr_dev, sizeof(struct rogue_fwif_hwrtdata_common),
 				   PVR_BO_FW_FLAGS_DEVICE_UNCACHED, hwrtdata_common_init, hwrt,
 				   &hwrt->common_fw_obj);
@@ -361,6 +381,28 @@ hwrt_data_init_fw_structure(struct pvr_file *pvr_file,
 	struct pvr_device *pvr_dev = pvr_file->pvr_dev;
 	struct rogue_fwif_rta_ctl *rta_ctl;
 	int err;
+
+	if (pvr_device_is_apple(pvr_dev)) {
+		/* Single-layer render targets only, so far */
+		if (args->layers > 1)
+			return -EOPNOTSUPP;
+
+		hwrt_data->data.tail_ptrs_dev_addr = geom_data_args->tpc_dev_addr;
+		hwrt_data->data.vheap_table_dev_addr = geom_data_args->vheap_table_dev_addr;
+		hwrt_data->data.rtc_dev_addr = geom_data_args->rtc_dev_addr;
+		hwrt_data->data.pm_mlist_dev_addr = rt_data_args->pm_mlist_dev_addr;
+		hwrt_data->data.macrotile_array_dev_addr = rt_data_args->macrotile_array_dev_addr;
+		hwrt_data->data.rgn_header_dev_addr = rt_data_args->region_header_dev_addr;
+
+		hwrt_data->sync_obj = pvr_gem_object_create(pvr_dev, PAGE_SIZE, 0);
+		if (IS_ERR(hwrt_data->sync_obj)) {
+			err = PTR_ERR(hwrt_data->sync_obj);
+			hwrt_data->sync_obj = NULL;
+			return err;
+		}
+		pvr_free_list_add_hwrt(hwrt->free_lists[0], hwrt_data);
+		return 0;
+	}
 
 	pvr_fw_object_get_fw_addr(hwrt->common_fw_obj,
 				  &hwrt_data->data.hwrt_data_common_fw_addr);
@@ -432,12 +474,111 @@ hwrt_data_fini_fw_structure(struct pvr_hwrt_dataset *hwrt, int hwrt_nr)
 
 	pvr_free_list_remove_hwrt(hwrt->free_lists[0], hwrt_data);
 
+	if (hwrt_data->sync_obj) {
+		pvr_gem_object_put(hwrt_data->sync_obj);
+		return;
+	}
+
 	if (hwrt->max_rts > 1) {
 		pvr_fw_object_destroy(hwrt_data->raa_obj);
 		pvr_fw_object_destroy(hwrt_data->srtc_obj);
 	}
 
 	pvr_fw_object_destroy(hwrt_data->fw_obj);
+}
+
+/**
+ * pvr_hwrt_data_resv_obj() - Object whose reservation orders jobs on @hwrt_data
+ * @hwrt_data: HWRT data.
+ *
+ * The geometry job writes the region headers the fragment job reads; both
+ * synchronise through this object's reservation.
+ */
+struct drm_gem_object *pvr_hwrt_data_resv_obj(struct pvr_hwrt_data *hwrt_data)
+{
+	if (hwrt_data->fw_obj)
+		return gem_from_pvr_gem(hwrt_data->fw_obj->gem);
+	return gem_from_pvr_gem(hwrt_data->sync_obj);
+}
+
+/* PM page catalogue, directory and table entries per 4 KiB PM page */
+#define PVR_PM_PC_ENTRIES_PER_PAGE 0x400
+#define PVR_PM_PD_ENTRIES_PER_PAGE 0x200
+#define PVR_PM_PT_ENTRIES_PER_PAGE 0x200
+/* The PM keeps one set of tables for each of its TE and VCE address spaces. */
+#define PVR_PM_NUM_ADDRESS_SPACES 2
+#define PVR_PM_MLIST_ENTRY_STRIDE 4
+#define PVR_PM_FREE_LIST_ENTRY_SIZE sizeof(u32)
+
+/**
+ * pvr_hwrt_dataset_bind_vm() - Bind a HWRT data set to the VM context its jobs
+ *                              run in
+ * @hwrt: HWRT data set a geometry or fragment job runs on.
+ * @vm_ctx: VM context of that job.
+ *
+ * The parameter manager (PM) records in a render target's MList the physical
+ * pages it takes from the free list, and returns them to the free list from
+ * there; the free list itself holds physical page addresses too. Whoever can
+ * write either can make the PM hand any physical page to the tiler. Both must
+ * therefore live in buffer objects that only the PM and the firmware can
+ * access, and the device-virtual addresses the PM uses for them must keep
+ * pointing there for as long as a job may run on the data set.
+ *
+ * The first call checks, in @vm_ctx, that each MList and free list lies within
+ * one PM/FW-protected, non-CPU-mappable mapping of the size the PM uses, and
+ * pins those ranges until the data set is released. The MList size covers the
+ * page catalogue, directory and table entries for every page the free lists
+ * can hold, for both PM address spaces. Later calls only check that the job
+ * runs in the same VM context.
+ *
+ * Return:
+ *  * 0 on success, or
+ *  * -%EINVAL if a range is not protected, or the data set is bound to
+ *    another VM context.
+ */
+int pvr_hwrt_dataset_bind_vm(struct pvr_hwrt_dataset *hwrt,
+			     struct pvr_vm_context *vm_ctx)
+{
+	u64 pages = 0, pt_pages, pd_pages, pc_pages, mlist_size;
+	unsigned int n = 0;
+	int err = 0;
+
+	mutex_lock(&hwrt->pin_lock);
+
+	if (hwrt->vm_ctx) {
+		if (hwrt->vm_ctx != vm_ctx)
+			err = -EINVAL;
+		goto out_unlock;
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(hwrt->free_lists); i++) {
+		struct pvr_free_list *free_list = hwrt->free_lists[i];
+
+		pages += free_list->max_pages;
+		hwrt->pins[n].start = free_list->free_list_gpu_addr;
+		hwrt->pins[n++].size = (u64)free_list->max_pages *
+				       PVR_PM_FREE_LIST_ENTRY_SIZE;
+	}
+
+	pt_pages = DIV_ROUND_UP_ULL(pages, PVR_PM_PT_ENTRIES_PER_PAGE);
+	pd_pages = DIV_ROUND_UP_ULL(pt_pages, PVR_PM_PD_ENTRIES_PER_PAGE);
+	pc_pages = DIV_ROUND_UP_ULL(pd_pages, PVR_PM_PC_ENTRIES_PER_PAGE);
+	mlist_size = (pc_pages + pd_pages + pt_pages) *
+		     PVR_PM_NUM_ADDRESS_SPACES * PVR_PM_MLIST_ENTRY_STRIDE;
+
+	for (int i = 0; i < ARRAY_SIZE(hwrt->data); i++) {
+		hwrt->pins[n].start = hwrt->data[i].data.pm_mlist_dev_addr;
+		hwrt->pins[n++].size = mlist_size;
+	}
+
+	err = pvr_vm_pin_pm_protected(vm_ctx, hwrt->pins, n);
+	if (!err)
+		hwrt->vm_ctx = pvr_vm_context_get(vm_ctx);
+
+out_unlock:
+	mutex_unlock(&hwrt->pin_lock);
+
+	return err;
 }
 
 /**
@@ -480,6 +621,7 @@ pvr_hwrt_dataset_create(struct pvr_file *pvr_file,
 		hwrt->data[i].hwrt_dataset = hwrt;
 	}
 
+	mutex_init(&hwrt->pin_lock);
 	kref_init(&hwrt->ref_count);
 	return hwrt;
 
@@ -503,10 +645,18 @@ pvr_hwrt_dataset_release(struct kref *ref_count)
 		container_of(ref_count, struct pvr_hwrt_dataset, ref_count);
 
 	for (int i = ARRAY_SIZE(hwrt->data) - 1; i >= 0; i--) {
-		WARN_ON(pvr_fw_structure_cleanup(hwrt->pvr_dev, ROGUE_FWIF_CLEANUP_HWRTDATA,
-						 hwrt->data[i].fw_obj, 0));
+		if (hwrt->data[i].fw_obj)
+			WARN_ON(pvr_fw_structure_cleanup(hwrt->pvr_dev,
+							 ROGUE_FWIF_CLEANUP_HWRTDATA,
+							 hwrt->data[i].fw_obj, 0));
 		hwrt_data_fini_fw_structure(hwrt, i);
 	}
+
+	if (hwrt->vm_ctx) {
+		pvr_vm_unpin(hwrt->vm_ctx, hwrt->pins, ARRAY_SIZE(hwrt->pins));
+		pvr_vm_context_put(hwrt->vm_ctx);
+	}
+	mutex_destroy(&hwrt->pin_lock);
 
 	hwrt_fini_common_fw_structure(hwrt);
 	hwrt_fini_kernel_structure(hwrt);
@@ -541,6 +691,23 @@ void pvr_destroy_hwrt_datasets_for_file(struct pvr_file *pvr_file)
 void
 pvr_hwrt_dataset_put(struct pvr_hwrt_dataset *hwrt)
 {
-	if (hwrt)
-		kref_put(&hwrt->ref_count, pvr_hwrt_dataset_release);
+	if (hwrt && !kref_put(&hwrt->ref_count, pvr_hwrt_dataset_release))
+		wake_up_var(&hwrt->ref_count);
+}
+
+/**
+ * pvr_hwrt_dataset_destroy() - Drop the handle reference on a HWRT dataset
+ * @hwrt: HWRT dataset whose handle userspace destroyed.
+ *
+ * Jobs hold references on the data set until they are freed, shortly after
+ * they complete. Waiting for them here releases the data set, and with it the
+ * ranges pvr_hwrt_dataset_bind_vm() pinned, before userspace sees the destroy
+ * complete, so that it can unmap the MList and free list buffers right away.
+ */
+void
+pvr_hwrt_dataset_destroy(struct pvr_hwrt_dataset *hwrt)
+{
+	wait_var_event_killable(&hwrt->ref_count,
+				kref_read(&hwrt->ref_count) == 1);
+	pvr_hwrt_dataset_put(hwrt);
 }

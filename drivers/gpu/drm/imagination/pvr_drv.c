@@ -3,6 +3,7 @@
 
 #include "pvr_context.h"
 #include "pvr_debugfs.h"
+#include "pvr_apple.h"
 #include "pvr_device.h"
 #include "pvr_drv.h"
 #include "pvr_free_list.h"
@@ -24,6 +25,7 @@
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_ioctl.h>
+#include <drm/drm_print.h>
 
 #include <linux/err.h>
 #include <linux/export.h>
@@ -113,7 +115,7 @@ pvr_ioctl_create_bo(struct drm_device *drm_dev, void *raw_args,
 	 * Create a buffer object and transfer ownership to a userspace-
 	 * accessible handle.
 	 */
-	pvr_obj = pvr_gem_object_create(pvr_dev, sanitized_size, args->flags);
+	pvr_obj = pvr_gem_object_create_user(pvr_dev, sanitized_size, args->flags);
 	if (IS_ERR(pvr_obj)) {
 		err = PTR_ERR(pvr_obj);
 		goto err_drm_dev_exit;
@@ -893,7 +895,7 @@ pvr_ioctl_destroy_hwrt_dataset(struct drm_device *drm_dev, void *raw_args,
 	if (!hwrt)
 		return -EINVAL;
 
-	pvr_hwrt_dataset_put(hwrt);
+	pvr_hwrt_dataset_destroy(hwrt);
 	return 0;
 }
 
@@ -1270,6 +1272,28 @@ pvr_set_uobj_array(const struct drm_pvr_obj_array *out, u32 min_stride, u32 obj_
 	return 0;
 }
 
+/* Apple: the ioctl's time in debugfs apple_jobs (statistics only) */
+#define PVR_IOCTL_TIMED(_name, _func) \
+static int pvr_ioctl_timed_##_func(struct drm_device *drm_dev, void *raw_args, \
+				   struct drm_file *file) \
+{ \
+	ktime_t start = ktime_get(); \
+	int err = pvr_ioctl_##_func(drm_dev, raw_args, file); \
+ \
+	pvr_apple_ioctl_time(to_pvr_device(drm_dev), APPLE_IOCTL_##_name, start); \
+	return err; \
+}
+
+PVR_IOCTL_TIMED(CREATE_BO, create_bo)
+PVR_IOCTL_TIMED(VM_MAP, vm_map)
+PVR_IOCTL_TIMED(CREATE_VM_CONTEXT, create_vm_context)
+PVR_IOCTL_TIMED(CREATE_CONTEXT, create_context)
+PVR_IOCTL_TIMED(CREATE_FREE_LIST, create_free_list)
+PVR_IOCTL_TIMED(CREATE_HWRT_DATASET, create_hwrt_dataset)
+PVR_IOCTL_TIMED(SUBMIT_JOBS, submit_jobs)
+
+#undef PVR_IOCTL_TIMED
+
 #define DRM_PVR_IOCTL(_name, _func, _flags) \
 	DRM_IOCTL_DEF_DRV(PVR_##_name, pvr_ioctl_##_func, _flags)
 
@@ -1277,19 +1301,19 @@ pvr_set_uobj_array(const struct drm_pvr_obj_array *out, u32 min_stride, u32 obj_
 
 static const struct drm_ioctl_desc pvr_drm_driver_ioctls[] = {
 	DRM_PVR_IOCTL(DEV_QUERY, dev_query, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_BO, create_bo, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_BO, timed_create_bo, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(GET_BO_MMAP_OFFSET, get_bo_mmap_offset, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_VM_CONTEXT, create_vm_context, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_VM_CONTEXT, timed_create_vm_context, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(DESTROY_VM_CONTEXT, destroy_vm_context, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(VM_MAP, vm_map, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(VM_MAP, timed_vm_map, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(VM_UNMAP, vm_unmap, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_CONTEXT, create_context, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_CONTEXT, timed_create_context, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(DESTROY_CONTEXT, destroy_context, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_FREE_LIST, create_free_list, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_FREE_LIST, timed_create_free_list, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(DESTROY_FREE_LIST, destroy_free_list, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(CREATE_HWRT_DATASET, create_hwrt_dataset, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(CREATE_HWRT_DATASET, timed_create_hwrt_dataset, DRM_RENDER_ALLOW),
 	DRM_PVR_IOCTL(DESTROY_HWRT_DATASET, destroy_hwrt_dataset, DRM_RENDER_ALLOW),
-	DRM_PVR_IOCTL(SUBMIT_JOBS, submit_jobs, DRM_RENDER_ALLOW),
+	DRM_PVR_IOCTL(SUBMIT_JOBS, timed_submit_jobs, DRM_RENDER_ALLOW),
 };
 
 /* clang-format on */
@@ -1376,7 +1400,17 @@ pvr_drm_driver_postclose(__always_unused struct drm_device *drm_dev,
 	file->driver_priv = NULL;
 }
 
-DEFINE_DRM_GEM_FOPS(pvr_drm_driver_fops);
+static void pvr_drm_driver_show_fdinfo(struct drm_printer *p,
+				       struct drm_file *file)
+{
+	drm_show_memory_stats(p, file);
+}
+
+static const struct file_operations pvr_drm_driver_fops = {
+	.owner = THIS_MODULE,
+	DRM_GEM_FOPS,
+	.show_fdinfo = drm_show_fdinfo,
+};
 
 static struct drm_driver pvr_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_RENDER |
@@ -1386,6 +1420,7 @@ static struct drm_driver pvr_drm_driver = {
 	.ioctls = pvr_drm_driver_ioctls,
 	.num_ioctls = ARRAY_SIZE(pvr_drm_driver_ioctls),
 	.fops = &pvr_drm_driver_fops,
+	.show_fdinfo = pvr_drm_driver_show_fdinfo,
 #if defined(CONFIG_DEBUG_FS)
 	.debugfs_init = pvr_debugfs_init,
 #endif
@@ -1418,15 +1453,17 @@ pvr_probe(struct platform_device *plat_dev)
 
 	err = pvr_power_domains_init(pvr_dev);
 	if (err)
-		return err;
+		return dev_err_probe(&plat_dev->dev, err, "power domains\n");
 
 	init_rwsem(&pvr_dev->reset_sem);
 
 	pvr_context_device_init(pvr_dev);
 
 	err = pvr_queue_device_init(pvr_dev);
-	if (err)
+	if (err) {
+		dev_err_probe(&plat_dev->dev, err, "queue init\n");
 		goto err_context_fini;
+	}
 
 	devm_pm_runtime_enable(&plat_dev->dev);
 	pm_runtime_mark_last_busy(&plat_dev->dev);
@@ -1436,12 +1473,16 @@ pvr_probe(struct platform_device *plat_dev)
 	pvr_watchdog_init(pvr_dev);
 
 	err = pvr_device_init(pvr_dev);
-	if (err)
+	if (err) {
+		dev_err_probe(&plat_dev->dev, err, "device init\n");
 		goto err_watchdog_fini;
+	}
 
 	err = drm_dev_register(drm_dev, 0);
-	if (err)
+	if (err) {
+		dev_err_probe(&plat_dev->dev, err, "DRM device registration\n");
 		goto err_device_fini;
+	}
 
 	xa_init_flags(&pvr_dev->free_list_ids, XA_FLAGS_ALLOC1);
 	xa_init_flags(&pvr_dev->job_ids, XA_FLAGS_ALLOC1);
@@ -1469,6 +1510,9 @@ static void pvr_remove(struct platform_device *plat_dev)
 	struct drm_device *drm_dev = platform_get_drvdata(plat_dev);
 	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
 
+	if (pvr_device_is_apple(pvr_dev))
+		pvr_apple_quiesce(pvr_dev);
+
 	WARN_ON(!xa_empty(&pvr_dev->job_ids));
 	WARN_ON(!xa_empty(&pvr_dev->free_list_ids));
 
@@ -1484,6 +1528,17 @@ static void pvr_remove(struct platform_device *plat_dev)
 	pvr_power_domains_fini(pvr_dev);
 }
 
+static void pvr_shutdown(struct platform_device *plat_dev)
+{
+	struct drm_device *drm_dev = platform_get_drvdata(plat_dev);
+	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
+
+	if (!pvr_device_is_apple(pvr_dev))
+		return;
+	/* Unplug waits for ioctl SRCU readers, including wedged submitters. */
+	pvr_apple_shutdown(pvr_dev);
+}
+
 static const struct pvr_device_data pvr_device_data_manual = {
 	.pwr_ops = &pvr_power_sequence_ops_manual,
 };
@@ -1492,7 +1547,41 @@ static const struct pvr_device_data pvr_device_data_pwrseq = {
 	.pwr_ops = &pvr_power_sequence_ops_pwrseq,
 };
 
+#if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
+static const struct pvr_device_data pvr_device_data_apple = {
+	.pwr_ops = &pvr_power_sequence_ops_apple,
+	.apple_fw = true,
+	.apple_chip = &pvr_apple_chip_t8010,
+};
+
+static const struct pvr_device_data pvr_device_data_apple_s8003 = {
+	.pwr_ops = &pvr_power_sequence_ops_apple,
+	.apple_fw = true,
+	.apple_chip = &pvr_apple_chip_s8003,
+};
+
+static const struct pvr_device_data pvr_device_data_apple_t7000 = {
+	.pwr_ops = &pvr_power_sequence_ops_apple,
+	.apple_fw = true,
+	.apple_chip = &pvr_apple_chip_t7000,
+};
+#endif
+
 static const struct of_device_id dt_match[] = {
+#if IS_ENABLED(CONFIG_DRM_POWERVR_APPLE)
+	{
+		.compatible = "apple,s8003-gpu",
+		.data = &pvr_device_data_apple_s8003,
+	},
+	{
+		.compatible = "apple,t8010-gpu",
+		.data = &pvr_device_data_apple,
+	},
+	{
+		.compatible = "apple,t7000-gpu",
+		.data = &pvr_device_data_apple_t7000,
+	},
+#endif
 	{
 		.compatible = "thead,th1520-gpu",
 		.data = &pvr_device_data_pwrseq,
@@ -1515,13 +1604,40 @@ static const struct of_device_id dt_match[] = {
 };
 MODULE_DEVICE_TABLE(of, dt_match);
 
+/*
+ * System sleep: the Apple GPU loses its firmware state when its power domain
+ * goes off, so it stops and restarts the firmware. Other GPUs keep relying on
+ * runtime PM as before.
+ */
+static int pvr_system_suspend(struct device *dev)
+{
+	struct drm_device *drm_dev = dev_get_drvdata(dev);
+	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
+
+	if (!pvr_device_is_apple(pvr_dev))
+		return 0;
+	return pvr_apple_suspend(pvr_dev);
+}
+
+static int pvr_system_resume(struct device *dev)
+{
+	struct drm_device *drm_dev = dev_get_drvdata(dev);
+	struct pvr_device *pvr_dev = to_pvr_device(drm_dev);
+
+	if (!pvr_device_is_apple(pvr_dev))
+		return 0;
+	return pvr_apple_resume(pvr_dev);
+}
+
 static const struct dev_pm_ops pvr_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(pvr_system_suspend, pvr_system_resume)
 	RUNTIME_PM_OPS(pvr_power_device_suspend, pvr_power_device_resume, pvr_power_device_idle)
 };
 
 static struct platform_driver pvr_driver = {
 	.probe = pvr_probe,
 	.remove = pvr_remove,
+	.shutdown = pvr_shutdown,
 	.driver = {
 		.name = PVR_DRIVER_NAME,
 		.pm = &pvr_pm_ops,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_mmu.h"
 
 #include "pvr_ccb.h"
@@ -132,6 +133,13 @@ int pvr_mmu_flush_exec(struct pvr_device *pvr_dev, bool wait)
 
 	if (!drm_dev_enter(from_pvr_device(pvr_dev), &idx))
 		return -EIO;
+
+	/* Apple's firmware invalidates on a context generation change instead. */
+	if (pvr_device_is_apple(pvr_dev)) {
+		if (atomic_xchg(&pvr_dev->mmu_flush_cache_flags, 0))
+			pvr_apple_mmu_flush(pvr_dev);
+		goto err_drm_dev_exit;
+	}
 
 	/* Can't flush MMU if the firmware hasn't been initialised yet. */
 	if (!READ_ONCE(pvr_dev->fw_dev.initialised))
@@ -292,6 +300,7 @@ pvr_mmu_backing_page_init(struct pvr_mmu_backing_page *page,
 	page->pvr_dev = pvr_dev;
 	page->raw_page = raw_page;
 	kmemleak_alloc(page->host_ptr, PAGE_SIZE, 1, GFP_KERNEL);
+	atomic_inc(&pvr_dev->live.mmu_pages);
 
 	return 0;
 
@@ -337,6 +346,7 @@ pvr_mmu_backing_page_fini(struct pvr_mmu_backing_page *page)
 	vunmap(page->host_ptr);
 
 	__free_page(page->raw_page);
+	atomic_dec(&page->pvr_dev->live.mmu_pages);
 
 	memset(page, 0, sizeof(*page));
 }
@@ -1779,9 +1789,11 @@ pvr_page_table_l1_get_or_insert(struct pvr_mmu_op_context *op_ctx,
  *  * 0 on success,
  *
  *    If @should_insert is %false:
- *     * -%ENXIO if a level 0 page table would have been inserted.
+ *     * -%ENXIO if a level 0 page table would have been inserted, or if
+ *       there is no level 1 page table to look in.
  *
  *    If @should_insert is %true:
+ *     * -%EINVAL if there is no level 1 page table to insert into, or
  *     * Any error encountered while inserting the level 0 page table.
  */
 static int
@@ -1789,6 +1801,18 @@ pvr_page_table_l0_get_or_insert(struct pvr_mmu_op_context *op_ctx,
 				bool should_insert)
 {
 	struct pvr_page_table_l0 *table;
+
+	/*
+	 * A walk that does not create tables can reach a level 0 boundary with
+	 * no level 1 table: the level 1 table was absent when it was loaded,
+	 * or removing its last entry earlier in the same walk freed it. There
+	 * is then no level 0 table either.
+	 */
+	if (!op_ctx->curr_page.l1_table) {
+		if (WARN_ON_ONCE(should_insert))
+			return -EINVAL;
+		return -ENXIO;
+	}
 
 	if (pvr_page_table_l1_entry_is_valid(op_ctx->curr_page.l1_table,
 					     op_ctx->curr_page.l1_idx)) {
@@ -2269,8 +2293,13 @@ pvr_page_create(struct pvr_mmu_op_context *op_ctx, dma_addr_t dma_addr,
 static void
 pvr_page_destroy(struct pvr_mmu_op_context *op_ctx)
 {
-	/* Do nothing if the page does not exist. */
-	if (!pvr_page_table_l0_entry_is_valid(op_ctx->curr_page.l0_table,
+	/*
+	 * Do nothing if the page does not exist, nor if its L0 table does not:
+	 * pvr_mmu_map() unwinding a failed map (-ENOMEM from a page table
+	 * allocation) walks pages whose tables were never created.
+	 */
+	if (!op_ctx->curr_page.l0_table ||
+	    !pvr_page_table_l0_entry_is_valid(op_ctx->curr_page.l0_table,
 					      op_ctx->curr_page.l0_idx)) {
 		return;
 	}
@@ -2335,7 +2364,8 @@ void pvr_mmu_op_context_destroy(struct pvr_mmu_op_context *op_ctx)
  * pvr_mmu_op_context_create() - Create an MMU op context.
  * @ctx: MMU context associated with owning VM context.
  * @sgt: Scatter gather table containing pages pinned for use by this context.
- * @sgt_offset: Start offset of the requested device-virtual memory mapping.
+ * @device_addr: Virtual device address at the start of the requested mapping.
+ * @sgt_offset: Offset into @sgt of the start of the requested mapping.
  * @size: Size in bytes of the requested device-virtual memory mapping. For an
  * unmapping, this should be zero so that no page tables are allocated.
  *
@@ -2346,7 +2376,7 @@ void pvr_mmu_op_context_destroy(struct pvr_mmu_op_context *op_ctx)
  */
 struct pvr_mmu_op_context *
 pvr_mmu_op_context_create(struct pvr_mmu_context *ctx, struct sg_table *sgt,
-			  u64 sgt_offset, u64 size)
+			  u64 device_addr, u64 sgt_offset, u64 size)
 {
 	int err;
 
@@ -2362,18 +2392,19 @@ pvr_mmu_op_context_create(struct pvr_mmu_context *ctx, struct sg_table *sgt,
 
 	if (size) {
 		/*
-		 * The number of page table objects we need to prealloc is
-		 * indicated by the mapping size, start offset and the sizes
-		 * of the areas mapped per PT or PD. The range calculation is
-		 * identical to that for the index into a table for a device
-		 * address, so we reuse those functions here.
+		 * Count absolute regions touched by the inclusive device-VA range.
+		 * BO offsets only locate the backing pages, and masked table indices
+		 * wrap when a mapping crosses a parent table boundary.
+		 * Existing tables do not consume preallocations, so this is an upper bound.
 		 */
-		const u32 l1_start_idx = pvr_page_table_l2_idx(sgt_offset);
-		const u32 l1_end_idx = pvr_page_table_l2_idx(sgt_offset + size);
-		const u32 l1_count = l1_end_idx - l1_start_idx + 1;
-		const u32 l0_start_idx = pvr_page_table_l1_idx(sgt_offset);
-		const u32 l0_end_idx = pvr_page_table_l1_idx(sgt_offset + size);
-		const u32 l0_count = l0_end_idx - l0_start_idx + 1;
+		const u64 first = device_addr;
+		const u64 last = device_addr + size - 1;
+		const u64 l1_count =
+			(last >> ROGUE_MMUCTRL_VADDR_PC_INDEX_SHIFT) -
+			(first >> ROGUE_MMUCTRL_VADDR_PC_INDEX_SHIFT) + 1;
+		const u64 l0_count =
+			(last >> ROGUE_MMUCTRL_VADDR_PD_INDEX_SHIFT) -
+			(first >> ROGUE_MMUCTRL_VADDR_PD_INDEX_SHIFT) + 1;
 
 		/*
 		 * Alloc and push page table entries until we have enough of
@@ -2428,36 +2459,51 @@ static int
 pvr_mmu_op_context_unmap_curr_page(struct pvr_mmu_op_context *op_ctx,
 				   u64 nr_pages)
 {
+	u64 page = 0;
 	int err;
 
-	if (nr_pages == 0)
-		return 0;
+	while (page < nr_pages) {
+		u64 skip = 0;
 
-	/*
-	 * Destroy first page outside loop, as it doesn't require a page
-	 * advance beforehand. If the L0 page table reference in
-	 * @op_ctx.curr_page is %NULL, there cannot be a mapped page at
-	 * @op_ctx.curr_page (so skip ahead).
-	 */
-	if (op_ctx->curr_page.l0_table)
+		/* Does nothing if there is no page, or no L0 table, here. */
 		pvr_page_destroy(op_ctx);
 
-	for (u64 page = 1; page < nr_pages; ++page) {
-		err = pvr_mmu_op_context_next_page(op_ctx, false);
 		/*
-		 * If the page table tree structure at @op_ctx.curr_page is
-		 * incomplete, skip ahead. We don't care about unmapping pages
-		 * that cannot exist.
-		 *
-		 * FIXME: This could be made more efficient by jumping ahead
-		 * using pvr_mmu_op_context_set_curr_page().
+		 * Without an L0 page table here, which may have just been
+		 * removed with its last page, no page up to the end of the
+		 * span of that table can be mapped. Without an L1 page table,
+		 * the same holds up to the end of the span of the L1 table.
+		 * Move to the last page of that span, so that the next advance
+		 * crosses its boundary and loads the tables after it.
 		 */
-		if (err == -ENXIO)
-			continue;
-		else if (err)
-			return err;
+		if (!op_ctx->curr_page.l1_table) {
+			skip = (u64)(ROGUE_MMUCTRL_ENTRIES_PD_VALUE - 1 -
+				     op_ctx->curr_page.l1_idx) *
+			       ROGUE_MMUCTRL_ENTRIES_PT_VALUE_X +
+			       (ROGUE_MMUCTRL_ENTRIES_PT_VALUE_X - 1 -
+				op_ctx->curr_page.l0_idx);
+		} else if (!op_ctx->curr_page.l0_table) {
+			skip = ROGUE_MMUCTRL_ENTRIES_PT_VALUE_X - 1 -
+			       op_ctx->curr_page.l0_idx;
+		}
 
-		pvr_page_destroy(op_ctx);
+		/* Stop at the last page; never advance past the range. */
+		if (skip >= nr_pages - page - 1)
+			return 0;
+
+		if (skip) {
+			if (!op_ctx->curr_page.l1_table)
+				op_ctx->curr_page.l1_idx =
+					ROGUE_MMUCTRL_ENTRIES_PD_VALUE - 1;
+			op_ctx->curr_page.l0_idx =
+				ROGUE_MMUCTRL_ENTRIES_PT_VALUE_X - 1;
+			page += skip;
+		}
+
+		err = pvr_mmu_op_context_next_page(op_ctx, false);
+		if (err && err != -ENXIO)
+			return err;
+		++page;
 	}
 
 	return 0;
@@ -2594,7 +2640,7 @@ int pvr_mmu_map(struct pvr_mmu_op_context *op_ctx, u64 size, u64 flags,
 
 	memcpy(&ptr_copy, &op_ctx->curr_page, sizeof(ptr_copy));
 
-	flags_raw = pvr_page_flags_raw_create(false, false,
+	flags_raw = pvr_page_flags_raw_create(false, flags & PVR_BO_DEVICE_CACHE_COHERENT,
 					      flags & DRM_PVR_BO_BYPASS_DEVICE_CACHE,
 					      flags & DRM_PVR_BO_PM_FW_PROTECT);
 
@@ -2640,4 +2686,22 @@ int pvr_mmu_map(struct pvr_mmu_op_context *op_ctx, u64 size, u64 flags,
 	}
 
 	return err;
+}
+
+/* Reclaim only needs an unmap cursor, never preallocated page tables. */
+struct pvr_mmu_op_context *pvr_mmu_unmap_context_create(struct pvr_mmu_context *ctx)
+{
+	struct pvr_mmu_op_context *op_ctx = kzalloc(sizeof(*op_ctx), GFP_NOWAIT);
+
+	if (!op_ctx)
+		return ERR_PTR(-ENOMEM);
+	op_ctx->mmu_ctx = ctx;
+	return op_ctx;
+}
+
+int pvr_mmu_unmap_flush(struct pvr_mmu_op_context *op_ctx)
+{
+	pvr_mmu_op_context_sync(op_ctx);
+	pvr_mmu_flush_request_all(op_ctx->mmu_ctx->pvr_dev);
+	return pvr_mmu_flush_exec(op_ctx->mmu_ctx->pvr_dev, true);
 }

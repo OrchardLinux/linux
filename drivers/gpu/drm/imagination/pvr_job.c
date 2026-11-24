@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_context.h"
 #include "pvr_device.h"
 #include "pvr_drv.h"
@@ -15,6 +16,7 @@
 #include "pvr_stream_defs.h"
 #include "pvr_sync.h"
 #include "pvr_trace.h"
+#include "pvr_vm.h"
 
 #include <drm/drm_exec.h>
 #include <drm/drm_gem.h>
@@ -78,8 +80,11 @@ pvr_job_process_stream(struct pvr_device *pvr_dev, const struct pvr_stream_cmd_d
 	job->cmd_len = cmd_defs->dest_size;
 
 	err = pvr_stream_process(pvr_dev, cmd_defs, stream, stream_size, job->cmd);
-	if (err)
+	if (err) {
 		kfree(job->cmd);
+		job->cmd = NULL;
+		job->cmd_len = 0;
+	}
 
 	return err;
 }
@@ -156,7 +161,10 @@ pvr_geom_job_fw_cmd_init(struct pvr_job *job,
 		return -EINVAL;
 
 	job->fw_ccb_cmd_type = ROGUE_FWIF_CCB_CMD_TYPE_GEOM;
-	err = pvr_fw_cmd_init(job->pvr_dev, job, &pvr_cmd_geom_stream,
+	err = pvr_fw_cmd_init(job->pvr_dev, job,
+			      pvr_device_is_apple(job->pvr_dev) ?
+				pvr_apple_cmd_stream(job->pvr_dev, DRM_PVR_JOB_TYPE_GEOMETRY) :
+				&pvr_cmd_geom_stream,
 			      args->cmd_stream, args->cmd_stream_len);
 	if (err)
 		return err;
@@ -164,7 +172,8 @@ pvr_geom_job_fw_cmd_init(struct pvr_job *job,
 	cmd = job->cmd;
 	cmd->cmd_shared.cmn.frame_num = 0;
 	cmd->flags = convert_geom_flags(args->flags);
-	pvr_fw_object_get_fw_addr(job->hwrt->fw_obj, &cmd->cmd_shared.hwrt_data_fw_addr);
+	if (job->hwrt->fw_obj)
+		pvr_fw_object_get_fw_addr(job->hwrt->fw_obj, &cmd->cmd_shared.hwrt_data_fw_addr);
 	return 0;
 }
 
@@ -187,7 +196,10 @@ pvr_frag_job_fw_cmd_init(struct pvr_job *job,
 	job->fw_ccb_cmd_type = (args->flags & DRM_PVR_SUBMIT_JOB_FRAG_CMD_PARTIAL_RENDER) ?
 			       ROGUE_FWIF_CCB_CMD_TYPE_FRAG_PR :
 			       ROGUE_FWIF_CCB_CMD_TYPE_FRAG;
-	err = pvr_fw_cmd_init(job->pvr_dev, job, &pvr_cmd_frag_stream,
+	err = pvr_fw_cmd_init(job->pvr_dev, job,
+			      pvr_device_is_apple(job->pvr_dev) ?
+				pvr_apple_cmd_stream(job->pvr_dev, DRM_PVR_JOB_TYPE_FRAGMENT) :
+				&pvr_cmd_frag_stream,
 			      args->cmd_stream, args->cmd_stream_len);
 	if (err)
 		return err;
@@ -195,7 +207,8 @@ pvr_frag_job_fw_cmd_init(struct pvr_job *job,
 	cmd = job->cmd;
 	cmd->cmd_shared.cmn.frame_num = 0;
 	cmd->flags = convert_frag_flags(args->flags);
-	pvr_fw_object_get_fw_addr(job->hwrt->fw_obj, &cmd->cmd_shared.hwrt_data_fw_addr);
+	if (job->hwrt->fw_obj)
+		pvr_fw_object_get_fw_addr(job->hwrt->fw_obj, &cmd->cmd_shared.hwrt_data_fw_addr);
 	return 0;
 }
 
@@ -226,7 +239,10 @@ pvr_compute_job_fw_cmd_init(struct pvr_job *job,
 		return -EINVAL;
 
 	job->fw_ccb_cmd_type = ROGUE_FWIF_CCB_CMD_TYPE_CDM;
-	err = pvr_fw_cmd_init(job->pvr_dev, job, &pvr_cmd_compute_stream,
+	err = pvr_fw_cmd_init(job->pvr_dev, job,
+			      pvr_device_is_apple(job->pvr_dev) ?
+				pvr_apple_cmd_stream(job->pvr_dev, DRM_PVR_JOB_TYPE_COMPUTE) :
+				&pvr_cmd_compute_stream,
 			      args->cmd_stream, args->cmd_stream_len);
 	if (err)
 		return err;
@@ -346,22 +362,29 @@ prepare_job_syncs(struct pvr_file *pvr_file,
 		/* The geometry job writes the HWRT region headers, which are
 		 * then read by the fragment job.
 		 */
-		struct drm_gem_object *obj =
-			gem_from_pvr_gem(job_data->job->hwrt->fw_obj->gem);
+		struct drm_gem_object *obj = pvr_hwrt_data_resv_obj(job_data->job->hwrt);
 		enum dma_resv_usage usage =
 			dma_resv_usage_rw(job_data->job->type ==
 					  DRM_PVR_JOB_TYPE_GEOMETRY);
 
-		dma_resv_lock(obj->resv, NULL);
+		/* prepare_job_resvs_for_each() already locked this with drm_exec. */
+		dma_resv_assert_held(obj->resv);
 		err = drm_sched_job_add_resv_dependencies(&job_data->job->base,
 							  obj->resv, usage);
-		dma_resv_unlock(obj->resv);
 		if (err)
 			return err;
 	}
 
 	/* We need to arm the job to get the job finished fence. */
+	if (pvr_device_is_apple(job_data->job->pvr_dev)) {
+		err = pvr_apple_job_add_deps(job_data->job);
+		if (err)
+			return err;
+	}
+
 	finished_fence = pvr_queue_job_arm(job_data->job);
+	if (pvr_device_is_apple(job_data->job->pvr_dev))
+		pvr_apple_job_armed(job_data->job, finished_fence);
 
 	err = pvr_sync_signal_array_update_fences(signal_array,
 						  job_data->sync_op_count,
@@ -441,6 +464,12 @@ create_job(struct pvr_device *pvr_dev,
 			err = -EINVAL;
 			goto err_put_job;
 		}
+
+		/* The PM uses the data set's MLists and free lists. */
+		err = pvr_hwrt_dataset_bind_vm(job->hwrt->hwrt_dataset,
+					       job->ctx->vm_ctx);
+		if (err)
+			goto err_put_job;
 	}
 
 	err = pvr_job_fw_cmd_init(job, args);
@@ -531,30 +560,33 @@ push_jobs(struct pvr_job_data *job_data, u32 job_count)
 }
 
 static int
-prepare_fw_obj_resv(struct drm_exec *exec, struct pvr_fw_object *fw_obj)
-{
-	return drm_exec_prepare_obj(exec, gem_from_pvr_gem(fw_obj->gem), 1);
-}
-
-static int
 jobs_lock_all_objs(struct drm_exec *exec, struct pvr_job_data *job_data,
-		   u32 job_count)
+		   u32 job_count, bool vm_only)
 {
 	for (u32 i = 0; i < job_count; i++) {
 		struct pvr_job *job = job_data[i].job;
 
-		/* Grab a lock on a the context, to guard against
-		 * concurrent submission to the same queue.
-		 */
-		int err = drm_exec_lock_obj(exec,
-					    gem_from_pvr_gem(job->ctx->fw_obj->gem));
+		int err;
 
+		/* Grab a lock on a the context, to guard against
+		 * concurrent submission to the same queue. Apple contexts have
+		 * no firmware object; their queue's scheduler entity orders jobs.
+		 */
+		if (!vm_only && job->ctx->fw_obj) {
+			err = drm_exec_lock_obj(exec, gem_from_pvr_gem(job->ctx->fw_obj->gem));
+			if (err)
+				return err;
+		}
+
+		err = drm_exec_prepare_obj(exec, pvr_vm_resv_obj(job->ctx->vm_ctx), job_count);
+		if (err)
+			return err;
+		err = pvr_vm_prepare_objects(job->ctx->vm_ctx, exec);
 		if (err)
 			return err;
 
-		if (job->hwrt) {
-			err = prepare_fw_obj_resv(exec,
-						  job->hwrt->fw_obj);
+		if (!vm_only && job->hwrt) {
+			err = drm_exec_prepare_obj(exec, pvr_hwrt_data_resv_obj(job->hwrt), 1);
 			if (err)
 				return err;
 		}
@@ -565,10 +597,10 @@ jobs_lock_all_objs(struct drm_exec *exec, struct pvr_job_data *job_data,
 
 static int
 prepare_job_resvs_for_each(struct drm_exec *exec, struct pvr_job_data *job_data,
-			   u32 job_count)
+			   u32 job_count, bool vm_only)
 {
 	drm_exec_until_all_locked(exec) {
-		int err = jobs_lock_all_objs(exec, job_data, job_count);
+		int err = jobs_lock_all_objs(exec, job_data, job_count, vm_only);
 
 		drm_exec_retry_on_contention(exec);
 		if (err)
@@ -581,10 +613,15 @@ prepare_job_resvs_for_each(struct drm_exec *exec, struct pvr_job_data *job_data,
 static void
 update_job_resvs(struct pvr_job *job)
 {
+	struct dma_fence *fence = &job->base.s_fence->finished;
+
+	dma_resv_add_fence(pvr_vm_get_dma_resv(job->ctx->vm_ctx), fence,
+			   DMA_RESV_USAGE_BOOKKEEP);
+
 	if (job->hwrt) {
 		enum dma_resv_usage usage = job->type == DRM_PVR_JOB_TYPE_GEOMETRY ?
 					    DMA_RESV_USAGE_WRITE : DMA_RESV_USAGE_READ;
-		struct drm_gem_object *obj = gem_from_pvr_gem(job->hwrt->fw_obj->gem);
+		struct drm_gem_object *obj = pvr_hwrt_data_resv_obj(job->hwrt);
 
 		dma_resv_add_fence(obj->resv, &job->base.s_fence->finished, usage);
 	}
@@ -712,6 +749,8 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 	struct xarray signal_array;
 	u32 jobs_alloced = 0;
 	struct drm_exec exec;
+	struct pvr_vm_context **vms = NULL;
+	u32 vm_count = 0;
 	int err;
 
 	if (!args->jobs.count)
@@ -734,6 +773,55 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 		goto out_free;
 
 	jobs_alloced = args->jobs.count;
+	if (pvr_device_is_apple(pvr_dev)) {
+		for (u32 i = 0; i < jobs_alloced; i++) {
+			err = pvr_apple_job_prepare_resources(job_data[i].job);
+			if (err)
+				goto out_job_data_cleanup;
+		}
+	}
+
+	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT | DRM_EXEC_IGNORE_DUPLICATES, 0);
+
+	xa_init_flags(&signal_array, XA_FLAGS_ALLOC);
+
+	/*
+	 * Apple GPUs hold one scene at a time: a geometry job is ordered after the
+	 * last fragment job armed on any context (pvr_apple_job_add_deps()). The
+	 * jobs of a submission are armed one by one, so a submission from another
+	 * file in between let its geometry job run between this geometry job and
+	 * its fragment job, which then rendered the other scene and hung the GPU.
+	 * Submissions are made whole under one lock.
+	 */
+	vms = kvmalloc_array(jobs_alloced, sizeof(*vms), GFP_KERNEL);
+	if (!vms) {
+		err = -ENOMEM;
+		goto out_exec_fini_unlocked;
+	}
+	err = mutex_lock_interruptible(&pvr_dev->submit_order);
+	if (err)
+		goto out_exec_fini_unlocked;
+	for (u32 i = 0; i < jobs_alloced; i++) {
+		struct pvr_vm_context *vm = job_data[i].job->ctx->vm_ctx;
+		u32 j;
+
+		for (j = 0; j < vm_count && vms[j] != vm; j++)
+			;
+		if (j != vm_count)
+			continue;
+		pvr_vm_submit_lock(vm, &pvr_dev->submit_order);
+		vms[vm_count++] = vm;
+	}
+
+	err = prepare_job_resvs_for_each(&exec, job_data, args->jobs.count,
+					 !pvr_device_is_apple(pvr_dev));
+	if (err)
+		goto out_exec_fini;
+	for (u32 i = 0; i < vm_count; i++) {
+		err = pvr_vm_validate(vms[i], &exec);
+		if (err)
+			goto out_exec_fini;
+	}
 
 	/*
 	 * Flush MMU if needed - this has been deferred until now to avoid
@@ -741,18 +829,23 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 	 */
 	err = pvr_mmu_flush_exec(pvr_dev, false);
 	if (err)
-		goto out_job_data_cleanup;
-
-	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT | DRM_EXEC_IGNORE_DUPLICATES, 0);
-
-	xa_init_flags(&signal_array, XA_FLAGS_ALLOC);
-
-	err = prepare_job_syncs_for_each(pvr_file, job_data, &args->jobs.count,
-					 &signal_array);
-	if (err)
 		goto out_exec_fini;
 
-	err = prepare_job_resvs_for_each(&exec, job_data, args->jobs.count);
+	if (!pvr_device_is_apple(pvr_dev)) {
+		/* A failed IMG flush resets and vmaps firmware objects. Do not
+		 * hold context/HWRT reservations until that path has completed.
+		 * VM mutexes span both exec passes, so backing cannot be evicted.
+		 */
+		drm_exec_fini(&exec);
+		drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT | DRM_EXEC_IGNORE_DUPLICATES, 0);
+		err = prepare_job_resvs_for_each(&exec, job_data, args->jobs.count, false);
+		if (err)
+			goto out_exec_fini;
+	}
+
+	/* prepare_job_syncs arms jobs: residency failures must precede it. */
+	err = prepare_job_syncs_for_each(pvr_file, job_data, &args->jobs.count,
+					 &signal_array);
 	if (err)
 		goto out_exec_fini;
 
@@ -770,6 +863,14 @@ pvr_submit_jobs(struct pvr_device *pvr_dev, struct pvr_file *pvr_file,
 
 out_exec_fini:
 	drm_exec_fini(&exec);
+	while (vm_count)
+		pvr_vm_submit_unlock(vms[--vm_count]);
+	mutex_unlock(&pvr_dev->submit_order);
+	goto out_sync_cleanup;
+out_exec_fini_unlocked:
+	drm_exec_fini(&exec);
+out_sync_cleanup:
+	kvfree(vms);
 	pvr_sync_signal_array_cleanup(&signal_array);
 
 out_job_data_cleanup:

@@ -11,6 +11,8 @@
 #include "pvr_stream.h"
 
 #include <drm/drm_device.h>
+#include <drm/drm_gem.h>
+#include <linux/shrinker.h>
 #include <drm/drm_file.h>
 #include <drm/drm_mm.h>
 
@@ -62,13 +64,23 @@ struct pvr_fw_version {
 	u16 major, minor;
 };
 
+struct pvr_apple_chip;
+
 /**
  * struct pvr_device_data - Platform specific data associated with a compatible string.
  * @pwr_ops: Pointer to a structure with platform-specific power functions.
  */
 struct pvr_device_data {
 	const struct pvr_power_sequence_ops *pwr_ops;
+
+	/** @apple_fw: GPU driven by Apple's GFX firmware (see pvr_apple.c). */
+	bool apple_fw;
+
+	/** @apple_chip: With @apple_fw, the chip's side of it (pvr_apple_chip.h). */
+	const struct pvr_apple_chip *apple_chip;
 };
+
+struct pvr_apple;
 
 /**
  * struct pvr_device - powervr-specific wrapper for &struct drm_device
@@ -81,6 +93,27 @@ struct pvr_device {
 	 * from_pvr_device().
 	 */
 	struct drm_device base;
+
+	/**
+	 * @submit_order: Makes a submission whole and nests its VM locks
+	 * outside reservation locking and job arming (pvr_submit_jobs()).
+	 */
+	struct mutex submit_order;
+
+	/** @gem_reclaim: GEM residency, using base.gem_lru_mutex for all LRUs. */
+	struct {
+		struct drm_gem_lru evictable;
+		struct drm_gem_lru dontneed;
+		struct drm_gem_lru pinned;
+		struct mutex scan_lock;
+		struct shrinker *shrinker;
+		bool stopped;
+		struct work_struct work;
+		atomic_long_t requested;
+		atomic64_t evicted_bytes;
+		atomic64_t scans, evicts, purges, restores, restore_fail;
+		atomic64_t skip[12];
+	} gem_reclaim;
 
 	/** @gpu_id: GPU ID detected at runtime. */
 	struct pvr_gpu_id gpu_id;
@@ -113,6 +146,9 @@ struct pvr_device {
 
 	/** @device_data: Pointer to platform-specific data. */
 	const struct pvr_device_data *device_data;
+
+	/** @apple: Apple firmware state, if @device_data->apple_fw. */
+	struct pvr_apple *apple;
 
 	/** @regs_resource: Resource representing device control registers. */
 	struct resource *regs_resource;
@@ -222,6 +258,17 @@ struct pvr_device {
 	 *           are of type "struct pvr_job *".
 	 */
 	struct xarray job_ids;
+
+	/**
+	 * @live: Objects alive now, for leak checks (debugfs apple_jobs):
+	 * GEM objects and their bytes, MMU page-table pages, VM contexts.
+	 */
+	struct {
+		atomic_t gem_objs;
+		atomic64_t gem_bytes;
+		atomic_t mmu_pages;
+		atomic_t vm_ctxs;
+	} live;
 
 	/**
 	 * @queues: Queue-related fields.
@@ -785,6 +832,12 @@ static __always_inline void
 pvr_fw_irq_clear(struct pvr_device *pvr_dev)
 {
 	pvr_dev->fw_dev.defs->irq_clear(pvr_dev);
+}
+
+static inline bool
+pvr_device_is_apple(const struct pvr_device *pvr_dev)
+{
+	return IS_ENABLED(CONFIG_DRM_POWERVR_APPLE) && pvr_dev->device_data->apple_fw;
 }
 
 #endif /* PVR_DEVICE_H */

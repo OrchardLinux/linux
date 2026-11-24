@@ -7,12 +7,14 @@
 #include <linux/compiler_attributes.h>
 #include <linux/kref.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/xarray.h>
 #include <uapi/drm/pvr_drm.h>
 
 #include "pvr_device.h"
 #include "pvr_rogue_fwif_shared.h"
+#include "pvr_vm.h"
 
 /* Forward declaration from pvr_free_list.h. */
 struct pvr_free_list;
@@ -49,6 +51,12 @@ struct pvr_hwrt_data {
 
 	/** @hwrt_dataset: Back pointer to owning HWRT dataset. */
 	struct pvr_hwrt_dataset *hwrt_dataset;
+
+	/**
+	 * @sync_obj: Object whose reservation orders the geometry and fragment
+	 * jobs on this HWRT data where there is no @fw_obj (Apple firmware).
+	 */
+	struct pvr_gem_object *sync_obj;
 };
 
 /**
@@ -75,7 +83,57 @@ struct pvr_hwrt_dataset {
 
 	/** @max_rts: Maximum render targets for this HWRT data set. */
 	u16 max_rts;
+
+	/**
+	 * @width: Width in pixels, as created; with @height and @samples for a
+	 * firmware that takes the target's geometry with each job (Apple A9).
+	 */
+	u32 width;
+
+	/** @height: Height in pixels. */
+	u32 height;
+
+	/** @samples: Samples per pixel. */
+	u32 samples;
+
+	/** @pin_lock: Protects @vm_ctx and @pins. */
+	struct mutex pin_lock;
+
+	/**
+	 * @vm_ctx: VM context the first job on this data set ran in, or %NULL
+	 * before then. Jobs in any other VM context are refused.
+	 */
+	struct pvr_vm_context *vm_ctx;
+
+	/**
+	 * @pins: PM MLists of @data and the free lists in @free_lists, pinned in
+	 * @vm_ctx while this data set exists.
+	 */
+	struct pvr_vm_pin pins[ROGUE_FWIF_NUM_RTDATAS + ROGUE_FWIF_NUM_RTDATA_FREELISTS];
+
+	/**
+	 * @apple_rgn: Region-header ring of this target on a firmware that
+	 * gives each frame its own slice of it (Apple A8), like the cursor in
+	 * Apple's per-render-target RTM structure. It lives as long as the
+	 * data set, so a queued job always finds it. Zero until the first
+	 * geometry job on the data set is prepared; under the chip's lock.
+	 */
+	struct {
+		/** @apple_rgn.ring: Size of the mirrored ring in bytes; 0: not prepared. */
+		u64 ring;
+
+		/** @apple_rgn.cursor: Offset of the next frame's slice, unmasked. */
+		u64 cursor;
+
+		/** @apple_rgn.slice: Bytes of one frame's region headers. */
+		u32 slice;
+	} apple_rgn;
 };
+
+struct drm_gem_object *pvr_hwrt_data_resv_obj(struct pvr_hwrt_data *hwrt_data);
+
+int pvr_hwrt_dataset_bind_vm(struct pvr_hwrt_dataset *hwrt,
+			     struct pvr_vm_context *vm_ctx);
 
 struct pvr_hwrt_dataset *
 pvr_hwrt_dataset_create(struct pvr_file *pvr_file,
@@ -114,6 +172,9 @@ pvr_hwrt_dataset_lookup(struct pvr_file *pvr_file, u32 handle)
 
 void
 pvr_hwrt_dataset_put(struct pvr_hwrt_dataset *hwrt);
+
+void
+pvr_hwrt_dataset_destroy(struct pvr_hwrt_dataset *hwrt);
 
 /**
  * pvr_hwrt_data_lookup() - Lookup HWRT data pointer from handle and index

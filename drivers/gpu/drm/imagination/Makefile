@@ -18,6 +18,7 @@ powervr-y := \
 	pvr_fw_trace.o \
 	pvr_fw_util.o \
 	pvr_gem.o \
+	pvr_gem_shrinker.o \
 	pvr_hwrt.o \
 	pvr_job.o \
 	pvr_mmu.o \
@@ -28,6 +29,13 @@ powervr-y := \
 	pvr_sync.o \
 	pvr_vm.o \
 	pvr_vm_mips.o
+
+powervr-$(CONFIG_DRM_POWERVR_APPLE) += \
+	pvr_apple.o \
+	pvr_apple_layout.o \
+	pvr_apple_queue.o \
+	pvr_apple_s8003.o \
+	pvr_apple_t8010.o
 
 powervr-$(CONFIG_DEBUG_FS) += \
 	pvr_debugfs.o

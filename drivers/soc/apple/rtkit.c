@@ -865,6 +865,44 @@ int apple_rtkit_shutdown(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_shutdown);
 
+/**
+ * apple_rtkit_shutdown_terminal() - Stop firmware without joining callbacks
+ * @rtk: RTKit reference, retained until the CPUs stop
+ *
+ * Each send polls for at most 500 ms, each ACK waits at most one second.
+ * The caller must halt the co-processor even if a request fails. Do not
+ * reinitialize or free any storage: a callback may still be running.
+ *
+ * Return: zero on acknowledgement, or the first request error.
+ */
+int apple_rtkit_shutdown_terminal(struct apple_rtkit *rtk)
+{
+	u64 msg;
+	int ret;
+
+	reinit_completion(&rtk->ap_pwr_ack_completion);
+	msg = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE) |
+	      FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_QUIESCED);
+	ret = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_MGMT, msg, NULL, true);
+	if (!ret)
+		ret = apple_rtkit_wait_for_completion(&rtk->ap_pwr_ack_completion);
+	if (!ret && rtk->ap_power_state != APPLE_RTKIT_PWR_STATE_QUIESCED)
+		ret = -EINVAL;
+	if (!ret) {
+		reinit_completion(&rtk->iop_pwr_ack_completion);
+		msg = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE) |
+		      FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_SLEEP);
+		ret = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_MGMT, msg, NULL, true);
+		if (!ret)
+			ret = apple_rtkit_wait_for_completion(&rtk->iop_pwr_ack_completion);
+		if (!ret && rtk->iop_power_state != APPLE_RTKIT_PWR_STATE_SLEEP)
+			ret = -EINVAL;
+	}
+	apple_mbox_stop_nowait(rtk->mbox);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_shutdown_terminal);
+
 int apple_rtkit_poweroff(struct apple_rtkit *rtk)
 {
 	int ret;

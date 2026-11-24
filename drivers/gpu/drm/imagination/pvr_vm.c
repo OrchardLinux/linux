@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright (c) 2023 Imagination Technologies Ltd. */
 
+#include "pvr_apple.h"
 #include "pvr_vm.h"
 
 #include "pvr_device.h"
@@ -21,7 +22,11 @@
 #include <linux/errno.h>
 #include <linux/gfp_types.h>
 #include <linux/kref.h>
+#include <linux/list.h>
+#include <linux/lockdep.h>
 #include <linux/mutex.h>
+#include <linux/overflow.h>
+#include <linux/scatterlist.h>
 #include <linux/stddef.h>
 
 /**
@@ -49,6 +54,18 @@ struct pvr_vm_context {
 
 	/** @lock: Global lock on this VM. */
 	struct mutex lock;
+
+	/* Latest published job retirement, updated under lock when checking idle. */
+	ktime_t last_retired;
+
+	/**
+	 * @pins: Ranges that map and unmap requests must leave alone, as
+	 * &struct pvr_vm_pin. Protected by @lock.
+	 */
+	struct list_head pins;
+
+	/** @is_userspace_context: Mappings must lie within the userspace heaps. */
+	bool is_userspace_context;
 
 	/**
 	 * @fw_mem_ctx_obj: Firmware object representing firmware memory
@@ -114,6 +131,9 @@ struct dma_resv *pvr_vm_get_dma_resv(struct pvr_vm_context *vm_ctx)
 struct pvr_vm_gpuva {
 	/** @base: The wrapped drm_gpuva object. */
 	struct drm_gpuva base;
+
+	/** @evicted: PTEs absent, even if another VA of this BO is resident. */
+	bool evicted;
 };
 
 #define to_pvr_vm_gpuva(va) container_of_const(va, struct pvr_vm_gpuva, base)
@@ -214,7 +234,16 @@ static int pvr_vm_bind_op_exec(struct pvr_vm_bind_op *bind_op)
 
 static void pvr_vm_bind_op_fini(struct pvr_vm_bind_op *bind_op)
 {
-	drm_gpuvm_bo_put(bind_op->gpuvm_bo);
+	if (bind_op->gpuvm_bo) {
+		struct drm_gem_object *obj = bind_op->gpuvm_bo->obj;
+
+		/* Last put removes vm_bo from the BO's GPUVA list. */
+		drm_gem_object_get(obj);
+		dma_resv_lock(obj->resv, NULL);
+		drm_gpuvm_bo_put(bind_op->gpuvm_bo);
+		dma_resv_unlock(obj->resv);
+		drm_gem_object_put(obj);
+	}
 
 	kfree(bind_op->new_va);
 	kfree(bind_op->prev_va);
@@ -231,19 +260,18 @@ static int
 pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
 			struct pvr_vm_context *vm_ctx,
 			struct pvr_gem_object *pvr_obj, u64 offset,
-			u64 device_addr, u64 size)
+			u64 device_addr, u64 size, bool reserved)
 {
 	struct drm_gem_object *obj = gem_from_pvr_gem(pvr_obj);
-	const bool is_user = vm_ctx != vm_ctx->pvr_dev->kernel_vm_ctx;
+	const bool is_user = vm_ctx->is_userspace_context;
 	const u64 pvr_obj_size = pvr_gem_object_size(pvr_obj);
-	struct sg_table *sgt;
 	u64 offset_plus_size;
 	int err;
 
 	if (check_add_overflow(offset, size, &offset_plus_size))
 		return -EINVAL;
 
-	if (is_user &&
+	if (is_user && !reserved &&
 	    !pvr_find_heap_containing(vm_ctx->pvr_dev, device_addr, size)) {
 		return -EINVAL;
 	}
@@ -266,20 +294,6 @@ pvr_vm_bind_op_map_init(struct pvr_vm_bind_op *bind_op,
 	bind_op->next_va = kzalloc_obj(*bind_op->next_va);
 	if (!bind_op->new_va || !bind_op->prev_va || !bind_op->next_va) {
 		err = -ENOMEM;
-		goto err_bind_op_fini;
-	}
-
-	/* Pin pages so they're ready for use. */
-	sgt = pvr_gem_object_get_pages_sgt(pvr_obj);
-	err = PTR_ERR_OR_ZERO(sgt);
-	if (err)
-		goto err_bind_op_fini;
-
-	bind_op->mmu_op_ctx =
-		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, sgt, offset, size);
-	err = PTR_ERR_OR_ZERO(bind_op->mmu_op_ctx);
-	if (err) {
-		bind_op->mmu_op_ctx = NULL;
 		goto err_bind_op_fini;
 	}
 
@@ -318,7 +332,7 @@ pvr_vm_bind_op_unmap_init(struct pvr_vm_bind_op *bind_op,
 	}
 
 	bind_op->mmu_op_ctx =
-		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, 0, 0);
+		pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, device_addr, 0, 0);
 	err = PTR_ERR_OR_ZERO(bind_op->mmu_op_ctx);
 	if (err) {
 		bind_op->mmu_op_ctx = NULL;
@@ -336,6 +350,16 @@ err_bind_op_fini:
 	pvr_vm_bind_op_fini(bind_op);
 
 	return err;
+}
+
+static void pvr_vm_gpuva_unlink(struct drm_gpuva *va)
+{
+	struct drm_gpuvm_bo *vm_bo = va->vm_bo;
+
+	/* prepare_range() only locks objects with a live VA. */
+	if (vm_bo->evicted && list_is_singular(&vm_bo->list.gpuva))
+		drm_gpuvm_bo_evict(vm_bo, false);
+	drm_gpuva_unlink(va);
 }
 
 /**
@@ -389,14 +413,17 @@ pvr_vm_gpuva_unmap(struct drm_gpuva_op *op, void *op_ctx)
 {
 	struct pvr_vm_bind_op *ctx = op_ctx;
 
-	int err = pvr_mmu_unmap(ctx->mmu_op_ctx, op->unmap.va->va.addr,
-				op->unmap.va->va.range);
+	int err = 0;
+
+	if (!to_pvr_vm_gpuva(op->unmap.va)->evicted)
+		err = pvr_mmu_unmap(ctx->mmu_op_ctx, op->unmap.va->va.addr,
+				    op->unmap.va->va.range);
 
 	if (err)
 		return err;
 
 	drm_gpuva_unmap(&op->unmap);
-	drm_gpuva_unlink(op->unmap.va);
+	pvr_vm_gpuva_unlink(op->unmap.va);
 	kfree(to_pvr_vm_gpuva(op->unmap.va));
 
 	return 0;
@@ -423,9 +450,13 @@ pvr_vm_gpuva_remap(struct drm_gpuva_op *op, void *op_ctx)
 	int err;
 
 	drm_gpuva_op_remap_to_unmap_range(&op->remap, &va_start, &va_range);
-	err = pvr_mmu_unmap(ctx->mmu_op_ctx, va_start, va_range);
-	if (err)
-		return err;
+	if (!to_pvr_vm_gpuva(op->remap.unmap->va)->evicted) {
+		err = pvr_mmu_unmap(ctx->mmu_op_ctx, va_start, va_range);
+		if (err)
+			return err;
+	}
+	ctx->prev_va->evicted = to_pvr_vm_gpuva(op->remap.unmap->va)->evicted;
+	ctx->next_va->evicted = ctx->prev_va->evicted;
 
 	/* No actual remap required: the page table tree depth is fixed to 3,
 	 * and we use 4k page table entries only for now.
@@ -444,7 +475,7 @@ pvr_vm_gpuva_remap(struct drm_gpuva_op *op, void *op_ctx)
 		ctx->next_va = NULL;
 	}
 
-	drm_gpuva_unlink(op->remap.unmap->va);
+	pvr_vm_gpuva_unlink(op->remap.unmap->va);
 	kfree(to_pvr_vm_gpuva(op->remap.unmap->va));
 
 	return 0;
@@ -509,7 +540,10 @@ static void pvr_gpuvm_free(struct drm_gpuvm *gpuvm)
 	kfree(to_pvr_vm_context(gpuvm));
 }
 
+static int pvr_vm_bo_validate(struct drm_gpuvm_bo *vm_bo, struct drm_exec *exec);
+
 static const struct drm_gpuvm_ops pvr_vm_gpuva_ops = {
+	.vm_bo_validate = pvr_vm_bo_validate,
 	.vm_free = pvr_gpuvm_free,
 	.sm_step_map = pvr_vm_gpuva_map,
 	.sm_step_remap = pvr_vm_gpuva_remap,
@@ -570,13 +604,15 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 		return ERR_PTR(-ENOMEM);
 
 	vm_ctx->pvr_dev = pvr_dev;
+	vm_ctx->is_userspace_context = is_userspace_context;
 
 	vm_ctx->mmu_ctx = pvr_mmu_context_create(pvr_dev);
 	err = PTR_ERR_OR_ZERO(vm_ctx->mmu_ctx);
 	if (err)
 		goto err_free;
 
-	if (is_userspace_context) {
+	/* Apple's firmware has no IMG memory-context object (see pvr_apple.c). */
+	if (is_userspace_context && !pvr_device_is_apple(pvr_dev)) {
 		err = pvr_fw_object_create(pvr_dev, sizeof(struct rogue_fwif_fwmemcontext),
 					   PVR_BO_FW_FLAGS_DEVICE_UNCACHED,
 					   fw_mem_context_init, vm_ctx, &vm_ctx->fw_mem_ctx_obj);
@@ -592,7 +628,18 @@ pvr_vm_create_context(struct pvr_device *pvr_dev, bool is_userspace_context)
 		       0, 1ULL << device_addr_bits, 0, 0, &pvr_vm_gpuva_ops);
 
 	mutex_init(&vm_ctx->lock);
+	vm_ctx->last_retired = ktime_get();
+	INIT_LIST_HEAD(&vm_ctx->pins);
 	kref_init(&vm_ctx->ref_count);
+	atomic_inc(&pvr_dev->live.vm_ctxs);	/* until pvr_vm_context_release() */
+
+	if (is_userspace_context && pvr_device_is_apple(pvr_dev)) {
+		err = pvr_apple_vm_init(pvr_dev, vm_ctx);
+		if (err) {
+			pvr_vm_context_put(vm_ctx);
+			return ERR_PTR(err);
+		}
+	}
 
 	return vm_ctx;
 
@@ -618,10 +665,16 @@ pvr_vm_context_release(struct kref *ref_count)
 	struct pvr_vm_context *vm_ctx =
 		container_of(ref_count, struct pvr_vm_context, ref_count);
 
+	atomic_dec(&vm_ctx->pvr_dev->live.vm_ctxs);
+	/* Apple: GPU context 0 must not keep running on these page tables. */
+	if (pvr_device_is_apple(vm_ctx->pvr_dev))
+		pvr_apple_vm_fini(vm_ctx->pvr_dev, vm_ctx);
+
 	if (vm_ctx->fw_mem_ctx_obj)
 		pvr_fw_object_destroy(vm_ctx->fw_mem_ctx_obj);
 
 	pvr_vm_unmap_all(vm_ctx);
+	WARN_ON(!list_empty(&vm_ctx->pins));
 
 	pvr_mmu_context_destroy(vm_ctx->mmu_ctx);
 	drm_gem_private_object_fini(&vm_ctx->dummy_gem);
@@ -691,6 +744,33 @@ void pvr_destroy_vm_contexts_for_file(struct pvr_file *pvr_file)
 	}
 }
 
+/**
+ * pvr_vm_range_is_pinned_locked() - Check whether a range overlaps a pin
+ * @vm_ctx: Target VM context.
+ * @device_addr: Start of the range.
+ * @size: Size of the range in bytes.
+ *
+ * The vm_ctx->lock must be held when calling this function.
+ *
+ * Return: %true if any part of the range is pinned.
+ */
+static bool
+pvr_vm_range_is_pinned_locked(struct pvr_vm_context *vm_ctx, u64 device_addr,
+			      u64 size)
+{
+	struct pvr_vm_pin *pin;
+
+	lockdep_assert_held(&vm_ctx->lock);
+
+	list_for_each_entry(pin, &vm_ctx->pins, node) {
+		if (device_addr < pin->start + pin->size &&
+		    pin->start < device_addr + size)
+			return true;
+	}
+
+	return false;
+}
+
 static int
 pvr_vm_lock_extra(struct drm_gpuvm_exec *vm_exec)
 {
@@ -719,13 +799,14 @@ pvr_vm_lock_extra(struct drm_gpuvm_exec *vm_exec)
  *    address; the region specified by @pvr_obj_offset and @size does not fall
  *    entirely within @pvr_obj, or any part of the specified region of @pvr_obj
  *    is not device-virtual page-aligned,
+ *  * -%EBUSY if the requested mapping overlaps a pinned range,
  *  * Any error encountered while performing internal operations required to
  *    destroy the mapping (returned from pvr_vm_gpuva_map or
  *    pvr_vm_gpuva_remap).
  */
-int
-pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
-	   u64 pvr_obj_offset, u64 device_addr, u64 size)
+static int
+__pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
+	     u64 pvr_obj_offset, u64 device_addr, u64 size, bool reserved)
 {
 	struct pvr_vm_bind_op bind_op = {0};
 	struct drm_gpuvm_exec vm_exec = {
@@ -740,20 +821,54 @@ pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
 
 	int err = pvr_vm_bind_op_map_init(&bind_op, vm_ctx, pvr_obj,
 					  pvr_obj_offset, device_addr,
-					  size);
+					  size, reserved);
 
 	if (err)
 		return err;
 
 	pvr_gem_object_get(pvr_obj);
 
-	mutex_lock(&vm_ctx->lock);
+	/*
+	 * Killable: a process blocked here behind a stuck lock holder can still be
+	 * killed, which closes its files and frees its memory, instead of staying in
+	 * D state with its GPU memory pinned until a reboot.
+	 */
+	err = mutex_lock_killable(&vm_ctx->lock);
+	if (err) {
+		pvr_vm_bind_op_fini(&bind_op);
+		return err;
+	}
+
+	if (pvr_vm_range_is_pinned_locked(vm_ctx, device_addr, size)) {
+		err = -EBUSY;
+		goto err_cleanup;
+	}
+
 	err = drm_gpuvm_exec_lock(&vm_exec);
 	if (err)
 		goto err_cleanup;
 
-	err = pvr_vm_bind_op_exec(&bind_op);
+	{
+		struct sg_table *sgt = pvr_gem_get_pages_sgt_locked(pvr_obj);
 
+		err = PTR_ERR_OR_ZERO(sgt);
+		if (!err) {
+			bind_op.mmu_op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, sgt,
+								   device_addr, pvr_obj_offset,
+								   size);
+			err = PTR_ERR_OR_ZERO(bind_op.mmu_op_ctx);
+			if (err)
+				bind_op.mmu_op_ctx = NULL;
+		}
+		if (!err)
+			err = pvr_vm_bind_op_exec(&bind_op);
+	}
+
+	/* Publish table edits while both VM and BO reservations still exclude reclaim. */
+	if (bind_op.mmu_op_ctx) {
+		pvr_mmu_op_context_destroy(bind_op.mmu_op_ctx);
+		bind_op.mmu_op_ctx = NULL;
+	}
 	drm_gpuvm_exec_unlock(&vm_exec);
 
 err_cleanup:
@@ -761,6 +876,31 @@ err_cleanup:
 	pvr_vm_bind_op_fini(&bind_op);
 
 	return err;
+}
+
+int
+pvr_vm_map(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
+	   u64 pvr_obj_offset, u64 device_addr, u64 size)
+{
+	return __pvr_vm_map(vm_ctx, pvr_obj, pvr_obj_offset, device_addr, size, false);
+}
+
+/**
+ * pvr_vm_map_reserved() - Map a driver-owned object outside the userspace heaps
+ * @vm_ctx: Target VM context.
+ * @pvr_obj: Target PowerVR memory object.
+ * @device_addr: Virtual device address at the start of the mapping.
+ * @size: Size of the mapping.
+ *
+ * Like pvr_vm_map() at object offset 0, without requiring a userspace
+ * context's mapping to lie within a heap. For addresses the firmware or the
+ * driver's own GPU programs use in every VM.
+ */
+int
+pvr_vm_map_reserved(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
+		    u64 device_addr, u64 size)
+{
+	return __pvr_vm_map(vm_ctx, pvr_obj, 0, device_addr, size, true);
 }
 
 /**
@@ -810,6 +950,11 @@ pvr_vm_unmap_obj_locked(struct pvr_vm_context *vm_ctx,
 
 	err = pvr_vm_bind_op_exec(&bind_op);
 
+	/* Publish table edits while both VM and BO reservations still exclude reclaim. */
+	if (bind_op.mmu_op_ctx) {
+		pvr_mmu_op_context_destroy(bind_op.mmu_op_ctx);
+		bind_op.mmu_op_ctx = NULL;
+	}
 	drm_gpuvm_exec_unlock(&vm_exec);
 
 err_cleanup:
@@ -844,6 +989,85 @@ pvr_vm_unmap_obj(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
 }
 
 /**
+ * pvr_vm_map_io() - Map device registers into the kernel VM context
+ * @vm_ctx: The kernel VM context.
+ * @io_addr: Bus address of the registers.
+ * @device_addr: Virtual device address at the start of the mapping.
+ * @size: Size of the mapping.
+ *
+ * For a firmware that reaches registers outside the GPU through its own page
+ * tables. The pages are mapped for the firmware only and bypass the device
+ * cache. No memory object stands behind the mapping, so it is not tracked:
+ * the caller keeps the range free of other mappings and removes it with
+ * pvr_vm_unmap_io() before the context goes.
+ *
+ * Return:
+ *  * 0 on success,
+ *  * -%EINVAL for a userspace context or an address or size that is not
+ *    device page-aligned, or
+ *  * Any error encountered while building the page tables.
+ */
+int
+pvr_vm_map_io(struct pvr_vm_context *vm_ctx, phys_addr_t io_addr, u64 device_addr, u64 size)
+{
+	struct pvr_mmu_op_context *op_ctx;
+	struct sg_table sgt;
+	int err;
+
+	if (vm_ctx->is_userspace_context || !size ||
+	    ((io_addr | device_addr | size) & ~PVR_DEVICE_PAGE_MASK))
+		return -EINVAL;
+
+	err = sg_alloc_table(&sgt, 1, GFP_KERNEL);
+	if (err)
+		return err;
+
+	sg_dma_address(sgt.sgl) = io_addr;
+	sg_dma_len(sgt.sgl) = size;
+
+	op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, &sgt, device_addr, 0, size);
+	if (IS_ERR(op_ctx)) {
+		err = PTR_ERR(op_ctx);
+		goto err_free_table;
+	}
+
+	mutex_lock(&vm_ctx->lock);
+	err = pvr_mmu_map(op_ctx, size,
+			  DRM_PVR_BO_BYPASS_DEVICE_CACHE | DRM_PVR_BO_PM_FW_PROTECT,
+			  device_addr);
+	mutex_unlock(&vm_ctx->lock);
+
+	pvr_mmu_op_context_destroy(op_ctx);
+
+err_free_table:
+	sg_free_table(&sgt);
+
+	return err;
+}
+
+/**
+ * pvr_vm_unmap_io() - Remove a mapping made with pvr_vm_map_io()
+ * @vm_ctx: The kernel VM context.
+ * @device_addr: Virtual device address at the start of the mapping.
+ * @size: Size of the mapping.
+ */
+void
+pvr_vm_unmap_io(struct pvr_vm_context *vm_ctx, u64 device_addr, u64 size)
+{
+	struct pvr_mmu_op_context *op_ctx;
+
+	op_ctx = pvr_mmu_op_context_create(vm_ctx->mmu_ctx, NULL, device_addr, 0, 0);
+	if (WARN_ON(IS_ERR(op_ctx)))
+		return;
+
+	mutex_lock(&vm_ctx->lock);
+	WARN_ON(pvr_mmu_unmap(op_ctx, device_addr, size));
+	mutex_unlock(&vm_ctx->lock);
+
+	pvr_mmu_op_context_destroy(op_ctx);
+}
+
+/**
  * pvr_vm_unmap() - Unmap an already mapped section of device-virtual memory.
  * @vm_ctx: Target VM context.
  * @device_addr: Virtual device address at the start of the target mapping.
@@ -851,6 +1075,7 @@ pvr_vm_unmap_obj(struct pvr_vm_context *vm_ctx, struct pvr_gem_object *pvr_obj,
  *
  * Return:
  *  * 0 on success,
+ *  * -%EBUSY if the mapping overlaps a pinned range,
  *  * Any error encountered by drm_gpuva_find,
  *  * Any error encountered by pvr_vm_unmap_obj_locked.
  */
@@ -864,7 +1089,9 @@ pvr_vm_unmap(struct pvr_vm_context *vm_ctx, u64 device_addr, u64 size)
 	mutex_lock(&vm_ctx->lock);
 
 	va = drm_gpuva_find(&vm_ctx->gpuvm_mgr, device_addr, size);
-	if (va) {
+	if (va && pvr_vm_range_is_pinned_locked(vm_ctx, va->va.addr, va->va.range)) {
+		err = -EBUSY;
+	} else if (va) {
 		pvr_obj = gem_to_pvr_gem(va->gem.obj);
 		err = pvr_vm_unmap_obj_locked(vm_ctx, pvr_obj,
 					      va->va.addr, va->va.range);
@@ -907,6 +1134,40 @@ pvr_vm_unmap_all(struct pvr_vm_context *vm_ctx)
 
 	mutex_unlock(&vm_ctx->lock);
 }
+
+/* Apple: the same heaps below the GPU's 38-bit data address limit */
+static const struct drm_pvr_heap pvr_apple_heaps[] = {
+	[DRM_PVR_HEAP_GENERAL] = {
+		.base = PVR_APPLE_GENERAL_HEAP_BASE,
+		.size = ROGUE_GENERAL_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_PDS_CODE_DATA] = {
+		.base = PVR_APPLE_PDSCODEDATA_HEAP_BASE,
+		.size = ROGUE_PDSCODEDATA_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_USC_CODE] = {
+		.base = PVR_APPLE_USCCODE_HEAP_BASE,
+		.size = ROGUE_USCCODE_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_RGNHDR] = {
+		.base = PVR_APPLE_RGNHDR_HEAP_BASE,
+		.size = ROGUE_RGNHDR_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_VIS_TEST] = {
+		.base = PVR_APPLE_VISTEST_HEAP_BASE,
+		.size = ROGUE_VISTEST_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+	[DRM_PVR_HEAP_TRANSFER_FRAG] = {
+		.base = PVR_APPLE_TRANSFER_FRAG_HEAP_BASE,
+		.size = ROGUE_TRANSFER_FRAG_HEAP_SIZE,
+		.page_size_log2 = PVR_DEVICE_PAGE_SHIFT,
+	},
+};
 
 /* Static data areas are determined by firmware. */
 static const struct drm_pvr_static_data_area static_data_areas[] = {
@@ -987,6 +1248,19 @@ static const struct drm_pvr_heap pvr_heaps[] = {
 	},
 };
 
+static_assert(ARRAY_SIZE(pvr_apple_heaps) == ARRAY_SIZE(pvr_heaps));
+
+static const struct drm_pvr_heap *pvr_device_heaps(const struct pvr_device *pvr_dev)
+{
+	const struct drm_pvr_heap *heaps;
+
+	if (!pvr_device_is_apple(pvr_dev))
+		return pvr_heaps;
+	/* A chip may lay its heaps out as its firmware does */
+	heaps = pvr_apple_chip_heaps(pvr_dev);
+	return heaps ?: pvr_apple_heaps;
+}
+
 int
 pvr_static_data_areas_get(const struct pvr_device *pvr_dev,
 			  struct drm_pvr_ioctl_dev_query_args *args)
@@ -1055,7 +1329,7 @@ pvr_heap_info_get(const struct pvr_device *pvr_dev,
 	/* Region header heap is only present if BRN63142 is present. */
 	dest = query.heaps.array;
 	for (size_t i = 0; i < query.heaps.count; i++) {
-		struct drm_pvr_heap heap = pvr_heaps[i];
+		struct drm_pvr_heap heap = pvr_device_heaps(pvr_dev)[i];
 
 		if (i == DRM_PVR_HEAP_RGNHDR && !PVR_HAS_QUIRK(pvr_dev, 63142))
 			heap.size = 0;
@@ -1126,8 +1400,8 @@ pvr_find_heap_containing(struct pvr_device *pvr_dev, u64 start, u64 size)
 			continue;
 		}
 
-		if (pvr_heap_contains_range(&pvr_heaps[heap_id], start, end))
-			return &pvr_heaps[heap_id];
+		if (pvr_heap_contains_range(&pvr_device_heaps(pvr_dev)[heap_id], start, end))
+			return &pvr_device_heaps(pvr_dev)[heap_id];
 	}
 
 	return NULL;
@@ -1184,6 +1458,104 @@ err_unlock:
 }
 
 /**
+ * pvr_vm_range_is_pm_protected_locked() - Check that only the PM and firmware
+ *                                         can access a device-virtual range
+ * @vm_ctx: Target VM context.
+ * @device_addr: Start of the range.
+ * @size: Size of the range in bytes.
+ *
+ * The vm_ctx->lock must be held when calling this function.
+ *
+ * Return: %true if one mapping of a buffer object created with
+ * %DRM_PVR_BO_PM_FW_PROTECT, and without
+ * %DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS, covers the whole range.
+ */
+static bool
+pvr_vm_range_is_pm_protected_locked(struct pvr_vm_context *vm_ctx,
+				    u64 device_addr, u64 size)
+{
+	struct pvr_gem_object *pvr_obj;
+	struct drm_gpuva *va;
+	u64 end;
+
+	lockdep_assert_held(&vm_ctx->lock);
+
+	if (!size || check_add_overflow(device_addr, size, &end))
+		return false;
+
+	va = drm_gpuva_find_first(&vm_ctx->gpuvm_mgr, device_addr, 1);
+	if (!va || !va->gem.obj || end > va->va.addr + va->va.range)
+		return false;
+
+	pvr_obj = gem_to_pvr_gem(va->gem.obj);
+
+	return (pvr_obj->flags & DRM_PVR_BO_PM_FW_PROTECT) &&
+	       !(pvr_obj->flags & DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS);
+}
+
+/**
+ * pvr_vm_pin_pm_protected() - Pin device-virtual ranges that only the PM and
+ *                             firmware can access
+ * @vm_ctx: Target VM context.
+ * @pins: Ranges to pin, with &pvr_vm_pin.start and &pvr_vm_pin.size set.
+ * @count: Number of entries in @pins.
+ *
+ * Checks that each range lies within one mapping of a buffer object created
+ * with %DRM_PVR_BO_PM_FW_PROTECT and without
+ * %DRM_PVR_BO_ALLOW_CPU_USERSPACE_ACCESS, and then pins all of them: until
+ * pvr_vm_unpin(), pvr_vm_map() and pvr_vm_unmap() refuse to change any mapping
+ * that overlaps one. The check and the pin are atomic with respect to both.
+ *
+ * Return:
+ *  * 0 on success, or
+ *  * -%EINVAL if any range is not covered by such a mapping; nothing is
+ *    pinned then.
+ */
+int
+pvr_vm_pin_pm_protected(struct pvr_vm_context *vm_ctx, struct pvr_vm_pin *pins,
+			unsigned int count)
+{
+	unsigned int i;
+	int err = 0;
+
+	mutex_lock(&vm_ctx->lock);
+
+	for (i = 0; i < count; i++) {
+		if (!pvr_vm_range_is_pm_protected_locked(vm_ctx, pins[i].start,
+							 pins[i].size)) {
+			err = -EINVAL;
+			goto out_unlock;
+		}
+	}
+
+	for (i = 0; i < count; i++)
+		list_add_tail(&pins[i].node, &vm_ctx->pins);
+
+out_unlock:
+	mutex_unlock(&vm_ctx->lock);
+
+	return err;
+}
+
+/**
+ * pvr_vm_unpin() - Release ranges pinned by pvr_vm_pin_pm_protected()
+ * @vm_ctx: VM context the ranges were pinned in.
+ * @pins: The array passed to pvr_vm_pin_pm_protected().
+ * @count: Number of entries in @pins.
+ */
+void
+pvr_vm_unpin(struct pvr_vm_context *vm_ctx, struct pvr_vm_pin *pins,
+	     unsigned int count)
+{
+	mutex_lock(&vm_ctx->lock);
+
+	for (unsigned int i = 0; i < count; i++)
+		list_del(&pins[i].node);
+
+	mutex_unlock(&vm_ctx->lock);
+}
+
+/**
  * pvr_vm_get_fw_mem_context: Get object representing firmware memory context
  * @vm_ctx: Target VM context.
  *
@@ -1195,4 +1567,191 @@ struct pvr_fw_object *
 pvr_vm_get_fw_mem_context(struct pvr_vm_context *vm_ctx)
 {
 	return vm_ctx->fw_mem_ctx_obj;
+}
+
+struct drm_gem_object *pvr_vm_resv_obj(struct pvr_vm_context *vm_ctx)
+{
+	return drm_gpuvm_resv_obj(&vm_ctx->gpuvm_mgr);
+}
+
+static bool pvr_vm_quiet(struct pvr_vm_context *vm, unsigned int idle_ms)
+{
+	struct dma_resv_iter cursor;
+	struct dma_fence *fence;
+	bool idle = true;
+
+	lockdep_assert_held(&vm->lock);
+	dma_resv_iter_begin(&cursor, pvr_vm_get_dma_resv(vm), DMA_RESV_USAGE_BOOKKEEP);
+	dma_resv_for_each_fence_unlocked(&cursor, fence) {
+		/* The signalled bit can be set before the timestamp is published.
+		 * Do not spin or touch a job's lifetime from reclaim.
+		 */
+		if (!dma_fence_is_signaled(fence) ||
+		    !test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &fence->flags)) {
+			idle = false;
+			break;
+		}
+		vm->last_retired = max(vm->last_retired, dma_fence_timestamp(fence));
+	}
+	dma_resv_iter_end(&cursor);
+	return idle && ktime_ms_delta(ktime_get(), vm->last_retired) >= idle_ms;
+}
+
+/* BO resv stabilizes its vm_bo list; all VM locks are trylocked before edits. */
+bool pvr_vm_evict_bo(struct drm_gem_object *obj, unsigned int idle_ms,
+		     unsigned int *reason)
+{
+	struct drm_gpuvm_bo *vm_bo, *last = NULL;
+	bool success = false;
+
+	drm_gem_for_each_gpuvm_bo(vm_bo, obj) {
+		struct pvr_vm_context *vm = to_pvr_vm_context(vm_bo->vm);
+
+		if (!mutex_trylock(&vm->lock)) {
+			*reason = 6;
+			goto unlock;
+		}
+		last = vm_bo;
+		if (!vm->is_userspace_context ||
+		    !dma_resv_test_signaled(pvr_vm_get_dma_resv(vm), DMA_RESV_USAGE_BOOKKEEP)) {
+			*reason = 7;
+			goto unlock;
+		}
+		if (!pvr_vm_quiet(vm, idle_ms)) {
+			*reason = 8;
+			goto unlock;
+		}
+		if (pvr_device_is_apple(vm->pvr_dev) &&
+		    !pvr_apple_vm_evictable(vm->pvr_dev, vm)) {
+			*reason = 9;
+			goto unlock;
+		}
+	}
+
+	drm_gem_for_each_gpuvm_bo(vm_bo, obj) {
+		struct pvr_vm_context *vm = to_pvr_vm_context(vm_bo->vm);
+		struct pvr_mmu_op_context *op;
+		struct drm_gpuva *va;
+		int err = 0, flush_err;
+
+		if (list_empty(&vm_bo->list.gpuva))
+			continue;
+		op = pvr_mmu_unmap_context_create(vm->mmu_ctx);
+		if (IS_ERR(op)) {
+			*reason = 10;
+			goto unlock;
+		}
+		/* On any partial failure keep pages and validate all cleared VAs. */
+		if (!vm_bo->evicted)
+			drm_gpuvm_bo_evict(vm_bo, true);
+		drm_gpuvm_bo_for_each_va(va, vm_bo) {
+			struct pvr_vm_gpuva *pva = to_pvr_vm_gpuva(va);
+
+			if (pva->evicted)
+				continue;
+			/* Failed unmaps may have cleared a prefix. Restore the full VA. */
+			pva->evicted = true;
+			err = pvr_mmu_unmap(op, va->va.addr, va->va.range);
+			if (err)
+				break;
+		}
+		flush_err = pvr_mmu_unmap_flush(op);
+		pvr_mmu_op_context_destroy(op);
+		if (err || flush_err) {
+			*reason = 11;
+			goto unlock;
+		}
+	}
+	success = true;
+unlock:
+	if (last) {
+		drm_gem_for_each_gpuvm_bo(vm_bo, obj) {
+			mutex_unlock(&to_pvr_vm_context(vm_bo->vm)->lock);
+			if (vm_bo == last)
+				break;
+		}
+	}
+	return success;
+}
+
+int pvr_vm_submit_lock(struct pvr_vm_context *vm, struct mutex *nest)
+{
+	mutex_lock_nest_lock(&vm->lock, nest);
+	return 0;
+}
+
+void pvr_vm_submit_unlock(struct pvr_vm_context *vm)
+{
+	/* Fence reservation may prune completed fences even on a failed submit.
+	 * Keep a conservative quiet-period floor before releasing the VM lock.
+	 */
+	vm->last_retired = max(vm->last_retired, ktime_get());
+	mutex_unlock(&vm->lock);
+}
+
+int pvr_vm_prepare_objects(struct pvr_vm_context *vm, struct drm_exec *exec)
+{
+	lockdep_assert_held(&vm->lock);
+	/* PowerVR does not register extobjs. Prepare its actual VA tree instead. */
+	return drm_gpuvm_prepare_range(&vm->gpuvm_mgr, exec, 0,
+				      vm->gpuvm_mgr.mm_range, 0);
+}
+
+static int pvr_vm_bo_validate(struct drm_gpuvm_bo *vm_bo, struct drm_exec *exec)
+{
+	struct pvr_vm_context *vm = to_pvr_vm_context(vm_bo->vm);
+	struct pvr_gem_object *bo = gem_to_pvr_gem(vm_bo->obj);
+	struct drm_gpuva *va;
+	struct sg_table *sgt;
+
+	lockdep_assert_held(&vm->lock);
+	dma_resv_assert_held(vm_bo->obj->resv);
+	sgt = pvr_gem_get_pages_sgt_locked(bo);
+	if (IS_ERR(sgt))
+		return -ENOMEM;
+	drm_gpuvm_bo_for_each_va(va, vm_bo) {
+		struct pvr_vm_gpuva *pva = to_pvr_vm_gpuva(va);
+		struct pvr_mmu_op_context *op;
+		int err;
+
+		if (!pva->evicted)
+			continue;
+		op = pvr_mmu_op_context_create(vm->mmu_ctx, sgt, va->va.addr,
+					       va->gem.offset, va->va.range);
+		if (IS_ERR(op))
+			return -ENOMEM;
+		/* Also repair an eviction that stopped after clearing only a prefix. */
+		err = pvr_mmu_unmap(op, va->va.addr, va->va.range);
+		if (!err)
+			err = pvr_mmu_map(op, va->va.range, bo->flags, va->va.addr);
+		pvr_mmu_op_context_destroy(op);
+		if (err)
+			return -ENOMEM;
+		pva->evicted = false;
+	}
+	/* A failed flush leaves vm_bo evicted, so a retry must flush again. */
+	pvr_mmu_flush_request_all(vm->pvr_dev);
+	if (pvr_mmu_flush_exec(vm->pvr_dev, false))
+		return -ENOMEM;
+	drm_gpuvm_bo_evict(vm_bo, false);
+	pvr_gem_lru_update_locked(bo);
+	atomic64_inc(&vm->pvr_dev->gem_reclaim.restores);
+	return 0;
+}
+
+int pvr_vm_validate(struct pvr_vm_context *vm, struct drm_exec *exec)
+{
+	struct drm_gpuva *va;
+	int err;
+
+	lockdep_assert_held(&vm->lock);
+	err = drm_gpuvm_validate(&vm->gpuvm_mgr, exec);
+	if (err) {
+		atomic64_inc(&vm->pvr_dev->gem_reclaim.restore_fail);
+		return -ENOMEM;
+	}
+	drm_gpuvm_for_each_va(va, &vm->gpuvm_mgr)
+		if (va->gem.obj)
+			pvr_gem_lru_update_locked(gem_to_pvr_gem(va->gem.obj));
+	return 0;
 }
