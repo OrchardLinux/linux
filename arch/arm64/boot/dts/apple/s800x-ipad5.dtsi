@@ -132,6 +132,11 @@
 		       "0", "0", "-1";
 };
 
+/* ADT /backlight function-backlight_enable is the LP8559's ("bklE"). */
+&dwi_bl {
+	apple,led-driver = <&backlight_led>;
+};
+
 &framebuffer0 {
 	power-domains = <&ps_disp0 &ps_dp>;
 };
@@ -152,6 +157,12 @@
 &i2c0 {
 	status = "okay";
 
+	/* ADT i2c0/lp8559: the backlight LED driver; DWI sends its levels. */
+	backlight_led: backlight@26 {
+		compatible = "ti,lp8559";
+		reg = <0x26>;
+	};
+
 	tristar: port-controller@1a {
 		compatible = "nxp,cbtl1610";
 		reg = <0x1a>;
@@ -165,18 +176,24 @@
 
 		/*
 		 * 0, 10: Smart Cover halls; 13: Bluetooth power enable;
-		 * 14: WLAN REG_ON.
+		 * 14: WLAN REG_ON; 22: panel supply (lcd_ldo).
 		 */
 		pmu_gpio: gpio {
 			compatible = "apple,d2365-pmic-gpio";
 			gpio-controller;
 			#gpio-cells = <2>;
-			gpio-reserved-ranges = <1 9>, <11 2>, <15 9>;
+			gpio-reserved-ranges = <1 9>, <11 2>, <15 7>, <23 1>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupts-extended = <&pinctrl_ap 76 IRQ_TYPE_LEVEL_LOW>;
-			/* Smart Cover front hall sensor (line 0): wake only. */
-			apple,wake-events = <0x30>;
+			/*
+			 * Smart Cover hall sensors (lines 0 and 10): wake only,
+			 * as iOS arms them: line 10 alone (its boot
+			 * configuration 0x25 passes the sleep rule
+			 * cfg & 0xc1 == 1; line 0's 0x24 does not). Line 0
+			 * latches at every sleep, with or without a cover.
+			 */
+			apple,wake-events = <0x3a>;
 		};
 
 		tristar_charger: charger@180 {
@@ -196,7 +213,6 @@
 				     <42 IRQ_TYPE_EDGE_RISING>,
 				     <43 IRQ_TYPE_EDGE_RISING>,
 				     <72 IRQ_TYPE_EDGE_RISING>,
-				     <73 IRQ_TYPE_EDGE_RISING>,
 				     <77 IRQ_TYPE_EDGE_RISING>;
 			apple,tristar = <&tristar>;
 			input-current-limit-microamp = <2400000>;
@@ -388,7 +404,15 @@
 	};
 };
 
+/*
+ * ADT displayport function-lcd_ldo = PMU GPIO 22: the panel supply, off in
+ * system sleep as on iOS. Neither it nor the backlight holds up the
+ * pipe's probe; the driver looks them up before the first sleep.
+ */
 &disp0 {
+	apple,lcd-ldo-gpios = <&pmu_gpio 22 GPIO_ACTIVE_HIGH>;
+	backlight = <&dwi_bl>;
+	post-init-providers = <&pmu_gpio>, <&dwi_bl>;
 	status = "okay";
 };
 
