@@ -134,6 +134,8 @@ struct tsl2583_chip {
 	struct apple_als_calibration cal;
 	u16 integration_cycles;
 	bool needs_reinit;
+	/* The LSCI record was usable; without one lux is the TSL258x's. */
+	bool calibrated;
 };
 
 struct gainadj {
@@ -308,9 +310,14 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 	int i;
 
 	data = apple_als_read_calibration(dev, &len);
-	if (IS_ERR(data))
-		return dev_err_probe(dev, PTR_ERR(data),
+	if (IS_ERR(data)) {
+		ret = PTR_ERR(data);
+		/* No record at all is reported by the caller. */
+		if (ret == -ENOENT)
+			return ret;
+		return dev_err_probe(dev, ret,
 				     "failed to read LSCI calibration\n");
+	}
 
 	if (len < APPLE_ALS_CAL_HEADER_SIZE + info->cal_record_size ||
 	    len & 1 || data[1] != info->cal_version || data[2] != 1 ||
@@ -504,7 +511,7 @@ static int tsl2583_get_lux(struct iio_dev *indio_dev)
 
 	chip->als_cur_info.als_ch0 = ch0;
 	chip->als_cur_info.als_ch1 = ch1;
-	if (chip->info->apple) {
+	if (chip->info->apple && chip->calibrated) {
 		ret = apple_als_get_lux(chip, ch0, ch1);
 		if (ret >= 0)
 			chip->als_cur_info.lux = ret;
@@ -1393,10 +1400,21 @@ static int tsl2583_probe(struct i2c_client *clientp)
 
 	/* Load defaults before exposing the IIO device to userspace. */
 	tsl2583_defaults(chip);
+	/*
+	 * Not every unit has a usable record: the iPad Air's device tree
+	 * carries none. Without one the sensor still reports the TSL258x lux
+	 * computation, uncalibrated, at the part's default time and gain.
+	 */
 	if (chip->info->apple) {
 		ret = apple_als_load_calibration(chip);
-		if (ret)
+		if (ret == -ENOENT || ret == -EINVAL)
+			dev_warn(&clientp->dev,
+				 "%s LSCI calibration, lux is uncalibrated\n",
+				 ret == -ENOENT ? "no" : "unusable");
+		else if (ret)
 			return ret;
+		else
+			chip->calibrated = true;
 	}
 
 	pm_runtime_enable(&clientp->dev);
