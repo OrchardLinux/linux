@@ -242,6 +242,8 @@ struct w1_master {
 };
 
 int w1_add_master_device(struct w1_bus_master *master);
+int w1_add_master_device_parent(struct w1_bus_master *master,
+				struct device *parent);
 void w1_remove_master_device(struct w1_bus_master *master);
 
 /**

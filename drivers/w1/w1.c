@@ -78,6 +78,7 @@ static void w1_slave_release(struct device *dev)
 
 	dev_dbg(dev, "%s: Releasing %s [%p]\n", __func__, sl->name, sl);
 
+	of_node_put(sl->dev.of_node);
 	w1_family_put(sl->family);
 	sl->master->slave_count--;
 }
@@ -666,6 +667,22 @@ static int w1_family_notify(unsigned long action, struct w1_slave *sl)
 	return 0;
 }
 
+static struct device_node *w1_slave_of_node(struct w1_slave *sl)
+{
+	struct device *parent = sl->master->dev.parent;
+	struct device_node *child;
+
+	if (!parent)
+		return of_find_matching_node(sl->master->dev.of_node,
+					     sl->family->of_match_table);
+	if (!parent->of_node)
+		return NULL;
+	for_each_available_child_of_node(parent->of_node, child)
+		if (of_match_node(sl->family->of_match_table, child))
+			return child;
+	return NULL;
+}
+
 static int __w1_attach_slave_device(struct w1_slave *sl)
 {
 	int err;
@@ -675,8 +692,7 @@ static int __w1_attach_slave_device(struct w1_slave *sl)
 	sl->dev.bus = &w1_bus_type;
 	sl->dev.release = &w1_slave_release;
 	sl->dev.groups = w1_slave_groups;
-	sl->dev.of_node = of_find_matching_node(sl->master->dev.of_node,
-						sl->family->of_match_table);
+	sl->dev.of_node = w1_slave_of_node(sl);
 
 	dev_set_name(&sl->dev, "%02x-%012llx",
 		 (unsigned int) sl->reg_num.family,
@@ -697,7 +713,6 @@ static int __w1_attach_slave_device(struct w1_slave *sl)
 		dev_err(&sl->dev,
 			"Device registration [%s] failed. err=%d\n",
 			dev_name(&sl->dev), err);
-		of_node_put(sl->dev.of_node);
 		put_device(&sl->dev);
 		return err;
 	}
@@ -713,7 +728,8 @@ static int __w1_attach_slave_device(struct w1_slave *sl)
 	return 0;
 }
 
-int w1_attach_slave_device(struct w1_master *dev, struct w1_reg_num *rn)
+static int w1_attach_slave(struct w1_master *dev, struct w1_reg_num *rn,
+			   bool load_family)
 {
 	struct w1_slave *sl;
 	struct w1_family *f;
@@ -741,10 +757,12 @@ int w1_attach_slave_device(struct w1_master *dev, struct w1_reg_num *rn)
 	dev_info(&dev->dev, "Attaching one wire slave %02x.%012llx crc %02x\n",
 		  rn->family, (unsigned long long)rn->id, rn->crc);
 
-	/* slave modules need to be loaded in a context with unlocked mutex */
-	mutex_unlock(&dev->mutex);
-	request_module("w1-family-0x%02X", rn->family);
-	mutex_lock(&dev->mutex);
+	if (load_family) {
+		/* Family registration may take the master mutex. */
+		mutex_unlock(&dev->mutex);
+		request_module("w1-family-0x%02X", rn->family);
+		mutex_lock(&dev->mutex);
+	}
 
 	spin_lock(&w1_flock);
 	f = w1_family_registered(rn->family);
@@ -775,6 +793,11 @@ int w1_attach_slave_device(struct w1_master *dev, struct w1_reg_num *rn)
 	w1_netlink_send(dev, &msg);
 
 	return 0;
+}
+
+int w1_attach_slave_device(struct w1_master *dev, struct w1_reg_num *rn)
+{
+	return w1_attach_slave(dev, rn, true);
 }
 
 int w1_unref_slave(struct w1_slave *sl)
@@ -894,8 +917,9 @@ void w1_reconnect_slaves(struct w1_family *f, int attach)
 				/* If it was already in use let the automatic
 				 * scan pick it up again later.
 				 */
+				/* Reconnect runs inside family registration or removal. */
 				if (!w1_slave_detach(sl))
-					w1_attach_slave_device(dev, &rn);
+					w1_attach_slave(dev, &rn, false);
 				mutex_lock(&dev->list_mutex);
 			}
 		}

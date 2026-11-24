@@ -23,7 +23,7 @@ module_param_named(enable_pullup, w1_enable_pullup, int, 0);
 
 static struct w1_master *w1_alloc_dev(u32 id, int slave_count, int slave_ttl,
 				       struct device_driver *driver,
-				       struct device *device)
+				       struct device *device, struct device *parent)
 {
 	struct w1_master *dev;
 	int err;
@@ -58,6 +58,7 @@ static struct w1_master *w1_alloc_dev(u32 id, int slave_count, int slave_ttl,
 	mutex_init(&dev->list_mutex);
 
 	memcpy(&dev->dev, device, sizeof(struct device));
+	dev->dev.parent = parent;
 	dev_set_name(&dev->dev, "w1_bus_master%u", dev->id);
 	snprintf(dev->name, sizeof(dev->name), "w1_bus_master%u", dev->id);
 	dev->dev.init_name = dev->name;
@@ -82,10 +83,12 @@ static void w1_free_dev(struct w1_master *dev)
 }
 
 /**
- * w1_add_master_device() - registers a new master device
+ * w1_add_master_device_parent() - register a master with an optional parent
  * @master:	master bus device to register
+ * @parent:	transport device owning this bus, or NULL for legacy masters
  */
-int w1_add_master_device(struct w1_bus_master *master)
+int w1_add_master_device_parent(struct w1_bus_master *master,
+				struct device *parent)
 {
 	struct w1_master *dev, *entry;
 	int retval = 0;
@@ -116,7 +119,7 @@ int w1_add_master_device(struct w1_bus_master *master)
 	} while (found);
 
 	dev = w1_alloc_dev(id, w1_max_slave_count, w1_max_slave_ttl,
-		&w1_master_driver, &w1_master_device);
+		&w1_master_driver, &w1_master_device, parent);
 	if (!dev) {
 		mutex_unlock(&w1_mlock);
 		return -ENOMEM;
@@ -163,6 +166,12 @@ err_out_free_dev:
 	w1_free_dev(dev);
 
 	return retval;
+}
+EXPORT_SYMBOL(w1_add_master_device_parent);
+
+int w1_add_master_device(struct w1_bus_master *master)
+{
+	return w1_add_master_device_parent(master, NULL);
 }
 EXPORT_SYMBOL(w1_add_master_device);
 
