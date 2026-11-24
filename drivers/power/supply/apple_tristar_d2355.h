@@ -207,9 +207,9 @@ static int tristar_d2355_prepare(struct tristar_charger *chg)
 	struct tristar_d2355 *hw;
 	struct device_node *np;
 	struct i2c_client *adc;
-	const struct firmware *firmware;
-	const char *name;
+	const void *table;
 	u32 limits[6];
+	int len;
 	unsigned int i;
 	int ret;
 
@@ -231,14 +231,11 @@ static int tristar_d2355_prepare(struct tristar_charger *chg)
 			return -EINVAL;
 	if (hw->pack_limits[2] <= 0)
 		return -EINVAL;
-	ret = device_property_read_string(dev, "firmware-name", &name);
-	if (ret)
-		return ret;
-	ret = request_firmware(&firmware, name, dev);
-	if (ret)
-		return ret;
-	ret = d2355_calibration_parse_hv(firmware->data, firmware->size, &hw->calibration);
-	release_firmware(firmware);
+	/* The unit's ADT /charger table, copied by the boot loader */
+	table = of_get_property(dev->of_node, "apple,usb-input-limit-calibration-hv", &len);
+	if (!table)
+		return -ENOENT;
+	ret = d2355_calibration_parse_hv(table, len, &hw->calibration);
 	if (ret)
 		return ret;
 	np = of_parse_phandle(dev->of_node, "apple,adc-pmic", 0);

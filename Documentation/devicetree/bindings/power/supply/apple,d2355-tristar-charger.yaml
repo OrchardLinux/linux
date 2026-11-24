@@ -56,9 +56,13 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: The August PMIC providing the ADC registers.
 
-  firmware-name:
-    maxItems: 1
-    description: The D2355 input-limit calibration for this unit.
+  apple,usb-input-limit-calibration-hv:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 84
+    maxItems: 84
+    description:
+      This unit's input-current calibration, the ADT's /charger
+      usb-input-limit-calibration-hv, filled in by the boot loader.
 
   apple,pack-limits:
     $ref: /schemas/types.yaml#/definitions/int32-array
@@ -87,7 +91,6 @@ required:
   - interrupts-extended
   - apple,tristar
   - apple,adc-pmic
-  - firmware-name
   - apple,pack-limits
   - input-current-limit-microamp
   - port
