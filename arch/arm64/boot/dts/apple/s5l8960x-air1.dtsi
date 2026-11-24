@@ -332,6 +332,33 @@
 };
 
 /*
+ * The ambient light sensor: a CT819 at 0x39, on i2c0 or on i2c3. Apple's
+ * device trees of the J71, J72 and J73 carry both (i2c0/als-i2c0 and
+ * i2c3/als-i2c3, each with a proximity sensor beside it, interrupt
+ * GPIO 6) and iOS probes for the one fitted, so both are described: the
+ * absent one fails its chip ID read. Their alsCalibration is zero-filled,
+ * with no SysCfg reference, so the sensor reports uncalibrated lux and has
+ * no als0 alias for the loader.
+ */
+&i2c0 {
+	light-sensor@39 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x39>;
+		interrupts-extended = <&pinctrl 6 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	light-sensor@39 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x39>;
+		interrupts-extended = <&pinctrl 6 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
+/*
  * The battery gauge on UART5's HDQ line: a BQ27540 by Apple's device tree
  * (/arm-io/uart5/gas-gauge), the same on every A7 iPad. It runs the gauge
  * firmware profile measured on the J72.
