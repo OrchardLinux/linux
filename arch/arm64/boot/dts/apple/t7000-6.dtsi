@@ -96,6 +96,18 @@
 			nvmem-cell-names = "rtc_offset";
 		};
 
+		/*
+		 * The PMIC's housekeeping ADC, as on the iPod touch 6. The
+		 * iPhone 6 has a bq27540 gauge for the battery, so no
+		 * apple,d2186-battery node: it would report the same battery
+		 * a second time.
+		 */
+		pmu_adc: adc@500 {
+			compatible = "apple,d2186-adc";
+			reg = <0x500 0x24>;
+			#io-channel-cells = <1>;
+		};
+
 		nvmem@4000 {
 			compatible = "apple,pmic-nvmem";
 			reg = <0x4000 0x28>;
