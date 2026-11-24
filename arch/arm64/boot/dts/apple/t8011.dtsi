@@ -300,6 +300,25 @@
 			status = "disabled";
 		};
 
+		/* The speaker link: TDM, eight slots, with V/I feedback capture */
+		mca2: mca@20a0a8000 {
+			compatible = "apple,t8011-mca";
+			reg = <0x2 0x0a0a8000 0x0 0x4000>,
+			      <0x2 0x0a002008 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 227 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca2>;
+			clocks = <&nco 2>;
+			clock-names = "bitclk";
+			dmas = <&sio 0x2c>, <&sio 0x2d>;
+			dma-names = "tx", "rx";
+			#clock-cells = <0>;
+			clock-output-names = "mca2-mclk";
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
 		mca4: mca@20a0b0000 {
 			compatible = "apple,t8010-mca-i2s";
 			reg = <0x2 0x0a0b0000 0x0 0x4000>,
@@ -315,6 +334,17 @@
 			#clock-cells = <0>;
 			clock-output-names = "mca4-mclk";
 			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
+		 * The H9G display pipe. Only its registers are described: the
+		 * boot framebuffer names it so that the boot scanout cadence
+		 * can be switched (simpledrm).
+		 */
+		h9g_display: display-controller@206000000 {
+			compatible = "apple,t8011-h9g-display";
+			reg = <0x2 0x06000000 0x0 0xe0000>;
 			status = "disabled";
 		};
 

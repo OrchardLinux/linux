@@ -23,8 +23,17 @@
 	simple-audio-card,name = "J120 Headphones";
 };
 
+&speakers {
+	simple-audio-card,name = "J120 Speakers";
+};
+
 &microphones {
 	simple-audio-card,name = "J120 Microphones";
+};
+
+/* The NVMe limits of tompta1's working setup: namespace 1 writes only. */
+&pcie0 {
+	compatible = "apple,j120-pcie", "apple,t8011-pcie";
 };
 
 /* Touch personality K1F18,3 (ADT multi-touch hid-merge-personality) */

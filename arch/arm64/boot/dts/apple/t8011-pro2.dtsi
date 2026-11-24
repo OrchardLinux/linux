@@ -20,6 +20,7 @@
 	chassis-type = "tablet";
 
 	aliases {
+		als0 = &als0;
 		aop = &aop;
 		bluetooth0 = &bluetooth;
 		nvme-hmb = &nvme_hmb;
@@ -55,26 +56,6 @@
 		clock-output-names = "spi3-nclk";
 	};
 
-	/*
-	 * Smart Cover hall sensors: D2400 GPIO 0 ("halleffect1") and 10
-	 * ("halleffect") in the ADT /buttons node, low while the cover is
-	 * closed. Reported as SW_MACHINE_COVER, as on the iPad 6; the PMU
-	 * events of both lines wake the system (apple,wake-events).
-	 */
-	smart-cover {
-		compatible = "gpio-keys-polled";
-		poll-interval = <50>;
-		label = "iPad Smart Cover";
-
-		cover-switch {
-			label = "Smart Cover (PMIC GPIO 0)";
-			gpios = <&august_gpio 0 GPIO_ACTIVE_LOW>;
-			linux,input-type = <EV_SW>;
-			linux,code = <SW_MACHINE_COVER>;
-			debounce-interval = <50>;
-		};
-	};
-
 	/* The two built-in PDM microphones */
 	dmics: audio-codec {
 		compatible = "dmic-codec";
@@ -98,6 +79,34 @@
 
 		simple-audio-card,codec {
 			sound-dai = <&jack_codec>;
+		};
+	};
+
+	/*
+	 * The four MAX98723 speaker amplifiers: two on I2C1 and two on I2C2,
+	 * at 0x31 and 0x32, behind one reset line (AP GPIO 119), on the MCA2
+	 * TDM link. The driver programs the J120 ADT's speaker-config.
+	 */
+	speaker_amps: speaker-amplifiers {
+		compatible = "apple,j120-speaker-amplifiers";
+		reset-gpios = <&pinctrl_ap 119 GPIO_ACTIVE_LOW>;
+		speaker-buses = <&i2c1>, <&i2c2>;
+		#sound-dai-cells = <0>;
+	};
+
+	/* The node name is what the desktop's speaker routing looks for. */
+	speakers: sound-speaker-transport {
+		compatible = "simple-audio-card";
+		simple-audio-card,format = "dsp_a";
+		simple-audio-card,bitclock-master = <&speaker_cpu>;
+		simple-audio-card,frame-master = <&speaker_cpu>;
+
+		speaker_cpu: simple-audio-card,cpu {
+			sound-dai = <&mca2>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <&speaker_amps>;
 		};
 	};
 
@@ -144,7 +153,22 @@
 	};
 };
 
+&framebuffer0 {
+	display = <&h9g_display>;
+};
+
 &august_pmic {
+	/*
+	 * Smart Cover hall sensors: D2400 GPIO 0 ("halleffect1") and 10
+	 * ("halleffect") in the ADT /buttons node, low while the cover is
+	 * closed, read by polling; the cover counts as closed once both
+	 * agree twice. The PMU events of both lines wake the system
+	 * (apple,wake-events).
+	 */
+	cover-switch {
+		compatible = "apple,j120-cover-switch";
+	};
+
 	backlight@b00 {
 		compatible = "apple,august-pmic-bl", "apple,aria-pmic-bl";
 		reg = <0xb00 0x2>;
@@ -164,6 +188,86 @@
 	touch_analog: regulator-touch-analog {
 		compatible = "apple,august-touch-analog-regulator";
 		regulator-name = "touch-analog";
+	};
+};
+
+/*
+ * The Lightning port: the cbtl1610 Tristar and the D2355 charger PMU, whose
+ * PMU events come on AP GPIO 204. The August PMIC's ADC samples the
+ * Tristar's lines (conversion done is August event 168).
+ */
+&i2c0 {
+	tristar: port-controller@1a {
+		compatible = "nxp,cbtl1610";
+		reg = <0x1a>;
+	};
+
+	d2355_pmic: pmic@75 {
+		compatible = "apple,d2355-pmic", "apple,i2c-pmic";
+		reg = <0x75>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		d2355_events: gpio {
+			compatible = "apple,d2355-pmic-gpio";
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&pinctrl_ap>;
+			interrupts = <204 IRQ_TYPE_LEVEL_LOW>;
+		};
+
+		charger: charger@80 {
+			compatible = "apple,d2355-tristar-charger";
+			reg = <0x80 0x0a>, <0x443 0x0c>, <0x4000 0x03>;
+			reg-names = "status", "control", "adc";
+			/* The PMU line, ADC done, then the source events. */
+			interrupts-extended = <&d2355_events 80 IRQ_TYPE_EDGE_RISING>,
+					      <&august_gpio 168 IRQ_TYPE_EDGE_RISING>,
+					      <&d2355_events 40 IRQ_TYPE_EDGE_RISING>,
+					      <&d2355_events 42 IRQ_TYPE_EDGE_RISING>,
+					      <&d2355_events 53 IRQ_TYPE_EDGE_RISING>;
+			apple,tristar = <&tristar>;
+			apple,adc-pmic = <&august_pmic>;
+			firmware-name = "apple/j120/usb-input-limit-calibration-hv.bin";
+			/* A conservative window, not Apple's production limits. */
+			apple,pack-limits = <150 350 3400000 4200000 (-2000000) 2000000>;
+			/* 1.5 A only while the Lightning VBUS reads 4.75-5.5 V. */
+			input-current-limit-microamp = <1500000>;
+			io-channels = <&orion_vbus 0>;
+			io-channel-names = "vbus";
+
+			port {
+				charger_usb: endpoint {
+					remote-endpoint = <&usb2dev_role>;
+				};
+			};
+		};
+	};
+};
+
+&i2c1 {
+	status = "okay";
+
+	/* Bellatrix (ADT orion-ic): reads the Lightning VBUS. */
+	orion_vbus: adc@13 {
+		compatible = "apple,orion-bellatrix-vbus";
+		reg = <0x13>;
+		#io-channel-cells = <1>;
+	};
+};
+
+/* The two CT709 ambient light sensors; m1n1 copies the calibration to als0. */
+&i2c3 {
+	status = "okay";
+
+	als0: light-sensor@29 {
+		compatible = "apple,ct709";
+		reg = <0x29>;
+	};
+
+	light-sensor@39 {
+		compatible = "apple,ct709";
+		reg = <0x39>;
 	};
 };
 
@@ -221,6 +325,12 @@
 	apple,aop-i2s-route = <&aop_i2s_switch 0x0 0x00010101>,
 			      <&aop_i2s_switch 0xc 0x00080818>,
 			      <&aop_i2s_oe 0x0 0xf>;
+	status = "okay";
+};
+
+/* The speaker amplifiers sit on AP pads behind the i2s-switch. */
+&mca2 {
+	apple,i2s-switch = <&i2s_switch 2 2>;
 	status = "okay";
 };
 
@@ -361,7 +471,7 @@
 	status = "okay";
 
 	onewire {
-		compatible = "ti,hdq-uart";
+		compatible = "apple,j120-hdq-uart", "ti,hdq-uart";
 
 		battery: fuel-gauge {
 			compatible = "apple,j120-bq27540", "ti,bq27540-hdq";
@@ -388,6 +498,17 @@
 		pinctrl-names = "display-sync-active", "display-sync-inactive";
 		pinctrl-0 = <&touch_sync_active>;
 		pinctrl-1 = <&touch_sync_inactive>;
+	};
+};
+
+/* The Lightning charger sets the data role once the source is known. */
+&usb2dev {
+	usb-role-switch;
+
+	port {
+		usb2dev_role: endpoint {
+			remote-endpoint = <&charger_usb>;
+		};
 	};
 };
 

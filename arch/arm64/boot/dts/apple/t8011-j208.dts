@@ -23,6 +23,10 @@
 	simple-audio-card,name = "J208 Headphones";
 };
 
+&speakers {
+	simple-audio-card,name = "J208 Speakers";
+};
+
 &microphones {
 	simple-audio-card,name = "J208 Microphones";
 };
