@@ -92,6 +92,7 @@ static int apple_z2_d21_smc_rw(struct apple_smc *smc, smc_key key,
 #define APPLE_Z2_D21_J172_FLOAT_FORMAT        BIT(1)
 #define APPLE_Z2_D21_REPORT_SURFACE           0xd9
 #define APPLE_Z2_D21_SURFACE_DESCRIPTOR_SIZE  16
+#define APPLE_Z2_D21_D9_ATTEMPTS  5
 #define APPLE_Z2_D21_CMD_DEVICE_INFO         0xE2
 #define APPLE_Z2_D21_CMD_REPORT_INFO         0xE3
 #define APPLE_Z2_D21_CMD_CTRL_WRITE_SHORT    0xE4
@@ -3707,6 +3708,7 @@ static int apple_z2_d21_init_locked(struct apple_z2_d21 *z2)
 	static const u8 repbf[] = { 0x9d, 0x81, 0x09, 0x00 };
 	struct device *dev = &z2->spidev->dev;
 	u8 high_level[8] = { };	/* the state channel sits at offset 1 */
+	unsigned int attempt;
 	u8 status = 0;
 	u16 len = 0;
 	int error;
@@ -3728,19 +3730,42 @@ static int apple_z2_d21_init_locked(struct apple_z2_d21 *z2)
 			 error, z2->runtime_frame_valid);
 	}
 
-	error = apple_z2_d21_read_report_info_locked(z2, 0xd9, &status, &len,
-						 "d21-d9");
-	dev_info(dev, "D21 init: d9 info err=%d status=%u len=%u\n",
-		 error, status, len);
-	if (!error && len) {
-		error = apple_z2_d21_read_report_locked(z2, 0xd9, len, "d21-d9-read");
-		dev_info(dev, "D21 init: d9 read err=%d\n", error);
-		if (!error) {
-			error = apple_z2_d21_store_surface_descriptor(z2, len);
-			dev_info(dev, "D21 init: d9 store err=%d len=%u\n",
-				 error, len);
+	/*
+	 * The controller may already be streaming when the surface descriptor
+	 * is queried, and a touch frame can then land in the report read
+	 * (seen once in 76 starts: rx began e1 56 00 ...).  Without the
+	 * descriptor every touch packet is dropped for the whole session, so
+	 * retry the query a few times before giving up.
+	 */
+	for (attempt = 1; attempt <= APPLE_Z2_D21_D9_ATTEMPTS; attempt++) {
+		status = 0;
+		len = 0;
+		error = apple_z2_d21_read_report_info_locked(z2, 0xd9, &status,
+							     &len, "d21-d9");
+		dev_info(dev, "D21 init: d9 info err=%d status=%u len=%u\n",
+			 error, status, len);
+		if (!error && len) {
+			error = apple_z2_d21_read_report_locked(z2, 0xd9, len,
+								"d21-d9-read");
+			dev_info(dev, "D21 init: d9 read err=%d\n", error);
+			if (!error) {
+				error = apple_z2_d21_store_surface_descriptor(z2,
+									      len);
+				dev_info(dev,
+					 "D21 init: d9 store err=%d len=%u attempt %u\n",
+					 error, len, attempt);
+			}
+		} else if (!error) {
+			error = -EPROTO;
 		}
+		if (!error)
+			break;
+		usleep_range(10000, 11000);
 	}
+	if (error)
+		dev_warn(dev,
+			 "D21 init: no surface descriptor after %u attempts (%d); touches will be dropped\n",
+			 APPLE_Z2_D21_D9_ATTEMPTS, error);
 
 	status = 0; len = 0;
 	error = apple_z2_d21_read_report_info_locked(z2, 0xdb, &status, &len,
