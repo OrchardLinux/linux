@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/leds/backlight/apple,dsi-bl.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple OLED panel brightness over the MIPI DSI host
+
+maintainers:
+  - Eduardo Martins <eduardo@martins.ws>
+
+description:
+  The OLED iPhones have no DWI backlight controller. iOS sets their panel's
+  brightness with the MIPI DCS "set display brightness" command (0x51) and an
+  11-bit display brightness value, sent through the SoC's Synopsys
+  DesignWare MIPI DSI host while the display runs in video mode. The node
+  takes the host's command registers; the ADT's backlight node gives the
+  value range (DBVMin, DBVMax) and the boot level.
+
+allOf:
+  - $ref: common.yaml#
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8015-dsi-bl
+      - const: apple,dsi-bl
+
+  reg:
+    maxItems: 1
+    description: The DSI host's register window.
+
+  power-domains:
+    maxItems: 1
+
+  max-brightness:
+    maximum: 2047
+
+  apple,min-dbv:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 2047
+    description:
+      The lowest display brightness value the panel takes (the ADT's
+      DBVMin); lower levels are raised to it.
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    soc {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      backlight@218400000 {
+        compatible = "apple,t8015-dsi-bl", "apple,dsi-bl";
+        reg = <0x2 0x18400000 0x0 0x100>;
+        power-domains = <&ps_mipi_dsi>;
+        max-brightness = <2047>;
+        apple,min-dbv = <139>;
+        default-brightness-level = <740>;
+      };
+    };

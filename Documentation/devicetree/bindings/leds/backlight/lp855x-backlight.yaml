@@ -19,6 +19,7 @@ properties:
       - ti,lp8555
       - ti,lp8556
       - ti,lp8557
+      - ti,lp8559
 
   reg:
     maxItems: 1

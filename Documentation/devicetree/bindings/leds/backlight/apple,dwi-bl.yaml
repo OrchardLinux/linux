@@ -37,6 +37,14 @@ properties:
   power-domains:
     maxItems: 1
 
+  apple,led-driver:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The LED driver that receives the DWI brightness commands, when it has
+      an enable of its own on another bus. A DWI brightness of 0 leaves its
+      LEDs lit at their lowest current; they are only off while it is
+      disabled (for example a TI LP8559 or LM3534 on I2C).
+
 required:
   - compatible
   - reg
