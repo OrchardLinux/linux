@@ -19,13 +19,26 @@ properties:
           - const: brcm,bcm4355c0-bt
           - const: brcm,bcm4345c5
       - items:
-          - const: apple,j172-bcm4355c1-bt
+          - enum:
+              - apple,j71t-bcm4355c0-bt
+              - apple,j120-bcm4355c0-bt
+              - apple,j121-bcm4355c0-bt
+              - apple,j207-bcm4355c0-bt
+              - apple,j208-bcm4355c0-bt
+          - const: brcm,bcm4355c0-bt
+      - items:
+          - enum:
+              - apple,j71b-bcm4355c1-bt
+              - apple,j172-bcm4355c1-bt
           - const: brcm,bcm4355c1-bt
       - items:
           - enum:
               - infineon,cyw43439-bt
           - const: brcm,bcm4329-bt
       - enum:
+          - apple,j81-bcm4350c2-bt
+          - apple,n66-bcm4350c5-bt
+          - apple,n102-bcm4345b1-bt
           - brcm,bcm20702a1
           - brcm,bcm4329-bt
           - brcm,bcm4330-bt
@@ -97,6 +110,21 @@ properties:
   vddio-supply:
     description: phandle to regulator supply for VDDIO
 
+  local-bd-address:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 6
+    maxItems: 6
+    description: Device Bluetooth address in least significant byte first order
+
+  brcm,taurus-cal-blob:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 1
+    maxItems: 15073280
+    description:
+      Per-device Taurus calibration supplied by the bootloader. Do not put
+      calibration bytes in board source files. The transport supports at most
+      65536 blocks of 230 bytes.
+
   brcm,bt-pcm-int-params:
     $ref: /schemas/types.yaml#/definitions/uint8-array
     minItems: 5
@@ -116,6 +144,14 @@ properties:
       if the device's initial baud rate in normal mode is not supported by the
       host or if the device requires autobaud mode startup before loading FW.
 
+  apple,wlan:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The Wi-Fi function of the same Apple module. Apple fits modules from
+      several vendors, each needing its own Patchram, and only the Wi-Fi
+      function can read the module vendor from its OTP. The Patchram is
+      chosen by the vendor that the Wi-Fi driver reads.
+
   interrupts:
     items:
       - description: Handle to the line HOST_WAKE used to wake
@@ -134,6 +170,18 @@ dependencies:
 
 allOf:
   - $ref: /schemas/serial/serial-peripheral-props.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,j120-bcm4355c0-bt
+              - apple,j121-bcm4355c0-bt
+              - apple,j207-bcm4355c0-bt
+              - apple,j208-bcm4355c0-bt
+    then:
+      required:
+        - local-bd-address
   - if:
       not:
         properties:

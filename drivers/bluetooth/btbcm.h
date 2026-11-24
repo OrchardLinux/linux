@@ -55,6 +55,8 @@ int btbcm_check_bdaddr(struct hci_dev *hdev);
 int btbcm_reset(struct hci_dev *hdev);
 int btbcm_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr);
 int btbcm_patchram(struct hci_dev *hdev, const struct firmware *fw);
+int btbcm_send_calibration(struct hci_dev *hdev, const void *data, size_t size);
+int btbcm_send_regulatory(struct hci_dev *hdev, const void *data, size_t size);
 int btbcm_read_pcm_int_params(struct hci_dev *hdev,
 			      struct bcm_set_pcm_int_params *params);
 int btbcm_write_pcm_int_params(struct hci_dev *hdev,
@@ -64,6 +66,8 @@ int btbcm_setup_patchram(struct hci_dev *hdev);
 int btbcm_setup_apple(struct hci_dev *hdev);
 
 int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode);
+int btbcm_initialize_variant(struct hci_dev *hdev, bool *fw_load_done,
+			     bool use_autobaud_mode, const char *variant);
 int btbcm_finalize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode);
 
 #else
@@ -79,6 +83,18 @@ static inline int btbcm_reset(struct hci_dev *hdev)
 }
 
 static inline int btbcm_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int btbcm_send_regulatory(struct hci_dev *hdev,
+					const void *data, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int btbcm_send_calibration(struct hci_dev *hdev,
+					 const void *data, size_t size)
 {
 	return -EOPNOTSUPP;
 }
@@ -111,6 +127,14 @@ static inline int btbcm_setup_apple(struct hci_dev *hdev)
 }
 
 static inline int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode)
+{
+	return 0;
+}
+
+static inline int btbcm_initialize_variant(struct hci_dev *hdev,
+					   bool *fw_load_done,
+					   bool use_autobaud_mode,
+					   const char *variant)
 {
 	return 0;
 }

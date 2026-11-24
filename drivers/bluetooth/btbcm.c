@@ -30,12 +30,13 @@
 #define BDADDR_BCM4330B1 (&(bdaddr_t) {{0x00, 0x00, 0x00, 0xb1, 0x30, 0x43}})
 #define BDADDR_BCM4334B0 (&(bdaddr_t) {{0x00, 0x00, 0x00, 0xb0, 0x34, 0x43}})
 #define BDADDR_BCM4345C5 (&(bdaddr_t) {{0xac, 0x1f, 0x00, 0xc5, 0x45, 0x43}})
+#define BDADDR_BCM4350C5 (&(bdaddr_t) {{0xac, 0x1f, 0x00, 0xc5, 0x50, 0x43}})
 #define BDADDR_BCM4355C0 (&(bdaddr_t) {{0xac, 0x1f, 0x00, 0xc0, 0x55, 0x43}})
 #define BDADDR_BCM4355C1 (&(bdaddr_t) {{0x93, 0x76, 0x00, 0xc1, 0x55, 0x43}})
 #define BDADDR_BCM43341B (&(bdaddr_t) {{0xac, 0x1f, 0x00, 0x1b, 0x34, 0x43}})
 
 #define BCM_FW_NAME_LEN			64
-#define BCM_FW_NAME_COUNT_MAX		4
+#define BCM_FW_NAME_COUNT_MAX		6
 /* For kmalloc-ing the fw-name array instead of putting it on the stack */
 typedef char bcm_fw_name[BCM_FW_NAME_LEN];
 
@@ -123,6 +124,9 @@ int btbcm_check_bdaddr(struct hci_dev *hdev)
 	 * The address AA:AA:AA:AA:AA:AA indicates a BCM43430A1 controller
 	 * with no configured address.
 	 *
+	 * The address 43:50:C5:00:1F:AC indicates a BCM4350C5 controller
+	 * with no configured address.
+	 *
 	 * The address 43:55:C0:00:1F:AC indicates a BCM4355C0 controller
 	 * with no configured address.
 	 *
@@ -136,6 +140,7 @@ int btbcm_check_bdaddr(struct hci_dev *hdev)
 	    !bacmp(&bda->bdaddr, BDADDR_BCM4330B1) ||
 	    !bacmp(&bda->bdaddr, BDADDR_BCM4334B0) ||
 	    !bacmp(&bda->bdaddr, BDADDR_BCM4345C5) ||
+	    !bacmp(&bda->bdaddr, BDADDR_BCM4350C5) ||
 	    !bacmp(&bda->bdaddr, BDADDR_BCM4355C0) ||
 	    !bacmp(&bda->bdaddr, BDADDR_BCM4355C1) ||
 	    !bacmp(&bda->bdaddr, BDADDR_BCM43430A0) ||
@@ -171,6 +176,75 @@ int btbcm_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(btbcm_set_bdaddr);
+
+/* Taurus calibration uses fixed-size, zero-padded vendor command packets. */
+int btbcm_send_calibration(struct hci_dev *hdev, const void *data, size_t size)
+{
+	struct {
+		u8 type;
+		__le16 blocks_left;
+		u8 data[230];
+	} __packed cmd;
+	const u8 *cursor = data;
+	size_t blocks, len;
+	struct sk_buff *skb;
+	int err;
+
+	if (!data || !size)
+		return -EINVAL;
+
+	/* The remaining-block count on the wire has only 16 bits. */
+	if (size > sizeof(cmd.data) * ((size_t)U16_MAX + 1))
+		return -E2BIG;
+
+	blocks = DIV_ROUND_UP(size, sizeof(cmd.data));
+	while (blocks) {
+		len = min(size, sizeof(cmd.data));
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.type = 3;
+		cmd.blocks_left = cpu_to_le16(--blocks);
+		memcpy(cmd.data, cursor, len);
+
+		skb = __hci_cmd_sync(hdev, 0xfd97, sizeof(cmd), &cmd,
+				     HCI_INIT_TIMEOUT);
+		if (IS_ERR(skb))
+			return PTR_ERR(skb);
+
+		/* Some firmware returns a zero-extended status reply. */
+		if ((skb->len != 1 && skb->len != 2) ||
+		    skb->data[0] || (skb->len == 2 && skb->data[1])) {
+			err = (skb->len == 1 || skb->len == 2) && skb->data[0] ?
+				-bt_to_errno(skb->data[0]) : -EIO;
+			kfree_skb(skb);
+			return err;
+		}
+		kfree_skb(skb);
+		cursor += len;
+		size -= len;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(btbcm_send_calibration);
+
+/* Legacy controllers accept the regulatory table in one vendor command. */
+int btbcm_send_regulatory(struct hci_dev *hdev, const void *data, size_t size)
+{
+	struct sk_buff *skb;
+	int err = 0;
+
+	if (!data || !size || size > U8_MAX)
+		return -EINVAL;
+
+	skb = __hci_cmd_sync(hdev, 0xfd98, size, data, HCI_INIT_TIMEOUT);
+	if (IS_ERR(skb))
+		return PTR_ERR(skb);
+	if (skb->len != 1 || skb->data[0])
+		err = skb->len == 1 ? -bt_to_errno(skb->data[0]) : -EIO;
+	kfree_skb(skb);
+	return err;
+}
+EXPORT_SYMBOL_GPL(btbcm_send_regulatory);
 
 int btbcm_read_pcm_int_params(struct hci_dev *hdev,
 			      struct bcm_set_pcm_int_params *params)
@@ -575,7 +649,13 @@ static const char *btbcm_get_board_name(struct device *dev)
 #endif
 }
 
-int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode)
+/*
+ * @variant names the module a board's controller sits on, when the board
+ * comes with modules from several vendors that each need their own Patchram.
+ * Its file names are tried before the generic ones.
+ */
+int btbcm_initialize_variant(struct hci_dev *hdev, bool *fw_load_done,
+			     bool use_autobaud_mode, const char *variant)
 {
 	u16 subver, rev, pid, vid;
 	struct sk_buff *skb;
@@ -659,6 +739,18 @@ int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud
 	if (!fw_name)
 		return -ENOMEM;
 
+	if (board_name && variant) {
+		if (hw_name) {
+			snprintf(fw_name[fw_name_count], BCM_FW_NAME_LEN,
+				 "brcm/%s%s.%s-%s.hcd", hw_name, postfix,
+				 board_name, variant);
+			fw_name_count++;
+		}
+		snprintf(fw_name[fw_name_count], BCM_FW_NAME_LEN,
+			 "brcm/BCM%s.%s-%s.hcd", postfix, board_name, variant);
+		fw_name_count++;
+	}
+
 	if (hw_name) {
 		if (board_name) {
 			snprintf(fw_name[fw_name_count], BCM_FW_NAME_LEN,
@@ -703,6 +795,13 @@ int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud
 
 	kfree(fw_name);
 	return 0;
+}
+EXPORT_SYMBOL_GPL(btbcm_initialize_variant);
+
+int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud_mode)
+{
+	return btbcm_initialize_variant(hdev, fw_load_done, use_autobaud_mode,
+					NULL);
 }
 EXPORT_SYMBOL_GPL(btbcm_initialize);
 

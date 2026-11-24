@@ -57,9 +57,13 @@
  * @set_baudrate_before_patch: switch to operational speed before Patchram
  * @broken_read_transmit_power: controller cannot read LE min/max TX power
  * @fixup_le_adv_report_evt_type: controller uses reserved advertising bits
+ * @use_bdaddr_property: require the unit address supplied by firmware
+ * @power_off_on_close: power-cycle and repeat setup across HCI opens
  * @no_uart_clock_set: UART clock set command for >3Mbps mode is unavailable
  * @max_autobaud_speed: max baudrate supported by device in autobaud mode
  * @max_speed: max baudrate supported
+ * @regulatory_size: Apple regulatory table length; non-zero sends the unit's
+ *	address, RF calibration and regulatory table after the Patchram
  */
 struct bcm_device_data {
 	bool	no_early_set_baudrate;
@@ -68,9 +72,20 @@ struct bcm_device_data {
 	bool	set_baudrate_before_patch;
 	bool	broken_read_transmit_power;
 	bool	fixup_le_adv_report_evt_type;
+	bool	use_bdaddr_property;
+	bool	power_off_on_close;
 	bool	no_uart_clock_set;
 	u32	max_autobaud_speed;
 	u32	max_speed;
+	size_t regulatory_size;
+};
+
+struct bcm_apple_data {
+	bdaddr_t bdaddr;
+	const u8 *calibration;
+	size_t calibration_size;
+	const u8 *regulatory;
+	size_t regulatory_size;
 };
 
 /**
@@ -116,10 +131,17 @@ struct bcm_device_data {
  * @set_baudrate_before_patch: switch to operational speed before Patchram
  * @broken_read_transmit_power: controller cannot read LE min/max TX power
  * @fixup_le_adv_report_evt_type: controller uses reserved advertising bits
+ * @use_bdaddr_property: require the unit address supplied by firmware
  * @no_uart_clock_set: UART clock set command for >3Mbps mode is unavailable
  * @pcm_int_params: keep the initial PCM configuration
  * @use_autobaud_mode: start Bluetooth device in autobaud mode
  * @max_autobaud_speed: max baudrate supported by device in autobaud mode
+ * @fw_variant: module vendor whose Patchram this controller needs, if the
+ *	board comes with modules from several vendors
+ * @apple_data: validated unit identity and Apple radio setup data
+ * @power_off_on_close: power-cycle the controller across HCI opens
+ * @hci_open: original serdev HCI open callback
+ * @hci_close: original serdev HCI close callback
  */
 struct bcm_device {
 	/* Must be the first member, hci_serdev.c expects this. */
@@ -161,10 +183,16 @@ struct bcm_device {
 	bool			set_baudrate_before_patch;
 	bool			broken_read_transmit_power;
 	bool			fixup_le_adv_report_evt_type;
+	bool			use_bdaddr_property;
+	bool			power_off_on_close;
+	int			(*hci_open)(struct hci_dev *hdev);
+	int			(*hci_close)(struct hci_dev *hdev);
 	bool			no_uart_clock_set;
 	bool			use_autobaud_mode;
+	struct bcm_apple_data	*apple_data;
 	u8			pcm_int_params[5];
 	u32			max_autobaud_speed;
+	const char		*fw_variant;
 };
 
 /* generic bcm uart resources */
@@ -617,6 +645,109 @@ static int bcm_flush(struct hci_uart *hu)
 	return 0;
 }
 
+/* HCI serializes open/close; the serdev parent outlives HCI unregister. */
+static int bcm_apple_hci_open(struct hci_dev *hdev)
+{
+	struct hci_uart *hu = hci_get_drvdata(hdev);
+	struct bcm_data *bcm = hu->priv;
+	struct bcm_device *dev = bcm->dev;
+	int err, close_err;
+
+	err = dev->hci_open(hdev);
+	if (err)
+		return err;
+
+	mutex_lock(&bcm_device_lock);
+	err = dev->res_enabled ? 0 : bcm_gpio_set_power(dev, true);
+	mutex_unlock(&bcm_device_lock);
+	if (err) {
+		close_err = dev->hci_close(hdev);
+		if (close_err)
+			bt_dev_err(hdev, "UART close after power failure: %d",
+				   close_err);
+	}
+
+	return err;
+}
+
+static int bcm_apple_hci_close(struct hci_dev *hdev)
+{
+	struct hci_uart *hu = hci_get_drvdata(hdev);
+	struct bcm_data *bcm = hu->priv;
+	struct bcm_device *dev = bcm->dev;
+	int err;
+
+	err = dev->hci_close(hdev);
+	if (err)
+		return err;
+
+	mutex_lock(&bcm_device_lock);
+	err = dev->res_enabled ? bcm_gpio_set_power(dev, false) : 0;
+	mutex_unlock(&bcm_device_lock);
+	if (err)
+		bt_dev_err(hdev, "Failed to power off controller: %d", err);
+
+	return err;
+}
+
+static void bcm_apple_install_lifecycle(struct hci_uart *hu)
+{
+	struct bcm_data *bcm = hu->priv;
+	struct bcm_device *dev = bcm->dev;
+	struct hci_dev *hdev = hu->hdev;
+
+	if (!hu->serdev || !dev || !dev->power_off_on_close || dev->hci_open)
+		return;
+
+	dev->hci_open = hdev->open;
+	dev->hci_close = hdev->close;
+	hdev->open = bcm_apple_hci_open;
+	hdev->close = bcm_apple_hci_close;
+	hci_set_quirk(hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
+}
+
+static int bcm_setup_apple_radio(struct hci_dev *hdev,
+				 const struct bcm_apple_data *radio)
+{
+	struct hci_rp_read_bd_addr *reply;
+	struct sk_buff *skb;
+	int err;
+
+	err = btbcm_set_bdaddr(hdev, &radio->bdaddr);
+	if (err)
+		return err;
+	skb = __hci_cmd_sync(hdev, HCI_OP_READ_BD_ADDR, 0, NULL,
+			     HCI_INIT_TIMEOUT);
+	if (IS_ERR(skb))
+		return PTR_ERR(skb);
+	if (skb->len != sizeof(*reply)) {
+		err = -EIO;
+	} else {
+		reply = (void *)skb->data;
+		if (reply->status)
+			err = -bt_to_errno(reply->status);
+		else if (bacmp(&reply->bdaddr, &radio->bdaddr))
+			err = -EADDRNOTAVAIL;
+	}
+	kfree_skb(skb);
+	if (err)
+		return err;
+	err = btbcm_send_calibration(hdev, radio->calibration,
+				     radio->calibration_size);
+	if (err)
+		return err;
+	err = btbcm_send_regulatory(hdev, radio->regulatory,
+				    radio->regulatory_size);
+	if (err)
+		return err;
+
+	/* Address repair is complete; do not repeat it after radio calibration. */
+	bacpy(&hdev->public_addr, &radio->bdaddr);
+	hci_clear_quirk(hdev, HCI_QUIRK_INVALID_BDADDR);
+	hci_clear_quirk(hdev, HCI_QUIRK_USE_BDADDR_PROPERTY);
+	return 0;
+}
+
 static int bcm_setup(struct hci_uart *hu)
 {
 	struct bcm_data *bcm = hu->priv;
@@ -629,6 +760,7 @@ static int bcm_setup(struct hci_uart *hu)
 	bt_dev_dbg(hu->hdev, "hu %p", hu);
 
 	hu->hdev->set_diag = bcm_set_diag;
+	bcm_apple_install_lifecycle(hu);
 	hu->hdev->set_bdaddr = btbcm_set_bdaddr;
 
 	if (bcm->dev && bcm->dev->broken_read_transmit_power)
@@ -638,6 +770,13 @@ static int bcm_setup(struct hci_uart *hu)
 	if (bcm->dev && bcm->dev->fixup_le_adv_report_evt_type)
 		hci_set_quirk(hu->hdev,
 			      HCI_QUIRK_FIXUP_LE_ADV_REPORT_EVT_TYPE);
+
+	if (bcm->dev && bcm->dev->use_bdaddr_property)
+		hci_set_quirk(hu->hdev, HCI_QUIRK_USE_BDADDR_PROPERTY);
+
+	/* Match the tested H4 policy: no core reset after unit radio setup. */
+	if (bcm->dev && bcm->dev->apple_data)
+		hci_set_quirk(hu->hdev, HCI_QUIRK_RESET_ON_CLOSE);
 
 	baudrate_set_before_patch = bcm->dev &&
 				   bcm->dev->set_baudrate_before_patch &&
@@ -655,7 +794,9 @@ static int bcm_setup(struct hci_uart *hu)
 		host_set_baudrate(hu, speed);
 	}
 
-	err = btbcm_initialize(hu->hdev, &fw_load_done, use_autobaud_mode);
+	err = btbcm_initialize_variant(hu->hdev, &fw_load_done,
+				       use_autobaud_mode,
+				       bcm->dev ? bcm->dev->fw_variant : NULL);
 	if (err)
 		return err;
 
@@ -702,6 +843,12 @@ static int bcm_setup(struct hci_uart *hu)
 	err = btbcm_finalize(hu->hdev, &fw_load_done, use_autobaud_mode);
 	if (err)
 		return err;
+
+	if (bcm->dev && bcm->dev->apple_data) {
+		err = bcm_setup_apple_radio(hu->hdev, bcm->dev->apple_data);
+		if (err)
+			return err;
+	}
 
 	/* Some devices ship with the controller default address.
 	 * Allow the bootloader to set a valid address through the
@@ -1286,6 +1433,65 @@ static int bcm_acpi_probe(struct bcm_device *dev)
 }
 #endif /* CONFIG_ACPI */
 
+/*
+ * Apple builds these controllers into a combined Wi-Fi and Bluetooth module
+ * from one of several vendors, and each vendor's module needs its own
+ * Patchram. Only the Wi-Fi function can tell which module this is: brcmfmac
+ * reads the vendor from the chip's OTP and records it in its device tree
+ * node. Wait for that while the Wi-Fi driver may still probe; without it,
+ * the generic Patchram names are used as before.
+ */
+static const struct {
+	const char *otp;
+	const char *name;
+} bcm_apple_module_vendors[] = {
+	{ "m", "MUR" },	/* Murata */
+	{ "t", "TDK" },
+	{ "u", "USI" },
+};
+
+static int bcm_of_get_fw_variant(struct bcm_device *bdev)
+{
+	struct device_node *wlan;
+	const char *vendor;
+	int i, err;
+
+	wlan = of_parse_phandle(bdev->dev->of_node, "apple,wlan", 0);
+	if (!wlan)
+		return 0;
+
+	if (!of_device_is_available(wlan)) {
+		of_node_put(wlan);
+		return 0;
+	}
+
+	err = of_property_read_string(wlan, "apple,module-vendor", &vendor);
+	if (err) {
+		of_node_put(wlan);
+		err = driver_deferred_probe_check_state(bdev->dev);
+		if (err == -EPROBE_DEFER)
+			return err;
+		dev_info(bdev->dev,
+			 "Wi-Fi module vendor unknown, using generic Patchram names\n");
+		return 0;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(bcm_apple_module_vendors); i++) {
+		if (!strcmp(vendor, bcm_apple_module_vendors[i].otp)) {
+			bdev->fw_variant = bcm_apple_module_vendors[i].name;
+			break;
+		}
+	}
+	if (!bdev->fw_variant)
+		dev_warn(bdev->dev, "Unknown Wi-Fi module vendor '%s'\n", vendor);
+	else
+		dev_info(bdev->dev, "Wi-Fi module vendor %s\n",
+			 bdev->fw_variant);
+
+	of_node_put(wlan);
+	return 0;
+}
+
 static int bcm_of_probe(struct bcm_device *bdev)
 {
 	bdev->use_autobaud_mode = device_property_read_bool(bdev->dev,
@@ -1297,7 +1503,7 @@ static int bcm_of_probe(struct bcm_device *bdev)
 	bdev->irq = of_irq_get_byname(bdev->dev->of_node, "host-wakeup");
 	bdev->irq_active_low = irq_get_trigger_type(bdev->irq)
 			     & (IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_LEVEL_LOW);
-	return 0;
+	return bcm_of_get_fw_variant(bdev);
 }
 
 static int bcm_probe(struct platform_device *pdev)
@@ -1568,6 +1774,81 @@ static struct platform_driver bcm_driver = {
 	},
 };
 
+/*
+ * The unit's address and RF calibration come from the boot loader (the
+ * ADT), the regulatory table next to the module's Patchram:
+ * brcm/BCM.<board>-<module vendor>.regulatory.
+ */
+static int bcm_prepare_apple_data(struct bcm_device *bdev, size_t regulatory_size)
+{
+	struct device_node *root __free(device_node) = of_find_node_by_path("/");
+	struct device *dev = bdev->dev;
+	struct bcm_apple_data *radio;
+	const struct firmware *fw;
+	const char *board;
+	u8 *calibration;
+	char *name;
+	int count, err;
+
+	if (regulatory_size > U8_MAX || !root ||
+	    of_property_read_string_index(root, "compatible", 0, &board))
+		return -EINVAL;
+	radio = devm_kzalloc(dev, sizeof(*radio), GFP_KERNEL);
+	if (!radio)
+		return -ENOMEM;
+	count = device_property_count_u8(dev, "local-bd-address");
+	if (count != sizeof(radio->bdaddr))
+		return -EINVAL;
+	err = device_property_read_u8_array(dev, "local-bd-address",
+					    radio->bdaddr.b, sizeof(radio->bdaddr));
+	if (err)
+		return err;
+	/* local-bd-address is in Bluetooth (least significant byte first) order. */
+	if (!bacmp(&radio->bdaddr, BDADDR_ANY) || (radio->bdaddr.b[5] & 1))
+		return -EINVAL;
+	count = device_property_count_u8(dev, "brcm,taurus-cal-blob");
+	if (count <= 0)
+		return count ? count : -EINVAL;
+	if ((size_t)count > 230 * ((size_t)U16_MAX + 1))
+		return -E2BIG;
+	calibration = devm_kmalloc(dev, count, GFP_KERNEL);
+	if (!calibration)
+		return -ENOMEM;
+	err = device_property_read_u8_array(dev, "brcm,taurus-cal-blob",
+					    calibration, count);
+	if (err)
+		return err;
+	if (count >= 7 && !memcmp(calibration, "syscfg/", 7))
+		return -EINVAL;
+	radio->calibration = calibration;
+	radio->calibration_size = count;
+	if (bdev->fw_variant)
+		name = kasprintf(GFP_KERNEL, "brcm/BCM.%s-%s.regulatory", board,
+				 bdev->fw_variant);
+	else
+		name = kasprintf(GFP_KERNEL, "brcm/BCM.%s.regulatory", board);
+	if (!name)
+		return -ENOMEM;
+	strreplace(name + strlen("brcm/"), '/', '-');
+	err = firmware_request_nowarn(&fw, name, dev);
+	kfree(name);
+	if (err)
+		return err;
+	if (fw->size != regulatory_size) {
+		err = -EINVAL;
+	} else {
+		radio->regulatory = devm_kmemdup(dev, fw->data, fw->size, GFP_KERNEL);
+		radio->regulatory_size = fw->size;
+		if (!radio->regulatory)
+			err = -ENOMEM;
+	}
+	release_firmware(fw);
+	if (err)
+		return err;
+	bdev->apple_data = radio;
+	return 0;
+}
+
 static int bcm_serdev_probe(struct serdev_device *serdev)
 {
 	struct bcm_device *bcmdev;
@@ -1585,6 +1866,8 @@ static int bcm_serdev_probe(struct serdev_device *serdev)
 	bcmdev->serdev_hu.serdev = serdev;
 	serdev_device_set_drvdata(serdev, bcmdev);
 
+	data = device_get_match_data(bcmdev->dev);
+
 	/* Initialize routing field to an unused value */
 	bcmdev->pcm_int_params[0] = 0xff;
 
@@ -1594,6 +1877,14 @@ static int bcm_serdev_probe(struct serdev_device *serdev)
 		err = bcm_of_probe(bcmdev);
 	if (err)
 		return err;
+
+	/* After bcm_of_probe(): the regulatory table follows the module vendor. */
+	if (data && data->regulatory_size) {
+		err = bcm_prepare_apple_data(bcmdev, data->regulatory_size);
+		if (err)
+			return dev_err_probe(bcmdev->dev, err,
+					     "Failed to prepare Apple radio data\n");
+	}
 
 	err = bcm_get_resources(bcmdev);
 	if (err)
@@ -1609,7 +1900,6 @@ static int bcm_serdev_probe(struct serdev_device *serdev)
 	if (err)
 		dev_err(&serdev->dev, "Failed to power down\n");
 
-	data = device_get_match_data(bcmdev->dev);
 	if (data) {
 		bcmdev->max_autobaud_speed = data->max_autobaud_speed;
 		bcmdev->no_early_set_baudrate = data->no_early_set_baudrate;
@@ -1621,6 +1911,8 @@ static int bcm_serdev_probe(struct serdev_device *serdev)
 			data->broken_read_transmit_power;
 		bcmdev->fixup_le_adv_report_evt_type =
 			data->fixup_le_adv_report_evt_type;
+		bcmdev->use_bdaddr_property = data->use_bdaddr_property;
+		bcmdev->power_off_on_close = data->power_off_on_close;
 		bcmdev->no_uart_clock_set = data->no_uart_clock_set;
 		if (data->max_speed && bcmdev->oper_speed > data->max_speed)
 			bcmdev->oper_speed = data->max_speed;
@@ -1644,6 +1936,31 @@ static struct bcm_device_data bcm4354_device_data = {
 static struct bcm_device_data bcm4355_device_data = {
 	.no_early_set_baudrate = true,
 	.drive_rts_on_open = true,
+};
+
+static struct bcm_device_data bcm4355_j71b_device_data = {
+	.no_early_set_baudrate = true,
+	.drive_rts_on_open = true,
+	.set_baudrate_before_patch = true,
+	.broken_read_transmit_power = true,
+	.fixup_le_adv_report_evt_type = true,
+};
+
+/*
+ * The iPad Pro 2's BCM4355 C0 (ADT module-instance joya/joyb/angera/angerb):
+ * the wake-before-power and early-baud sequence, reserved bits in LE
+ * advertising event types, and the unit's address, RF calibration and
+ * regulatory table sent after the Patchram. Its setup is repeated on each
+ * open, so the radio is powered off when closed.
+ */
+static struct bcm_device_data bcm4355c0_ipad_pro2_device_data = {
+	.power_off_on_close = true,
+	.no_early_set_baudrate = true,
+	.wake_before_power_cycle = true,
+	.set_baudrate_before_patch = true,
+	.fixup_le_adv_report_evt_type = true,
+	.use_bdaddr_property = true,
+	.regulatory_size = 210,
 };
 
 static struct bcm_device_data bcm4355_j172_device_data = {
@@ -1677,6 +1994,25 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
 	{ .compatible = "brcm,bcm43438-bt", .data = &bcm43438_device_data },
 	{ .compatible = "brcm,bcm4349-bt", .data = &bcm43438_device_data },
 	{ .compatible = "brcm,bcm43540-bt", .data = &bcm4354_device_data },
+	/* The iPad 5 BCM4355C0 needs the same sequence as the iPad 7 C1. */
+	{ .compatible = "apple,j71t-bcm4355c0-bt",
+	  .data = &bcm4355_j172_device_data },
+	/* The iPad Air 2 BCM4350C2 runs the plain sequence at 115,200 baud. */
+	{ .compatible = "apple,j81-bcm4350c2-bt" },
+	/* The iPhone 6s Plus BCM4350C5, as the iPad Air 2's C2 so far. */
+	{ .compatible = "apple,n66-bcm4350c5-bt" },
+	/* The iPod touch 6 BCM4345B1 uses the plain sequence at 115,200 baud. */
+	{ .compatible = "apple,n102-bcm4345b1-bt" },
+	{ .compatible = "apple,j120-bcm4355c0-bt",
+	  .data = &bcm4355c0_ipad_pro2_device_data },
+	{ .compatible = "apple,j121-bcm4355c0-bt",
+	  .data = &bcm4355c0_ipad_pro2_device_data },
+	{ .compatible = "apple,j207-bcm4355c0-bt",
+	  .data = &bcm4355c0_ipad_pro2_device_data },
+	{ .compatible = "apple,j208-bcm4355c0-bt",
+	  .data = &bcm4355c0_ipad_pro2_device_data },
+	{ .compatible = "apple,j71b-bcm4355c1-bt",
+	  .data = &bcm4355_j71b_device_data },
 	{ .compatible = "apple,j172-bcm4355c1-bt",
 	  .data = &bcm4355_j172_device_data },
 	{ .compatible = "brcm,bcm4355c1-bt", .data = &bcm4355_device_data },
