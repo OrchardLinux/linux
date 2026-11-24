@@ -268,11 +268,13 @@ struct s8000_mca_hw {
 	unsigned int sync_bits;		/* 0: half a frame */
 	u32 stream_irqs;		/* error causes open while TX is prepared */
 	/*
-	 * Leave the interrupt line alone. On the iPad mini 2 (J85), A7 MCA1's
-	 * line stayed asserted with both version 1 enables clear and no known
-	 * cause in the status register: 100000 unhandled interrupts during
-	 * the first prepare, which starved the touchscreen's SPI firmware
-	 * upload.
+	 * Leave the interrupt line alone. On the A7 the line stays asserted
+	 * with both version 1 enables clear and no known cause in the status
+	 * register, on MCA0 (iPad Air, J71) as on MCA1 (iPad mini 2, J85):
+	 * 100000 unhandled interrupts, then "nobody cared". On the J85 that
+	 * starved the touchscreen's SPI firmware upload. Playback is
+	 * DMA-driven and the handler only masks error causes, so nothing
+	 * else depends on it.
 	 */
 	bool no_irq;
 	/*
@@ -1484,6 +1486,7 @@ static const struct s8000_mca_hw t7001_mca_hw = {
  */
 static const struct s8000_mca_hw s5l8960x_mca_hw = {
 	.version = 1,
+	.no_irq = true,
 	.regs = &mca_v1_regs,
 	.dai_format = SND_SOC_DAIFMT_I2S,
 	.v1_ctl = MCA_V1_XX_CTL_A7,
