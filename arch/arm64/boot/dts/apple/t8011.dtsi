@@ -18,6 +18,12 @@
 	#address-cells = <2>;
 	#size-cells = <2>;
 
+	nco_clkref: clock-ref-nco {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-output-names = "nco_ref";
+	};
+
 	clkref: clock-ref {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
@@ -276,6 +282,246 @@
 #endif
 		};
 
+		i2s_switch: syscon@20a004000 {
+			compatible = "apple,t8010-i2s-switch", "syscon";
+			reg = <0x2 0x0a004000 0x0 0x1000>;
+			status = "disabled";
+		};
+
+		aop_i2s_switch: syscon@210540000 {
+			compatible = "apple,t8010-aop-i2s-switch", "syscon";
+			reg = <0x2 0x10540000 0x0 0x1000>;
+			status = "disabled";
+		};
+
+		aop_i2s_oe: syscon@210000600 {
+			compatible = "apple,t8010-aop-i2s-oe", "syscon";
+			reg = <0x2 0x10000600 0x0 0x4>;
+			status = "disabled";
+		};
+
+		/* The speaker link: TDM, eight slots, with V/I feedback capture */
+		mca2: mca@20a0a8000 {
+			compatible = "apple,t8011-mca";
+			reg = <0x2 0x0a0a8000 0x0 0x4000>,
+			      <0x2 0x0a002008 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 227 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca2>;
+			clocks = <&nco 2>;
+			clock-names = "bitclk";
+			dmas = <&sio 0x2c>, <&sio 0x2d>;
+			dma-names = "tx", "rx";
+			#clock-cells = <0>;
+			clock-output-names = "mca2-mclk";
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
+		mca4: mca@20a0b0000 {
+			compatible = "apple,t8010-mca-i2s";
+			reg = <0x2 0x0a0b0000 0x0 0x4000>,
+			      <0x2 0x0a002010 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 229 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca4>;
+			clocks = <&nco 4>;
+			clock-names = "bitclk";
+			dmas = <&sio 0x30>;
+			dma-names = "tx";
+			#clock-cells = <0>;
+			clock-output-names = "mca4-mclk";
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
+		/*
+		 * The H9G display pipe. Only its registers are described: the
+		 * boot framebuffer names it so that the boot scanout cadence
+		 * can be switched (simpledrm).
+		 */
+		h9g_display: display-controller@206000000 {
+			compatible = "apple,t8011-h9g-display";
+			reg = <0x2 0x06000000 0x0 0xe0000>;
+			status = "disabled";
+		};
+
+		pdm: pdm@20a0b4000 {
+			compatible = "apple,t8011-pdm";
+			reg = <0x2 0x0a0b4000 0x0 0x1000>,
+			      <0x2 0x0a120000 0x0 0x4000>,
+			      <0x2 0x0a124000 0x0 0x4000>;
+			reg-names = "pdm", "dec0", "dec1";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 236 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&aop_audio>;
+			power-domains = <&ps_hfd0>;
+			dmas = <&sio 0x5b>;
+			dma-names = "rx";
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+
+		nco: clock-controller@20e044000 {
+			compatible = "apple,t8010-nco";
+			reg = <0x2 0x0e044000 0x0 0x14000>;
+			clocks = <&nco_clkref>;
+			#clock-cells = <1>;
+			status = "disabled";
+		};
+
+		/*
+		 * Imagination MSVDX ("VXD") H.264 decoder, as on the T8010; it
+		 * has its own two-level GART, so no DART.
+		 */
+		vxd: video-codec@208100000 {
+			compatible = "apple,t8011-vxd", "apple,t8010-vxd";
+			reg = <0x2 0x08100000 0x0 0x30000>,
+			      <0x2 0x08130000 0x0 0x1000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 169 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_vdec0>;
+			status = "disabled";
+		};
+
+		sio: dma-controller@20ae00000 {
+			compatible = "apple,t8011-sio";
+			reg = <0x2 0x0ae00000 0x0 0x10000>;
+			reg-names = "a7iop";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 209 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 208 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 211 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 210 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_sio>;
+			firmware-name = "apple/t8011-smartio.bin";
+			#dma-cells = <1>;
+			status = "disabled";
+		};
+
+		spi3: spi@20a08c000 {
+			compatible = "apple,t8011-spi", "apple,t8010-spi", "apple,spi";
+			reg = <0x2 0x0a08c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 215 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		wlan_uart2: wlan-platform-control@20a0c8000 {
+			compatible = "apple,t8010-wlan-uart-provider";
+			reg = <0x2 0x0a0c8000 0x0 0x4000>;
+			power-domains = <&ps_uart2>;
+			status = "disabled";
+		};
+
+		serial3: serial@20a0cc000 {
+			compatible = "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0cc000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 219 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart3>;
+			status = "disabled";
+		};
+
+		serial5: serial@20a0d4000 {
+			compatible = "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0d4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 221 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart5>;
+			status = "disabled";
+		};
+
+		pcie0_dart0: iommu@601008000 {
+			compatible = "apple,t8011-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x01008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 271 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			#iommu-cells = <5>;
+			apple,error-reflector = /bits/ 64 <0x20fffc000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x00000100>;
+			status = "disabled";
+		};
+
+		pcie0_dart2: iommu@603008000 {
+			compatible = "apple,t8011-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x03008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 277 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			#iommu-cells = <5>;
+			apple,error-reflector = /bits/ 64 <0x20fffc000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x00000100>;
+			status = "disabled";
+		};
+
+		/* H9P root complex: six root ports, storage on port 0 (NVMMU). */
+		pcie0: pcie@610000000 {
+			compatible = "apple,t8011-pcie";
+			device_type = "pci";
+			reg = <0x6 0x10000000 0x0 0x1000000>,
+			      <0x6 0x00000000 0x0 0x8000>,
+			      <0x6 0x00008000 0x0 0x4000>,
+			      <0x6 0x0a000000 0x0 0x40000>,
+			      <0x6 0x01000000 0x0 0x4000>,
+			      <0x6 0x02000000 0x0 0x4000>,
+			      <0x6 0x03000000 0x0 0x4000>,
+			      <0x6 0x04000000 0x0 0x4000>,
+			      <0x6 0x05000000 0x0 0x4000>,
+			      <0x6 0x06000000 0x0 0x4000>,
+			      <0x6 0x01004000 0x0 0x4000>;
+			reg-names = "config", "rc", "phy", "phy-ip",
+				    "port0", "port1", "port2", "port3", "port4", "port5",
+				    "nvmmu";
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 270 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 273 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 276 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 279 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 285 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 272 IRQ_TYPE_EDGE_RISING>;
+			interrupt-names = "port0", "port1", "port2", "port3",
+					  "port4", "port5", "nvmmu";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+
+			msi-controller;
+			msi-parent = <&pcie0>;
+			msi-ranges = <&aic AIC_IRQ 288 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-doorbell = <0xbffff000>;
+			apple,nvmmu-iova = <0xbc000000>;
+
+			#address-cells = <3>;
+			#size-cells = <2>;
+			bus-range = <0 8>;
+			ranges = <0x43000000 0x6 0x20000000 0x6 0x20000000 0x1 0xa0000000>,
+				 <0x02000000 0x0 0xc0000000 0x7 0xc0000000 0x0 0x40000000>;
+
+			power-domains = <&ps_pcie>;
+			clocks = <&ps_pcie_aux>, <&ps_pcie_ref>;
+			clock-names = "aux", "ref";
+			status = "disabled";
+		};
+
 		pmgr: power-management@20e000000 {
 			compatible = "apple,t8010-pmgr", "apple,pmgr", "syscon", "simple-mfd";
 			#address-cells = <1>;
@@ -292,8 +538,9 @@
 			power-domains = <&ps_aic>;
 		};
 
+		/* The A9's function encoding (iPad Pro 2 display sync pins). */
 		pinctrl_ap: pinctrl@20f100000 {
-			compatible = "apple,t8010-pinctrl", "apple,pinctrl";
+			compatible = "apple,t8011-pinctrl", "apple,s8000-pinctrl", "apple,pinctrl";
 			reg = <0x2 0x0f100000 0x0 0x100000>;
 			power-domains = <&ps_gpio>;
 
@@ -370,6 +617,49 @@
 			clocks = <&clkref>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 4 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/*
+		 * The ipad7aop firmware runs past the T8010's 0xa0000 of SRAM, up
+		 * to the boot loader's reservation at 0x210ed8000.
+		 */
+		aop: aop@210800000 {
+			compatible = "apple,t8011-aop";
+			reg = <0x2 0x10800000 0x0 0x4000>,
+			      <0x2 0x10000500 0x0 0x100>,
+			      <0x2 0x10e00000 0x0 0xd8000>;
+			reg-names = "akf", "control", "sram";
+			mboxes = <&aop_mbox>;
+			mbox-names = "mbox";
+			status = "disabled";
+
+			aop_accel: accel {
+				compatible = "apple,t8010-aop-accel";
+			};
+
+			aop_gyro: gyro {
+				compatible = "apple,t8010-aop-gyro";
+			};
+
+			aop_pressure: pressure {
+				compatible = "apple,t8010-aop-pressure";
+			};
+
+			aop_audio: aop-audio {
+				compatible = "apple,t8011-aop-audio", "apple,t8010-aop-audio";
+				#clock-cells = <0>;
+			};
+		};
+
+		aop_mbox: mbox@210804000 {
+			compatible = "apple,t8010-a7iop-mailbox";
+			reg = <0x2 0x10804000 0x0 0x1000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 142 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 145 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
 		};
 	};
 

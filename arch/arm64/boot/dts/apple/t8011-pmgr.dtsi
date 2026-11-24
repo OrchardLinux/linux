@@ -6,6 +6,16 @@
  */
 
 &pmgr {
+	/* The touch controller's reference clock; its consumer gates it. */
+	touchclk: clock-controller@78000 {
+		compatible = "apple,t8011-touch-clock", "apple,t8010-touch-clock";
+		reg = <0x78000 0x8>;
+		#clock-cells = <0>;
+		clocks = <&clkref>;
+		clock-output-names = "touchclk";
+		clock-frequency = <24000000>;
+	};
+
 	ps_cpu0: power-controller@80000 {
 		compatible = "apple,t8010-pmgr-pwrstate", "apple,pmgr-pwrstate";
 		reg = <0x80000 4>;
@@ -102,11 +112,11 @@
 		apple,always-on; /* Core device */
 	};
 
-	ps_pcie_ref: power-controller@80148 {
+	ps_pcie_ref: clock-controller@80148 {
 		compatible = "apple,t8010-pmgr-pwrstate", "apple,pmgr-pwrstate";
 		reg = <0x80148 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
+		#clock-cells = <0>;
+		apple,clock-gate-only;
 		label = "pcie_ref";
 	};
 
@@ -630,11 +640,11 @@
 		label = "pcie";
 	};
 
-	ps_pcie_aux: power-controller@80330 {
+	ps_pcie_aux: clock-controller@80330 {
 		compatible = "apple,t8010-pmgr-pwrstate", "apple,pmgr-pwrstate";
 		reg = <0x80330 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
+		#clock-cells = <0>;
+		apple,clock-gate-only;
 		label = "pcie_aux";
 	};
 
