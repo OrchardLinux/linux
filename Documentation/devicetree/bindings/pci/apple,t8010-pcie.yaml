@@ -250,6 +250,9 @@ properties:
       - items:
           - const: apple,j172-pcie
           - const: apple,t8010-pcie
+      - items:
+          - const: apple,j120-pcie
+          - const: apple,t8011-pcie
 
   reg:
     minItems: 4
