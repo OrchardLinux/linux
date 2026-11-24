@@ -37,6 +37,7 @@
 	aliases {
 		serial0 = &uart0;
 		serial1 = &uart1;
+		bluetooth0 = &bluetooth;
 	};
 
 	chosen {
@@ -452,10 +453,10 @@
 		 * from syscfg and reads zero in this tree, and with Apple's
 		 * patchram the chip says 43:34:43:34:1F:AC, the same on every
 		 * iPad -- a placeholder, which btbcm.c is taught to treat as one
-		 * so that this property is used.  A fixed address in the same
-		 * family as the gadget's and Wi-Fi's MACs,
-		 * 02:10:5A:05:00:04 (bytes reversed here).  Put the iPad's own
-		 * (Settings > General > About > Bluetooth) here to use that.
+		 * so that this property is used.  It is a zero placeholder for
+		 * the boot stage to fill with the unit's own address (alias
+		 * bluetooth0, as m1n1 does on 64-bit boards); left zero, the
+		 * chip keeps its default address.
 		 */
 		uart1: serial@2600000 {
 			/* s5l8940x: UCON bit 10, the 24 MHz clock, which iBoot sets
@@ -470,13 +471,13 @@
 			pinctrl-0 = <&uart1_pins>;
 			status = "okay";
 
-			bluetooth {
+			bluetooth: bluetooth {
 				compatible = "brcm,bcm4334-bt";
 				shutdown-gpios = <&pmu 2 0>;
 				device-wakeup-gpios = <&gpio 9 0>;
 				vddio-supply = <&wlan_lpo>;
 				max-speed = <1500000>;
-				local-bd-address = [04 00 05 5a 10 02];
+				local-bd-address = [00 00 00 00 00 00];
 			};
 		};
 
