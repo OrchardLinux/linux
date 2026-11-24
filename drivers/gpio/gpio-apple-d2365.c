@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * GPIO and PMU event interrupt driver for Apple/Dialog PMICs used with the
- * A7, A8, A8X, A9 and A10 SoCs. On the A7's D2089 only the PMU events are
- * described, not its GPIO lines.
+ * A7, A8, A8X, A9 and A10 SoCs.
  *
  * The D2365 latches 240 PMU events and the D2207 112 in a read-to-clear
  * block. Any unmasked pending event pulls the PMU interrupt line to the AP
@@ -90,11 +89,22 @@
  * dispatches every set bit without writing them back; start writes all
  * ones to the 14 mask bytes at 0x70 and subscribes events by number (ADC
  * conversion complete is event 89, as on the D2207). Which events the
- * GPIO lines raise is not known, so no GPIO line is described.
+ * GPIO lines raise is not established, so the lines have no interrupt.
  */
 #define D2089_EVENTS		0x50
 #define D2089_EVENT_MASK	0x70
 #define D2089_EVENT_BYTES	14
+
+/*
+ * D2089 GPIO lines, as iOS 12 AppleD2089PMU accesses them: the
+ * configuration byte of line n (0-16) is 0x400 + n (_index2GPIOAddress),
+ * as on the D2207. Bits 7:5 are the mode. Its direction setter treats any
+ * byte at or above 0x60 as an input and then writes nothing; it makes a
+ * line an input with (old & 0x1f) | 0x60 and an output with old & 0x1f.
+ * Bit 1 is the output level: _setGPIOFunction() keeps old & 0x1d. Input
+ * levels are bit n % 8 of 0x63 + n / 8 (_getGPIO).
+ */
+#define D2089_NGPIO		17
 
 #define D2365_GPIO_SPLIT		18
 #define D2365_GPIO_CFG_0_17	0x900
@@ -161,6 +171,11 @@ struct apple_pmic_gpio_info {
 	bool preserve_boot_direction;
 	/* No known configuration registers: inputs read at input_base only. */
 	bool input_only;
+	/*
+	 * Every mode from input_mode up is an input, and direction_input()
+	 * leaves a line that is one as it is (D2089).
+	 */
+	bool inputs_from_mode;
 	unsigned int output_update_mask;
 	unsigned int (*config_reg)(unsigned int offset);
 	const struct apple_pmic_event_info *events;
@@ -195,6 +210,16 @@ struct apple_pmic_gpio {
 	bool wake_only_armed;		/* wake_only unmasked for this sleep */
 	bool parent_wake_armed;		/* our own wake reference on the line */
 };
+
+static bool apple_pmic_gpio_is_input(const struct apple_pmic_gpio_info *info,
+				     unsigned int config)
+{
+	unsigned int mode = config & info->direction_mask;
+
+	if (info->inputs_from_mode)
+		return mode >= info->input_mode;
+	return mode == info->input_mode;
+}
 
 static unsigned int d2186_gpio_config_reg(unsigned int offset)
 {
@@ -957,7 +982,7 @@ static int apple_pmic_gpio_get_direction(struct gpio_chip *chip,
 	    (value & info->direction_mask) != info->output_mode)
 		return -EOPNOTSUPP;
 
-	if ((value & info->direction_mask) == info->input_mode)
+	if (apple_pmic_gpio_is_input(info, value))
 		return GPIO_LINE_DIRECTION_IN;
 	if ((value & info->direction_mask) == info->output_mode)
 		return GPIO_LINE_DIRECTION_OUT;
@@ -970,11 +995,27 @@ static int apple_pmic_gpio_direction_input(struct gpio_chip *chip,
 {
 	struct apple_pmic_gpio *gpio = gpiochip_get_data(chip);
 	const struct apple_pmic_gpio_info *info = gpio->info;
+	unsigned int value;
+	int ret;
 
 	if (info->input_only)
 		return 0;
 	if (info->preserve_boot_direction)
 		return -EOPNOTSUPP;
+
+	/* As iOS: an input stays as it is, a mode change keeps bits 4:0. */
+	if (info->inputs_from_mode) {
+		ret = regmap_read(gpio->regmap, info->config_reg(offset),
+				  &value);
+		if (ret)
+			return ret;
+		if (apple_pmic_gpio_is_input(info, value))
+			return 0;
+		return regmap_update_bits(gpio->regmap,
+					  info->config_reg(offset),
+					  info->direction_mask,
+					  info->input_mode);
+	}
 
 	return regmap_update_bits(gpio->regmap,
 				  info->config_reg(offset),
@@ -1016,7 +1057,7 @@ static int apple_pmic_gpio_get(struct gpio_chip *chip, unsigned int offset)
 		return !!(value & info->value_mask);
 	if (info->preserve_boot_direction)
 		return -EOPNOTSUPP;
-	if ((value & info->direction_mask) != info->input_mode)
+	if (!apple_pmic_gpio_is_input(info, value))
 		return -EINVAL;
 
 read_input:
@@ -1068,8 +1109,12 @@ static int apple_pmic_gpio_probe(struct platform_device *pdev)
 	ret = apple_pmic_event_probe(pdev, gpio);
 	if (ret)
 		return ret;
-	/* A PMIC described only by its PMU events has no GPIO chip. */
-	if (!gpio->info->ngpio)
+	/*
+	 * A PMIC described only by its PMU events has no GPIO chip, nor has a
+	 * D2089 node that is no GPIO controller.
+	 */
+	if (!gpio->info->ngpio ||
+	    !device_property_read_bool(dev, "gpio-controller"))
 		return 0;
 
 	gpio->chip.label = gpio->info->label;
@@ -1082,7 +1127,8 @@ static int apple_pmic_gpio_probe(struct platform_device *pdev)
 	gpio->chip.direction_output = apple_pmic_gpio_direction_output;
 	gpio->chip.get = apple_pmic_gpio_get;
 	gpio->chip.set = apple_pmic_gpio_set;
-	if (gpio->domain)
+	/* Only where the event of each line is known. */
+	if (gpio->domain && gpio->info->events->gpio_event)
 		gpio->chip.to_irq = apple_pmic_gpio_to_irq;
 
 	return devm_gpiochip_add_data(dev, &gpio->chip, gpio);
@@ -1096,6 +1142,14 @@ static const struct apple_pmic_event_info d2089_event_info = {
 
 static const struct apple_pmic_gpio_info d2089_gpio_info = {
 	.label = "d2089-pmic-gpio",
+	.ngpio = D2089_NGPIO,
+	.input_base = 0x63,
+	.value_mask = D2207_GPIO_VALUE,
+	.direction_mask = D2207_GPIO_MODE_MASK,
+	.input_mode = D2207_GPIO_INPUT,
+	.output_mode = D2207_GPIO_OUTPUT,
+	.inputs_from_mode = true,
+	.config_reg = d2207_gpio_config_reg,
 	.events = &d2089_event_info,
 };
 
