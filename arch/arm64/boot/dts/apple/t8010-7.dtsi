@@ -280,3 +280,8 @@
 &touchclk {
 	clock-frequency = <32768>;
 };
+
+/* The USB device controller tells the SN2400 driver what the USB host allows. */
+&usbdev {
+	usb-psy-name = "usb";
+};
