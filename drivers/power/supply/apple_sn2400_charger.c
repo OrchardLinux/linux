@@ -64,6 +64,19 @@
 #define SN2400_REG_HDQ			0x1d
 
 /*
+ * The battery's temperature, from the gauge that monitors the same battery,
+ * against the monitored battery's operating-range-celsius (outside it: no
+ * input, the phone runs on its battery) and alert-celsius (outside it: the
+ * input is held at SN2400_THERMAL_REDUCED_UA). Each limit is left only
+ * SN2400_THERMAL_HYST_DC inside it. Without a reading for
+ * SN2400_THERMAL_STALE_MS the input is reduced, never cut off.
+ */
+#define SN2400_THERMAL_POLL_MS		5000
+#define SN2400_THERMAL_STALE_MS		60000
+#define SN2400_THERMAL_HYST_DC		20
+#define SN2400_THERMAL_REDUCED_UA	500000
+
+/*
  * A board whose charger node has "apple,read-only" gets a driver that only
  * reads the status, input-limit and control registers and leaves the charger
  * as the bootloader programmed it: no foldback, no ADC, nothing written on
@@ -75,6 +88,12 @@ static int control = -1;
 module_param(control, int, 0644);
 MODULE_PARM_DESC(control,
 		 "Charger control: -1 = follow the DT (default), 0 = read-only, 1 = run the charging policy");
+
+enum sn2400_thermal_level {
+	SN2400_THERMAL_NORMAL,
+	SN2400_THERMAL_REDUCED,
+	SN2400_THERMAL_OFF,
+};
 
 enum sn2400_foldback_state {
 	SN2400_FOLDBACK_IDLE,
@@ -118,6 +137,15 @@ struct sn2400_charger {
 	bool vbus_absent;
 	bool stopped;
 	bool control;
+	/* Battery temperature limits in 0.1 C; thermal: any are given */
+	int temp_min, temp_max, temp_alert_min, temp_alert_max;
+	bool thermal;
+	struct fwnode_handle *battery;
+	struct power_supply *gauge;
+	enum sn2400_thermal_level thermal_level;
+	unsigned long thermal_checked;
+	unsigned long temp_read_at;
+	bool temp_read;
 };
 
 static int sn2400_read_adc(struct sn2400_charger *charger,
@@ -333,11 +361,125 @@ static bool sn2400_usb_host(struct sn2400_charger *charger, unsigned int grant)
 static unsigned int sn2400_input_cap(struct sn2400_charger *charger)
 {
 	unsigned int grant = READ_ONCE(charger->usb_grant_ua);
+	unsigned int cap = charger->session_max_input_ua;
 
-	if (!sn2400_usb_host(charger, grant))
-		return charger->session_max_input_ua;
+	if (sn2400_usb_host(charger, grant))
+		cap = min(cap, grant);
+	if (charger->thermal_level == SN2400_THERMAL_REDUCED)
+		cap = min(cap, SN2400_THERMAL_REDUCED_UA);
 
-	return min(charger->session_max_input_ua, grant);
+	return cap;
+}
+
+/*
+ * The level for battery temperature @temp (0.1 C), coming from @level: a
+ * limit is crossed at the limit, and left SN2400_THERMAL_HYST_DC inside it.
+ */
+static enum sn2400_thermal_level
+sn2400_thermal_level(const struct sn2400_charger *charger,
+		     enum sn2400_thermal_level level, int temp)
+{
+	int hyst;
+
+	hyst = level == SN2400_THERMAL_OFF ? SN2400_THERMAL_HYST_DC : 0;
+	if (temp <= charger->temp_min + hyst ||
+	    temp >= charger->temp_max - hyst)
+		return SN2400_THERMAL_OFF;
+
+	hyst = level != SN2400_THERMAL_NORMAL ? SN2400_THERMAL_HYST_DC : 0;
+	if (temp <= charger->temp_alert_min + hyst ||
+	    temp >= charger->temp_alert_max - hyst)
+		return SN2400_THERMAL_REDUCED;
+
+	return SN2400_THERMAL_NORMAL;
+}
+
+struct sn2400_gauge_match {
+	struct fwnode_handle *battery;
+	struct power_supply *psy;
+};
+
+static int sn2400_match_gauge(struct power_supply *psy, void *data)
+{
+	struct sn2400_gauge_match *match = data;
+	struct fwnode_handle *battery;
+
+	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY || !psy->dev.fwnode)
+		return 0;
+
+	battery = fwnode_find_reference(psy->dev.fwnode, "monitored-battery", 0);
+	if (IS_ERR(battery))
+		return 0;
+	fwnode_handle_put(battery);
+	if (battery != match->battery)
+		return 0;
+
+	get_device(&psy->dev);
+	match->psy = psy;
+	return 1;
+}
+
+/*
+ * Follow the battery temperature: the gauge is found once it has registered,
+ * and read every SN2400_THERMAL_POLL_MS. Returns whether the level changed.
+ */
+static bool sn2400_update_thermal(struct sn2400_charger *charger)
+{
+	enum sn2400_thermal_level level = charger->thermal_level;
+	union power_supply_propval val;
+	int ret = -ENODEV;
+
+	if (!charger->thermal ||
+	    (charger->thermal_checked &&
+	     time_is_after_jiffies(charger->thermal_checked +
+				   msecs_to_jiffies(SN2400_THERMAL_POLL_MS))))
+		return false;
+	charger->thermal_checked = jiffies ?: 1;
+
+	if (!charger->gauge) {
+		struct sn2400_gauge_match match = { .battery = charger->battery };
+
+		power_supply_for_each_psy(&match, sn2400_match_gauge);
+		charger->gauge = match.psy;
+	}
+	if (charger->gauge)
+		ret = power_supply_get_property(charger->gauge,
+						POWER_SUPPLY_PROP_TEMP, &val);
+
+	if (!ret) {
+		charger->temp_read = true;
+		charger->temp_read_at = jiffies;
+		level = sn2400_thermal_level(charger, level, val.intval);
+	} else if (!charger->temp_read ||
+		   time_is_before_jiffies(charger->temp_read_at +
+					  msecs_to_jiffies(SN2400_THERMAL_STALE_MS))) {
+		/* No temperature: charge, but slowly; off stays off. */
+		if (level == SN2400_THERMAL_NORMAL)
+			level = SN2400_THERMAL_REDUCED;
+	}
+
+	if (level == charger->thermal_level)
+		return false;
+
+	if (ret)
+		dev_warn(charger->dev,
+			 "no battery temperature (%d): input up to %u mA\n",
+			 ret, SN2400_THERMAL_REDUCED_UA / 1000);
+	else if (level == SN2400_THERMAL_OFF)
+		dev_warn(charger->dev, "battery at %s%d.%d C: input off\n",
+			 val.intval < 0 ? "-" : "", abs(val.intval) / 10,
+			 abs(val.intval) % 10);
+	else if (level == SN2400_THERMAL_REDUCED)
+		dev_info(charger->dev, "battery at %s%d.%d C: input up to %u mA\n",
+			 val.intval < 0 ? "-" : "", abs(val.intval) / 10,
+			 abs(val.intval) % 10, SN2400_THERMAL_REDUCED_UA / 1000);
+	else
+		dev_info(charger->dev, "battery at %s%d.%d C: input as allowed\n",
+			 val.intval < 0 ? "-" : "", abs(val.intval) / 10,
+			 abs(val.intval) % 10);
+	charger->thermal_level = level;
+
+	return true;
 }
 
 static void sn2400_log_usb_host(struct sn2400_charger *charger)
@@ -437,9 +579,23 @@ static void sn2400_charger_work(struct work_struct *work)
 	charger->vbus_absent = false;
 	sn2400_log_usb_host(charger);
 
-	/* The USB host lowered what it allows: follow it at once. */
-	if (READ_ONCE(charger->usb_grant_ua) &&
-	    charger->state != SN2400_FOLDBACK_IDLE &&
+	if (sn2400_update_thermal(charger) &&
+	    charger->thermal_level == SN2400_THERMAL_OFF) {
+		ret = sn2400_disable_input(charger);
+		if (ret)
+			goto fail_safe;
+		input_limit_ua = 0;
+		/* Off until the battery is back in range, then probe anew. */
+		charger->state = SN2400_FOLDBACK_IDLE;
+		charger->target_limit_ua = 0;
+	}
+	if (charger->thermal_level == SN2400_THERMAL_OFF) {
+		sn2400_cache(charger, 0, status, 0, 0, 0);
+		goto out_schedule;
+	}
+
+	/* The USB host or the battery temperature lowered the cap: follow it at once. */
+	if (charger->state != SN2400_FOLDBACK_IDLE &&
 	    charger->state != SN2400_FOLDBACK_NOLOAD &&
 	    charger->target_limit_ua > sn2400_input_cap(charger)) {
 		ret = sn2400_set_input_limit(charger, sn2400_input_cap(charger),
@@ -600,6 +756,15 @@ static void sn2400_charger_monitor_work(struct work_struct *work)
 							input_reg));
 
 	sn2400_schedule(charger, SN2400_STABLE_POLL_MS);
+}
+
+static void sn2400_put_battery(void *data)
+{
+	struct sn2400_charger *charger = data;
+
+	if (charger->gauge)
+		power_supply_put(charger->gauge);
+	fwnode_handle_put(charger->battery);
 }
 
 static int sn2400_charger_get_property(struct power_supply *psy,
@@ -943,7 +1108,36 @@ static int sn2400_charger_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, ret,
 				     "failed to get monitored battery limits\n");
 	charger->max_charge_ua = battery_info->constant_charge_current_max_ua;
+	charger->temp_min = battery_info->temp_min == INT_MIN ?
+		INT_MIN + SN2400_THERMAL_HYST_DC : battery_info->temp_min * 10;
+	charger->temp_max = battery_info->temp_max == INT_MAX ?
+		INT_MAX - SN2400_THERMAL_HYST_DC : battery_info->temp_max * 10;
+	charger->temp_alert_min = battery_info->temp_alert_min == INT_MIN ?
+		charger->temp_min : battery_info->temp_alert_min * 10;
+	charger->temp_alert_max = battery_info->temp_alert_max == INT_MAX ?
+		charger->temp_max : battery_info->temp_alert_max * 10;
+	charger->thermal = battery_info->temp_min != INT_MIN ||
+			   battery_info->temp_max != INT_MAX ||
+			   battery_info->temp_alert_min != INT_MIN ||
+			   battery_info->temp_alert_max != INT_MAX;
 	power_supply_put_battery_info(charger->psy, battery_info);
+	if (charger->thermal) {
+		charger->battery = fwnode_find_reference(dev_fwnode(&pdev->dev),
+							 "monitored-battery", 0);
+		if (IS_ERR(charger->battery))
+			return dev_err_probe(&pdev->dev,
+					     PTR_ERR(charger->battery),
+					     "no monitored battery\n");
+		ret = devm_add_action_or_reset(&pdev->dev, sn2400_put_battery,
+					       charger);
+		if (ret)
+			return ret;
+		dev_info(&pdev->dev,
+			 "battery %d..%d C, full input %d..%d C\n",
+			 charger->temp_min / 10, charger->temp_max / 10,
+			 charger->temp_alert_min / 10,
+			 charger->temp_alert_max / 10);
+	}
 	if (charger->max_charge_ua < SN2400_INPUT_REG_STEP_UA ||
 	    charger->max_charge_ua > U8_MAX * SN2400_INPUT_REG_STEP_UA)
 		return dev_err_probe(&pdev->dev, -EINVAL,
@@ -1055,7 +1249,9 @@ static int sn2400_charger_suspend(struct device *dev)
 	if (ret)
 		goto restart;
 
-	if (status & SN2400_STATUS_VBUS) {
+	/* Asleep the work does not run: a hot or cold battery gets no input. */
+	if ((status & SN2400_STATUS_VBUS) &&
+	    charger->thermal_level != SN2400_THERMAL_OFF) {
 		input_limit_ua = min(charger->session_max_input_ua,
 				     SN2400_INPUT_START_UA);
 		ret = sn2400_set_input_limit(charger, input_limit_ua,
