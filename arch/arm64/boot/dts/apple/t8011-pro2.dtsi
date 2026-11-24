@@ -260,14 +260,17 @@
 &i2c3 {
 	status = "okay";
 
+	/* Calibration records: orientation 6 for 0x29, 5 for 0x39 (J120). */
 	als0: light-sensor@29 {
 		compatible = "apple,ct709";
 		reg = <0x29>;
+		apple,als-orientation = <6>;
 	};
 
 	light-sensor@39 {
 		compatible = "apple,ct709";
 		reg = <0x39>;
+		apple,als-orientation = <5>;
 	};
 };
 
