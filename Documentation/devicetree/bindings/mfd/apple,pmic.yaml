@@ -63,9 +63,6 @@ properties:
   gpio:
     $ref: /schemas/gpio/apple,d2365-pmic-gpio.yaml
 
-  events:
-    $ref: /schemas/interrupt-controller/apple,pmic-events.yaml
-
   cover-switch:
     type: object
     description: Magnetic cover switch wired to GPIOs 0 and 10 on the J120 August PMIC.
