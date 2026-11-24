@@ -1626,6 +1626,15 @@ L:	linux-input@vger.kernel.org
 S:	Odd fixes
 F:	drivers/input/mouse/bcm5974.c
 
+APPLE H2FMI AND SFTL FLASH DRIVERS
+M:	Shayne Legault <8741557+shaynelegault@users.noreply.github.com>
+S:	Maintained
+F:	Documentation/devicetree/bindings/mtd/apple,h2fmi.yaml
+F:	Documentation/driver-api/mtd/apple-sftl-reclamation.rst
+F:	drivers/mtd/devices/mtd-apple-h2fmi*
+F:	drivers/mtd/devices/mtd-apple-sftl*
+F:	include/linux/mtd/apple-ppn*
+
 APPLE PCIE CONTROLLER DRIVER
 M:	Alyssa Rosenzweig <alyssa@rosenzweig.io>
 M:	Marc Zyngier <maz@kernel.org>

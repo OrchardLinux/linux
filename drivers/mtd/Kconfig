@@ -206,6 +206,37 @@ config MTD_PARTITIONED_MASTER
 	  the parent of the partition device be the master device, rather than
 	  what lies behind the master.
 
+config MTD_APPLE_SFTL
+	tristate "Apple PPN VFL/SwissPPNFTL translation"
+	depends on BLOCK
+	help
+	  Recover the logical block medium stored in Apple VFL/SwissPPNFTL
+	  metadata on the measured 64 GB and 16 GB Hynix PPN layouts. The
+	  H2FMI driver supplies canonical page reads through its aggregate PPN
+	  provider. The 16 GB layout is read-only.
+	  Recovery can expose a complete older generation read-only after an
+	  interrupted native save. Unsupported geometry, conflicting replicas
+	  and unaccounted journal gaps stop recovery.
+
+	  Writes are appended to verified blank blocks. A provider with a
+	  qualified erase operation can also recycle verified retired blocks.
+	  H2FMI supplies this operation for packages whose geometry
+	  validates. Providers without a qualified erase operation return
+	  ENOSPC when their supply of blank blocks runs out.
+
+config MTD_APPLE_SFTL_KUNIT_TEST
+	tristate "KUnit tests for Apple VFL/SwissPPNFTL" if !KUNIT_ALL_TESTS
+	depends on KUNIT && MTD_APPLE_SFTL
+	default KUNIT_ALL_TESTS
+	help
+	  Synthesize complete VFL/SFTL media and exercise checkpoint recovery,
+	  native block summaries, open-block journal replay, checkpoint encoding
+	  and verified reclamation during normal writes. Exercise failed erase,
+	  readback and recovery using synthetic flash.
+	  Exercise native accounting, checkpoint page cuts, interrupted lane
+	  retirement, both replicated VFL banks and fresh-loader replay.
+	  All test media and provider operations are synthetic.
+
 source "drivers/mtd/chips/Kconfig"
 
 source "drivers/mtd/maps/Kconfig"
