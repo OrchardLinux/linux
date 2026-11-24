@@ -36,9 +36,10 @@ description: |
 
   The Dialog D2089 PMIC used with the Apple A7 latches the same 112 events
   in the same block as the D2207, and the D2355 charger PMU used with the
-  Apple A10X latches 80. Only those event controllers are described: their
-  GPIO lines and the events they raise are not, so the node is no GPIO
-  controller.
+  Apple A10X latches 80. The D2355 is only an event controller: its GPIO
+  lines are not described, so its node is no GPIO controller. The D2089
+  has 17 GPIO lines configured as on the D2207 (lines 0-16); its node may
+  also be a GPIO controller, whose lines are not mapped to their events.
 
   Interrupt 112 (D2089, D2207) or 240 (D2365), one past the last event, is
   the event line itself. Its consumers run on every assertion of the line,
@@ -97,6 +98,7 @@ required:
   - compatible
 
 dependencies:
+  gpio-controller: ["#gpio-cells"]
   interrupt-controller: ["#interrupt-cells"]
   apple,wake-events: [interrupt-controller]
 
@@ -109,9 +111,6 @@ allOf:
             - apple,d2355-pmic-gpio
     then:
       properties:
-        gpio-controller: false
-        "#gpio-cells": false
-        gpio-reserved-ranges: false
         apple,wake-events: false
       required:
         - interrupt-controller
@@ -120,6 +119,15 @@ allOf:
       required:
         - gpio-controller
         - "#gpio-cells"
+  - if:
+      properties:
+        compatible:
+          const: apple,d2355-pmic-gpio
+    then:
+      properties:
+        gpio-controller: false
+        "#gpio-cells": false
+        gpio-reserved-ranges: false
   - if:
       properties:
         compatible:
