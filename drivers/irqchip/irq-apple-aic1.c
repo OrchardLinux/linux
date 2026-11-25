@@ -132,6 +132,9 @@ static struct apple_aic1 *apple_aic1;
 static unsigned int aic1_handler_entries;
 
 void apple_a9_gic_drain(void);
+void apple_aic1_arm_cpu0(void);
+void apple_aic1_hw_quiesce(bool read_back);
+int __init apple_aic1_timer_start(void);
 extern bool apple_aic1_early_irq_escape;
 
 static void aic1_tmr_event(struct apple_aic1 *aic);
@@ -279,6 +282,42 @@ void apple_aic1_quiesce(void)
 		return;
 
 	aic1_clear_sticky_nirq(aic);
+}
+
+void apple_aic1_hw_quiesce(bool read_back)
+{
+	struct apple_aic1 *aic = apple_aic1;
+
+	if (!aic)
+		return;
+
+	aic1_clear_sticky_nirq(aic);
+	dsb(sy);
+	if (read_back) {
+		/*
+		 * Reading EVENT consumes a pending event. Keep the readback
+		 * sequence used during the first quiesce.
+		 */
+		aic1_read(aic, AIC1_CONFIG);
+		aic1_read(aic, AIC1_CPU_EVENT(0));
+		aic1_read(aic, AIC1_TARGET_CPU);
+	}
+}
+
+void apple_aic1_arm_cpu0(void)
+{
+	struct apple_aic1 *aic = apple_aic1;
+	unsigned int i, nr_words;
+
+	if (!aic)
+		return;
+
+	aic1_mask_all(aic);
+	aic1_target_all(aic, BIT(0));
+	nr_words = DIV_ROUND_UP(aic->nr_irq, 32);
+	for (i = 0; i < nr_words; i++)
+		aic1_write(aic, AIC1_MASK_SET + i * 4, ~0U);
+	aic1_drain_events(aic);
 }
 
 void apple_aic1_enable(void)
@@ -648,8 +687,8 @@ static int __init aic1_of_init(struct device_node *node,
 	 * PL310, bufferable writes lose the writing CPU's identity on their way
 	 * through its store buffer, and IPI_SEND in the per-CPU 0x2000 window
 	 * then sends nothing (the same write from /dev/mem, strongly-ordered,
-	 * arrives).  Not the static MT_DEVICE map in mach-apple/apple.c: the
-	 * types differ, so this gets a mapping of its own. */
+	 * arrives). The boot quiesce and rearm code uses this mapping too.
+	 */
 	{
 		struct resource res;
 

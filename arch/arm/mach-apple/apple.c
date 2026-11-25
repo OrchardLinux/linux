@@ -14,13 +14,9 @@
 #include <linux/of_address.h>
 #include <linux/sched/task.h>
 #include <asm/cputype.h>
-#include <asm/barrier.h>
 #include <asm/mach/arch.h>
-#include <asm/mach/map.h>
 #include <asm/memory.h>
 
-void apple_aic1_arm_cpu0(void);
-void apple_aic1_hw_quiesce(bool read_back);
 pid_t __init apple_s5l_rest_spawn_init(int (*fn)(void *), void *arg,
 				       unsigned long flags);
 
@@ -40,34 +36,6 @@ void __init apple_s5l_pmu_clkevt_init(unsigned long cpu_hz);
 /* P105AP recovery scanout address. */
 #define P105_FB_PHYS	0x9f6fc000
 
-#define P105_AIC_PHYS	0x3f200000
-#define P105_AIC_VIRT	0xF0500000UL
-
-/* aic1-lab v30: EVENT is per-CPU @ 0x5004; 0x2004 stays idle on aic,1 */
-#define P105_AIC_CONFIG		0x0010
-#define P105_AIC_EVENT		0x2004
-#define P105_AIC_EVENT_CPU0	0x5004
-#define P105_AIC_IPI_ACK	0x200c
-#define P105_AIC_IPI_MASK_SET	0x2024
-#define P105_AIC_SW_CLR		0x4080
-#define P105_AIC_MASK_SET	0x4100
-#define P105_AIC_TARGET_CPU	0x3000
-#define P105_AIC_NR_IRQ		192
-#define P105_AIC_NR_WORDS	6
-
-/*
- * For the early quiesce/rearm code only.  The AIC driver maps the block again
- * itself, strongly-ordered -- see aic1_of_init() in irq-apple-aic1.c.  (Made
- * MT_UNCACHED here, this static map came out without page tables and the
- * driver, reusing it, faulted at the first read.)
- */
-static struct map_desc apple_aic_desc __initdata = {
-	.virtual	= P105_AIC_VIRT,
-	.pfn		= __phys_to_pfn(P105_AIC_PHYS),
-	.length		= SZ_1M,
-	.type		= MT_DEVICE,
-};
-
 /*
  * Lab: CBAR phys 0x3E100000 R/W is fine bare-metal.  Under Linux, both
  * ioremap and static MT_DEVICE map of that window hang (aic1q33 stuck after
@@ -76,88 +44,6 @@ static struct map_desc apple_aic_desc __initdata = {
 void apple_a9_gic_drain(void)
 {
 	/* no CBAR map — AIC drain only */
-}
-
-/*
- * Early aic,1 quiesce (aic1-lab v30 P0 + E5 drain):
- * TARGET=0, MASK, IPI, drain EVENT@0x5004 (and 0x2004), CFG.enable=0.
- * Never PMGR gate 0x4D while AIC must live.
- */
-void apple_aic1_hw_quiesce(bool read_back)
-{
-	void __iomem *base = (void __iomem *)P105_AIC_VIRT;
-	unsigned int i, n, cpu;
-	u32 cfg;
-
-	for (i = 0; i < P105_AIC_NR_WORDS; i++) {
-		writel_relaxed(~0U, base + P105_AIC_MASK_SET + i * 4);
-		writel_relaxed(~0U, base + P105_AIC_SW_CLR + i * 4);
-	}
-
-	for (i = 0; i < P105_AIC_NR_IRQ; i++)
-		writel_relaxed(0, base + P105_AIC_TARGET_CPU + i * 4);
-
-	writel_relaxed(~0U, base + P105_AIC_IPI_MASK_SET);
-	writel_relaxed(BIT(31) | BIT(0), base + P105_AIC_IPI_ACK);
-	writel_relaxed(~0U, base + P105_AIC_IPI_MASK_SET);
-	for (i = 0; i < 2; i++) {
-		writel_relaxed(BIT(31) | BIT(0), base + 0x500c + (i << 7));
-		writel_relaxed(~0U, base + 0x5024 + (i << 7));
-	}
-
-	for (n = 0; n < 512; n++) {
-		u32 any = readl_relaxed(base + P105_AIC_EVENT);
-
-		for (cpu = 0; cpu < 2; cpu++)
-			any |= readl_relaxed(base + P105_AIC_EVENT_CPU0 +
-					     (cpu << 7));
-		if (!any)
-			break;
-	}
-
-	for (i = 0; i < P105_AIC_NR_WORDS; i++)
-		writel_relaxed(~0U, base + P105_AIC_MASK_SET + i * 4);
-
-	cfg = readl_relaxed(base + P105_AIC_CONFIG);
-	cfg |= 0xE0000000U;
-	cfg &= ~BIT(0);
-	writel_relaxed(cfg, base + P105_AIC_CONFIG);
-	dsb(sy);
-
-	if (read_back) {
-		/*
-		 * Reading EVENT consumes a pending event. Keep the readback
-		 * sequence used during the first quiesce.
-		 */
-		readl_relaxed(base + P105_AIC_CONFIG);
-		readl_relaxed(base + P105_AIC_EVENT_CPU0);
-		readl_relaxed(base + P105_AIC_TARGET_CPU);
-	}
-}
-
-/* Affinity to CPU0 after IRQs are on; drain per-CPU EVENT. */
-void apple_aic1_arm_cpu0(void)
-{
-	void __iomem *base = (void __iomem *)P105_AIC_VIRT;
-	unsigned int i, n, cpu;
-
-	for (i = 0; i < P105_AIC_NR_WORDS; i++) {
-		writel_relaxed(~0U, base + P105_AIC_MASK_SET + i * 4);
-		writel_relaxed(~0U, base + P105_AIC_SW_CLR + i * 4);
-	}
-	for (i = 0; i < P105_AIC_NR_IRQ; i++)
-		writel_relaxed(BIT(0), base + P105_AIC_TARGET_CPU + i * 4);
-	for (i = 0; i < P105_AIC_NR_WORDS; i++)
-		writel_relaxed(~0U, base + P105_AIC_MASK_SET + i * 4);
-	for (n = 0; n < 512; n++) {
-		u32 any = readl_relaxed(base + P105_AIC_EVENT);
-
-		for (cpu = 0; cpu < 2; cpu++)
-			any |= readl_relaxed(base + P105_AIC_EVENT_CPU0 +
-					     (cpu << 7));
-		if (!any)
-			break;
-	}
 }
 
 pid_t __init apple_s5l_rest_spawn_init(int (*fn)(void *), void *arg,
@@ -171,11 +57,6 @@ static void __init apple_s5l_reserve(void)
 	phys_addr_t phys = P105_FB_PHYS & ~(SZ_1M - 1);
 
 	memblock_remove(phys, P105_FB_PHYS - phys);
-}
-
-static void __init apple_s5l_map_io(void)
-{
-	iotable_init(&apple_aic_desc, 1);
 }
 
 /*
@@ -273,7 +154,6 @@ static const char * const apple_s5l_dt_compat[] __initconst = {
 DT_MACHINE_START(APPLE_S5L, "Apple S5L (Device Tree)")
 	.dt_compat	= apple_s5l_dt_compat,
 	.reserve	= apple_s5l_reserve,
-	.map_io		= apple_s5l_map_io,
 	.init_early	= apple_s5l_a9_errata,
 	.init_irq	= apple_s5l_init_irq,
 	.init_time	= apple_s5l_init_time,
