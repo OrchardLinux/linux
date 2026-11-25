@@ -343,7 +343,7 @@ do_alignment_ldrhstrh(unsigned long addr, u32 instr, struct pt_regs *regs)
 
 	ai_half += 1;
 
-	if (user_mode(regs) || addr < TASK_SIZE)
+	if (user_mode(regs))
 		goto user;
 
 	if (LDST_L_BIT(instr)) {
@@ -405,7 +405,7 @@ do_alignment_ldrdstrd(unsigned long addr, u32 instr, struct pt_regs *regs)
 
 	ai_dword += 1;
 
-	if (user_mode(regs) || addr < TASK_SIZE)
+	if (user_mode(regs))
 		goto user;
 
 	if (load) {
@@ -454,8 +454,7 @@ do_alignment_ldrstr(unsigned long addr, u32 instr, struct pt_regs *regs)
 
 	ai_word += 1;
 
-	if ((!LDST_P_BIT(instr) && LDST_W_BIT(instr)) || user_mode(regs) ||
-	    addr < TASK_SIZE)
+	if ((!LDST_P_BIT(instr) && LDST_W_BIT(instr)) || user_mode(regs))
 		goto trans;
 
 	if (LDST_L_BIT(instr)) {
@@ -546,7 +545,7 @@ do_alignment_ldmstm(unsigned long addr, u32 instr, struct pt_regs *regs)
 	}
 #endif
 
-	if (user_mode(regs) || addr < TASK_SIZE) {
+	if (user_mode(regs)) {
 		unsigned int __ua_flags = uaccess_save_and_enable();
 		for (regbits = REGMASK_BITS(instr), rd = 0; regbits;
 		     regbits >>= 1, rd += 1)
