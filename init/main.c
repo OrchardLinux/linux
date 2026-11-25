@@ -698,11 +698,6 @@ static void __init setup_command_line(char *command_line)
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
 
-#ifdef CONFIG_ARCH_APPLE_S5L
-pid_t __init apple_s5l_rest_spawn_init(int (*fn)(void *), void *arg,
-				       unsigned long flags);
-#endif
-
 static noinline void __ref __noreturn rest_init(void)
 {
 	struct task_struct *tsk;
@@ -714,11 +709,7 @@ static noinline void __ref __noreturn rest_init(void)
 	 * the init task will end up wanting to create kthreads, which, if
 	 * we schedule it before we create kthreadd, will OOPS.
 	 */
-#ifdef CONFIG_ARCH_APPLE_S5L
-	pid = apple_s5l_rest_spawn_init(kernel_init, NULL, CLONE_FS);
-#else
 	pid = user_mode_thread(kernel_init, NULL, CLONE_FS);
-#endif
 	/*
 	 * Pin init on the boot CPU. Task migration is not properly working
 	 * until sched_init_smp() has been run. It will set the allowed
@@ -1286,10 +1277,7 @@ int __init_or_module do_one_initcall(initcall_t fn)
 	}
 	if (irqs_disabled()) {
 		strlcat(msgbuf, "disabled interrupts ", sizeof(msgbuf));
-#ifdef CONFIG_ARCH_APPLE_S5L
-		if (!early_boot_irqs_disabled)
-#endif
-			local_irq_enable();
+		local_irq_enable();
 	}
 	WARN(msgbuf[0], "initcall %pS returned with %s\n", fn, msgbuf);
 

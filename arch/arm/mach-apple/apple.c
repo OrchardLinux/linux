@@ -12,13 +12,9 @@
 #include <linux/memblock.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
-#include <linux/sched/task.h>
 #include <asm/cputype.h>
 #include <asm/mach/arch.h>
 #include <asm/memory.h>
-
-pid_t __init apple_s5l_rest_spawn_init(int (*fn)(void *), void *arg,
-				       unsigned long flags);
 
 void __init apple_s5l_pmccntr_enable_counter(void);
 void __init apple_s5l_pmccntr_init(unsigned long rate);
@@ -28,12 +24,6 @@ void __init apple_s5l_pmu_clkevt_init(unsigned long cpu_hz);
 
 /* P105AP recovery scanout address. */
 #define P105_FB_PHYS	0x9f6fc000
-
-pid_t __init apple_s5l_rest_spawn_init(int (*fn)(void *), void *arg,
-				       unsigned long flags)
-{
-	return user_mode_thread(fn, arg, flags | CLONE_FILES);
-}
 
 static void __init apple_s5l_reserve(void)
 {
