@@ -37,6 +37,16 @@ struct nvme_pci_dma_ops {
 	void (*exit)(struct nvme_dev *dev);
 	int (*preinit)(struct nvme_dev *dev);
 	int (*prepare_enable)(struct nvme_dev *dev);
+	/* Controller register hooks for CC writes and CSTS reads (optional) */
+	int (*write_cc)(struct nvme_dev *dev, u32 cc);
+	int (*read_csts)(struct nvme_dev *dev, u32 *csts);
+	/*
+	 * Stop for sleep (optional, see nvme_dev.sleep_stop): @drain before
+	 * the shutdown, with the I/O queues idle; @stopped once the
+	 * controller is disabled and off the bus.
+	 */
+	int (*drain)(struct nvme_dev *dev);
+	int (*stopped)(struct nvme_dev *dev);
 	blk_status_t (*map_data)(struct request *req);
 	bool (*unmap_data)(struct request *req);
 	u32 (*queue_depth)(struct nvme_dev *dev, u32 depth);
@@ -75,6 +85,10 @@ struct nvme_dev {
 	mempool_t *dmavec_mempool;
 	const struct nvme_pci_dma_ops *dma_ops;
 	void *dma_data;
+	/* Enable bus mastering only once the glue's preinit has run */
+	bool late_bus_master;
+	/* The controller loses power in system sleep: stop it completely */
+	bool sleep_stop;
 
 	/* shadow doorbell buffer support: */
 	__le32 *dbbuf_dbs;
@@ -189,5 +203,8 @@ struct nvme_iod {
 };
 
 extern const struct nvme_pci_dma_ops nvme_pci_apple_ans_ops;
+
+bool nvme_pci_apple_ans_match(struct pci_dev *pdev);
+unsigned long nvme_pci_apple_ans_quirks(struct pci_dev *pdev);
 
 #endif /* _NVME_PCI_INTERNAL_H */

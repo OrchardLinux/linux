@@ -2155,6 +2155,12 @@ static bool nvme_update_disk_info(struct nvme_ns *ns, struct nvme_id_ns *id,
 	else
 		lim->max_hw_discard_sectors = 0;
 
+	/* The primary-namespace trial admits ordinary Write and Flush only. */
+	if (ctrl->quirks & NVME_QUIRK_PRIMARY_NS_WRITES) {
+		lim->max_write_zeroes_sectors = 0;
+		lim->max_hw_discard_sectors = 0;
+	}
+
 	/*
 	 * NVMe namespaces advertise both a preferred deallocate granularity
 	 * (for a discard length) and alignment (for a discard starting offset).
@@ -2194,7 +2200,10 @@ static bool nvme_update_disk_info(struct nvme_ns *ns, struct nvme_id_ns *id,
 
 static bool nvme_ns_is_readonly(struct nvme_ns *ns, struct nvme_ns_info *info)
 {
-	return info->is_readonly || test_bit(NVME_NS_FORCE_RO, &ns->flags);
+	return info->is_readonly || test_bit(NVME_NS_FORCE_RO, &ns->flags) ||
+	       ((ns->ctrl->quirks & NVME_QUIRK_READ_ONLY) &&
+		(!(ns->ctrl->quirks & NVME_QUIRK_PRIMARY_NS_WRITES) ||
+		 ns->head->ns_id != 1));
 }
 
 static inline bool nvme_first_scan(struct gendisk *disk)
@@ -3791,6 +3800,10 @@ int nvme_init_ctrl_finish(struct nvme_ctrl *ctrl, bool was_suspended)
 		ctrl->queue_count = 1;
 	}
 
+	/* Read-only bring-up leaves optional controller features untouched. */
+	if (ctrl->quirks & NVME_QUIRK_READ_ONLY)
+		goto skip_optional_features;
+
 	ret = nvme_configure_apst(ctrl);
 	if (ret < 0)
 		return ret;
@@ -3805,6 +3818,7 @@ int nvme_init_ctrl_finish(struct nvme_ctrl *ctrl, bool was_suspended)
 
 	nvme_configure_opal(ctrl, was_suspended);
 
+skip_optional_features:
 	if (!ctrl->identified && !nvme_discovery_ctrl(ctrl)) {
 		/*
 		 * Do not return errors unless we are in a controller reset,
