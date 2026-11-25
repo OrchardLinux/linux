@@ -1566,6 +1566,14 @@ static inline bool nvme_poll_cq(struct nvme_queue *nvmeq,
  * The actions of one IRQ never run concurrently, so this needs no more locking
  * than a single CQ. Threaded handlers can run concurrently and keep the
  * per-queue behaviour.
+ *
+ * The pass that finds nothing is only final once the controller has seen the
+ * CQ doorbells written before it, and everything the controller wrote before
+ * that has reached memory: until then a completion can be posted to a CQ the
+ * controller still takes for non-empty, with no MSI, or be on its way behind
+ * the MSI that announced it. A register read orders both (it can't pass the
+ * posted doorbell writes, and its completion can't pass the controller's
+ * posted writes), so read one after an empty pass and look once more.
  */
 static bool nvme_apple_ans_shared_vector(struct nvme_dev *dev)
 {
@@ -1585,19 +1593,31 @@ static bool nvme_apple_ans_vector_queue(struct nvme_queue *nvmeq, u16 vector)
 static bool nvme_apple_ans_irq_vector(struct nvme_dev *dev, u16 vector,
 				      struct io_comp_batch *iob)
 {
-	bool found = false, more;
+	bool found = false, flushed = false, more, enabled;
 	unsigned int i;
 
 	do {
 		more = false;
+		enabled = false;
 		for (i = 0; i < dev->ctrl.queue_count; i++) {
 			struct nvme_queue *nvmeq = &dev->queues[i];
 
-			if (nvme_apple_ans_vector_queue(nvmeq, vector) &&
-			    nvme_poll_cq(nvmeq, nvmeq->qid ? iob : NULL))
+			if (!nvme_apple_ans_vector_queue(nvmeq, vector))
+				continue;
+			enabled = true;
+			if (nvme_poll_cq(nvmeq, nvmeq->qid ? iob : NULL))
 				more = true;
 		}
 		found |= more;
+
+		if (more) {
+			flushed = false;
+		} else if (enabled && !flushed) {
+			/* With no queue enabled the link can be down */
+			readl(dev->bar + NVME_REG_CSTS);
+			flushed = true;
+			more = true;
+		}
 	} while (more);
 
 	return found;
