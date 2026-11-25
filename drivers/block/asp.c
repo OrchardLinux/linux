@@ -584,7 +584,12 @@ static blk_status_t apple_asp_submit_cmd(struct apple_asp *asp,
 		      | FIELD_PREP(ASP_SUBMIT_TAG, cmd->tag)
 		      | FIELD_PREP(ASP_SUBMIT_OP, ASP_SUBMIT_OP_RING);
 
-	ret = apple_rtkit_send_message(asp->rtk, asp->ep, rtk_msg, NULL, false);
+	/*
+	 * ->queue_rq() runs under rcu_read_lock() and must not sleep: send
+	 * the doorbell without taking the mailbox's TX mutex, polling if the
+	 * FIFO is full.
+	 */
+	ret = apple_rtkit_send_message(asp->rtk, asp->ep, rtk_msg, NULL, true);
 	if (ret == -ETIMEDOUT)
 		return BLK_STS_TIMEOUT;
 	else if (ret < 0)
