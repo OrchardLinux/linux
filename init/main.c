@@ -1490,7 +1490,7 @@ static int __ref kernel_init(void *unused)
 
 		apple_aic1_quiesce();
 		apple_aic1_hw_quiesce(true);
-		/* CFG off; keep early_irq_escape for sticky nIRQ */
+		/* Check for a sticky nIRQ with the controller disabled. */
 		early_boot_irqs_disabled = false;
 		local_irq_enable();
 		local_irq_disable();
@@ -1501,7 +1501,6 @@ static int __ref kernel_init(void *unused)
 		early_boot_irqs_disabled = true;
 	}
 	{
-		void apple_aic1_release_escape(void);
 		void apple_aic1_quiesce(void);
 		void apple_aic1_hw_quiesce(bool read_back);
 		void apple_aic1_rearm(void);
@@ -1516,7 +1515,6 @@ static int __ref kernel_init(void *unused)
 		apple_aic1_rearm();
 		early_boot_irqs_disabled = false;
 		local_irq_enable();
-		apple_aic1_release_escape();
 		/* The tick, before workqueue_init() makes the first kernel
 		 * threads: kthread_bind() can sleep one tick in
 		 * wait_task_inactive(), and with no clockevent yet that sleep

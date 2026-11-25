@@ -20,13 +20,6 @@
 pid_t __init apple_s5l_rest_spawn_init(int (*fn)(void *), void *arg,
 				       unsigned long flags);
 
-/*
- * Lab IRQ stub forced SPSR.I on return against sticky nIRQ.  Keep true through
- * first enables; apple_aic1_release_escape() clears it after 0x5004 drain +
- * successful irq_thaw (aic1-lab v30: I0 HOLD OK without force).
- */
-bool apple_aic1_early_irq_escape = true;
-
 void __init apple_s5l_pmccntr_enable_counter(void);
 void __init apple_s5l_pmccntr_init(unsigned long rate);
 unsigned long __init apple_s5l_calibrate_cpu_hz(void);
@@ -35,16 +28,6 @@ void __init apple_s5l_pmu_clkevt_init(unsigned long cpu_hz);
 
 /* P105AP recovery scanout address. */
 #define P105_FB_PHYS	0x9f6fc000
-
-/*
- * Lab: CBAR phys 0x3E100000 R/W is fine bare-metal.  Under Linux, both
- * ioremap and static MT_DEVICE map of that window hang (aic1q33 stuck after
- * printing CP15 CBAR).  Skip GIC MMIO; rely on AIC EVENT@0x5004 drain.
- */
-void apple_a9_gic_drain(void)
-{
-	/* no CBAR map — AIC drain only */
-}
 
 pid_t __init apple_s5l_rest_spawn_init(int (*fn)(void *), void *arg,
 				       unsigned long flags)

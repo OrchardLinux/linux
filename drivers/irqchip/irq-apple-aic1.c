@@ -131,11 +131,9 @@ static struct apple_aic1 *apple_aic1;
  * Read by the late_initcall smoke-test at the bottom of the file. */
 static unsigned int aic1_handler_entries;
 
-void apple_a9_gic_drain(void);
 void apple_aic1_arm_cpu0(void);
 void apple_aic1_hw_quiesce(bool read_back);
 int __init apple_aic1_timer_start(void);
-extern bool apple_aic1_early_irq_escape;
 
 static void aic1_tmr_event(struct apple_aic1 *aic);
 
@@ -506,17 +504,6 @@ static int __init aic1_init_smp(struct apple_aic1 *aic) { return 0; }
 void apple_aic1_ipi_wake(unsigned int cpu) { }
 #endif
 
-/**
- * apple_aic1_release_escape - drop SPSR.I force after lab-proven drain
- *
- * Call only after aic1_clear_sticky_nirq() / hw_quiesce and a successful
- * local_irq_enable window (see irq_thaw / arm_cpu0).
- */
-void apple_aic1_release_escape(void)
-{
-	apple_aic1_early_irq_escape = false;
-}
-
 /** Software-trigger one hwirq (lab SW_SET path). */
 void apple_aic1_sw_trigger(unsigned int hwirq)
 {
@@ -586,15 +573,9 @@ static void __exception_irq_entry aic1_handle_irq(struct pt_regs *regs)
 
 	aic1_handler_entries++;
 
-	if (apple_aic1_early_irq_escape)
-		regs->ARM_cpsr |= PSR_I_BIT;
-
-	if (!aic) {
-		apple_a9_gic_drain();
+	if (!aic)
 		return;
-	}
 
-	apple_a9_gic_drain();
 	event = aic1_read_event(aic);
 	if (!event) {
 		/* They do happen in normal running, a few a minute.  Not
@@ -737,14 +718,9 @@ static int __init aic1_of_init(struct device_node *node,
 	 * Turn it back on now that IPI/domain setup is done. */
 	aic1_enable_hw(aic);
 
-	/* FIX (2026-09-13): drop the early-IRQ escape (forces PSR.I on handler
-	 * return). Was intended to be cleared after "first enables" but the
-	 * caller was never wired up. Without this, CPU stays interrupt-blind. */
-	apple_aic1_early_irq_escape = false;
-
-	pr_info("aic,1: %u IRQs, WHOAMI=%u, CONFIG=%#x (EVENT@0x5004), escape=%d\n",
+	pr_info("aic,1: %u IRQs, WHOAMI=%u, CONFIG=%#x (EVENT@0x5004)\n",
 		aic->nr_irq, aic1_read(aic, AIC1_WHOAMI),
-		aic1_read(aic, AIC1_CONFIG), apple_aic1_early_irq_escape);
+		aic1_read(aic, AIC1_CONFIG));
 
 	/* DIAG-2 (2026-09-13): bulk unmask ALL IRQs — MASK register semantics
 	 * are set/clr write-only (reading returns 0xffffffff on this HW),
