@@ -26,6 +26,7 @@
 #include <linux/ioport.h>
 #include <linux/init.h>
 #include <linux/initrd.h>
+#include <linux/irqchip/apple-aic1.h>
 #include <linux/memblock.h>
 #include <linux/acpi.h>
 #include <linux/bootconfig.h>
@@ -1466,50 +1467,8 @@ static int __ref kernel_init(void *unused)
 	 */
 	wait_for_completion(&kthreadd_done);
 
-	/*
-	 * P105AP: AIC bring-up before initcalls.
-	 */
-#ifdef CONFIG_ARCH_APPLE_S5L
-	{
-		void apple_aic1_quiesce(void);
-		void apple_aic1_hw_quiesce(bool read_back);
-		void apple_aic1_enable(void);
-		void apple_aic1_arm_cpu0(void);
-
-		apple_aic1_quiesce();
-		apple_aic1_hw_quiesce(true);
-		/* Check for a sticky nIRQ with the controller disabled. */
-		early_boot_irqs_disabled = false;
-		local_irq_enable();
-		local_irq_disable();
-		apple_aic1_enable();
-		apple_aic1_arm_cpu0();
-		local_irq_enable();
-		local_irq_disable();
-		early_boot_irqs_disabled = true;
-	}
-	{
-		void apple_aic1_quiesce(void);
-		void apple_aic1_hw_quiesce(bool read_back);
-		void apple_aic1_rearm(void);
-		int apple_aic1_timer_start(void);
-
-		apple_aic1_quiesce();
-		apple_aic1_hw_quiesce(false);
-		/* FIX (2026-09-14): both quiesce calls above clear CFG.ENABLE and zero
-		 * TARGET_CPU for all 192 lines.  Without this re-arm the AIC stays dead
-		 * for the whole of do_initcalls(), which is why every /proc/interrupts
-		 * counter (incl. IPIs) stayed at 0. */
-		apple_aic1_rearm();
-		early_boot_irqs_disabled = false;
-		local_irq_enable();
-		/* The tick, before workqueue_init() makes the first kernel
-		 * threads: kthread_bind() can sleep one tick in
-		 * wait_task_inactive(), and with no clockevent yet that sleep
-		 * never ends (irq-apple-aic1.c, apple_aic1_timer_start). */
-		apple_aic1_timer_start();
-	}
-#endif
+	/* AIC1 needs a clockevent before kernel_init_freeable starts workers. */
+	apple_aic1_prepare_boot();
 	kernel_init_freeable();
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
