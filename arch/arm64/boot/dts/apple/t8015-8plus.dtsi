@@ -7,3 +7,31 @@
 
 /* The 8 Plus has minor differences like 1 more camera, 1 GiB of RAM more and a bigger display. */
 #include "t8015-8.dtsi"
+
+&smc {
+	smc_regulators: regulators {
+		compatible = "apple,t8015-smc-regulator";
+
+		mesa_1v8: mesa-1v8 {
+			regulator-name = "mesa-1v8";
+		};
+
+		mesa_3v0: mesa-3v0 {
+			regulator-name = "mesa-3v0";
+		};
+	};
+};
+
+&spi3 {
+	status = "okay";
+
+	/* Touch ID sensor: SPI mode 2 (clock idles high, sample on the first edge) */
+	touch-id@0 {
+		compatible = "apple,mesa";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+		spi-cpol;
+		vdd18-supply = <&mesa_1v8>;
+		vdd30-supply = <&mesa_3v0>;
+	};
+};
