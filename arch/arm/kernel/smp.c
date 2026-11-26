@@ -469,8 +469,7 @@ asmlinkage void secondary_start_kernel(struct task_struct *task)
 	complete(&cpu_running);
 
 	local_irq_enable();
-	/* Cascadia: the A5's AIC delivers everything as IRQ; FIQ stays off on
-	 * secondaries until something is known to need it. */
+	local_fiq_enable();
 	local_abt_enable();
 
 	/*

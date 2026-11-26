@@ -28,7 +28,9 @@
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/irqchip.h>
+#include <linux/irqchip/apple-aic1.h>
 #include <linux/irqdomain.h>
+#include <linux/irqflags.h>
 #include <linux/math64.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
@@ -130,9 +132,6 @@ static struct apple_aic1 *apple_aic1;
  * whether the CPU ever takes an IRQ exception from AIC1's output line.
  * Read by the late_initcall smoke-test at the bottom of the file. */
 static unsigned int aic1_handler_entries;
-
-void apple_a9_gic_drain(void);
-extern bool apple_aic1_early_irq_escape;
 
 static void aic1_tmr_event(struct apple_aic1 *aic);
 
@@ -271,70 +270,23 @@ static unsigned int aic1_event_hwirq(struct apple_aic1 *aic, u32 event)
 	return aic->nr_irq;
 }
 
-void apple_aic1_quiesce(void)
-{
-	struct apple_aic1 *aic = apple_aic1;
-
-	if (!aic)
-		return;
-
-	aic1_clear_sticky_nirq(aic);
-}
-
-void apple_aic1_enable(void)
-{
-	struct apple_aic1 *aic = apple_aic1;
-
-	if (!aic)
-		return;
-
-	aic1_enable_hw(aic);
-}
-
-/**
- * apple_aic1_rearm - bring AIC1 back to a live-but-quiet state
- *
- * kernel_init() quiesces AIC1 (mask all, TARGET=0, CFG.ENABLE=0) right before
- * do_initcalls() and never turns it back on, so every driver that requests an
- * IRQ afterwards gets a dead controller.  Call this at the end of that quiesce:
- * every hardware line stays MASKED (drivers unmask through request_irq, so no
- * sticky-line storm), but routing is restored to CPU0, IPIs are live again and
- * CFG.ENABLE is set.
+/*
+ * Keep hardware IRQs masked until their drivers request them. Restore
+ * CPU0 routing and IPIs before probing the first clockevent.
  */
-void apple_aic1_rearm(void)
+static void aic1_rearm(struct apple_aic1 *aic)
 {
-	struct apple_aic1 *aic = apple_aic1;
-	unsigned int i, nr_words;
-
-	if (!aic) {
-		pr_err("AIC1-REARM: no aic instance, skipping\n");
-		return;
-	}
-
-	nr_words = DIV_ROUND_UP(aic->nr_irq, 32);
-
-	/* Keep every HW line masked and free of stale SW triggers. */
-	for (i = 0; i < nr_words; i++) {
-		aic1_write(aic, AIC1_MASK_SET + i * 4, ~0U);
-		aic1_write(aic, AIC1_SW_CLR + i * 4, ~0U);
-	}
-
-	/* Route every line at CPU0 (quiesce zeroed all of them). */
-	for (i = 0; i < aic->nr_irq; i++)
-		aic1_write(aic, AIC1_TARGET_CPU + i * 4, BIT(0));
-
+	aic1_mask_all(aic);
+	aic1_target_all(aic, BIT(0));
 	aic1_drain_events(aic);
 
-	/* IPIs back on for this CPU. */
 	aic1_write(aic, AIC1_IPI_MASK_CLR, AIC1_IPI_OTHER | AIC1_IPI_SELF);
 	aic1_write(aic, AIC1_CPU_IPI_MASK_CLR(0), ~0U);
-
 	aic1_enable_hw(aic);
 	dsb(sy);
 
-	pr_err("AIC1-REARM: CONFIG=%#x (ENABLE=%u) all lines masked, TARGET=CPU0, IPI live\n",
-	       aic1_read(aic, AIC1_CONFIG),
-	       !!(aic1_read(aic, AIC1_CONFIG) & AIC1_CONFIG_ENABLE));
+	pr_info("AIC1-REARM: CONFIG=%#x, all lines masked, TARGET=CPU0, IPI live\n",
+		aic1_read(aic, AIC1_CONFIG));
 }
 
 #ifdef CONFIG_SMP
@@ -467,17 +419,6 @@ static int __init aic1_init_smp(struct apple_aic1 *aic) { return 0; }
 void apple_aic1_ipi_wake(unsigned int cpu) { }
 #endif
 
-/**
- * apple_aic1_release_escape - drop SPSR.I force after lab-proven drain
- *
- * Call only after aic1_clear_sticky_nirq() / hw_quiesce and a successful
- * local_irq_enable window (see irq_thaw / arm_cpu0).
- */
-void apple_aic1_release_escape(void)
-{
-	apple_aic1_early_irq_escape = false;
-}
-
 /** Software-trigger one hwirq (lab SW_SET path). */
 void apple_aic1_sw_trigger(unsigned int hwirq)
 {
@@ -547,15 +488,9 @@ static void __exception_irq_entry aic1_handle_irq(struct pt_regs *regs)
 
 	aic1_handler_entries++;
 
-	if (apple_aic1_early_irq_escape)
-		regs->ARM_cpsr |= PSR_I_BIT;
-
-	if (!aic) {
-		apple_a9_gic_drain();
+	if (!aic)
 		return;
-	}
 
-	apple_a9_gic_drain();
 	event = aic1_read_event(aic);
 	if (!event) {
 		/* They do happen in normal running, a few a minute.  Not
@@ -648,8 +583,8 @@ static int __init aic1_of_init(struct device_node *node,
 	 * PL310, bufferable writes lose the writing CPU's identity on their way
 	 * through its store buffer, and IPI_SEND in the per-CPU 0x2000 window
 	 * then sends nothing (the same write from /dev/mem, strongly-ordered,
-	 * arrives).  Not the static MT_DEVICE map in mach-apple/apple.c: the
-	 * types differ, so this gets a mapping of its own. */
+	 * arrives). The boot quiesce and rearm code uses this mapping too.
+	 */
 	{
 		struct resource res;
 
@@ -698,14 +633,9 @@ static int __init aic1_of_init(struct device_node *node,
 	 * Turn it back on now that IPI/domain setup is done. */
 	aic1_enable_hw(aic);
 
-	/* FIX (2026-09-13): drop the early-IRQ escape (forces PSR.I on handler
-	 * return). Was intended to be cleared after "first enables" but the
-	 * caller was never wired up. Without this, CPU stays interrupt-blind. */
-	apple_aic1_early_irq_escape = false;
-
-	pr_info("aic,1: %u IRQs, WHOAMI=%u, CONFIG=%#x (EVENT@0x5004), escape=%d\n",
+	pr_info("aic,1: %u IRQs, WHOAMI=%u, CONFIG=%#x (EVENT@0x5004)\n",
 		aic->nr_irq, aic1_read(aic, AIC1_WHOAMI),
-		aic1_read(aic, AIC1_CONFIG), apple_aic1_early_irq_escape);
+		aic1_read(aic, AIC1_CONFIG));
 
 	/* DIAG-2 (2026-09-13): bulk unmask ALL IRQs — MASK register semantics
 	 * are set/clr write-only (reading returns 0xffffffff on this HW),
@@ -999,34 +929,16 @@ static bool __init aic1_tmr_try(struct apple_aic1 *aic, u32 win,
 	return false;
 }
 
-/*
- * Register only on a timer seen to fire.  Failing leaves the system exactly as
- * it was -- the SOF tick carries on -- so this cannot cost a boot.
- *
- * kernel_init() calls apple_aic1_timer_start() as soon as the AIC is re-armed
- * and interrupts are on (init/main.c, in patches/tree/0001), before
- * workqueue_init() makes the first kernel threads.  That is required, not
- * tidy: kthread_bind() waits in wait_task_inactive(), and if the scheduler
- * has preempted the new thread before it slept, the wait is a one-tick
- * hrtimer sleep.  With no clockevent that sleep never ends.  Whether the
- * thread is preempted depends on timing, so on the J1 the boot hung or not
- * with how slow the early console was (a 2 ms delay per message was enough
- * to pass; earlycon=j1fb's drawing too).  The early_initcall below is the
- * fallback for a kernel without that call.
- *
- * early_initcall: dwc2 decides whether to take Start-of-Frame interrupts
- * when it first initialises the core, at device_initcall, and it asks whether
- * this timer is live; and it must come before smp_init().  Until it runs there
- * is no clockevent at all and jiffies stand still -- harmless on one CPU, but
- * with CPU1 online the first RCU grace period waits for ever and the boot
- * stops here.  Registered first, it hands CPU1 a clockevent of its own through
- * the STARTING callback as CPU1 comes up, the same order as onlining CPU1 by
- * hand.  The AIC is re-armed and interrupts are on before any initcall runs
- * (init/main.c), so the probe below still sees the timer fire.
- */
 static bool aic1_tmr_tried __initdata;
 
-int __init apple_aic1_timer_start(void)
+/*
+ * Probe once interrupts are usable. The boot CPU needs a clockevent before
+ * workqueue_init() starts kernel threads: kthread_bind() can sleep on an
+ * hrtimer in wait_task_inactive() before early initcalls. Registering here
+ * also gives CPU1 its clockevent as it comes online and lets dwc2 decide
+ * whether the USB SOF fallback is needed when it probes.
+ */
+static int __init aic1_timer_init(void)
 {
 	struct apple_aic1 *aic = apple_aic1;
 
@@ -1068,9 +980,20 @@ int __init apple_aic1_timer_start(void)
 	return 0;
 }
 
-static int __init aic1_timer_init(void)
+void __init apple_aic1_prepare_boot(void)
 {
-	return apple_aic1_timer_start();
+	struct apple_aic1 *aic = apple_aic1;
+	unsigned long flags;
+
+	if (!aic)
+		return;
+
+	local_irq_save(flags);
+	aic1_clear_sticky_nirq(aic);
+	aic1_rearm(aic);
+	local_irq_restore(flags);
+
+	aic1_timer_init();
 }
 early_initcall(aic1_timer_init);
 
