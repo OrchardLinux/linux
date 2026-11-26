@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Apple T8010 SmartIO coprocessor driver
+ * Apple S8000/T8010 SmartIO coprocessor driver
  *
  * Copyright (C) 2026 Paul Praschl
  */
@@ -13,7 +13,6 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
-#include <linux/idr.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -23,34 +22,102 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/refcount.h>
+#include <linux/reset.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/sio.h>
 #include <linux/xarray.h>
 
-#define APPLE_SIO_REMAP_AP_LO		0x0008
-#define APPLE_SIO_REMAP_AP_HI		0x0010
-#define APPLE_SIO_REMAP_IOP_LO		0x0018
-#define APPLE_SIO_REMAP_IOP_HI		0x0020
-#define APPLE_SIO_REMAP_SIZE_LO		0x0028
-#define APPLE_SIO_REMAP_SIZE_HI		0x0030
-#define APPLE_SIO_REMAP_ENABLE		0x0038
-#define APPLE_SIO_CPU_CONTROL		0x0044
+/*
+ * AppleA7IOP register layout. Version 2 (S8000, T8010) and version 1 (T7000
+ * and T7001, the A8 and A8X) differ only in where the registers sit; iOS's
+ * AppleA7IOPV1 and AppleA7IOPV2 program them in the same order. The A7
+ * (S5L8960X) block has the version 1 layout.
+ */
+struct apple_sio_regs {
+	u32 remap_ap_lo;
+	u32 remap_ap_hi;
+	u32 remap_iop_lo;
+	u32 remap_iop_hi;
+	u32 remap_size_lo;
+	u32 remap_size_hi;
+	u32 remap_enable;
+	u32 cpu_control;
+	u32 time_lo;
+	u32 time_hi;
+	u32 mbox;		/* base of the mailbox registers below */
+	bool mirror;		/* V2: mask writes are mirrored at 0xc00/0xc04 */
+	bool legacy_status;	/* V2: an older IRQ status at 0xb84 */
+	bool enable_tx;		/* V1: the AP enables the A2I FIFO itself */
+	/* A7: neither set nor wait for the A2I enable bit, as measured on a J72 */
+	bool tx_no_enable;
+	/* A7: the boot loader leaves a remap on; turn it off before replacing it */
+	bool remap_off_first;
+};
+
 #define APPLE_SIO_CPU_RUN		BIT(4)
 #define APPLE_SIO_TIME_CONTROL		0x080c
 #define APPLE_SIO_IRQ_STATUS_LEGACY	0x0b84
 #define APPLE_SIO_IRQ_STATUS		0x0b88
-#define APPLE_SIO_QUEUE_INIT_B		0x0c00
-#define APPLE_SIO_QUEUE_START_B		0x0c04
-#define APPLE_SIO_QUEUE_INIT_A		0x4000
-#define APPLE_SIO_QUEUE_START_A		0x4004
-#define APPLE_SIO_TX_STATUS		0x4008
-#define APPLE_SIO_TX_MESSAGE		0x4010
-#define APPLE_SIO_RX_STATUS		0x4020
-#define APPLE_SIO_RX_MESSAGE		0x4038
-#define APPLE_SIO_TIME_LO		0xc030
-#define APPLE_SIO_TIME_HI		0xc038
+#define APPLE_SIO_MASK_SET_MIRROR	0x0c00
+#define APPLE_SIO_MASK_CLEAR_MIRROR	0x0c04
+
+/* Mailbox registers, relative to apple_sio_regs.mbox */
+#define APPLE_SIO_MASK_SET		0x00
+#define APPLE_SIO_MASK_CLEAR		0x04
+#define APPLE_SIO_TX_STATUS		0x08
+#define APPLE_SIO_TX_MESSAGE		0x10
+#define APPLE_SIO_RX_STATUS		0x20
+#define APPLE_SIO_RX_MESSAGE		0x38
+
+static const struct apple_sio_regs apple_sio_regs_v2 = {
+	.remap_ap_lo = 0x08,
+	.remap_ap_hi = 0x10,
+	.remap_iop_lo = 0x18,
+	.remap_iop_hi = 0x20,
+	.remap_size_lo = 0x28,
+	.remap_size_hi = 0x30,
+	.remap_enable = 0x38,
+	.cpu_control = 0x44,
+	.time_lo = 0xc030,
+	.time_hi = 0xc038,
+	.mbox = 0x4000,
+	.mirror = true,
+	.legacy_status = true,
+};
+
+static const struct apple_sio_regs apple_sio_regs_v1 = {
+	.remap_ap_lo = 0x08,
+	.remap_ap_hi = 0x0c,
+	.remap_iop_lo = 0x10,
+	.remap_iop_hi = 0x14,
+	.remap_size_lo = 0x18,
+	.remap_size_hi = 0x1c,
+	.remap_enable = 0x20,
+	.cpu_control = 0x28,
+	.time_lo = 0x810,
+	.time_hi = 0x818,
+	.mbox = 0x1000,
+	.enable_tx = true,
+};
+
+static const struct apple_sio_regs apple_sio_regs_s5l8960x = {
+	.remap_ap_lo = 0x08,
+	.remap_ap_hi = 0x0c,
+	.remap_iop_lo = 0x10,
+	.remap_iop_hi = 0x14,
+	.remap_size_lo = 0x18,
+	.remap_size_hi = 0x1c,
+	.remap_enable = 0x20,
+	.cpu_control = 0x28,
+	.time_lo = 0x810,
+	.time_hi = 0x818,
+	.mbox = 0x1000,
+	.tx_no_enable = true,
+	.remap_off_first = true,
+};
 
 #define APPLE_SIO_MBOX_ENABLE		BIT(0)
 #define APPLE_SIO_MBOX_EMPTY		BIT(17)
@@ -62,11 +129,13 @@
 #define APPLE_SIO_MSG_PARAMETER		GENMASK_ULL(31, 24)
 #define APPLE_SIO_MSG_DATA		GENMASK_ULL(63, 32)
 
+#define APPLE_SIO_OP_DMA_ERROR		0x66
+#define APPLE_SIO_OP_DMA_COMPLETE	0x68
+#define APPLE_SIO_DMA_COMPLETE_TAGGED	BIT(7)
 #define APPLE_SIO_OP_ERROR		0x6a
 #define APPLE_SIO_OP_READY		0x6d
-#define APPLE_SIO_READY_PARAMETER	0x03
+#define APPLE_SIO_READY_PARAMETER	0x03	/* SMARTIO_PROTOCOL_VERSION */
 #define APPLE_SIO_RX_IRQ_INDEX		2
-#define APPLE_SIO_MAX_TAG		0xfe
 #define APPLE_SIO_READY_TIMEOUT_MS	5000
 #define APPLE_SIO_TX_TIMEOUT_US		200000
 #define APPLE_SIO_RX_DRAIN_LIMIT	256
@@ -77,6 +146,15 @@
 #define APPLE_SIO_DESC1_SIZE		0x10400
 #define APPLE_SIO_DESC1_COUNT		0x1040
 #define APPLE_SIO_SETUP_COMMANDS	10
+
+struct apple_sio_hw {
+	const struct apple_sio_regs *regs;
+	/* Region setup commands the firmware takes (NULL: all of them) */
+	const u8 *setup;
+	unsigned int num_setup;
+	const struct apple_sio_dma_range *dma_ranges;
+	unsigned int num_dma_ranges;
+};
 
 struct apple_sio_region {
 	void *buffer;
@@ -92,6 +170,7 @@ struct apple_sio_async {
 	apple_sio_async_callback_t callback;
 	void *callback_data;
 	unsigned long key;
+	u8 endpoint;
 	u8 tag;
 	u8 expected_opcode;
 	int status;
@@ -101,7 +180,12 @@ struct apple_sio_async {
 
 struct apple_sio {
 	struct device *dev;
+	int irq;
+	bool irq_requested;
+	bool irq_enabled;
 	void __iomem *base;
+	void __iomem *mbox;
+	const struct apple_sio_regs *regs;
 	void *firmware_buffer;
 	dma_addr_t firmware_dma;
 	size_t firmware_size;
@@ -111,7 +195,15 @@ struct apple_sio {
 	struct mutex tx_lock;
 	/* Protect the final transmit status check and message write. */
 	spinlock_t tx_hw_lock;
-	struct ida tags;
+	/* Protect the per-endpoint tag bitmaps. */
+	spinlock_t tag_lock;
+	/* Bit n set: tag n is in use on that endpoint (bit 0 is never used). */
+	u32 tags[APPLE_SIO_MAX_ENDPOINTS];
+	/* Unmatched messages per endpoint; under the pending xarray lock. */
+	struct {
+		apple_sio_notify_t fn;
+		void *data;
+	} notify[APPLE_SIO_MAX_ENDPOINTS];
 	struct xarray pending;
 	struct apple_sio_region ep0_general;
 	struct apple_sio_region ep0_spi;
@@ -122,6 +214,8 @@ struct apple_sio {
 	/* Protect contiguous Descriptor-0 slot allocation. */
 	spinlock_t desc0_lock;
 	struct platform_device *dma_pdev;
+	const u8 *setup;
+	unsigned int num_setup;
 	unsigned int setup_index;
 	unsigned int irq_count;
 	unsigned int unmatched_count;
@@ -144,10 +238,74 @@ apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 
 static void apple_sio_submit_setup(struct apple_sio *sio);
 
+static const u8 apple_sio_setup_all[APPLE_SIO_SETUP_COMMANDS] = {
+	0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+};
+
 static unsigned long apple_sio_request_key(u8 endpoint, u8 tag)
 {
 	return ((unsigned long)endpoint << 8) | tag;
 }
+
+/*
+ * The firmware keeps 32 response slots per endpoint and indexes them by
+ * tag - 1 (AppleSmartIODMAController::responseForEndpointAndTag), so tags
+ * are allocated per endpoint in 1..APPLE_SIO_MAX_TAG. A negative @fixed_tag
+ * takes the lowest free tag.
+ */
+static int apple_sio_tag_alloc(struct apple_sio *sio, u8 endpoint,
+			       int fixed_tag)
+{
+	unsigned long flags;
+	u32 *map;
+	int tag;
+
+	if (endpoint >= APPLE_SIO_MAX_ENDPOINTS ||
+	    fixed_tag > APPLE_SIO_MAX_TAG || fixed_tag == 0)
+		return -EINVAL;
+
+	map = &sio->tags[endpoint];
+	spin_lock_irqsave(&sio->tag_lock, flags);
+	if (fixed_tag > 0) {
+		tag = (*map & BIT(fixed_tag)) ? -EBUSY : fixed_tag;
+	} else {
+		tag = ffz(*map | BIT(0));
+		if (tag > APPLE_SIO_MAX_TAG)
+			tag = -EBUSY;
+	}
+	if (tag > 0)
+		*map |= BIT(tag);
+	spin_unlock_irqrestore(&sio->tag_lock, flags);
+
+	return tag;
+}
+
+static void apple_sio_tag_free(struct apple_sio *sio, u8 endpoint, u8 tag)
+{
+	unsigned long flags;
+
+	if (endpoint >= APPLE_SIO_MAX_ENDPOINTS || tag > APPLE_SIO_MAX_TAG)
+		return;
+
+	spin_lock_irqsave(&sio->tag_lock, flags);
+	sio->tags[endpoint] &= ~BIT(tag);
+	spin_unlock_irqrestore(&sio->tag_lock, flags);
+}
+
+void apple_sio_set_notify(struct apple_sio *sio, u8 endpoint,
+			  apple_sio_notify_t notify, void *data)
+{
+	unsigned long flags;
+
+	if (endpoint >= APPLE_SIO_MAX_ENDPOINTS)
+		return;
+
+	xa_lock_irqsave(&sio->pending, flags);
+	sio->notify[endpoint].fn = notify;
+	sio->notify[endpoint].data = data;
+	xa_unlock_irqrestore(&sio->pending, flags);
+}
+EXPORT_SYMBOL_GPL(apple_sio_set_notify);
 
 void *apple_sio_desc0_alloc(struct apple_sio *sio, unsigned int slots,
 			    u32 *first_slot)
@@ -198,9 +356,9 @@ static bool apple_sio_can_read(u32 status)
 	       !(status & (APPLE_SIO_MBOX_ERROR | APPLE_SIO_MBOX_EMPTY));
 }
 
-static bool apple_sio_can_write(u32 status)
+static bool apple_sio_can_write(struct apple_sio *sio, u32 status)
 {
-	return (status & APPLE_SIO_MBOX_ENABLE) &&
+	return (sio->regs->tx_no_enable || (status & APPLE_SIO_MBOX_ENABLE)) &&
 	       !(status & APPLE_SIO_MBOX_ERROR) &&
 	       (status & APPLE_SIO_MBOX_EMPTY);
 }
@@ -216,13 +374,23 @@ static bool apple_sio_is_ready(u64 message)
 
 static void apple_sio_dispatch(struct apple_sio *sio, u64 message)
 {
-	struct apple_sio_async *request;
+	struct apple_sio_async *request = NULL;
+	apple_sio_notify_t notify = NULL;
+	void *notify_data = NULL;
 	unsigned long flags;
 	bool matched = false;
 	u8 endpoint = FIELD_GET(APPLE_SIO_MSG_ENDPOINT, message);
 	u8 tag = FIELD_GET(APPLE_SIO_MSG_TAG, message);
 	u8 opcode = FIELD_GET(APPLE_SIO_MSG_OPCODE, message);
+	u8 parameter = FIELD_GET(APPLE_SIO_MSG_PARAMETER, message);
 	unsigned long key = apple_sio_request_key(endpoint, tag);
+	/*
+	 * A DMA completion (0x68) refers to a command only with parameter
+	 * bit 7 set (AppleSmartIODMA::_asyncAction). Without it, it is the
+	 * channel-idle notification and its tag field is meaningless.
+	 */
+	bool tagged = opcode != APPLE_SIO_OP_DMA_COMPLETE ||
+		      (parameter & APPLE_SIO_DMA_COMPLETE_TAGGED);
 
 	if (apple_sio_is_ready(message)) {
 		if (!READ_ONCE(sio->running) && !READ_ONCE(sio->stopping)) {
@@ -234,23 +402,31 @@ static void apple_sio_dispatch(struct apple_sio *sio, u64 message)
 	}
 
 	xa_lock_irqsave(&sio->pending, flags);
-	request = xa_load(&sio->pending, key);
+	if (tagged)
+		request = xa_load(&sio->pending, key);
 	if (request && (opcode == request->expected_opcode ||
-			opcode == APPLE_SIO_OP_ERROR)) {
+			opcode == APPLE_SIO_OP_ERROR ||
+			opcode == APPLE_SIO_OP_DMA_ERROR)) {
 		__xa_erase(&sio->pending, key);
 		request->active = false;
 		request->response = message;
-		request->status = opcode == APPLE_SIO_OP_ERROR ? -EIO : 0;
+		request->status = opcode == request->expected_opcode ? 0 : -EIO;
 		matched = true;
+	} else if (endpoint < APPLE_SIO_MAX_ENDPOINTS) {
+		notify = sio->notify[endpoint].fn;
+		notify_data = sio->notify[endpoint].data;
 	}
 	xa_unlock_irqrestore(&sio->pending, flags);
 
 	if (!matched) {
+		/* Acks of asynchronous submits, idle notifications, ... */
 		sio->unmatched_count++;
+		if (notify)
+			notify(notify_data, message);
 		return;
 	}
 
-	ida_free(&sio->tags, request->tag);
+	apple_sio_tag_free(sio, request->endpoint, request->tag);
 	if (request->callback)
 		request->callback(request->callback_data, request->status,
 				  request->response);
@@ -265,17 +441,18 @@ static irqreturn_t apple_sio_irq(int irq, void *data)
 	u32 status;
 
 	sio->irq_count++;
-	sio->last_irq_legacy =
-		readl_relaxed(sio->base + APPLE_SIO_IRQ_STATUS_LEGACY);
+	if (sio->regs->legacy_status)
+		sio->last_irq_legacy =
+			readl_relaxed(sio->base + APPLE_SIO_IRQ_STATUS_LEGACY);
 	sio->last_irq = readl_relaxed(sio->base + APPLE_SIO_IRQ_STATUS);
 	while (count < APPLE_SIO_RX_DRAIN_LIMIT) {
-		status = readl_relaxed(sio->base + APPLE_SIO_RX_STATUS);
+		status = readl_relaxed(sio->mbox + APPLE_SIO_RX_STATUS);
 		sio->last_rx_status = status;
 		if (!apple_sio_can_read(status))
 			break;
 
 		sio->last_rx_message =
-			readq_relaxed(sio->base + APPLE_SIO_RX_MESSAGE);
+			readq_relaxed(sio->mbox + APPLE_SIO_RX_MESSAGE);
 		apple_sio_dispatch(sio, sio->last_rx_message);
 		count++;
 	}
@@ -298,8 +475,8 @@ static int apple_sio_send(struct apple_sio *sio, u64 message)
 		goto out_unlock;
 	}
 
-	ret = readl_poll_timeout(sio->base + APPLE_SIO_TX_STATUS, status,
-				 apple_sio_can_write(status), 10,
+	ret = readl_poll_timeout(sio->mbox + APPLE_SIO_TX_STATUS, status,
+				 apple_sio_can_write(sio, status), 10,
 				 APPLE_SIO_TX_TIMEOUT_US);
 	if (ret)
 		goto out_unlock;
@@ -310,15 +487,15 @@ static int apple_sio_send(struct apple_sio *sio, u64 message)
 		goto out_hw_unlock;
 	}
 
-	status = readl_relaxed(sio->base + APPLE_SIO_TX_STATUS);
-	if (!apple_sio_can_write(status)) {
+	status = readl_relaxed(sio->mbox + APPLE_SIO_TX_STATUS);
+	if (!apple_sio_can_write(sio, status)) {
 		ret = -EBUSY;
 		goto out_hw_unlock;
 	}
 
 	dma_wmb();
 	sio->last_tx_message = message;
-	writeq_relaxed(message, sio->base + APPLE_SIO_TX_MESSAGE);
+	writeq_relaxed(message, sio->mbox + APPLE_SIO_TX_MESSAGE);
 
 out_hw_unlock:
 	spin_unlock_irqrestore(&sio->tx_hw_lock, flags);
@@ -339,16 +516,16 @@ static int apple_sio_send_atomic(struct apple_sio *sio, u64 message)
 		goto out_unlock;
 	}
 
-	status = readl_relaxed(sio->base + APPLE_SIO_TX_STATUS);
+	status = readl_relaxed(sio->mbox + APPLE_SIO_TX_STATUS);
 	sio->last_tx_status = status;
-	if (!apple_sio_can_write(status)) {
+	if (!apple_sio_can_write(sio, status)) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
 
 	dma_wmb();
 	sio->last_tx_message = message;
-	writeq_relaxed(message, sio->base + APPLE_SIO_TX_MESSAGE);
+	writeq_relaxed(message, sio->mbox + APPLE_SIO_TX_MESSAGE);
 
 out_unlock:
 	spin_unlock_irqrestore(&sio->tx_hw_lock, flags);
@@ -367,7 +544,7 @@ static void apple_sio_async_finish(struct apple_sio_async *request,
 {
 	struct apple_sio *sio = request->sio;
 
-	ida_free(&sio->tags, request->tag);
+	apple_sio_tag_free(sio, request->endpoint, request->tag);
 	request->status = status;
 	request->response = response;
 	if (notify && request->callback)
@@ -397,16 +574,14 @@ apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 	if (!request)
 		return ERR_PTR(-ENOMEM);
 
-	if (fixed_tag >= 0)
-		tag = ida_alloc_range(&sio->tags, fixed_tag, fixed_tag, gfp);
-	else
-		tag = ida_alloc_range(&sio->tags, 1, APPLE_SIO_MAX_TAG, gfp);
+	tag = apple_sio_tag_alloc(sio, endpoint, fixed_tag);
 	if (tag < 0) {
 		kfree(request);
 		return ERR_PTR(tag);
 	}
 
 	request->sio = sio;
+	request->endpoint = endpoint;
 	INIT_LIST_HEAD(&request->shutdown_node);
 	init_completion(&request->done);
 	refcount_set(&request->refs, 2);
@@ -418,9 +593,16 @@ apple_sio_request_async_common(struct apple_sio *sio, u8 endpoint, u8 opcode,
 	request->status = -EINPROGRESS;
 	request->active = true;
 
-	ret = xa_insert(&sio->pending, request->key, request, gfp);
+	/* Setup replies submit requests from hard IRQ context. */
+	if (atomic) {
+		xa_lock_irqsave(&sio->pending, flags);
+		ret = __xa_insert(&sio->pending, request->key, request, gfp);
+		xa_unlock_irqrestore(&sio->pending, flags);
+	} else {
+		ret = xa_insert_irq(&sio->pending, request->key, request, gfp);
+	}
 	if (ret) {
-		ida_free(&sio->tags, tag);
+		apple_sio_tag_free(sio, endpoint, tag);
 		apple_sio_async_put(request);
 		apple_sio_async_put(request);
 		return ERR_PTR(ret);
@@ -498,7 +680,7 @@ static void apple_sio_setup_done(void *data, int status, u64 response)
 	}
 
 	sio->setup_index++;
-	if (sio->setup_index == APPLE_SIO_SETUP_COMMANDS) {
+	if (sio->setup_index == sio->num_setup) {
 		sio->setup_status = 0;
 		complete_all(&sio->setup_done);
 		return;
@@ -520,9 +702,11 @@ static void apple_sio_submit_setup(struct apple_sio *sio)
 		0x0e, 0x01, 0x02, 0x0b, 0x0c,
 	};
 	struct apple_sio_async *request;
-	u32 index = sio->setup_index;
+	u32 index;
 	u32 value;
 
+	index = sio->setup_index < sio->num_setup ?
+		sio->setup[sio->setup_index] : APPLE_SIO_SETUP_COMMANDS;
 	switch (index) {
 	case 0:
 		value = lower_32_bits(sio->ep0_general.dma >> 12);
@@ -598,6 +782,32 @@ int apple_sio_async_cancel(struct apple_sio_async *request)
 }
 EXPORT_SYMBOL_GPL(apple_sio_async_cancel);
 
+void apple_sio_cancel_endpoint(struct apple_sio *sio, u8 endpoint)
+{
+	struct apple_sio_async *request;
+	LIST_HEAD(cancelled);
+	unsigned long index;
+	unsigned long flags;
+
+	xa_lock_irqsave(&sio->pending, flags);
+	xa_for_each(&sio->pending, index, request) {
+		if (request->endpoint != endpoint)
+			continue;
+		__xa_erase(&sio->pending, index);
+		request->active = false;
+		list_add_tail(&request->shutdown_node, &cancelled);
+	}
+	xa_unlock_irqrestore(&sio->pending, flags);
+
+	while (!list_empty(&cancelled)) {
+		request = list_first_entry(&cancelled, struct apple_sio_async,
+					   shutdown_node);
+		list_del_init(&request->shutdown_node);
+		apple_sio_async_finish(request, -ECANCELED, 0, true);
+	}
+}
+EXPORT_SYMBOL_GPL(apple_sio_cancel_endpoint);
+
 int apple_sio_request(struct apple_sio *sio, u8 endpoint, u8 opcode,
 		      u8 parameter, u32 data, u8 expected_opcode,
 		      unsigned long timeout, u64 *response)
@@ -656,13 +866,18 @@ static void apple_sio_stop(struct apple_sio *sio)
 	WRITE_ONCE(sio->running, false);
 	WRITE_ONCE(sio->stopping, true);
 
+	/* Quiesce the handler before stopping the CPU and freeing its state. */
+	if (sio->irq_enabled) {
+		disable_irq(sio->irq);
+		sio->irq_enabled = false;
+	}
 	mutex_lock(&sio->tx_lock);
 	spin_lock_irq(&sio->tx_hw_lock);
-	control = readl(sio->base + APPLE_SIO_CPU_CONTROL);
+	control = readl(sio->base + sio->regs->cpu_control);
 	writel(control & ~APPLE_SIO_CPU_RUN,
-	       sio->base + APPLE_SIO_CPU_CONTROL);
-	readl(sio->base + APPLE_SIO_CPU_CONTROL);
-	writel(0, sio->base + APPLE_SIO_REMAP_ENABLE);
+	       sio->base + sio->regs->cpu_control);
+	readl(sio->base + sio->regs->cpu_control);
+	writel(0, sio->base + sio->regs->remap_enable);
 	spin_unlock_irq(&sio->tx_hw_lock);
 	mutex_unlock(&sio->tx_lock);
 
@@ -681,17 +896,24 @@ static int apple_sio_start(struct apple_sio *sio, const char *firmware_name)
 	u32 status;
 	int ret;
 
-	control = readl(sio->base + APPLE_SIO_CPU_CONTROL);
-	if (control & APPLE_SIO_CPU_RUN)
-		return dev_err_probe(sio->dev, -EBUSY,
-				     "SmartIO CPU is already running\n");
+	control = readl(sio->base + sio->regs->cpu_control);
+	if (control & APPLE_SIO_CPU_RUN) {
+		/* Left running by the boot chain: reset it through the PMGR. */
+		ret = device_reset_optional(sio->dev);
+		control = readl(sio->base + sio->regs->cpu_control);
+		if (ret || (control & APPLE_SIO_CPU_RUN))
+			return dev_err_probe(sio->dev, ret ?: -EBUSY,
+					     "SmartIO CPU is already running\n");
+	}
 
-	ret = request_firmware(&firmware, firmware_name, sio->dev);
+	/* No user-helper fallback: a missing image must not stall the boot. */
+	ret = request_firmware_direct(&firmware, firmware_name, sio->dev);
 	if (ret)
 		return dev_err_probe(sio->dev, ret,
 				     "failed to load firmware %s\n",
 				     firmware_name);
 
+	/* iOS maps the image page-truncated; round up so all of it is mapped. */
 	size = ALIGN(firmware->size, SZ_4K);
 	buffer = dma_alloc_coherent(sio->dev, size, &dma, GFP_KERNEL);
 	if (!buffer) {
@@ -707,34 +929,48 @@ static int apple_sio_start(struct apple_sio *sio, const char *firmware_name)
 	sio->firmware_dma = dma;
 	sio->firmware_size = size;
 
-	writel(0, sio->base + APPLE_SIO_REMAP_IOP_LO);
-	writel(0, sio->base + APPLE_SIO_REMAP_IOP_HI);
-	writel(lower_32_bits(size), sio->base + APPLE_SIO_REMAP_SIZE_LO);
-	writel(upper_32_bits(size), sio->base + APPLE_SIO_REMAP_SIZE_HI);
-	writel(lower_32_bits(dma), sio->base + APPLE_SIO_REMAP_AP_LO);
-	writel(upper_32_bits(dma), sio->base + APPLE_SIO_REMAP_AP_HI);
-	writel(1, sio->base + APPLE_SIO_REMAP_ENABLE);
+	if (sio->regs->remap_off_first)
+		writel(0, sio->base + sio->regs->remap_enable);
+	writel(0, sio->base + sio->regs->remap_iop_lo);
+	writel(0, sio->base + sio->regs->remap_iop_hi);
+	writel(lower_32_bits(size), sio->base + sio->regs->remap_size_lo);
+	writel(upper_32_bits(size), sio->base + sio->regs->remap_size_hi);
+	writel(lower_32_bits(dma), sio->base + sio->regs->remap_ap_lo);
+	writel(upper_32_bits(dma), sio->base + sio->regs->remap_ap_hi);
+	writel(1, sio->base + sio->regs->remap_enable);
 
-	writel(0x1111, sio->base + APPLE_SIO_QUEUE_INIT_A);
-	writel(0x1111, sio->base + APPLE_SIO_QUEUE_INIT_B);
-	writel(1, sio->base + APPLE_SIO_QUEUE_START_A);
-	writel(1, sio->base + APPLE_SIO_QUEUE_START_B);
-	writel(0x1000, sio->base + APPLE_SIO_QUEUE_START_A);
-	writel(0x1000, sio->base + APPLE_SIO_QUEUE_START_B);
-	status = readl(sio->base + APPLE_SIO_RX_STATUS);
+	/* Mask everything, then unmask inbox-empty and outbox-not-empty. */
+	writel(0x1111, sio->mbox + APPLE_SIO_MASK_SET);
+	if (sio->regs->mirror)
+		writel(0x1111, sio->base + APPLE_SIO_MASK_SET_MIRROR);
+	writel(1, sio->mbox + APPLE_SIO_MASK_CLEAR);
+	if (sio->regs->mirror)
+		writel(1, sio->base + APPLE_SIO_MASK_CLEAR_MIRROR);
+	writel(0x1000, sio->mbox + APPLE_SIO_MASK_CLEAR);
+	if (sio->regs->mirror)
+		writel(0x1000, sio->base + APPLE_SIO_MASK_CLEAR_MIRROR);
+	status = readl(sio->mbox + APPLE_SIO_RX_STATUS);
 	writel(status | APPLE_SIO_MBOX_ENABLE,
-	       sio->base + APPLE_SIO_RX_STATUS);
+	       sio->mbox + APPLE_SIO_RX_STATUS);
+	if (sio->regs->enable_tx) {
+		status = readl(sio->mbox + APPLE_SIO_TX_STATUS);
+		writel(status | APPLE_SIO_MBOX_ENABLE,
+		       sio->mbox + APPLE_SIO_TX_STATUS);
+	}
 
 	control = readl(sio->base + APPLE_SIO_TIME_CONTROL);
 	writel(control & ~BIT(1), sio->base + APPLE_SIO_TIME_CONTROL);
 	counter = arch_timer_read_counter();
-	writel(lower_32_bits(counter), sio->base + APPLE_SIO_TIME_LO);
-	writel(upper_32_bits(counter), sio->base + APPLE_SIO_TIME_HI);
+	writel(lower_32_bits(counter), sio->base + sio->regs->time_lo);
+	writel(upper_32_bits(counter), sio->base + sio->regs->time_hi);
 	writel(control | BIT(1), sio->base + APPLE_SIO_TIME_CONTROL);
 
-	control = readl(sio->base + APPLE_SIO_CPU_CONTROL);
+	/* Requested disabled: a stale interrupt must not start region setup. */
+	sio->irq_enabled = true;
+	enable_irq(sio->irq);
+	control = readl(sio->base + sio->regs->cpu_control);
 	writel(control | APPLE_SIO_CPU_RUN,
-	       sio->base + APPLE_SIO_CPU_CONTROL);
+	       sio->base + sio->regs->cpu_control);
 
 	ready_timeout = msecs_to_jiffies(APPLE_SIO_READY_TIMEOUT_MS);
 	if (!wait_for_completion_timeout(&sio->ready, ready_timeout)) {
@@ -798,11 +1034,17 @@ static int apple_sio_alloc_shared_regions(struct apple_sio *sio)
 static int apple_sio_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct apple_sio_dma_pdata dma_pdata = {};
+	const struct apple_sio_hw *hw;
 	const char *firmware_name;
 	unsigned long setup_timeout;
 	struct apple_sio *sio;
 	int irq;
 	int ret;
+
+	hw = device_get_match_data(dev);
+	if (!hw)
+		return -ENODEV;
 
 	sio = devm_kzalloc(dev, sizeof(*sio), GFP_KERNEL);
 	if (!sio)
@@ -814,8 +1056,8 @@ static int apple_sio_probe(struct platform_device *pdev)
 	sio->setup_status = -EINPROGRESS;
 	mutex_init(&sio->tx_lock);
 	spin_lock_init(&sio->tx_hw_lock);
-	ida_init(&sio->tags);
-	xa_init(&sio->pending);
+	spin_lock_init(&sio->tag_lock);
+	xa_init_flags(&sio->pending, XA_FLAGS_LOCK_IRQ);
 	spin_lock_init(&sio->desc0_lock);
 	platform_set_drvdata(pdev, sio);
 
@@ -834,6 +1076,11 @@ static int apple_sio_probe(struct platform_device *pdev)
 		ret = PTR_ERR(sio->base);
 		goto out_pm_put;
 	}
+	sio->regs = hw->regs;
+	sio->mbox = sio->base + hw->regs->mbox;
+	sio->setup = hw->setup ?: apple_sio_setup_all;
+	sio->num_setup = hw->setup ? hw->num_setup :
+				     ARRAY_SIZE(apple_sio_setup_all);
 
 	irq = platform_get_irq(pdev, APPLE_SIO_RX_IRQ_INDEX);
 	if (irq < 0) {
@@ -841,12 +1088,14 @@ static int apple_sio_probe(struct platform_device *pdev)
 		goto out_pm_put;
 	}
 
-	ret = devm_request_irq(dev, irq, apple_sio_irq, 0,
+	sio->irq = irq;
+	ret = devm_request_irq(dev, irq, apple_sio_irq, IRQF_NO_AUTOEN,
 			       dev_name(dev), sio);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "failed to request RX interrupt\n");
 		goto out_pm_put;
 	}
+	sio->irq_requested = true;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
 	if (ret) {
@@ -893,9 +1142,13 @@ static int apple_sio_probe(struct platform_device *pdev)
 		goto out_stop;
 	}
 
+	dma_pdata.sio = sio;
+	dma_pdata.ranges = hw->dma_ranges;
+	dma_pdata.num_ranges = hw->num_dma_ranges;
 	sio->dma_pdev = platform_device_register_data(dev, "apple-sio-dma",
 						      PLATFORM_DEVID_AUTO,
-						      &sio, sizeof(sio));
+						      &dma_pdata,
+						      sizeof(dma_pdata));
 	if (IS_ERR(sio->dma_pdev)) {
 		ret = dev_err_probe(dev, PTR_ERR(sio->dma_pdev),
 				    "failed to register DMA child\n");
@@ -912,10 +1165,13 @@ out_stop:
 	sio->firmware_buffer = NULL;
 
 out_pm_put:
+	if (sio->irq_requested) {
+		devm_free_irq(dev, sio->irq, sio);
+		sio->irq_requested = false;
+	}
 	pm_runtime_put_sync(dev);
 out_destroy_allocators:
 	xa_destroy(&sio->pending);
-	ida_destroy(&sio->tags);
 	return ret;
 }
 
@@ -925,15 +1181,101 @@ static void apple_sio_remove(struct platform_device *pdev)
 
 	platform_device_unregister(sio->dma_pdev);
 	apple_sio_stop(sio);
+	devm_free_irq(sio->dev, sio->irq, sio);
+	sio->irq_requested = false;
 	dma_free_coherent(sio->dev, sio->firmware_size,
 			  sio->firmware_buffer, sio->firmware_dma);
 	pm_runtime_put_sync(sio->dev);
 	xa_destroy(&sio->pending);
-	ida_destroy(&sio->tags);
 }
 
+/* SPI0-3, MCA0-4 and UART0-8, transmit and receive (iOS 16.7.10 ADT) */
+static const struct apple_sio_dma_range apple_sio_s8000_dma_ranges[] = {
+	{ 0x14, 0x1b },
+	{ 0x28, 0x31 },
+	{ 0x3c, 0x4d },
+};
+
+static const struct apple_sio_hw apple_sio_s8000_hw = {
+	.regs = &apple_sio_regs_v2,
+	.dma_ranges = apple_sio_s8000_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_s8000_dma_ranges),
+};
+
+/*
+ * SPI3 touch TX, MCA2 speaker TX, MCA4 headphone TX and PDM microphone RX,
+ * each described by the J71b ADT.
+ */
+static const struct apple_sio_dma_range apple_sio_t8010_dma_ranges[] = {
+	{ 0x1a, 0x1a },
+	{ 0x2c, 0x2c },
+	{ 0x30, 0x30 },
+	{ 0x5b, 0x5b },
+};
+
+static const struct apple_sio_hw apple_sio_t8010_hw = {
+	.regs = &apple_sio_regs_v2,
+	.dma_ranges = apple_sio_t8010_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_t8010_dma_ranges),
+};
+
+/* MCA0 (headset codec) and MCA3 (speakers), as described by the J81 ADT. */
+static const struct apple_sio_dma_range apple_sio_t7000_dma_ranges[] = {
+	{ 0x28, 0x29 },
+	{ 0x2e, 0x2f },
+};
+
+static const struct apple_sio_hw apple_sio_t7000_hw = {
+	.regs = &apple_sio_regs_v1,
+	.dma_ranges = apple_sio_t7000_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_t7000_dma_ranges),
+};
+
+/*
+ * MCA0, the codec's link, as described by the J72 ADT, and MCA1 TX, the
+ * iPad mini 2's (J85) speaker link, as its ADT describes it
+ */
+static const struct apple_sio_dma_range apple_sio_s5l8960x_dma_ranges[] = {
+	{ 0x28, 0x29 },
+	{ 0x2a, 0x2a },
+};
+
+/*
+ * The A7 firmware takes the general region and the two descriptor rings
+ * only, no SPI or endpoint 3 region (setup commands 0, 1 and 6-9).
+ */
+static const u8 apple_sio_s5l8960x_setup[] = { 0, 1, 6, 7, 8, 9 };
+
+static const struct apple_sio_hw apple_sio_s5l8960x_hw = {
+	.regs = &apple_sio_regs_s5l8960x,
+	.setup = apple_sio_s5l8960x_setup,
+	.num_setup = ARRAY_SIZE(apple_sio_s5l8960x_setup),
+	.dma_ranges = apple_sio_s5l8960x_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_s5l8960x_dma_ranges),
+};
+
+/*
+ * The A10X's audio endpoints (ADT dma-channels of the iPad Pro 2 boards):
+ * MCA2 transmit and receive, MCA4 transmit, PDM receive.
+ */
+static const struct apple_sio_dma_range apple_sio_t8011_dma_ranges[] = {
+	{ 0x2c, 0x2d },
+	{ 0x30, 0x30 },
+	{ 0x5b, 0x5b },
+};
+
+static const struct apple_sio_hw apple_sio_t8011_hw = {
+	.regs = &apple_sio_regs_v2,
+	.dma_ranges = apple_sio_t8011_dma_ranges,
+	.num_dma_ranges = ARRAY_SIZE(apple_sio_t8011_dma_ranges),
+};
+
 static const struct of_device_id apple_sio_of_match[] = {
-	{ .compatible = "apple,t8010-sio" },
+	{ .compatible = "apple,s5l8960x-sio", .data = &apple_sio_s5l8960x_hw },
+	{ .compatible = "apple,t7000-sio", .data = &apple_sio_t7000_hw },
+	{ .compatible = "apple,s8000-sio", .data = &apple_sio_s8000_hw },
+	{ .compatible = "apple,t8010-sio", .data = &apple_sio_t8010_hw },
+	{ .compatible = "apple,t8011-sio", .data = &apple_sio_t8011_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_sio_of_match);
@@ -942,12 +1284,18 @@ static struct platform_driver apple_sio_driver = {
 	.driver = {
 		.name = "apple-sio",
 		.of_match_table = apple_sio_of_match,
+		/* Firmware boot waits up to 6 s: never hold up other probes. */
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 	.probe = apple_sio_probe,
 	.remove = apple_sio_remove,
 };
 module_platform_driver(apple_sio_driver);
 
+MODULE_FIRMWARE("apple/s5l8960x-smartio.bin");
+MODULE_FIRMWARE("apple/t7000-smartio.bin");
+MODULE_FIRMWARE("apple/s8000-smartio.bin");
 MODULE_FIRMWARE("apple/t8010-smartio.bin");
-MODULE_DESCRIPTION("Apple T8010 SmartIO coprocessor driver");
+MODULE_FIRMWARE("apple/t8011-smartio.bin");
+MODULE_DESCRIPTION("Apple S5L8960X/T7000/S8000/T8010/T8011 SmartIO coprocessor driver");
 MODULE_LICENSE("Dual MIT/GPL");

@@ -39,6 +39,11 @@ struct apple_rtkit_shmem {
  *
  * @crashed:       Called when the co-processor has crashed. Runs in process
  *                 context.
+ * @epmap_done:    Called when epmap is completed. Useful if the IOP requires
+ *                 app endpoints to be started in order to reach power-on state.
+ *                 If it is specified, it is assumed that messages may be
+ *                 received on app endpoints during boot and shutdown. Runs in
+ *                 process context.
  * @recv_message:  Function called when a message from RTKit is received
  *                 on a non-system endpoint. Called from a worker thread.
  * @recv_message_early:
@@ -57,6 +62,7 @@ struct apple_rtkit_shmem {
  */
 struct apple_rtkit_ops {
 	void (*crashed)(void *cookie, const void *crashlog, size_t crashlog_size);
+	void (*epmap_done)(void *cookie);
 	void (*recv_message)(void *cookie, u8 endpoint, u64 message);
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
 	int (*shmem_setup)(void *cookie, struct apple_rtkit_shmem *bfr);
@@ -126,6 +132,12 @@ int apple_rtkit_wake(struct apple_rtkit *rtk);
 int apple_rtkit_shutdown(struct apple_rtkit *rtk);
 
 /*
+ * Stop the mailbox of a shut-down co-processor, so that its power domain can
+ * go off; apple_rtkit_reinit() starts it again.
+ */
+int apple_rtkit_mbox_stop(struct apple_rtkit *rtk);
+
+/*
  * Put the co-processor into the lowest power state. Note that it usually
  * is not possible to recover from this state without a full SoC reset.
  */
@@ -183,7 +195,9 @@ int apple_rtkit_poll(struct apple_rtkit *rtk);
  * Convert an endpoint number relative to start of app endpoint to an absolute
  * endpoint number.
  *
- * Returns the endpoint number on success, 0 on failure.
+ * Returns the endpoint number on success, 0 on failure. A driver with an
+ * epmap_done callback may call it from that callback; others only once the
+ * co-processor runs.
  *
  * @rtk:            RTKit reference
  */

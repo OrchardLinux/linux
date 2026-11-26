@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,mesa.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Mesa (Touch ID) sensor
+
+maintainers:
+  - Dugs <dugahol@protonmail.com>
+
+description:
+  The Touch ID sensor of the A11 iPhones, on its own SPI bus in SPI mode 2,
+  with a 1.8 V and a 3 V supply.
+
+allOf:
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: apple,mesa
+
+  reg:
+    maxItems: 1
+
+  vdd18-supply:
+    description: 1.8 V supply, switched on first
+
+  vdd30-supply:
+    description: 3 V supply
+
+required:
+  - compatible
+  - reg
+  - vdd18-supply
+  - vdd30-supply
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    spi {
+      #address-cells = <1>;
+      #size-cells = <0>;
+
+      touch-id@0 {
+        compatible = "apple,mesa";
+        reg = <0>;
+        spi-max-frequency = <4000000>;
+        spi-cpol;
+        vdd18-supply = <&mesa_1v8>;
+        vdd30-supply = <&mesa_3v0>;
+      };
+    };

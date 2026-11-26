@@ -4,9 +4,11 @@
  *
  * Copyright The Asahi Linux Contributors
  *
- * This driver adds support for two mailbox variants (called ASC and M3 by
- * Apple) found in Apple SoCs such as the M1. It consists of two FIFOs used to
- * exchange 64+32 bit messages between the main CPU and a co-processor.
+ * This driver adds support for the mailbox variants called ASC and M3 by Apple,
+ * found in Apple SoCs such as the M1, and the older A7 IOP variant (AppleA7IOP
+ * V2) found in A9/A10 SoCs. ASC and M3 consist of two FIFOs used to exchange
+ * 64+32 bit messages between the main CPU and a co-processor. The A7 IOP
+ * variant moves a single 64-bit word, with the endpoint in its top byte.
  * Various coprocessors implement different IPC protocols based on these simple
  * messages and shared memory buffers.
  *
@@ -72,6 +74,29 @@
 #define APPLE_M3_MBOX_IRQ_I2A_EMPTY BIT(2)
 #define APPLE_M3_MBOX_IRQ_I2A_NOT_EMPTY BIT(3)
 
+/*
+ * A7 IOP mailbox. Its interrupts are masked through a set/clear register pair
+ * and each FIFO has to be enabled in its control register.
+ */
+#define APPLE_A7IOP_MBOX_IRQ_MASK_SET 0x00
+#define APPLE_A7IOP_MBOX_IRQ_MASK_CLEAR 0x04
+#define APPLE_A7IOP_MBOX_IRQ_A2I_EMPTY BIT(0)
+#define APPLE_A7IOP_MBOX_IRQ_A2I_NOT_EMPTY BIT(4)
+#define APPLE_A7IOP_MBOX_IRQ_I2A_EMPTY BIT(8)
+#define APPLE_A7IOP_MBOX_IRQ_I2A_NOT_EMPTY BIT(12)
+#define APPLE_A7IOP_MBOX_IRQ_ALL                                          \
+	(APPLE_A7IOP_MBOX_IRQ_A2I_EMPTY | APPLE_A7IOP_MBOX_IRQ_A2I_NOT_EMPTY | \
+	 APPLE_A7IOP_MBOX_IRQ_I2A_EMPTY | APPLE_A7IOP_MBOX_IRQ_I2A_NOT_EMPTY)
+#define APPLE_A7IOP_MBOX_A2I_CONTROL 0x08
+#define APPLE_A7IOP_MBOX_A2I_SEND 0x10
+#define APPLE_A7IOP_MBOX_I2A_CONTROL 0x20
+#define APPLE_A7IOP_MBOX_I2A_RECV 0x38
+#define APPLE_A7IOP_MBOX_CONTROL_ENABLE BIT(0)
+#define APPLE_A7IOP_MBOX_CONTROL_FULL BIT(16)
+#define APPLE_A7IOP_MBOX_CONTROL_EMPTY BIT(17)
+#define APPLE_A7IOP_MBOX_MSG_ENDPOINT GENMASK_ULL(63, 56)
+#define APPLE_A7IOP_MBOX_MSG_PAYLOAD GENMASK_ULL(55, 0)
+
 #define APPLE_MBOX_MSG1_OUTCNT GENMASK(56, 52)
 #define APPLE_MBOX_MSG1_INCNT GENMASK(51, 48)
 #define APPLE_MBOX_MSG1_OUTPTR GENMASK(47, 44)
@@ -92,20 +117,50 @@ struct apple_mbox_hw {
 	unsigned int i2a_recv0;
 	unsigned int i2a_recv1;
 
+	/* One 64-bit word per message, endpoint (msg1) in bits 63:56 */
+	bool packed_endpoint;
+	/* FIFOs must be enabled through APPLE_A7IOP_MBOX_CONTROL_ENABLE */
+	bool needs_enable;
+	/* A7 V1 needs FIFO setup at probe, before its IOP is started. */
+	bool needs_early_enable;
+
 	bool has_irq_controls;
+	/* A7 IOP V1 has an enable register, without the later ACK/mask pair. */
+	bool has_irq_enable_only;
 	unsigned int irq_enable;
 	unsigned int irq_ack;
+
+	bool has_irq_mask;
+	unsigned int irq_mask_set;
+	unsigned int irq_mask_clear;
+	unsigned int irq_mask_all;
+
 	unsigned int irq_bit_recv_not_empty;
 	unsigned int irq_bit_send_empty;
 };
 
-int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
-		    bool atomic)
+static void apple_mbox_disarm_tx_irq(struct apple_mbox *mbox)
+{
+	lockdep_assert_held(&mbox->tx_lock);
+
+	if (mbox->tx_irq_armed) {
+		disable_irq_nosync(mbox->irq_send_empty);
+		mbox->tx_irq_armed = false;
+	}
+}
+
+static int apple_mbox_send_locked(struct apple_mbox *mbox,
+				  const struct apple_mbox_msg msg, bool atomic)
 {
 	unsigned long flags;
 	int ret;
 	u32 mbox_ctrl;
 	long t;
+
+	if (mbox->hw->packed_endpoint &&
+	    ((msg.msg0 & ~APPLE_A7IOP_MBOX_MSG_PAYLOAD) ||
+	     msg.msg1 > FIELD_MAX(APPLE_A7IOP_MBOX_MSG_ENDPOINT)))
+		return -EINVAL;
 
 	spin_lock_irqsave(&mbox->tx_lock, flags);
 	mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
@@ -137,29 +192,53 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			writel_relaxed(mbox->hw->irq_bit_send_empty,
 				       mbox->regs + mbox->hw->irq_ack);
 		}
-		enable_irq(mbox->irq_send_empty);
 		reinit_completion(&mbox->tx_empty);
+		mbox->tx_irq_armed = true;
+		enable_irq(mbox->irq_send_empty);
 		spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 		t = wait_for_completion_interruptible_timeout(
 			&mbox->tx_empty,
 			msecs_to_jiffies(APPLE_MBOX_TX_TIMEOUT));
-		if (t < 0)
-			return t;
-		else if (t == 0)
-			return -ETIMEDOUT;
-
 		spin_lock_irqsave(&mbox->tx_lock, flags);
+		if (t <= 0) {
+			apple_mbox_disarm_tx_irq(mbox);
+			spin_unlock_irqrestore(&mbox->tx_lock, flags);
+			/* Drain a handler already dispatched before the disable. */
+			synchronize_irq(mbox->irq_send_empty);
+			return t < 0 ? t : -ETIMEDOUT;
+		}
 		mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
 	}
 
-	writeq_relaxed(msg.msg0, mbox->regs + mbox->hw->a2i_send0);
-	writeq_relaxed(FIELD_PREP(APPLE_MBOX_MSG1_MSG, msg.msg1),
-		       mbox->regs + mbox->hw->a2i_send1);
+	if (mbox->hw->packed_endpoint) {
+		writeq_relaxed(FIELD_PREP(APPLE_A7IOP_MBOX_MSG_ENDPOINT, msg.msg1) |
+				       msg.msg0,
+			       mbox->regs + mbox->hw->a2i_send0);
+	} else {
+		writeq_relaxed(msg.msg0, mbox->regs + mbox->hw->a2i_send0);
+		writeq_relaxed(FIELD_PREP(APPLE_MBOX_MSG1_MSG, msg.msg1),
+			       mbox->regs + mbox->hw->a2i_send1);
+	}
 
 	spin_unlock_irqrestore(&mbox->tx_lock, flags);
 
 	return 0;
+}
+
+int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
+		    bool atomic)
+{
+	int ret;
+
+	if (atomic)
+		return apple_mbox_send_locked(mbox, msg, true);
+
+	mutex_lock(&mbox->tx_mutex);
+	ret = apple_mbox_send_locked(mbox, msg, false);
+	mutex_unlock(&mbox->tx_mutex);
+
+	return ret;
 }
 EXPORT_SYMBOL(apple_mbox_send);
 
@@ -175,8 +254,10 @@ static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 	 * it at the main controller again.
 	 */
 	spin_lock(&mbox->tx_lock);
-	disable_irq_nosync(mbox->irq_send_empty);
-	complete(&mbox->tx_empty);
+	if (mbox->tx_irq_armed) {
+		apple_mbox_disarm_tx_irq(mbox);
+		complete(&mbox->tx_empty);
+	}
 	spin_unlock(&mbox->tx_lock);
 
 	return IRQ_HANDLED;
@@ -190,10 +271,16 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 	u32 mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
 
 	while (!(mbox_ctrl & mbox->hw->control_empty)) {
-		msg.msg0 = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);
-		msg.msg1 = FIELD_GET(
-			APPLE_MBOX_MSG1_MSG,
-			readq_relaxed(mbox->regs + mbox->hw->i2a_recv1));
+		if (mbox->hw->packed_endpoint) {
+			u64 word = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);
+
+			msg.msg0 = FIELD_GET(APPLE_A7IOP_MBOX_MSG_PAYLOAD, word);
+			msg.msg1 = FIELD_GET(APPLE_A7IOP_MBOX_MSG_ENDPOINT, word);
+		} else {
+			msg.msg0 = readq_relaxed(mbox->regs + mbox->hw->i2a_recv0);
+			msg.msg1 = FIELD_GET(APPLE_MBOX_MSG1_MSG,
+					     readq_relaxed(mbox->regs + mbox->hw->i2a_recv1));
+		}
 
 		mbox->rx(mbox, msg, mbox->cookie);
 		ret++;
@@ -259,10 +346,32 @@ int apple_mbox_start(struct apple_mbox *mbox)
 	 * the mailbox level so that both hardware revisions behave almost
 	 * the same.
 	 */
-	if (mbox->hw->has_irq_controls) {
+	if (mbox->hw->has_irq_controls || mbox->hw->has_irq_enable_only) {
 		writel_relaxed(mbox->hw->irq_bit_recv_not_empty |
 				       mbox->hw->irq_bit_send_empty,
 			       mbox->regs + mbox->hw->irq_enable);
+	}
+
+	/*
+	 * Variants with an interrupt mask get the same treatment: only the two
+	 * interrupts used here are unmasked. This state is set up on every
+	 * start because the coprocessor's power domain may have been off.
+	 */
+	if (mbox->hw->has_irq_mask) {
+		writel_relaxed(mbox->hw->irq_mask_all,
+			       mbox->regs + mbox->hw->irq_mask_set);
+		writel_relaxed(mbox->hw->irq_bit_recv_not_empty |
+				       mbox->hw->irq_bit_send_empty,
+			       mbox->regs + mbox->hw->irq_mask_clear);
+	}
+
+	if (mbox->hw->needs_enable) {
+		writel_relaxed(readl_relaxed(mbox->regs + mbox->hw->a2i_control) |
+				       APPLE_A7IOP_MBOX_CONTROL_ENABLE,
+			       mbox->regs + mbox->hw->a2i_control);
+		writel_relaxed(readl_relaxed(mbox->regs + mbox->hw->i2a_control) |
+				       APPLE_A7IOP_MBOX_CONTROL_ENABLE,
+			       mbox->regs + mbox->hw->i2a_control);
 	}
 
 	enable_irq(mbox->irq_recv_not_empty);
@@ -342,6 +451,18 @@ struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name)
 }
 EXPORT_SYMBOL(apple_mbox_get_byname);
 
+static void apple_mbox_enable_early(struct apple_mbox *mbox)
+{
+	if (!mbox->hw->needs_early_enable)
+		return;
+
+	/* Match the A7 V1 initialization before the client starts its IOP. */
+	writel(APPLE_A7IOP_MBOX_CONTROL_ENABLE,
+	       mbox->regs + mbox->hw->a2i_control);
+	writel(APPLE_A7IOP_MBOX_CONTROL_ENABLE,
+	       mbox->regs + mbox->hw->i2a_control);
+}
+
 static int apple_mbox_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -373,6 +494,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 
 	spin_lock_init(&mbox->rx_lock);
 	spin_lock_init(&mbox->tx_lock);
+	mutex_init(&mbox->tx_mutex);
 	init_completion(&mbox->tx_empty);
 
 	irqname = devm_kasprintf(dev, GFP_KERNEL, "%s-recv", dev_name(dev));
@@ -400,6 +522,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		return ret;
 
 	platform_set_drvdata(pdev, mbox);
+	apple_mbox_enable_early(mbox);
 	return 0;
 }
 
@@ -416,6 +539,52 @@ static const struct apple_mbox_hw apple_mbox_t8015_hw = {
 	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
 
 	.has_irq_controls = false,
+};
+
+static const struct apple_mbox_hw apple_mbox_a7iop_hw = {
+	.control_full = APPLE_A7IOP_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_A7IOP_MBOX_CONTROL_EMPTY,
+
+	.a2i_control = APPLE_A7IOP_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_A7IOP_MBOX_A2I_SEND,
+
+	.i2a_control = APPLE_A7IOP_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_A7IOP_MBOX_I2A_RECV,
+
+	.packed_endpoint = true,
+	.needs_enable = true,
+	.has_irq_controls = false,
+
+	.has_irq_mask = true,
+	.irq_mask_set = APPLE_A7IOP_MBOX_IRQ_MASK_SET,
+	.irq_mask_clear = APPLE_A7IOP_MBOX_IRQ_MASK_CLEAR,
+	.irq_mask_all = APPLE_A7IOP_MBOX_IRQ_ALL,
+	.irq_bit_recv_not_empty = APPLE_A7IOP_MBOX_IRQ_I2A_NOT_EMPTY,
+	.irq_bit_send_empty = APPLE_A7IOP_MBOX_IRQ_A2I_EMPTY,
+};
+
+/* S5L8960X ANS1 uses AppleA7IOP V1. Unlike the A9/A10 V2 mailbox,
+ * its interrupt setup is a single enable write at +0x04. Its FIFOs
+ * must be enabled at probe, before the client starts the IOP; the
+ * V2 setup instead enables them when starting mailbox communication.
+ * They are enabled again on every start too: after system sleep the
+ * A7's ANS mailbox comes back with its FIFOs off.
+ * The 64-bit endpoint/payload format and FIFO locations are shared.
+ */
+static const struct apple_mbox_hw apple_mbox_a7iop_v1_hw = {
+	.control_full = APPLE_A7IOP_MBOX_CONTROL_FULL,
+	.control_empty = APPLE_A7IOP_MBOX_CONTROL_EMPTY,
+	.a2i_control = APPLE_A7IOP_MBOX_A2I_CONTROL,
+	.a2i_send0 = APPLE_A7IOP_MBOX_A2I_SEND,
+	.i2a_control = APPLE_A7IOP_MBOX_I2A_CONTROL,
+	.i2a_recv0 = APPLE_A7IOP_MBOX_I2A_RECV,
+	.packed_endpoint = true,
+	.needs_enable = true,
+	.needs_early_enable = true,
+	.has_irq_enable_only = true,
+	.irq_enable = 0x04,
+	.irq_bit_recv_not_empty = APPLE_A7IOP_MBOX_IRQ_I2A_NOT_EMPTY,
+	.irq_bit_send_empty = APPLE_A7IOP_MBOX_IRQ_A2I_EMPTY,
 };
 
 static const struct apple_mbox_hw apple_mbox_asc_hw = {
@@ -455,6 +624,11 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,asc-mailbox-v4", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8015-asc-mailbox", .data = &apple_mbox_t8015_hw },
+	{ .compatible = "apple,t8010-a7iop-mailbox", .data = &apple_mbox_a7iop_hw },
+	/* The A7's ANS mailbox needs the V1 setup; listed before its fallback. */
+	{ .compatible = "apple,s5l8960x-akf-mailbox-v1", .data = &apple_mbox_a7iop_v1_hw },
+	/* A7-A8X ANS/AKF coprocessors: same FIFO, mask and packing layout as A7IOP */
+	{ .compatible = "apple,akf-mailbox-v1", .data = &apple_mbox_a7iop_hw },
 	{ .compatible = "apple,m3-mailbox-v2", .data = &apple_mbox_m3_hw },
 	{}
 };

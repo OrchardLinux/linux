@@ -9,6 +9,7 @@
 #define _APPLE_MAILBOX_H_
 
 #include <linux/device.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 
 /* encodes a single 96bit message sent over the single channel */
@@ -29,7 +30,10 @@ struct apple_mbox {
 	spinlock_t rx_lock;
 	spinlock_t tx_lock;
 
+	/* Only one sleepable sender may own the TX completion. */
+	struct mutex tx_mutex;
 	struct completion tx_empty;
+	bool tx_irq_armed; /* protected by tx_lock */
 
 	/** Receive callback for incoming messages */
 	void (*rx)(struct apple_mbox *mbox, struct apple_mbox_msg msg, void *cookie);
