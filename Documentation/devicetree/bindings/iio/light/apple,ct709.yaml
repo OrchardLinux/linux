@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iio/light/apple,ct709.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple CT709 four-channel ambient light sensor
+
+maintainers:
+  - Linux IIO <linux-iio@vger.kernel.org>
+
+description:
+  The CT709 measures clear, red, green and blue light intensity over I2C.
+  The iPad Pro 2 boards have two independently addressed sensors.
+
+properties:
+  compatible:
+    const: apple,ct709
+
+  reg:
+    maxItems: 1
+
+  apple,als-calibration:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 6696
+    maxItems: 9992
+    description:
+      Factory calibration supplied by the bootloader from the resolved Apple
+      device tree alsCalibration property. On J120 the eight-byte header and
+      two 3344-byte orientation records can be followed by padding. The
+      property on the als0 node contains records for both sensors.
+
+  apple,als-orientation:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The orientation index of this sensor's record in the factory
+      calibration (byte 2 of each record). Without it the sensor reports
+      raw channels only.
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

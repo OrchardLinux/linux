@@ -67,6 +67,18 @@ config ALS31300
 	  To compile this driver as a module, choose M here: the
 	  module will be called als31300.
 
+config APPLE_AOP_COMPASS
+	tristate "Apple AOP magnetometer"
+	depends on APPLE_AOP_T8010
+	select IIO_BUFFER
+	select IIO_KFIFO_BUF
+	help
+	  Say yes here to get support for the magnetometer (compass) that the
+	  Always-On Processor (AOP) of Apple A11 iPhones serves.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called apple_aop_compass.
+
 config BMC150_MAGN
 	tristate
 	select IIO_BUFFER

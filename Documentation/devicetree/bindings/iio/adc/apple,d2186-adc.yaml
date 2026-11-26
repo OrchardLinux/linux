@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iio/adc/apple,d2186-adc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple D2186 PMIC housekeeping ADC
+
+maintainers:
+  - Berkay Kösebay <brkosebay@users.noreply.github.com>
+
+description: |
+  The Dialog D2186 PMIC used on Apple A8 devices includes a 12-bit
+  housekeeping ADC accessed through the parent Apple I2C PMIC regmap.
+  It exposes battery, USB and system telemetry channels indexed by their
+  hardware multiplexer channel number:
+    0  - vcc_main (system supply voltage)
+    1  - ich (charger output current)
+    2  - tbat (battery NTC thermistor temperature)
+    4  - vbat (battery voltage)
+    9  - ibus (USB input current)
+    15 - vbus (USB bus voltage)
+
+properties:
+  compatible:
+    const: apple,d2186-adc
+
+  reg:
+    maxItems: 1
+    description: ADC control and result register range inside the PMIC regmap.
+
+  "#io-channel-cells":
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - "#io-channel-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        pmic@74 {
+            compatible = "apple,adi-pmic", "apple,i2c-pmic";
+            reg = <0x74>;
+            #address-cells = <1>;
+            #size-cells = <1>;
+
+            adc@500 {
+                compatible = "apple,d2186-adc";
+                reg = <0x500 0x24>;
+                #io-channel-cells = <1>;
+            };
+        };
+    };
