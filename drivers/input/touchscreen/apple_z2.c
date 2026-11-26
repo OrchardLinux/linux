@@ -5747,8 +5747,10 @@ static void __maybe_unused apple_z2_complete(struct device *dev)
 {
 	struct apple_z2 *z2 = spi_get_drvdata(to_spi_device(dev));
 
-	if (apple_z2_spi_is_d21(to_spi_device(dev)))
+	if (apple_z2_spi_is_d21(to_spi_device(dev))) {
+		apple_z2_d21_complete(dev);
 		return;
+	}
 	if (!z2->boot_due)
 		return;
 	z2->boot_due = false;

@@ -225,6 +225,9 @@ struct apple_z2_d21 {
 	/* A contact is currently reported down. */
 	bool d21_contact_down;
 	bool d21_recovering;
+	/* Resume marked a boot due; complete() starts it in the background. */
+	bool d21_boot_due;
+	struct work_struct d21_resume_work;
 	bool stopping;
 	bool irq_on;
 	/* Boot-edge storm guard + boot deadline (see apple_z2_d21_irq). */
@@ -308,6 +311,7 @@ static void apple_z2_d21_set_gpio(struct gpio_desc *gpio, int value);
 static void apple_z2_d21_z2_checksum(u8 *cmd, unsigned int len);
 static bool apple_z2_d21_z2_checksum_valid(const u8 *cmd, unsigned int len);
 static int apple_z2_d21_boot(struct apple_z2_d21 *z2);
+static void apple_z2_d21_resume_work(struct work_struct *work);
 static void apple_z2_d21_platform_power_off(struct apple_z2_d21 *z2);
 static void apple_z2_d21_start_recovery(struct apple_z2_d21 *z2, int error);
 static void apple_z2_d21_irq_off_nosync(struct apple_z2_d21 *z2);
@@ -5319,6 +5323,7 @@ static int apple_z2_d21_probe(struct spi_device *spi)
 	 * because stop() unconditionally cancels them. */
 	INIT_DELAYED_WORK(&z2->d21_rearm, apple_z2_d21_rearm_work);
 	INIT_DELAYED_WORK(&z2->d21_watch, apple_z2_d21_watch_work);
+	INIT_WORK(&z2->d21_resume_work, apple_z2_d21_resume_work);
 	spi_set_drvdata(spi, z2);
 
 	z2->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
@@ -5512,6 +5517,20 @@ static void apple_z2_d21_stop(struct apple_z2_d21 *z2)
 	apple_z2_d21_reset_protocol(z2);
 }
 
+/*
+ * A boot started by the last resume may still be running. Mark the
+ * controller stopping first, so the boot's waits give up at once, then
+ * wait for it: otherwise a sleep right after a wake blocks until the
+ * firmware upload finishes or hits its 60 s deadline.
+ */
+static void apple_z2_d21_stop_resume_boot(struct apple_z2_d21 *z2)
+{
+	mutex_lock(&z2->io_lock);
+	z2->stopping = true;
+	mutex_unlock(&z2->io_lock);
+	cancel_work_sync(&z2->d21_resume_work);
+}
+
 static void apple_z2_d21_remove(struct spi_device *spi)
 {
 	struct apple_z2_d21 *z2 = spi_get_drvdata(spi);
@@ -5525,22 +5544,58 @@ static void apple_z2_d21_remove(struct spi_device *spi)
 	if (d21_z2_now == z2)
 		d21_z2_now = NULL;
 	mutex_unlock(&d21_now_lock);
+	apple_z2_d21_stop_resume_boot(z2);
 	apple_z2_d21_stop(z2);
 }
 
 static int apple_z2_d21_suspend(struct device *dev)
 {
-	apple_z2_d21_stop(spi_get_drvdata(to_spi_device(dev)));
+	struct apple_z2_d21 *z2 = spi_get_drvdata(to_spi_device(dev));
+
+	/* A controller still booting from the last resume stops first */
+	apple_z2_d21_stop_resume_boot(z2);
+	apple_z2_d21_stop(z2);
 
 	return 0;
 }
 
+static void apple_z2_d21_resume_work(struct work_struct *work)
+{
+	struct apple_z2_d21 *z2 = container_of(work, struct apple_z2_d21,
+					       d21_resume_work);
+	int error;
+
+	error = apple_z2_d21_boot(z2);
+	/* Sleep or removal stopping the boot is not a failure */
+	if (error && !READ_ONCE(z2->stopping))
+		dev_err(&z2->spidev->dev,
+			"D21: touch did not start after resume: %d\n", error);
+}
+
+/*
+ * The boot uploads the firmware and takes about 7.8 s, which held up the
+ * whole resume (and so the screen) on the iPhone 8 Plus. As for the other
+ * controllers, resume only marks it due and complete() starts it in the
+ * background once every device, the SPI controller included, has resumed.
+ */
 static int apple_z2_d21_resume(struct device *dev)
 {
 	struct apple_z2_d21 *z2 = spi_get_drvdata(to_spi_device(dev));
 
 	z2->stopping = false;
-	return apple_z2_d21_boot(z2);
+	z2->d21_boot_due = true;
+	return 0;
+}
+
+/* Also runs when sleep was aborted before suspend(): boot only if stopped. */
+static void apple_z2_d21_complete(struct device *dev)
+{
+	struct apple_z2_d21 *z2 = spi_get_drvdata(to_spi_device(dev));
+
+	if (!z2->d21_boot_due)
+		return;
+	z2->d21_boot_due = false;
+	queue_work(system_dfl_long_wq, &z2->d21_resume_work);
 }
 
 #endif /* _APPLE_Z2_D21_H */
