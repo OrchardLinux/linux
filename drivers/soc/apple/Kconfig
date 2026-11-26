@@ -50,6 +50,17 @@ config APPLE_AOP_T8010
 
 	  Say 'y' or 'm' here if you have an A9- or A10-based iPad or iPhone.
 
+config APPLE_MESA
+	tristate "Apple Mesa (Touch ID) sensor"
+	depends on SPI && OF && REGULATOR
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  The Touch ID sensor of the A11 iPhones. Linux cannot run it, as its
+	  firmware comes from the Secure Enclave, so this driver checks that
+	  the sensor answers and then switches its supplies off.
+
+	  Say 'y' or 'm' here if you have an iPhone 8 Plus.
+
 config APPLE_PMP_T8015_V1
 	tristate "Apple T8015 PMP"
 	depends on ARCH_APPLE || COMPILE_TEST

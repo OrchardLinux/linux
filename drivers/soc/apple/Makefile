@@ -15,6 +15,8 @@ obj-$(CONFIG_APPLE_TUNABLE) += apple-tunable.o
 apple-tunable-y = tunable.o
 
 obj-$(CONFIG_APPLE_AOP_T8010) += apple-aop.o
+
+obj-$(CONFIG_APPLE_MESA) += apple-mesa.o
 apple-aop-y := aop.o
 
 obj-$(CONFIG_APPLE_PMP_T8015_V1) += pmp_t8015_v1.o
