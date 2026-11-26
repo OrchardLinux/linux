@@ -2814,7 +2814,14 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 		task_unlock(p);
 	}
 
+#ifdef CONFIG_ARCH_APPLE_S5L
+void p105_fb_dbg(const char *msg);
+	p105_fb_dbg("kc_wake");
+#endif
 	wake_up_new_task(p);
+#ifdef CONFIG_ARCH_APPLE_S5L
+	p105_fb_dbg("kc_woke");
+#endif
 
 	/* forking complete and child started to run, tell ptracer */
 	if (unlikely(trace))
@@ -2825,7 +2832,13 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 			ptrace_event_pid(PTRACE_EVENT_VFORK_DONE, pid);
 	}
 
+#ifdef CONFIG_ARCH_APPLE_S5L
+	p105_fb_dbg("kc_put");
+#endif
 	put_pid(pid);
+#ifdef CONFIG_ARCH_APPLE_S5L
+	p105_fb_dbg("kc_out");
+#endif
 	return nr;
 }
 
@@ -2851,8 +2864,19 @@ pid_t kernel_thread(int (*fn)(void *), void *arg, const char *name,
 /*
  * Create a user mode thread.
  */
+#ifdef CONFIG_ARCH_APPLE_S5L
+void p105_fb_dbg(const char *msg);
+#endif
+
 pid_t user_mode_thread(int (*fn)(void *), void *arg, unsigned long flags)
 {
+#ifdef CONFIG_ARCH_APPLE_S5L
+	static int apple_fork_fb_left = 32;
+	if (apple_fork_fb_left > 0) {
+		apple_fork_fb_left--;
+		p105_fb_dbg("umt_in");
+	}
+#endif
 	struct kernel_clone_args args = {
 		.flags		= ((lower_32_bits(flags) | CLONE_VM |
 				    CLONE_UNTRACED) & ~CSIGNAL),

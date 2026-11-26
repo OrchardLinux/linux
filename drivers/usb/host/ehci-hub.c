@@ -952,8 +952,17 @@ int ehci_hub_control(
 			/* REVISIT:  some hardware needs 550+ usec to clear
 			 * this bit; seems too long to spin routinely...
 			 */
+			/*
+			 * Cascadia: an HSIC port of Apple's S5L EHCI takes
+			 * longer than this millisecond to end a reset after
+			 * the first enumeration: every later reset of the
+			 * Wi-Fi chip's port "timed out", and done by hand the
+			 * same reset had PR clear by the first look, 2 ms on.
+			 */
 			retval = ehci_handshake(ehci, status_reg,
-					PORT_RESET, 0, 1000);
+					PORT_RESET, 0,
+					(ehci->hsic_ports & BIT(wIndex)) ?
+					20000 : 1000);
 			if (retval != 0) {
 				ehci_err (ehci, "port %d reset error %d\n",
 					wIndex + 1, retval);

@@ -272,9 +272,23 @@ static void brcmf_fweh_event_worker(struct work_struct *work)
 			  event->emsg.ifidx, event->emsg.bsscfgidx,
 			  event->emsg.addr);
 		if (event->emsg.bsscfgidx >= BRCMF_MAX_IFS) {
-			bphy_err(drvr, "invalid bsscfg index: %u\n",
-				 event->emsg.bsscfgidx);
-			goto event_free;
+			/* Apple's BCM4329 firmware for the iPad 2 (4.221.122)
+			 * leaves bsscfgidx at 0xff on the events of a connect;
+			 * it has one interface, the one ifidx names.
+			 */
+			static unsigned int logged;
+			u8 idx = event->emsg.ifidx < BRCMF_MAX_IFS ?
+				 event->emsg.ifidx : 0;
+
+			if (logged < 8) {
+				logged++;
+				brcmf_info("event %s (%u) v%u: bsscfg %u, ifidx %u, ifname %.16s, %u bytes: taken as bsscfg %u\n",
+					   brcmf_fweh_event_name(code), event->code,
+					   be16_to_cpu(event->emsg.version),
+					   event->emsg.bsscfgidx, event->emsg.ifidx,
+					   event->emsg.ifname, event->datalen, idx);
+			}
+			event->emsg.bsscfgidx = idx;
 		}
 
 		/* convert event message */

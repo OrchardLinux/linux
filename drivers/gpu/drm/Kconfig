@@ -449,6 +449,8 @@ source "drivers/gpu/drm/vboxvideo/Kconfig"
 
 source "drivers/gpu/drm/lima/Kconfig"
 
+source "drivers/gpu/drm/apple-sgx/Kconfig"
+
 source "drivers/gpu/drm/panfrost/Kconfig"
 
 source "drivers/gpu/drm/panthor/Kconfig"

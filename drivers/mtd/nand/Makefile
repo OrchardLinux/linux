@@ -7,6 +7,7 @@ obj-$(CONFIG_MTD_NAND_ECC_MEDIATEK) += ecc-mtk.o
 obj-y	+= onenand/
 obj-y	+= raw/
 obj-y	+= spi/
+obj-y	+= apple/
 
 nandcore-$(CONFIG_MTD_NAND_ECC) += ecc.o
 nandcore-$(CONFIG_MTD_NAND_ECC_SW_HAMMING) += ecc-sw-hamming.o

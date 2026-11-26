@@ -5,6 +5,7 @@ subdir-y += allwinner
 subdir-y += alphascale
 subdir-y += amazon
 subdir-y += amlogic
+subdir-y += apple
 subdir-y += arm
 subdir-y += aspeed
 subdir-y += axis

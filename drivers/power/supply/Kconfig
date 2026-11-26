@@ -263,6 +263,22 @@ config MANAGER_SBS
 	  This driver can also be built as a module. If so, the module will be
 	  called sbs-manager.
 
+config BATTERY_APPLE_HDQ
+	tristate "Apple iPad mini 1 battery gauge (bq27540 on HDQ over UART)"
+	depends on ARCH_APPLE_S5L || COMPILE_TEST
+	help
+	  The iPad mini 1's bq27540 gas gauge, read over its one-wire HDQ bus
+	  through UART5 as iOS does it: charge, voltage, current, temperature,
+	  capacities and cycle count, as the "battery" power supply.
+
+config CHARGER_APPLE_PMU
+	tristate "Apple iPad mini 1 USB input current limit (D1946 PMU)"
+	depends on MFD_APPLE_PMU_I2C && POWER_SUPPLY
+	help
+	  Raises the D1946 PMU's USB input current limit (register 0x3d) the
+	  way iBEC does, so the iPad mini 1 charges under Linux.  It writes
+	  nothing until armed through its "armed" module parameter.
+
 config BATTERY_BQ27XXX
 	tristate "BQ27xxx battery driver"
 	help

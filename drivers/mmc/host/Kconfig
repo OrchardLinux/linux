@@ -150,6 +150,17 @@ config MMC_SDHCI_PLTFM
 
 	  If unsure, say N.
 
+config MMC_SDHCI_APPLE_S5L
+	tristate "SDHCI support for the Apple S5L89xx SDIO controller"
+	depends on MMC_SDHCI_PLTFM && OF
+	depends on ARCH_APPLE_S5L || COMPILE_TEST
+	help
+	  The SDIO host of Apple's A4/A5 SoCs (S5L8930X/S5L8940X), an SDHC
+	  that iOS drives through its I/O coprocessor.  On the iPad 2 the
+	  BCM4329 Wi-Fi chip is behind it.
+
+	  If unsure, say N.
+
 config MMC_SDHCI_OF_ARASAN
 	tristate "SDHCI OF support for the Arasan SDHCI controllers"
 	depends on MMC_SDHCI_PLTFM

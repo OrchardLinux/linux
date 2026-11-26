@@ -1987,8 +1987,14 @@ static s32 brcmf_set_auth_type(struct net_device *ndev,
 		brcmf_dbg(CONN, "SAE authentication\n");
 		break;
 	default:
-		val = 2;
-		brcmf_dbg(CONN, "automatic, auth type (%d)\n", sme->auth_type);
+		/* Cascadia: "automatic" only has a choice to make with a WEP
+		 * key (shared or open); without one it is open system.  The
+		 * iPad's BCM4334 firmware, asked for auto (2), never gets
+		 * through authentication at all -- SET_SSID fails after the
+		 * join scan -- where open (0) connects at once. */
+		val = sme->key_len ? 2 : 0;
+		brcmf_dbg(CONN, "automatic, auth type (%d) -> %d\n",
+			  sme->auth_type, val);
 		break;
 	}
 
@@ -3109,6 +3115,32 @@ brcmf_cfg80211_get_station_ibss(struct brcmf_if *ifp,
 	return 0;
 }
 
+/* Apple's BCM4329 firmware for the iPad 2 ("minioctl") has no sta_info: for
+ * the AP of a connected station, the signal and the rate come from the old
+ * ioctls instead, so the link is not reported blind.
+ */
+static s32 brcmf_get_station_legacy(struct brcmf_if *ifp,
+				    struct station_info *sinfo)
+{
+	struct brcmf_scb_val_le scb_val;
+	__le32 rate;
+	s32 err;
+
+	memset(&scb_val, 0, sizeof(scb_val));
+	err = brcmf_fil_cmd_data_get(ifp, BRCMF_C_GET_RSSI, &scb_val,
+				     sizeof(scb_val));
+	if (err)
+		return err;
+	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
+	sinfo->signal = le32_to_cpu(scb_val.val);
+	if (!brcmf_fil_cmd_data_get(ifp, BRCMF_C_GET_RATE, &rate, sizeof(rate))) {
+		/* 500 kbit/s units; .legacy is in 100 kbit/s */
+		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
+		sinfo->txrate.legacy = le32_to_cpu(rate) * 5;
+	}
+	return 0;
+}
+
 static s32
 brcmf_cfg80211_get_station(struct wiphy *wiphy, struct net_device *ndev,
 			   const u8 *mac, struct station_info *sinfo)
@@ -3145,6 +3177,10 @@ brcmf_cfg80211_get_station(struct wiphy *wiphy, struct net_device *ndev,
 					       &sta_info_le,
 					       sizeof(sta_info_le));
 		if (err < 0) {
+			if (test_bit(BRCMF_VIF_STATUS_CONNECTED,
+				     &ifp->vif->sme_state) &&
+			    !brcmf_get_station_legacy(ifp, sinfo))
+				return 0;
 			bphy_err(drvr, "GET STA INFO failed, %d\n", err);
 			goto done;
 		}
@@ -3401,8 +3437,13 @@ static s32 brcmf_inform_bss(struct brcmf_cfg80211_info *cfg)
 	int i;
 
 	bss_list = (struct brcmf_scan_results *)cfg->escan_info.escan_buf;
+	/* 108, the format before 109, is the same in every field read here
+	 * (109 only named the reserved word after ctl_ch, for VHT, and added
+	 * SNR, which nothing reads); Apple's BCM4329 firmware still sends it.
+	 */
 	if (bss_list->count != 0 &&
-	    bss_list->version != BRCMF_BSS_INFO_VERSION) {
+	    bss_list->version != BRCMF_BSS_INFO_VERSION &&
+	    bss_list->version != 108) {
 		bphy_err(drvr, "Version %d != WL_BSS_INFO_VERSION\n",
 			 bss_list->version);
 		return -EOPNOTSUPP;
@@ -7060,6 +7101,11 @@ static int brcmf_construct_chaninfo(struct brcmf_cfg80211_info *cfg,
 			}
 		}
 	}
+	/* per_chan_info only refines the flags: a firmware without it --
+	 * Apple's BCM4329 build for the iPad 2 -- answers every query with an
+	 * error, which must not leak out of the loop as this function's.
+	 */
+	err = 0;
 
 fail_pbuf:
 	kfree(pbuf);
@@ -7752,8 +7798,10 @@ static s32 brcmf_config_dongle(struct brcmf_cfg80211_info *cfg)
 
 	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_FAKEFRAG, 1);
 	if (err) {
-		bphy_err(drvr, "failed to set frameburst mode\n");
-		goto default_conf_out;
+		/* frame bursting only speeds things up; Apple's BCM4329 build
+		 * for the iPad 2 ("minioctl") has no such command */
+		bphy_info_once(drvr, "frameburst mode not set (%d)\n", err);
+		err = 0;
 	}
 
 	cfg->dongle_up = true;

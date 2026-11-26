@@ -1252,6 +1252,10 @@ config SPI_TLE62X0
 # Add new SPI protocol masters in alphabetical order above this line
 #
 
+config SPI_S5L8940X
+	tristate "Apple S5L8940X (A5) SPI controller"
+	depends on OF
+	default y
 endif # SPI_MASTER
 
 #
@@ -1278,9 +1282,17 @@ config SPI_SLAVE_SYSTEM_CONTROL
 	  SPI slave handler to allow remote control of system reboot, power
 	  off, halt, and suspend.
 
+config SPI_S5L8940X
+	tristate "Apple S5L8940X (A5) SPI controller"
+	depends on OF
+	default y
 endif # SPI_SLAVE
 
 config SPI_DYNAMIC
 	def_bool ACPI || OF_DYNAMIC || SPI_SLAVE
 
+config SPI_S5L8940X
+	tristate "Apple S5L8940X (A5) SPI controller"
+	depends on OF
+	default y
 endif # SPI

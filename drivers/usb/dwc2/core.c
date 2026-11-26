@@ -318,7 +318,20 @@ static void dwc2_wait_for_mode(struct dwc2_hsotg *hsotg,
 			break;
 		}
 
-		usleep_range(1000, 2000);
+		/*
+		 * P105AP: usleep_range() is an hrtimer sleep, and this platform
+		 * has no clockevent yet -- jiffies are frozen and the sleep never
+		 * returns, hanging the probe here.  It only ever booted past this
+		 * point by accident: with CONFIG_USB_DWC2_DEBUG=y the dev_dbg in
+		 * dwc2_force_mode() spent ~10 ms pushing characters out of a
+		 * 115200 UART, which was enough settle time that the mode check
+		 * above succeeded on the first pass and this sleep was never
+		 * reached.  Turning that logging off removed the delay and the
+		 * board hung.  mdelay busy-waits off the PMCCNTR delay timer and
+		 * needs no tick, so USB no longer depends on debug logging or on
+		 * the timer work being finished.
+		 */
+		mdelay(1);
 	}
 }
 

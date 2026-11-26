@@ -1388,4 +1388,9 @@ config TOUCHSCREEN_HIMAX_HX83112B
 	  To compile this driver as a module, choose M here: the
 	  module will be called himax_hx83112b.
 
+config TOUCHSCREEN_APPLE_Z2
+	tristate "Apple Z2 multi-touch (Cypress/Broadcom) via SPI"
+	depends on SPI && OF
+	select INPUT_MT
+	default y
 endif

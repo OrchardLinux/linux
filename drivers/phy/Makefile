@@ -39,3 +39,4 @@ obj-y					+= allwinner/	\
 					   tegra/	\
 					   ti/		\
 					   xilinx/
+obj-$(CONFIG_PHY_APPLE_S5L_USB)	+= phy-apple-s5l-usb.o

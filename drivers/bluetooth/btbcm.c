@@ -31,6 +31,9 @@
 #define BDADDR_BCM4334B0 (&(bdaddr_t) {{0x00, 0x00, 0x00, 0xb0, 0x34, 0x43}})
 #define BDADDR_BCM4345C5 (&(bdaddr_t) {{0xac, 0x1f, 0x00, 0xc5, 0x45, 0x43}})
 #define BDADDR_BCM43341B (&(bdaddr_t) {{0xac, 0x1f, 0x00, 0x1b, 0x34, 0x43}})
+#define BDADDR_BCM4334B1_APPLE (&(bdaddr_t) {{0xac, 0x1f, 0x34, 0x43, 0x34, 0x43}})
+#define BDADDR_BCM4330B1_APPLE (&(bdaddr_t) {{0xac, 0x1f, 0x30, 0x43, 0x30, 0x43}})
+#define BDADDR_BCM4329C0_APPLE (&(bdaddr_t) {{0x00, 0x00, 0x0a, 0x1a, 0x29, 0x43}})
 
 #define BCM_FW_NAME_LEN			64
 #define BCM_FW_NAME_COUNT_MAX		4
@@ -120,6 +123,12 @@ int btbcm_check_bdaddr(struct hci_dev *hdev)
 	 *
 	 * The address AA:AA:AA:AA:AA:AA indicates a BCM43430A1 controller
 	 * with no configured address.
+	 *
+	 * The address 43:34:43:34:1F:AC indicates a BCM4334 running Apple's
+	 * patchram (iPad mini, iOS's BlueTool), which leaves the address to
+	 * the host; 43:30:43:30:1F:AC the same for the iPad 3's BCM4330
+	 * ("BCM4330B1 37.4 MHz Class 1.5 Olympic Mike Module"), and
+	 * 43:29:1A:0A:00:00 for the iPad 2's BCM4329C0 with its own.
 	 */
 	if (!bacmp(&bda->bdaddr, BDADDR_BCM20702A0) ||
 	    !bacmp(&bda->bdaddr, BDADDR_BCM20702A1) ||
@@ -130,7 +139,10 @@ int btbcm_check_bdaddr(struct hci_dev *hdev)
 	    !bacmp(&bda->bdaddr, BDADDR_BCM4345C5) ||
 	    !bacmp(&bda->bdaddr, BDADDR_BCM43430A0) ||
 	    !bacmp(&bda->bdaddr, BDADDR_BCM43430A1) ||
-	    !bacmp(&bda->bdaddr, BDADDR_BCM43341B)) {
+	    !bacmp(&bda->bdaddr, BDADDR_BCM43341B) ||
+	    !bacmp(&bda->bdaddr, BDADDR_BCM4334B1_APPLE) ||
+	    !bacmp(&bda->bdaddr, BDADDR_BCM4330B1_APPLE) ||
+	    !bacmp(&bda->bdaddr, BDADDR_BCM4329C0_APPLE)) {
 		/* Try falling back to BDADDR EFI variable */
 		if (btbcm_set_bdaddr_from_efi(hdev) != 0) {
 			bt_dev_info(hdev, "BCM: Using default device address (%pMR)",
@@ -511,6 +523,7 @@ static const struct bcm_subver_table bcm_uart_subver_table[] = {
 	{ 0x420d, "BCM4349B1"	},	/* 002.002.013 */
 	{ 0x420e, "BCM4349B1"	},	/* 002.002.014 */
 	{ 0x4217, "BCM4329B1"   },	/* 002.002.023 */
+	{ 0x610d, "BCM4329C0"   },	/* 003.001.013, the iPad 2's (BlueTool: BCM43291A0) */
 	{ 0x6106, "BCM4359C0"	},	/* 003.001.006 */
 	{ 0x4106, "BCM4335A0"	},	/* 002.001.006 */
 	{ 0x410c, "BCM43430B0"	},	/* 002.001.012 */
