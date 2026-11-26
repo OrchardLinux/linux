@@ -267,12 +267,14 @@
 };
 
 /*
- * The ambient light sensor: a CT819 on i2c2. The device trees of the J81
- * and J82 list it twice, as i2c2/als1 at 0x49 (interrupt GPIO 103) and
- * i2c2/als2 at 0x29 (interrupt GPIO 110), both "probe-for-hardware": iOS
- * uses the one that answers. Both are described; the absent one fails its
- * chip ID read. Both name the unit's SysCfg LSCI record as alsCalibration,
- * which the loader copies into each through the als0 and als1 aliases.
+ * The ambient light sensors: two CT819s on i2c2. The device trees of the
+ * J81 and J82 list i2c2/als1 at 0x49 (interrupt GPIO 103, orientation 6)
+ * and i2c2/als2 at 0x29 (interrupt GPIO 110, orientation 5), both
+ * "probe-for-hardware"; a J81 has both. Both name the unit's SysCfg LSCI
+ * record set as alsCalibration, which the loader copies into each through
+ * the als0 and als1 aliases. It holds one record per sensor, and each
+ * sensor takes the one of its placement and orientation (the ADT's
+ * IOHIDPlacementType and IOHIDOrientationType), as iOS does.
  * i2c2 has nothing else on it.
  */
 &i2c2 {
@@ -283,6 +285,8 @@
 		compatible = "apple,ct819", "amstaos,tsl2581";
 		reg = <0x29>;
 		interrupts-extended = <&pinctrl 110 IRQ_TYPE_LEVEL_LOW>;
+		apple,als-placement = <1>;
+		apple,als-orientation = <5>;
 	};
 
 	/* m1n1 adds apple,als-calibration from the ADT */
@@ -290,6 +294,8 @@
 		compatible = "apple,ct819", "amstaos,tsl2581";
 		reg = <0x49>;
 		interrupts-extended = <&pinctrl 103 IRQ_TYPE_LEVEL_LOW>;
+		apple,als-placement = <1>;
+		apple,als-orientation = <6>;
 	};
 };
 
