@@ -35,3 +35,38 @@
 		vdd30-supply = <&mesa_3v0>;
 	};
 };
+
+/ {
+	aliases {
+		aop = &aop; /* m1n1 passes the AOP its boot arguments and calibration */
+	};
+};
+
+/* The AOP firmware comes from the IPSW (Firmware/AOP/aopfw-iphone10aop). */
+&aop {
+	firmware-name = "apple/aop-t8015.bin", "apple/aop-t8015-ext.bin";
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+/*
+ * Measured on an iPhone 8 Plus: the accelerometer reports gravity on the
+ * device's axes (x right, y up, z out of the screen), as on the iPad 5 and
+ * the A9 iPhones: upright y = -1 g, flat screen up z = -1 g. iio-sensor-proxy
+ * takes upright as negative y and needs z flipped. The gyroscope turns
+ * positive about z when the phone spins anticlockwise screen up.
+ */
+&aop_accel {
+	mount-matrix = "1", "0", "0",
+		       "0", "1", "0",
+		       "0", "0", "-1";
+};
+
+&aop_gyro {
+	mount-matrix = "1", "0", "0",
+		       "0", "1", "0",
+		       "0", "0", "1";
+};
