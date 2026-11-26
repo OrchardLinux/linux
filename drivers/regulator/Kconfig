@@ -133,6 +133,15 @@ config REGULATOR_ADP5055
 	  Say M here if you want to include support for the regulator as a
 	  module.
 
+config REGULATOR_MACSMC
+	tristate "Apple SMC power switches"
+	depends on MFD_MACSMC && OF
+	default y if ARCH_APPLE
+	help
+	  Support the peripheral supplies that the SMC switches on and off
+	  on the A11 iPhones, such as the Touch ID sensor's 1.8 V and 3 V
+	  rails on the iPhone 8 Plus.
+
 config REGULATOR_APPLE_PMIC_TOUCH
 	tristate "Apple PMIC touchscreen supply regulators"
 	depends on MFD_SIMPLE_MFD_I2C && OF

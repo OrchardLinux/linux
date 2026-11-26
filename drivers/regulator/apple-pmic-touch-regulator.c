@@ -9,6 +9,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/property.h>
+#include <linux/delay.h>
 #include <linux/regmap.h>
 #include <linux/regulator/driver.h>
 #include <linux/regulator/of_regulator.h>
@@ -17,6 +18,79 @@ static const struct regulator_ops apple_pmic_touch_regulator_ops = {
 	.enable = regulator_enable_regmap,
 	.disable = regulator_disable_regmap,
 	.is_enabled = regulator_is_enabled_regmap,
+};
+
+/*
+ * D2089 (Anya, A7 iPad Air): the touchscreen analog supply is LDO 15 at
+ * register 0x84 bit 2. LDOs 13 to 15 share the analog bias in bits 0 and 1
+ * of that register, which must be set with any of them; like on the D2207
+ * the bias stays set when the touchscreen supply turns off, as other users
+ * may need it. The touchscreen core supply is register 0x85 bit 1.
+ */
+#define APPLE_D2089_LDO_BIAS_SHARED	0x03
+
+static int apple_d2089_touch_analog_enable(struct regulator_dev *rdev)
+{
+	return regmap_update_bits(rdev_get_regmap(rdev), rdev->desc->enable_reg,
+				  rdev->desc->enable_mask | APPLE_D2089_LDO_BIAS_SHARED,
+				  rdev->desc->enable_val | APPLE_D2089_LDO_BIAS_SHARED);
+}
+
+static const struct regulator_ops apple_d2089_touch_analog_ops = {
+	.enable = apple_d2089_touch_analog_enable,
+	.disable = regulator_disable_regmap,
+	.is_enabled = regulator_is_enabled_regmap,
+};
+
+static const struct regulator_desc apple_d2089_touch_analog = {
+	.name = "d2089-touch-analog",
+	.ops = &apple_d2089_touch_analog_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x84,
+	.enable_mask = 0x04,
+	.enable_val = 0x04,
+	.disable_val = 0,
+};
+
+static const struct regulator_desc apple_d2089_touch_core = {
+	.name = "d2089-touch-core",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x85,
+	.enable_mask = 0x02,
+	.enable_val = 0x02,
+	.disable_val = 0,
+};
+
+/*
+ * August (D2400, J120) pmuL(0x30c) encodes LDO index 12 and options 3,
+ * not a register address. In iPadOS 17.7.11 (21H461), _setLDO at
+ * 0xfffffff0064bd8b0 indexes 12-byte entries at 0xfffffff005551a54.
+ * Entry 12 selects control register 0x312 and enable mask 0x01; the
+ * native read/modify/write at 0xfffffff0064bdaac preserves the other bits.
+ */
+static const struct regulator_desc apple_august_touch_analog = {
+	.name = "august-touch-analog",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x312,
+	.enable_mask = 0x01,
+	.enable_val = 0x01,
+	.disable_val = 0,
+};
+
+static const struct regulator_desc apple_d2186_touch_core = {
+	.name = "d2186-touch-core",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x85,
+	.enable_mask = 0x02,
+	.enable_val = 0x02,
+	.disable_val = 0,
 };
 
 static const struct regulator_desc apple_adelyn_touch_core = {
@@ -32,6 +106,75 @@ static const struct regulator_desc apple_adelyn_touch_core = {
 	.off_on_delay = 1000,
 };
 
+/*
+ * Antigua (D2255, iPhone 6s/6s Plus) pmuL(0x219): LDO index 25, enable-only,
+ * through register 0x319 bit 0 (iOS 19H422 LDO table 0xfffffff0059cc58e,
+ * _setLDO 0xfffffff0069337f4). iOS turns it off when the PMU driver starts
+ * and the touch driver turns it on.
+ */
+static const struct regulator_desc apple_antigua_touch_core = {
+	.name = "antigua-touch-core",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x319,
+	.enable_mask = 0x01,
+	.enable_val = 0x01,
+	.disable_val = 0,
+	.enable_time = 1000,
+	.off_on_delay = 1000,
+};
+
+/*
+ * Angel (D2365, iPad 5) pmuL(0x21f): LDO index 31, enable-only, through
+ * register 0x31c bit 0 (iOS 0xfffffff006bbe488, 0xfffffff006bbe388,
+ * 0xfffffff006bbcdd8). The ADT names only the function, so the register
+ * and bit are not yet confirmed by a second source.
+ */
+static const struct regulator_desc apple_angel_touch_analog = {
+	.name = "angel-touch-analog",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x31c,
+	.enable_mask = 0x01,
+	.enable_val = 0x01,
+	.disable_val = 0,
+};
+
+/*
+ * D2207 (Arabela, iPad Air 2) pmuL(0x20e): LDO index 14, enable-only, at
+ * register 0x84 bit 2 (iOS LDO table 0xfffffff005a98774, setLDO
+ * 0xfffffff006cec138). LDOs 14 to 16 share bits 0 and 1 of the register,
+ * which iOS sets with any of them; they stay set when the touchscreen
+ * supply turns off, as other users may need them.
+ */
+#define APPLE_D2207_LDO14_SHARED	0x03
+
+static int apple_d2207_touch_analog_enable(struct regulator_dev *rdev)
+{
+	return regmap_update_bits(rdev_get_regmap(rdev), rdev->desc->enable_reg,
+				  rdev->desc->enable_mask | APPLE_D2207_LDO14_SHARED,
+				  rdev->desc->enable_val | APPLE_D2207_LDO14_SHARED);
+}
+
+static const struct regulator_ops apple_d2207_touch_analog_ops = {
+	.enable = apple_d2207_touch_analog_enable,
+	.disable = regulator_disable_regmap,
+	.is_enabled = regulator_is_enabled_regmap,
+};
+
+static const struct regulator_desc apple_d2207_touch_analog = {
+	.name = "d2207-touch-analog",
+	.ops = &apple_d2207_touch_analog_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x84,
+	.enable_mask = 0x04,
+	.enable_val = 0x04,
+	.disable_val = 0,
+};
+
 static const struct regulator_desc apple_chestnut_touch_hv = {
 	.name = "chestnut-touch-hv",
 	.ops = &apple_pmic_touch_regulator_ops,
@@ -43,6 +186,49 @@ static const struct regulator_desc apple_chestnut_touch_hv = {
 	.disable_val = 0,
 	.enable_time = 1000,
 	.off_on_delay = 1000,
+};
+
+/*
+ * Acorn (iPhone X display PMU, I2C 0x2a): the touch controller's supply is
+ * register 0x05. The ADT's multi-touch node has function-power_ana = dpLE(0x6)
+ * and function-power_pulldown = dpLE(0x40); its power-sequence turns the
+ * pulldown off and power_ana on. iOS AppleAcornDisplayPMU writes the ADT
+ * init value 0x09 to the same register at start; without bits 0x09 the
+ * controller stays silent. They are shared with the display and stay set.
+ */
+#define APPLE_ACORN_TOUCH_SHARED	0x09
+
+static int apple_acorn_touch_analog_enable(struct regulator_dev *rdev)
+{
+	struct regmap *regmap = rdev_get_regmap(rdev);
+	int ret;
+
+	ret = regmap_update_bits(regmap, rdev->desc->enable_reg,
+				 APPLE_ACORN_TOUCH_SHARED, APPLE_ACORN_TOUCH_SHARED);
+	if (ret)
+		return ret;
+	msleep(50);
+	return regmap_update_bits(regmap, rdev->desc->enable_reg,
+				  rdev->desc->enable_mask, rdev->desc->enable_val);
+}
+
+static const struct regulator_ops apple_acorn_touch_analog_ops = {
+	.enable = apple_acorn_touch_analog_enable,
+	.disable = regulator_disable_regmap,
+	.is_enabled = regulator_is_enabled_regmap,
+};
+
+static const struct regulator_desc apple_acorn_touch_analog = {
+	.name = "acorn-touch-analog",
+	.ops = &apple_acorn_touch_analog_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x05,
+	.enable_mask = 0x46,
+	.enable_val = 0x06,
+	.disable_val = 0x40,
+	.enable_time = 20000,
+	.off_on_delay = 1000000,
 };
 
 static int apple_pmic_touch_regulator_probe(struct platform_device *pdev)
@@ -73,8 +259,40 @@ static int apple_pmic_touch_regulator_probe(struct platform_device *pdev)
 
 static const struct of_device_id apple_pmic_touch_regulator_of_match[] = {
 	{
+		.compatible = "apple,d2089-touch-analog-regulator",
+		.data = &apple_d2089_touch_analog,
+	},
+	{
+		.compatible = "apple,d2089-touch-core-regulator",
+		.data = &apple_d2089_touch_core,
+	},
+	{
+		.compatible = "apple,august-touch-analog-regulator",
+		.data = &apple_august_touch_analog,
+	},
+	{
+		.compatible = "apple,d2186-touch-core-regulator",
+		.data = &apple_d2186_touch_core,
+	},
+	{
 		.compatible = "apple,adelyn-touch-core-regulator",
 		.data = &apple_adelyn_touch_core,
+	},
+	{
+		.compatible = "apple,antigua-touch-core-regulator",
+		.data = &apple_antigua_touch_core,
+	},
+	{
+		.compatible = "apple,angel-touch-analog-regulator",
+		.data = &apple_angel_touch_analog,
+	},
+	{
+		.compatible = "apple,d2207-touch-analog-regulator",
+		.data = &apple_d2207_touch_analog,
+	},
+	{
+		.compatible = "apple,acorn-touch-analog-regulator",
+		.data = &apple_acorn_touch_analog,
 	},
 	{
 		.compatible = "apple,chestnut-touch-hv-regulator",

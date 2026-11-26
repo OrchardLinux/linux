@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/regulator/apple,smc-regulator.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SMC power switches
+
+maintainers:
+  - Dugs <dugahol@protonmail.com>
+
+description:
+  On the A11 iPhones the SMC switches some peripheral supplies on and off.
+  Which supplies exist depends on the SMC firmware, so the compatible
+  selects them; each one is described by a child node named after it.
+
+properties:
+  compatible:
+    const: apple,t8015-smc-regulator
+
+patternProperties:
+  "^mesa-(1v8|3v0)$":
+    type: object
+    $ref: regulator.yaml#
+    unevaluatedProperties: false
+    description: Touch ID sensor 1.8 V and 3 V supplies
+
+required:
+  - compatible
+
+additionalProperties: false
+
+examples:
+  - |
+    regulators {
+      compatible = "apple,t8015-smc-regulator";
+
+      mesa-1v8 {
+        regulator-name = "mesa-1v8";
+      };
+
+      mesa-3v0 {
+        regulator-name = "mesa-3v0";
+      };
+    };

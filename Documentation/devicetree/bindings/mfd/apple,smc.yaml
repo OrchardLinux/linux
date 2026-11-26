@@ -59,6 +59,9 @@ properties:
   hwmon:
     $ref: /schemas/hwmon/apple,smc-hwmon.yaml
 
+  regulators:
+    $ref: /schemas/regulator/apple,smc-regulator.yaml
+
 additionalProperties: false
 
 required:
