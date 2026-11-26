@@ -688,6 +688,52 @@
 				     <AIC_IRQ 205 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
+		/*
+		 * The Always-On Processor, from the ADT's aop node (iop,t8015,
+		 * rtbuddy-v2): its control registers, the mailbox at the same
+		 * +0x8000 as the SMC's, and its SRAM (the nub's region-base and
+		 * region-size). The ADT lists its interrupts as 151, 150, 153,
+		 * 152, the order it lists the SMC's 210, 209, 212, 211 in.
+		 */
+		aop: aop@234800000 {
+			compatible = "apple,t8015-aop";
+			reg = <0x2 0x34800000 0x0 0x4000>,
+			      <0x2 0x34000200 0x0 0x100>,
+			      <0x2 0x34e00000 0x0 0x160000>;
+			reg-names = "akf", "control", "sram";
+			mboxes = <&aop_mbox>;
+			mbox-names = "mbox";
+			power-domains = <&ps_aop_base>;
+			status = "disabled";
+
+			/* The A11 firmware's sensors take the A10's interface. */
+			aop_accel: accel {
+				compatible = "apple,t8010-aop-accel";
+			};
+
+			aop_gyro: gyro {
+				compatible = "apple,t8010-aop-gyro";
+			};
+
+			aop_pressure: pressure {
+				compatible = "apple,t8010-aop-pressure";
+			};
+		};
+
+		aop_mbox: mbox@234808000 {
+			compatible = "apple,t8015-asc-mailbox";
+			reg = <0x2 0x34808000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 150 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 151 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 152 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 153 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
 		smc_mbox: mbox@236808000 {
 			compatible = "apple,t8015-asc-mailbox";
 			reg = <0x2 0x36808000 0x0 0x4000>;
