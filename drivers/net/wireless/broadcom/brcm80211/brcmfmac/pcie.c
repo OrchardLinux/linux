@@ -6,6 +6,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/firmware.h>
+#include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
@@ -50,10 +51,12 @@ enum brcmf_pcie_state {
 };
 
 BRCMF_FW_DEF(43602, "brcmfmac43602-pcie");
+BRCMF_FW_CLM_DEF(4345, "brcmfmac4345-pcie");
 BRCMF_FW_DEF(4350, "brcmfmac4350-pcie");
 BRCMF_FW_DEF(4350C, "brcmfmac4350c2-pcie");
 BRCMF_FW_CLM_DEF(4355, "brcmfmac4355-pcie");
 BRCMF_FW_CLM_DEF(4355C1, "brcmfmac4355c1-pcie");
+BRCMF_FW_CLM_DEF(4357, "brcmfmac4357-pcie");
 BRCMF_FW_CLM_DEF(4356, "brcmfmac4356-pcie");
 BRCMF_FW_CLM_DEF(43570, "brcmfmac43570-pcie");
 BRCMF_FW_DEF(4358, "brcmfmac4358-pcie");
@@ -84,6 +87,7 @@ MODULE_FIRMWARE(BRCMF_FW_DEFAULT_PATH "brcmfmac*-pcie.*.txcap_blob");
 
 static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_43602_CHIP_ID, 0xFFFFFFFF, 43602),
+	BRCMF_FW_ENTRY(BRCM_CC_4345_CHIP_ID, 0xFFFFFFFF, 4345),
 	BRCMF_FW_ENTRY(BRCM_CC_43465_CHIP_ID, 0xFFFFFFF0, 4366C),
 	BRCMF_FW_ENTRY(BRCM_CC_4350_CHIP_ID, 0x000000FF, 4350C),
 	BRCMF_FW_ENTRY(BRCM_CC_4350_CHIP_ID, 0xFFFFFF00, 4350),
@@ -91,6 +95,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 	BRCMF_FW_ENTRY(BRCM_CC_4355_CHIP_ID, 0x000007FF, 4355),
 	BRCMF_FW_ENTRY(BRCM_CC_4355_CHIP_ID, 0x00002000, 54591),
 	BRCMF_FW_ENTRY(BRCM_CC_4355_CHIP_ID, 0xFFFFF800, 4355C1), /* rev ID 12/C2 seen */
+	BRCMF_FW_ENTRY(BRCM_CC_4357_CHIP_ID, 0xFFFFFFFF, 4357),
 	BRCMF_FW_ENTRY(BRCM_CC_4356_CHIP_ID, 0xFFFFFFFF, 4356),
 	BRCMF_FW_ENTRY(BRCM_CC_43567_CHIP_ID, 0xFFFFFFFF, 43570),
 	BRCMF_FW_ENTRY(BRCM_CC_43569_CHIP_ID, 0xFFFFFFFF, 43570),
@@ -2004,6 +2009,39 @@ brcmf_pcie_parse_otp_sys_vendor(struct brcmf_pciedev_info *devinfo,
 	return 0;
 }
 
+/*
+ * Apple's Wi-Fi and Bluetooth share one module, and the Bluetooth Patchram
+ * differs per module vendor, which only the Wi-Fi OTP tells. Record the
+ * vendor in this device's DT node so that hci_bcm can pick its Patchram.
+ */
+static void brcmf_pcie_publish_otp_vendor(struct brcmf_pciedev_info *devinfo)
+{
+	struct device_node *np = devinfo->pdev->dev.of_node;
+	struct property *prop;
+
+	if (!np || !devinfo->otp.valid ||
+	    of_property_present(np, "apple,module-vendor"))
+		return;
+
+	prop = kzalloc(sizeof(*prop), GFP_KERNEL);
+	if (!prop)
+		return;
+
+	prop->name = kstrdup("apple,module-vendor", GFP_KERNEL);
+	prop->value = kstrdup(devinfo->otp.vendor, GFP_KERNEL);
+	if (!prop->name || !prop->value)
+		goto free;
+	prop->length = strlen(prop->value) + 1;
+
+	if (!of_add_property(np, prop))
+		return;
+
+free:
+	kfree(prop->value);
+	kfree(prop->name);
+	kfree(prop);
+}
+
 static int
 brcmf_pcie_parse_otp(struct brcmf_pciedev_info *devinfo, u8 *otp, size_t size)
 {
@@ -2050,17 +2088,53 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
 {
 	const struct pci_dev *pdev = devinfo->pdev;
 	struct brcmf_bus *bus = dev_get_drvdata(&pdev->dev);
-	u32 coreid, base, words, idx, sromctl;
+	u32 coreid, base, words, idx, sromctl, otpsize;
+	bool optional = false;
 	u16 *otp;
 	struct brcmf_core *core;
 	int ret;
 
 	switch (devinfo->ci->chip) {
+	case BRCM_CC_4345_CHIP_ID:
+		/*
+		 * Apple BCM4345 OTP is shadowed in ChipCommon from 0x800 with
+		 * Apple's records starting at 0x8c0 for 0x172 bytes (0xb9
+		 * 16-bit words). Keep the record optional so a missing Apple
+		 * tuple falls back to the board-type firmware names.
+		 */
+		coreid = BCMA_CORE_CHIPCOMMON;
+		base = 0x8c0;
+		words = 0xb9;
+		optional = true;
+		break;
+	case BRCM_CC_4350_CHIP_ID:
+		/*
+		 * The 40 nm OTP holds (CC_CAP_OTPSIZE + 1) Kbit and is
+		 * shadowed in ChipCommon from 0x800; Apple's records start
+		 * at 0x8c0. The BCM4350 is used on non-Apple boards too,
+		 * whose OTP has no Apple record, so don't fail without one.
+		 */
+		otpsize = (devinfo->ci->cc_caps & CC_CAP_OTPSIZE) >>
+			  CC_CAP_OTPSIZE_SHIFT;
+		if (!otpsize)
+			return 0;
+		coreid = BCMA_CORE_CHIPCOMMON;
+		base = 0x8c0;
+		words = (otpsize + 1) * 1024 / 16 - (0x8c0 - 0x800) / 2;
+		optional = true;
+		break;
 	case BRCM_CC_4355_CHIP_ID:
 		coreid = BCMA_CORE_CHIPCOMMON;
 		base = 0x8c0;
 		words = 0xb2;
 		break;
+	case BRCM_CC_4357_CHIP_ID:
+		/*
+		 * The A11 iPhones' BCM4357: reading the ChipCommon OTP shadow
+		 * at 0x8c0 takes the SoC down, and where else its OTP sits is
+		 * not known. Use the board-type firmware names.
+		 */
+		return 0;
 	case BRCM_CC_4364_CHIP_ID:
 		coreid = BCMA_CORE_CHIPCOMMON;
 		base = 0x8c0;
@@ -2127,6 +2201,11 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
 
 	ret = brcmf_pcie_parse_otp(devinfo, (u8 *)otp, 2 * words);
 	kfree(otp);
+
+	if (ret && optional) {
+		brcmf_dbg(PCIE, "No Apple OTP record, using default firmware\n");
+		return 0;
+	}
 
 	return ret;
 }
@@ -2264,39 +2343,37 @@ brcmf_pcie_prepare_fw_request(struct brcmf_pciedev_info *devinfo)
 	fwreq->bus_nr = devinfo->pdev->bus->number;
 
 	/* Apple platforms with fancy firmware/NVRAM selection */
-	if (devinfo->settings->board_type &&
-	    devinfo->settings->antenna_sku &&
-	    devinfo->otp.valid) {
+	if (devinfo->settings->board_type && devinfo->otp.valid) {
 		const struct brcmf_otp_params *otp = &devinfo->otp;
+		const char *board = devinfo->settings->board_type;
+		const char *sku = devinfo->settings->antenna_sku;
 		struct device *dev = &devinfo->pdev->dev;
 		const char **bt = fwreq->board_types;
+		unsigned int i, n = 0;
 
-		brcmf_dbg(PCIE, "Apple board: %s\n",
-			  devinfo->settings->board_type);
+		brcmf_dbg(PCIE, "Apple board: %s\n", board);
 
-		/* Example: apple,shikoku-RASP-m-6.11-X3 */
-		bt[0] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s-%s-%s-%s",
-				       devinfo->settings->board_type,
-				       otp->module, otp->vendor, otp->version,
-				       devinfo->settings->antenna_sku);
-		bt[1] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s-%s-%s",
-				       devinfo->settings->board_type,
-				       otp->module, otp->vendor, otp->version);
-		bt[2] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s-%s",
-				       devinfo->settings->board_type,
-				       otp->module, otp->vendor);
-		bt[3] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s",
-				       devinfo->settings->board_type,
-				       otp->module);
-		bt[4] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s",
-				       devinfo->settings->board_type,
-				       devinfo->settings->antenna_sku);
-		bt[5] = devinfo->settings->board_type;
-
-		if (!bt[0] || !bt[1] || !bt[2] || !bt[3] || !bt[4]) {
-			kfree(fwreq);
-			return NULL;
+		/* Example: apple,shikoku-RASP-m-6.11-X3; mobile devices have no SKU. */
+		if (sku)
+			bt[n++] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s-%s-%s-%s",
+						 board, otp->module, otp->vendor,
+						 otp->version, sku);
+		bt[n++] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s-%s-%s", board,
+					 otp->module, otp->vendor, otp->version);
+		bt[n++] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s-%s", board,
+					 otp->module, otp->vendor);
+		bt[n++] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s", board,
+					 otp->module);
+		if (sku)
+			bt[n++] = devm_kasprintf(dev, GFP_KERNEL, "%s-%s", board,
+						 sku);
+		for (i = 0; i < n; i++) {
+			if (!bt[i]) {
+				kfree(fwreq);
+				return NULL;
+			}
 		}
+		bt[n] = board;
 	} else {
 		brcmf_dbg(PCIE, "Board: %s\n", devinfo->settings->board_type);
 		fwreq->board_types[0] = devinfo->settings->board_type;
@@ -2537,6 +2614,7 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			brcmf_err(bus, "failed to parse OTP\n");
 			goto fail_brcmf;
 		}
+		brcmf_pcie_publish_otp_vendor(devinfo);
 		break;
 	case BRCMF_FWVENDOR_CYW:
 	default:
@@ -2643,6 +2721,10 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 
+	/* Lost over an earlier sleep, see brcmf_pcie_pm_leave_D3() */
+	if (!pci_device_is_present(devinfo->pdev))
+		return 0;
+
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
@@ -2675,6 +2757,23 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
+
+	/*
+	 * The host bridge could not bring the link back. Any BAR access now
+	 * could stall the CPU, so stay down; with the bus down, firmware
+	 * commands and transmits are refused early.
+	 */
+	if (!pci_device_is_present(devinfo->pdev)) {
+		brcmf_err(bus, "device lost over suspend, staying down\n");
+		return -ENODEV;
+	}
+
+	/*
+	 * The BAR0 window register is not part of the configuration space the
+	 * PCI core restores. After a sleep that reset the chip it selects
+	 * another core, and the test below would read that core's register.
+	 */
+	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
 
 	/* Check if device is still up and running, if so we are ready */
 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
@@ -2733,10 +2832,12 @@ static const struct dev_pm_ops brcmf_pciedrvr_pm = {
 	}
 
 static const struct pci_device_id brcmf_pcie_devid_table[] = {
+	BRCMF_PCIE_DEVICE(BRCM_PCIE_4345_DEVICE_ID, WCC_SEED),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4350_DEVICE_ID, WCC),
 	BRCMF_PCIE_DEVICE_SUB(0x4355, BRCM_PCIE_VENDOR_ID_BROADCOM, 0x4355, WCC),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4354_RAW_DEVICE_ID, WCC),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4355_DEVICE_ID, WCC_SEED),
+	BRCMF_PCIE_DEVICE(BRCM_PCIE_4357_DEVICE_ID, WCC_SEED),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_4356_DEVICE_ID, WCC),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_43567_DEVICE_ID, WCC),
 	BRCMF_PCIE_DEVICE(BRCM_PCIE_43570_DEVICE_ID, WCC),

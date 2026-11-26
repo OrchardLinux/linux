@@ -711,6 +711,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
 {
 	switch (ci->pub.chip) {
 	case BRCM_CC_4345_CHIP_ID:
+		return (ci->pub.chiprev < 6) ? 0x1b0000 : 0x198000;
 	case BRCM_CC_43454_CHIP_ID:
 		return 0x198000;
 	case BRCM_CC_4335_CHIP_ID:
@@ -740,6 +741,7 @@ static u32 brcmf_chip_tcm_rambase(struct brcmf_chip_priv *ci)
 		return 0x160000;
 	case BRCM_CC_43751_CHIP_ID:
 	case BRCM_CC_43752_CHIP_ID:
+	case BRCM_CC_4357_CHIP_ID:
 	case BRCM_CC_4377_CHIP_ID:
 		return 0x170000;
 	case BRCM_CC_4378_CHIP_ID:
