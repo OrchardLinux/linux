@@ -10,6 +10,15 @@
 / {
 	chassis-type = "tablet";
 
+	aliases {
+		als0 = &als49;	/* the loader copies the ADT's alsCalibration here */
+		als1 = &als29;	/* the same record, for the sensor at 0x29 */
+		bluetooth0 = &bluetooth;
+		serial3 = &serial3;
+		touchscreen0 = &touchscreen;
+		wifi0 = &wifi0;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -56,6 +65,28 @@
 		};
 	};
 
+	/*
+	 * Smart Cover hall sensors: PMIC GPIO 12 ("halleffect") and 10
+	 * ("halleffect1") in the ADT /buttons node, with the same flags as on
+	 * the iPad 6, where both read low while the cover is closed. Reported
+	 * as SW_MACHINE_COVER, not as a lid switch, so that closing the cover
+	 * doesn't suspend the system. Each line is its own device, so that
+	 * one the PMIC keeps for itself can't take the other down.
+	 */
+	smart-cover {
+		compatible = "gpio-keys-polled";
+		poll-interval = <50>;
+		label = "iPad Smart Cover";
+
+		cover-switch {
+			label = "Smart Cover (PMIC GPIO 12)";
+			gpios = <&pmu_gpio 12 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_MACHINE_COVER>;
+			debounce-interval = <50>;
+		};
+	};
+
 	memory@800000000 {
 		device_type = "memory";
 		reg = <0x8 0 0 0>; /* To be filled by loader */
@@ -66,8 +97,32 @@
 		#size-cells = <2>;
 		ranges;
 
-		/* To be filled by loader */
+		ans_firmware: ans-firmware {
+			/* Filled in by the loader. */
+			reg = <0 0 0 0>;
+			no-map;
+		};
 	};
+
+	battery_info: battery {
+		compatible = "simple-battery";
+		charge-full-design-microamp-hours = <7340000>;
+	};
+
+	/* Wi-Fi REG_ON is D2207 GPIO 3. */
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&pmu_gpio 3 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <100000>;
+	};
+};
+
+&ans {
+	memory-region = <&ans_firmware>;
+	memory-region-names = "firmware";
+	status = "okay";
 };
 
 &serial0 {
@@ -77,11 +132,67 @@
 &i2c0 {
 	status = "okay";
 
+	/* The Lightning port controller, from the ADT i2c0/tristar node. */
+	tristar: port-controller@1a {
+		compatible = "nxp,cbtl1610";
+		reg = <0x1a>;
+	};
+
 	pmic@3c {
 		compatible = "apple,arabela-pmic", "apple,i2c-pmic";
 		reg = <0x3c>;
 		#address-cells = <1>;
 		#size-cells = <1>;
+
+		touch_analog: regulator-touch-analog {
+			compatible = "apple,d2207-touch-analog-regulator";
+			regulator-name = "touch-analog";
+		};
+
+		pmu_gpio: gpio {
+			compatible = "apple,d2207-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			/* Only Bluetooth (2) and Wi-Fi (3) REG_ON are used; the other lines stay as iBoot left them. */
+			gpio-reserved-ranges = <0 2>, <4 6>, <11 1>, <13 8>;
+			/* Lines 10 and 12 are the Smart Cover hall sensors. */
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts-extended = <&pinctrl 86 IRQ_TYPE_LEVEL_LOW>;
+			/* Smart Cover front hall sensor (line 12): wake only. */
+			apple,wake-events = <0x24>;
+		};
+
+		/*
+		 * Lightning charging, at the D2207's registers as iOS 15.8
+		 * AppleD2207PMU uses them: connection and charger state at
+		 * 0x60, the input-current limit at 0x4c0, the ADC at 0x500.
+		 * The ADT's charger node allows 0x960 = 2400 mA of input.
+		 */
+		tristar_charger: charger@60 {
+			compatible = "apple,j81-tristar-charger", "apple,d2207-tristar-charger";
+			reg = <0x60 0x0d>, <0x4c0 0x01>, <0x500 0x04>;
+			reg-names = "status", "control", "adc";
+			interrupt-parent = <&pmu_gpio>;
+			/*
+			 * The PMU line and ADC done. No source events: the plug
+			 * event (0) stays unmasked across a reset that bypasses
+			 * iBoot (DFU entered from Linux), latches on the replugs
+			 * of the next boot and froze that boot. The charger's
+			 * 100 ms poll of 0x60 sees plug and unplug.
+			 */
+			interrupts = <112 IRQ_TYPE_EDGE_RISING>,
+				     <89 IRQ_TYPE_EDGE_RISING>;
+			apple,tristar = <&tristar>;
+			input-current-limit-microamp = <2400000>;
+
+			/* The charger decides when USB data may come on. */
+			port {
+				tristar_charger_usb: endpoint {
+					remote-endpoint = <&usbdev_role>;
+				};
+			};
+		};
 
 		rtc@5c0 {
 			compatible = "apple,arabela-pmic-rtc", "apple,amber-pmic-rtc";
@@ -109,5 +220,274 @@
 				};
 			};
 		};
+	};
+};
+
+/*
+ * The two speaker amplifiers, fed by MCA3 in TDM slots 0 (0x31) and 1
+ * (0x34); both read revision 0x80 on a J81. Their driver holds them off
+ * until a sound card runs a stream through them. Their interrupts (GPIO 8
+ * and 9) and the 0x31 amplifier's "function-alive" GPIO 101 are not
+ * described yet.
+ */
+&i2c1 {
+	status = "okay";
+
+	speaker_amp0: amplifier@31 {
+		compatible = "maxim,max98721";
+		reg = <0x31>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left";
+
+		port {
+			amp0_ep: endpoint {
+				remote-endpoint = <&speaker_amp0_ep>;
+				dai-tdm-slot-num = <8>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <1>;		/* slot 0 */
+			};
+		};
+	};
+
+	speaker_amp1: amplifier@34 {
+		compatible = "maxim,max98721";
+		reg = <0x34>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right";
+
+		port {
+			amp1_ep: endpoint {
+				remote-endpoint = <&speaker_amp1_ep>;
+				dai-tdm-slot-num = <8>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <0 1>;		/* slot 1 */
+			};
+		};
+	};
+};
+
+/*
+ * The ambient light sensors: two CT819s on i2c2. The device trees of the
+ * J81 and J82 list i2c2/als1 at 0x49 (interrupt GPIO 103, orientation 6)
+ * and i2c2/als2 at 0x29 (interrupt GPIO 110, orientation 5), both
+ * "probe-for-hardware"; a J81 has both. Both name the unit's SysCfg LSCI
+ * record set as alsCalibration, which the loader copies into each through
+ * the als0 and als1 aliases. It holds one record per sensor, and each
+ * sensor takes the one of its placement and orientation (the ADT's
+ * IOHIDPlacementType and IOHIDOrientationType), as iOS does.
+ * i2c2 has nothing else on it.
+ */
+&i2c2 {
+	status = "okay";
+
+	/* m1n1 adds apple,als-calibration from the ADT */
+	als29: light-sensor@29 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x29>;
+		interrupts-extended = <&pinctrl 110 IRQ_TYPE_LEVEL_LOW>;
+		apple,als-placement = <1>;
+		apple,als-orientation = <5>;
+	};
+
+	/* m1n1 adds apple,als-calibration from the ADT */
+	als49: light-sensor@49 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x49>;
+		interrupts-extended = <&pinctrl 103 IRQ_TYPE_LEVEL_LOW>;
+		apple,als-placement = <1>;
+		apple,als-orientation = <6>;
+	};
+};
+
+/* SmartIO: the DMA engine of every MCA and of spi1 */
+&sio {
+	status = "okay";
+};
+
+/*
+ * The NCO reference as iBoot reports it in a running J81's ADT
+ * (/arm-io clock-frequencies[10], the NCO's first clock-id 0x10a):
+ * 2.4 GHz / 7. iOS special-cases this rate for its divider precision.
+ */
+&nco_clkref {
+	clock-frequency = <342857142>;
+};
+
+&nco {
+	status = "okay";
+};
+
+&i2s_switch {
+	status = "okay";
+};
+
+/* The speaker link: MCA3 to pad 3 (ADT function-i2s_route aud3 -> pin3) */
+&mca3 {
+	apple,i2s-switch = <&i2s_switch 3 3>;
+	status = "okay";
+
+	mca3_port: port {
+		mca3_ep: endpoint {
+			remote-endpoint = <&speakers_cpu_ep>;
+			format = "dsp_a";
+			bitclock-master;
+			frame-master;
+		};
+	};
+};
+
+/*
+ * The speakers: MCA3 playing to both amplifiers on one TDM link
+ * (audio-graph-card2 "semi-multi", one CPU to two codecs). Channel 0 is
+ * slot 0 (amplifier 0x31, the left speaker in portrait), channel 1 slot 1
+ * (0x34, the right speaker).
+ */
+/ {
+	sound-speakers {
+		compatible = "audio-graph-card2";
+		label = "J81 Speakers";
+		links = <&mca3_port>;
+
+		multi {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ports@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					speakers_cpu_ep: endpoint {
+						remote-endpoint = <&mca3_ep>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					speaker_amp0_ep: endpoint {
+						remote-endpoint = <&amp0_ep>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+					speaker_amp1_ep: endpoint {
+						remote-endpoint = <&amp1_ep>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&serial5 {
+	pinctrl-0 = <&uart5_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		battery: fuel-gauge {
+			compatible = "ti,bq27545-hdq";
+			monitored-battery = <&battery_info>;
+		};
+	};
+};
+
+&pcie_dart1 {
+	status = "okay";
+};
+
+&pcie {
+	iommu-map = <0x100 &pcie_dart1 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	status = "okay";
+
+	pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		reset-gpios = <&pinctrl 179 GPIO_ACTIVE_LOW>;
+		max-link-speed = <1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,43a3";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl 165 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+			brcm,ccode-map-trivial;
+		};
+	};
+};
+
+/*
+ * The N1 touchscreen, from the ADT spi3/multi-touch functions: chip select
+ * GPIO 51, reset GPIO 82, interrupt GPIO 84, LDO enable GPIO 95, analog
+ * supply pmuL(0x20e) and the PMGR touch clock at 32768 Hz. Its display
+ * sync (GPIO 55) stays an input, as in iOS.
+ */
+&spi3 {
+	cs-gpios = <&pinctrl 51 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,j81-touchscreen";
+		reg = <0>;
+		/* N1 selects 83 ns; the controller rounds up to divider 5 */
+		spi-max-frequency = <12048192>;
+		interrupts-extended = <&pinctrl 84 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&pinctrl 82 GPIO_ACTIVE_LOW>;
+		power-ldo-gpios = <&pinctrl 95 GPIO_ACTIVE_HIGH>;
+		ana-supply = <&touch_analog>;
+		clocks = <&touchclk>;
+		touchscreen-size-x = <1536>;
+		touchscreen-size-y = <2048>;
+		/* As the iPad 5's C1F15 sensor; unconfirmed on the Air 2 */
+		touchscreen-inverted-y;
+	};
+};
+
+&touchclk {
+	status = "okay";
+};
+
+/* Tell the Lightning charger what the USB host allows. */
+&usbdev {
+	usb-psy-name = "lightning";
+	usb-role-switch;
+
+	port {
+		usbdev_role: endpoint {
+			remote-endpoint = <&tristar_charger_usb>;
+		};
+	};
+};
+
+/*
+ * The BCM4350C2's Bluetooth on UART3, from the ADT uart3/bluetooth node:
+ * power enable on D2207 GPIO 2, BT_WAKE on GPIO 164. m1n1 adds the device
+ * address. The controller starts at 115,200 baud; the driver then switches
+ * the link to 3 Mbit/s, the ADT's transport-speed. At 115,200 baud, A2DP
+ * audio crackles, and an HFP call's SCO audio (64 kbit/s each way) does not
+ * fit.
+ */
+&serial3 {
+	pinctrl-0 = <&uart3_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "apple,j81-bcm4350c2-bt";
+		current-speed = <115200>;
+		max-speed = <3000000>;
+		shutdown-gpios = <&pmu_gpio 2 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl 164 GPIO_ACTIVE_HIGH>;
 	};
 };
