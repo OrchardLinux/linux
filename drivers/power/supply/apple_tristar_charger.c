@@ -243,6 +243,7 @@ struct tristar_charger {
 	int irqs[TRISTAR_IRQS_MAX];
 	unsigned int nirqs;
 	int plug_irq;			/* wakes the system, 0 without one */
+	bool plug_irq_wake_armed;
 	const struct tristar_pmic *pmic;
 	u32 status_base;
 	u32 control_base;
@@ -1917,11 +1918,11 @@ static void tristar_complete(struct device *dev)
 }
 
 /*
- * A plug or unplug wakes the system, so sleep hides no source swap and an
- * identified source keeps its grant, as in iOS 16, which keeps a USB host's
- * granted current across sleep too (IOAccessoryUSBCurrentLimit): a tablet
- * left on a charger or a computer charges at the same rate while it sleeps.
- * Anything without a plug event to rely on parks at the handoff and is
+ * When the plug event is armed as a wake source, sleep hides no source swap
+ * and an identified source keeps its grant, as in iOS 16, which keeps a USB
+ * host's granted current across sleep too (IOAccessoryUSBCurrentLimit): a
+ * tablet left on a charger or a computer charges at the same rate while it
+ * sleeps. Anything without an armed plug event parks at the handoff and is
  * identified again on resume.
  *
  * Sleep never waits for the charger. iOS 16 (AppleARMPMUCharger) cancels the
@@ -1937,10 +1938,19 @@ static int tristar_suspend(struct device *dev)
 {
 	struct tristar_charger *chg = dev_get_drvdata(dev);
 	bool keep;
+	int wake_ret;
 	int ret = 0;
 
+	if (chg->plug_irq && device_may_wakeup(dev)) {
+		wake_ret = enable_irq_wake(chg->plug_irq);
+		if (!wake_ret)
+			chg->plug_irq_wake_armed = true;
+		else
+			dev_warn(dev, "cannot wake on plug events: %d\n", wake_ret);
+	}
+
 	mutex_lock(&chg->lock);
-	keep = chg->plug_irq && device_may_wakeup(dev) && chg->present &&
+	keep = chg->plug_irq_wake_armed && chg->present &&
 	       (chg->phase == TRISTAR_RAMPING || chg->phase == TRISTAR_CHARGING);
 	chg->stopping = true;
 	if (!keep) {
@@ -1951,15 +1961,15 @@ static int tristar_suspend(struct device *dev)
 			chg->stopping = false;
 	}
 	mutex_unlock(&chg->lock);
-	if (ret)
+	if (ret) {
+		if (chg->plug_irq_wake_armed) {
+			disable_irq_wake(chg->plug_irq);
+			chg->plug_irq_wake_armed = false;
+		}
 		return ret;
+	}
 	cancel_delayed_work_sync(&chg->poll_work);
 	tristar_accessory_stop(chg->acc);
-	if (chg->plug_irq && device_may_wakeup(dev)) {
-		ret = enable_irq_wake(chg->plug_irq);
-		if (ret)
-			dev_warn(dev, "cannot wake on plug events: %d\n", ret);
-	}
 
 	return 0;
 }
@@ -1968,8 +1978,10 @@ static int tristar_resume(struct device *dev)
 {
 	struct tristar_charger *chg = dev_get_drvdata(dev);
 
-	if (chg->plug_irq && device_may_wakeup(dev))
+	if (chg->plug_irq_wake_armed) {
 		disable_irq_wake(chg->plug_irq);
+		chg->plug_irq_wake_armed = false;
+	}
 	mutex_lock(&chg->lock);
 	chg->stopping = false;
 	mutex_unlock(&chg->lock);
