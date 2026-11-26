@@ -69,3 +69,8 @@
 &touchclk {
 	clock-frequency = <32768>;
 };
+
+/* The D21's Wi-Fi module, as its ADT's wlan module-instance names it */
+&wifi0 {
+	brcm,board-type = "apple,pegasuse";
+};
