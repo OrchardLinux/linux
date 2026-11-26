@@ -100,6 +100,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "gpio";
+		apple,always-on; /* Button and PMU wake IRQs over s2idle */
+		apple,manual-pm;
 	};
 
 	ps_mca0: power-controller@20048 {

@@ -68,3 +68,13 @@
 &disp0 {
 	status = "okay";
 };
+
+/* BCM4345B0 Bluetooth core; the iPod touch 6 entry has its sequence. */
+&bluetooth {
+	compatible = "apple,n61-bcm4345b0-bt", "apple,n102-bcm4345b1-bt";
+};
+
+/* ADT uart4/wlan module-instance */
+&wifi0 {
+	brcm,board-type = "apple,tempranillo";
+};

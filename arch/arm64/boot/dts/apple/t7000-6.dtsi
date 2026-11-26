@@ -8,6 +8,7 @@
 #include "t7000.dtsi"
 #include "t7000-common.dtsi"
 #include "t7000-handheld.dtsi"
+#include "t7000-bcm4345.dtsi"
 
 / {
 	chassis-type = "handset";
@@ -89,6 +90,14 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 
+		pmu_gpio: gpio {
+			compatible = "apple,d2186-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			/* Only Bluetooth (8) and Wi-Fi (10) REG_ON are used; the others stay as iBoot left them. */
+			gpio-reserved-ranges = <0 8>, <9 1>, <11 10>;
+		};
+
 		rtc@5c0 {
 			compatible = "apple,adi-pmic-rtc", "apple,amber-pmic-rtc";
 			reg = <0x5c0 0x10>;
@@ -123,4 +132,15 @@
 			};
 		};
 	};
+};
+
+/* The boot loader set up the display; nothing restores it after power loss. */
+&ps_disp0 {
+	apple,always-on;
+	apple,manual-pm;
+};
+
+&ps_mipi_dsi {
+	apple,always-on;
+	apple,manual-pm;
 };
