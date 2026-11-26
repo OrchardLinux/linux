@@ -7,6 +7,7 @@
 
 #include <linux/bits.h>
 #include <linux/delay.h>
+#include <linux/hwmon.h>
 #include <linux/jiffies.h>
 #include <linux/limits.h>
 #include <linux/mod_devicetable.h>
@@ -34,6 +35,10 @@
 #define SN2400_ADC_CHANNEL_MASK		GENMASK(3, 1)
 #define SN2400_ADC_CHANNEL_VBUS		0
 #define SN2400_ADC_CHANNEL_IBUS		BIT(1)
+/* iOS names channel 6 both "vdd_main" and "vbat": 2.5 V + 10 mV/LSB */
+#define SN2400_ADC_CHANNEL_VDD_MAIN	6
+/* iOS "tjunc": the die, about 1.8276 K/LSB from 0 K */
+#define SN2400_ADC_CHANNEL_TJUNC		8
 #define SN2400_ADC_START			BIT(4)
 #define SN2400_REG_ADC_DATA		0x12
 
@@ -48,8 +53,47 @@
 #define SN2400_FAST_POLL_MS		300
 #define SN2400_STABLE_POLL_MS		2000
 #define SN2400_VBUS_DETACH_MS		5000
+/* USB 2.0: 2.5 mA suspended, 100 mA until a configuration is set */
+#define SN2400_USB_SUSPEND_UA		2500
+#define SN2400_USB_UNCONFIGURED_UA	100000
+/* A host configures within a second or two of a reset */
+#define SN2400_USB_ENUM_MS		10000
 #define SN2400_ADC_POLL_US		5000
 #define SN2400_ADC_TIMEOUT_US		100000
+
+#define SN2400_REG_HDQ			0x1d
+
+/*
+ * The battery's temperature, from the gauge that monitors the same battery,
+ * against the monitored battery's operating-range-celsius (outside it: no
+ * input, the phone runs on its battery) and alert-celsius (outside it: the
+ * input is held at SN2400_THERMAL_REDUCED_UA). Each limit is left only
+ * SN2400_THERMAL_HYST_DC inside it. Without a reading for
+ * SN2400_THERMAL_STALE_MS the input is reduced, never cut off.
+ */
+#define SN2400_THERMAL_POLL_MS		5000
+#define SN2400_THERMAL_STALE_MS		60000
+#define SN2400_THERMAL_HYST_DC		20
+#define SN2400_THERMAL_REDUCED_UA	500000
+
+/*
+ * A board whose charger node has "apple,read-only" gets a driver that only
+ * reads the status, input-limit and control registers and leaves the charger
+ * as the bootloader programmed it: no foldback, no ADC, nothing written on
+ * remove, shutdown or suspend. Every other board keeps the full charging
+ * policy. This parameter overrides the DT for testing; it is read at probe,
+ * so a built-in driver applies a new value when the device is bound again.
+ */
+static int control = -1;
+module_param(control, int, 0644);
+MODULE_PARM_DESC(control,
+		 "Charger control: -1 = follow the DT (default), 0 = read-only, 1 = run the charging policy");
+
+enum sn2400_thermal_level {
+	SN2400_THERMAL_NORMAL,
+	SN2400_THERMAL_REDUCED,
+	SN2400_THERMAL_OFF,
+};
 
 enum sn2400_foldback_state {
 	SN2400_FOLDBACK_IDLE,
@@ -67,9 +111,20 @@ struct sn2400_charger {
 	struct delayed_work work;
 	/* Protects cached power-supply data and the stopped flag. */
 	struct mutex lock;
+	/* Serializes conversions: the work and hwmon share 0x11/0x12. */
+	struct mutex adc_lock;
 	enum sn2400_foldback_state state;
 	unsigned int max_input_ua;
 	unsigned int session_max_input_ua;
+	/* What the USB host allows (dwc2 vbus_draw); 0 = no USB session */
+	unsigned int usb_grant_ua;
+	/* The cap the probe stopped at; 0 when VBUS droop stopped it */
+	unsigned int settle_cap_ua;
+	/* A USB host configured the device during this VBUS session */
+	bool usb_configured;
+	/* Whether the last cap came from a USB host (-1 none yet), for the log */
+	int usb_host_logged;
+	unsigned long vbus_since;
 	unsigned int max_charge_ua;
 	unsigned int target_limit_ua;
 	unsigned int input_limit_ua;
@@ -81,6 +136,16 @@ struct sn2400_charger {
 	unsigned long vbus_absent_since;
 	bool vbus_absent;
 	bool stopped;
+	bool control;
+	/* Battery temperature limits in 0.1 C; thermal: any are given */
+	int temp_min, temp_max, temp_alert_min, temp_alert_max;
+	bool thermal;
+	struct fwnode_handle *battery;
+	struct power_supply *gauge;
+	enum sn2400_thermal_level thermal_level;
+	unsigned long thermal_checked;
+	unsigned long temp_read_at;
+	bool temp_read;
 };
 
 static int sn2400_read_adc(struct sn2400_charger *charger,
@@ -89,21 +154,20 @@ static int sn2400_read_adc(struct sn2400_charger *charger,
 	unsigned int value;
 	int ret;
 
+	mutex_lock(&charger->adc_lock);
 	ret = regmap_write(charger->regmap, SN2400_REG_ADC_CONTROL,
 			   (channel & SN2400_ADC_CHANNEL_MASK) |
 			   SN2400_ADC_START);
-	if (ret)
-		return ret;
-
-	ret = regmap_read_poll_timeout(charger->regmap,
-				       SN2400_REG_ADC_CONTROL, value,
-				       !(value & SN2400_ADC_START),
-				       SN2400_ADC_POLL_US,
-				       SN2400_ADC_TIMEOUT_US);
-	if (ret)
-		return ret;
-
-	ret = regmap_read(charger->regmap, SN2400_REG_ADC_DATA, &value);
+	if (!ret)
+		ret = regmap_read_poll_timeout(charger->regmap,
+					       SN2400_REG_ADC_CONTROL, value,
+					       !(value & SN2400_ADC_START),
+					       SN2400_ADC_POLL_US,
+					       SN2400_ADC_TIMEOUT_US);
+	if (!ret)
+		ret = regmap_read(charger->regmap, SN2400_REG_ADC_DATA,
+				  &value);
+	mutex_unlock(&charger->adc_lock);
 	if (ret)
 		return ret;
 
@@ -112,7 +176,15 @@ static int sn2400_read_adc(struct sn2400_charger *charger,
 		*result = value * 25000;
 		break;
 	case SN2400_ADC_CHANNEL_IBUS:
-		*result = value * 10000;
+		/* iOS AppleSN2400Charger: 78/10000 A per LSB */
+		*result = value * 7800;
+		break;
+	case SN2400_ADC_CHANNEL_VDD_MAIN:
+		*result = 2500000 + value * 10000;
+		break;
+	case SN2400_ADC_CHANNEL_TJUNC:
+		/* iOS: (value * 3900 - 581300) / 2134.4, in degrees C */
+		*result = value * 1827553 / 1000 - 272399;
 		break;
 	default:
 		return -EINVAL;
@@ -260,6 +332,173 @@ static bool sn2400_vbus_drooped(struct sn2400_charger *charger, int vbus_uv)
 		charger->vbus_noload_uv - vbus_uv > SN2400_MAX_VBUS_DROOP_UV;
 }
 
+/*
+ * Whether a USB host is behind VBUS. The device controller reports 0 mA
+ * without a session and 2 mA when the bus is suspended, which is also what
+ * it reports on a dedicated charger: nothing enumerates the device there and
+ * the idle lines look like a suspended bus. So a suspended bus is a host only
+ * if a host configured the device during this VBUS session. A reset without
+ * a configuration (100 mA) counts as a host for SN2400_USB_ENUM_MS.
+ */
+static bool sn2400_usb_host(struct sn2400_charger *charger, unsigned int grant)
+{
+	if (!grant)
+		return false;
+	if (READ_ONCE(charger->usb_configured))
+		return true;
+	if (grant <= SN2400_USB_SUSPEND_UA)
+		return false;
+
+	return time_is_after_jiffies(charger->vbus_since +
+				     msecs_to_jiffies(SN2400_USB_ENUM_MS));
+}
+
+/*
+ * A USB host session caps the input at what the host allows (500 mA from a
+ * USB 2.0 port, more after an Apple host's grant). Without a host, as on a
+ * wall adapter, the VBUS-droop foldback alone finds the limit.
+ */
+static unsigned int sn2400_input_cap(struct sn2400_charger *charger)
+{
+	unsigned int grant = READ_ONCE(charger->usb_grant_ua);
+	unsigned int cap = charger->session_max_input_ua;
+
+	if (sn2400_usb_host(charger, grant))
+		cap = min(cap, grant);
+	if (charger->thermal_level == SN2400_THERMAL_REDUCED)
+		cap = min(cap, SN2400_THERMAL_REDUCED_UA);
+
+	return cap;
+}
+
+/*
+ * The level for battery temperature @temp (0.1 C), coming from @level: a
+ * limit is crossed at the limit, and left SN2400_THERMAL_HYST_DC inside it.
+ */
+static enum sn2400_thermal_level
+sn2400_thermal_level(const struct sn2400_charger *charger,
+		     enum sn2400_thermal_level level, int temp)
+{
+	int hyst;
+
+	hyst = level == SN2400_THERMAL_OFF ? SN2400_THERMAL_HYST_DC : 0;
+	if (temp <= charger->temp_min + hyst ||
+	    temp >= charger->temp_max - hyst)
+		return SN2400_THERMAL_OFF;
+
+	hyst = level != SN2400_THERMAL_NORMAL ? SN2400_THERMAL_HYST_DC : 0;
+	if (temp <= charger->temp_alert_min + hyst ||
+	    temp >= charger->temp_alert_max - hyst)
+		return SN2400_THERMAL_REDUCED;
+
+	return SN2400_THERMAL_NORMAL;
+}
+
+struct sn2400_gauge_match {
+	struct fwnode_handle *battery;
+	struct power_supply *psy;
+};
+
+static int sn2400_match_gauge(struct power_supply *psy, void *data)
+{
+	struct sn2400_gauge_match *match = data;
+	struct fwnode_handle *battery;
+
+	if (psy->desc->type != POWER_SUPPLY_TYPE_BATTERY || !psy->dev.fwnode)
+		return 0;
+
+	battery = fwnode_find_reference(psy->dev.fwnode, "monitored-battery", 0);
+	if (IS_ERR(battery))
+		return 0;
+	fwnode_handle_put(battery);
+	if (battery != match->battery)
+		return 0;
+
+	get_device(&psy->dev);
+	match->psy = psy;
+	return 1;
+}
+
+/*
+ * Follow the battery temperature: the gauge is found once it has registered,
+ * and read every SN2400_THERMAL_POLL_MS. Returns whether the level changed.
+ */
+static bool sn2400_update_thermal(struct sn2400_charger *charger)
+{
+	enum sn2400_thermal_level level = charger->thermal_level;
+	union power_supply_propval val;
+	int ret = -ENODEV;
+
+	if (!charger->thermal ||
+	    (charger->thermal_checked &&
+	     time_is_after_jiffies(charger->thermal_checked +
+				   msecs_to_jiffies(SN2400_THERMAL_POLL_MS))))
+		return false;
+	charger->thermal_checked = jiffies ?: 1;
+
+	if (!charger->gauge) {
+		struct sn2400_gauge_match match = { .battery = charger->battery };
+
+		power_supply_for_each_psy(&match, sn2400_match_gauge);
+		charger->gauge = match.psy;
+	}
+	if (charger->gauge)
+		ret = power_supply_get_property(charger->gauge,
+						POWER_SUPPLY_PROP_TEMP, &val);
+
+	if (!ret) {
+		charger->temp_read = true;
+		charger->temp_read_at = jiffies;
+		level = sn2400_thermal_level(charger, level, val.intval);
+	} else if (!charger->temp_read ||
+		   time_is_before_jiffies(charger->temp_read_at +
+					  msecs_to_jiffies(SN2400_THERMAL_STALE_MS))) {
+		/* No temperature: charge, but slowly; off stays off. */
+		if (level == SN2400_THERMAL_NORMAL)
+			level = SN2400_THERMAL_REDUCED;
+	}
+
+	if (level == charger->thermal_level)
+		return false;
+
+	if (ret)
+		dev_warn(charger->dev,
+			 "no battery temperature (%d): input up to %u mA\n",
+			 ret, SN2400_THERMAL_REDUCED_UA / 1000);
+	else if (level == SN2400_THERMAL_OFF)
+		dev_warn(charger->dev, "battery at %s%d.%d C: input off\n",
+			 val.intval < 0 ? "-" : "", abs(val.intval) / 10,
+			 abs(val.intval) % 10);
+	else if (level == SN2400_THERMAL_REDUCED)
+		dev_info(charger->dev, "battery at %s%d.%d C: input up to %u mA\n",
+			 val.intval < 0 ? "-" : "", abs(val.intval) / 10,
+			 abs(val.intval) % 10, SN2400_THERMAL_REDUCED_UA / 1000);
+	else
+		dev_info(charger->dev, "battery at %s%d.%d C: input as allowed\n",
+			 val.intval < 0 ? "-" : "", abs(val.intval) / 10,
+			 abs(val.intval) % 10);
+	charger->thermal_level = level;
+
+	return true;
+}
+
+static void sn2400_log_usb_host(struct sn2400_charger *charger)
+{
+	unsigned int grant = READ_ONCE(charger->usb_grant_ua);
+	bool host = sn2400_usb_host(charger, grant);
+
+	if (charger->usb_host_logged == host)
+		return;
+	charger->usb_host_logged = host;
+	if (host)
+		dev_info(charger->dev, "USB host: input up to %u mA\n",
+			 sn2400_input_cap(charger) / 1000);
+	else
+		dev_info(charger->dev,
+			 "no USB host (%u mA reported, not configured): VBUS foldback up to %u mA\n",
+			 grant / 1000, sn2400_input_cap(charger) / 1000);
+}
+
 static int sn2400_raise_input_limit(struct sn2400_charger *charger,
 				    unsigned int *input_limit_ua)
 {
@@ -267,7 +506,7 @@ static int sn2400_raise_input_limit(struct sn2400_charger *charger,
 	int ret;
 
 	requested = min(charger->target_limit_ua + SN2400_INPUT_STEP_UA,
-			charger->session_max_input_ua);
+			sn2400_input_cap(charger));
 	ret = sn2400_set_input_limit(charger, requested, input_limit_ua);
 	if (!ret)
 		charger->target_limit_ua = requested;
@@ -318,6 +557,8 @@ static void sn2400_charger_work(struct work_struct *work)
 		}
 		charger->state = SN2400_FOLDBACK_IDLE;
 		charger->target_limit_ua = 0;
+		/* A new cable needs a new configuration to count as a host. */
+		WRITE_ONCE(charger->usb_configured, false);
 		if (!charger->vbus_absent) {
 			charger->vbus_absent = true;
 			charger->vbus_absent_since = jiffies;
@@ -333,7 +574,40 @@ static void sn2400_charger_work(struct work_struct *work)
 	    time_is_before_jiffies(charger->vbus_absent_since +
 				   msecs_to_jiffies(SN2400_VBUS_DETACH_MS)))
 		charger->session_max_input_ua = charger->max_input_ua;
+	if (charger->vbus_absent)
+		charger->vbus_since = jiffies;
 	charger->vbus_absent = false;
+	sn2400_log_usb_host(charger);
+
+	if (sn2400_update_thermal(charger) &&
+	    charger->thermal_level == SN2400_THERMAL_OFF) {
+		ret = sn2400_disable_input(charger);
+		if (ret)
+			goto fail_safe;
+		input_limit_ua = 0;
+		/* Off until the battery is back in range, then probe anew. */
+		charger->state = SN2400_FOLDBACK_IDLE;
+		charger->target_limit_ua = 0;
+	}
+	if (charger->thermal_level == SN2400_THERMAL_OFF) {
+		sn2400_cache(charger, 0, status, 0, 0, 0);
+		goto out_schedule;
+	}
+
+	/* The USB host or the battery temperature lowered the cap: follow it at once. */
+	if (charger->state != SN2400_FOLDBACK_IDLE &&
+	    charger->state != SN2400_FOLDBACK_NOLOAD &&
+	    charger->target_limit_ua > sn2400_input_cap(charger)) {
+		ret = sn2400_set_input_limit(charger, sn2400_input_cap(charger),
+					     &input_limit_ua);
+		if (ret)
+			goto fail_safe;
+		charger->target_limit_ua = sn2400_input_cap(charger);
+		charger->state = SN2400_FOLDBACK_PROBE;
+		next_poll_ms = SN2400_FAST_POLL_MS;
+		sn2400_cache(charger, 0, status, 0, 0, input_limit_ua);
+		goto out_schedule;
+	}
 
 	switch (charger->state) {
 	case SN2400_FOLDBACK_IDLE:
@@ -349,7 +623,7 @@ static void sn2400_charger_work(struct work_struct *work)
 		if (ret)
 			goto fail_safe;
 		charger->vbus_noload_uv = vbus_uv;
-		charger->target_limit_ua = min(charger->session_max_input_ua,
+		charger->target_limit_ua = min(sn2400_input_cap(charger),
 					       SN2400_INPUT_START_UA);
 		ret = sn2400_set_input_limit(charger, charger->target_limit_ua,
 					     &input_limit_ua);
@@ -368,7 +642,8 @@ static void sn2400_charger_work(struct work_struct *work)
 			goto fail_safe;
 		if (sn2400_vbus_drooped(charger, vbus_uv)) {
 			charger->state = SN2400_FOLDBACK_DEBOUNCE;
-		} else if (input_limit_ua >= charger->session_max_input_ua) {
+		} else if (input_limit_ua >= sn2400_input_cap(charger)) {
+			charger->settle_cap_ua = sn2400_input_cap(charger);
 			charger->state = SN2400_FOLDBACK_SETTLE;
 		} else {
 			ret = sn2400_raise_input_limit(charger, &input_limit_ua);
@@ -389,6 +664,7 @@ static void sn2400_charger_work(struct work_struct *work)
 			ret = sn2400_lower_input_limit(charger, &input_limit_ua);
 			if (ret)
 				goto fail_safe;
+			charger->settle_cap_ua = 0;
 			charger->state = input_limit_ua ?
 				SN2400_FOLDBACK_SETTLE : SN2400_FOLDBACK_NOLOAD;
 		} else {
@@ -408,9 +684,22 @@ static void sn2400_charger_work(struct work_struct *work)
 			ret = sn2400_lower_input_limit(charger, &input_limit_ua);
 			if (ret)
 				goto fail_safe;
+			charger->settle_cap_ua = 0;
 			if (!input_limit_ua)
 				charger->state = SN2400_FOLDBACK_NOLOAD;
+		} else if (charger->settle_cap_ua) {
+			/*
+			 * The probe stopped at the cap, not at a droop. If the
+			 * USB host has since allowed more (100 mA unconfigured,
+			 * then bMaxPower), probe on up to it. The host's limit
+			 * says nothing about the source: do not learn it.
+			 */
+			if (sn2400_input_cap(charger) > charger->settle_cap_ua) {
+				charger->state = SN2400_FOLDBACK_PROBE;
+				next_poll_ms = SN2400_FAST_POLL_MS;
+			}
 		} else if (charger->target_limit_ua) {
+			/* VBUS droop found this source's limit: keep it. */
 			charger->session_max_input_ua =
 				min(charger->session_max_input_ua,
 				    charger->target_limit_ua);
@@ -432,6 +721,50 @@ fail_safe:
 
 out_schedule:
 	sn2400_schedule(charger, next_poll_ms);
+}
+
+static unsigned int sn2400_monitor_input_limit(unsigned int control_reg,
+					       unsigned int input_reg)
+{
+	if (control_reg & SN2400_CONTROL_OFF)
+		return 0;
+
+	return sn2400_decode_input_limit(input_reg);
+}
+
+/* Read-only polling: never writes a charger register. */
+static void sn2400_charger_monitor_work(struct work_struct *work)
+{
+	struct sn2400_charger *charger =
+		container_of(to_delayed_work(work), struct sn2400_charger, work);
+	unsigned int status, input_reg, control_reg;
+	int ret;
+
+	ret = regmap_read(charger->regmap, SN2400_REG_STATUS, &status);
+	if (!ret)
+		ret = regmap_read(charger->regmap, SN2400_REG_INPUT_LIMIT,
+				  &input_reg);
+	if (!ret)
+		ret = regmap_read(charger->regmap, SN2400_REG_CONTROL,
+				  &control_reg);
+
+	if (ret)
+		sn2400_cache(charger, ret, 0, 0, 0, 0);
+	else
+		sn2400_cache(charger, 0, status, 0, 0,
+			     sn2400_monitor_input_limit(control_reg,
+							input_reg));
+
+	sn2400_schedule(charger, SN2400_STABLE_POLL_MS);
+}
+
+static void sn2400_put_battery(void *data)
+{
+	struct sn2400_charger *charger = data;
+
+	if (charger->gauge)
+		power_supply_put(charger->gauge);
+	fwnode_handle_put(charger->battery);
 }
 
 static int sn2400_charger_get_property(struct power_supply *psy,
@@ -464,12 +797,21 @@ static int sn2400_charger_get_property(struct power_supply *psy,
 		ret = charger->status_error;
 		if (ret)
 			break;
+		/* The ADC needs a register write to convert. */
+		if (!charger->control) {
+			ret = -ENODATA;
+			break;
+		}
 		val->intval = charger->vbus_uv;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		ret = charger->status_error;
 		if (ret)
 			break;
+		if (!charger->control) {
+			ret = -ENODATA;
+			break;
+		}
 		val->intval = charger->ibus_ua;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
@@ -480,6 +822,9 @@ static int sn2400_charger_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
 		val->intval = charger->max_charge_ua;
+		break;
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		val->intval = charger->usb_grant_ua;
 		break;
 	default:
 		ret = -EINVAL;
@@ -497,7 +842,44 @@ static const enum power_supply_property sn2400_charger_properties[] = {
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 };
+
+/*
+ * The USB device controller reports what the host allows (usb-psy-name):
+ * 0 without a session, 100 mA unconfigured, bMaxPower when configured, more
+ * after an Apple host's grant. Kernel only; sysfs keeps it read-only. A
+ * read-only charger only records it.
+ */
+static int sn2400_charger_set_property(struct power_supply *psy,
+				       enum power_supply_property property,
+				       const union power_supply_propval *val)
+{
+	struct sn2400_charger *charger = power_supply_get_drvdata(psy);
+	unsigned int grant;
+
+	if (property != POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
+		return -EINVAL;
+
+	grant = max(val->intval, 0);
+	mutex_lock(&charger->lock);
+	if (grant > SN2400_USB_UNCONFIGURED_UA)
+		WRITE_ONCE(charger->usb_configured, true);
+	else if (!grant)
+		WRITE_ONCE(charger->usb_configured, false);
+	if (charger->usb_grant_ua == grant) {
+		mutex_unlock(&charger->lock);
+		return 0;
+	}
+	WRITE_ONCE(charger->usb_grant_ua, grant);
+	dev_dbg(charger->dev, "USB host allows %u mA\n", grant / 1000);
+	if (charger->control && !charger->stopped)
+		mod_delayed_work(system_percpu_wq, &charger->work, 0);
+	mutex_unlock(&charger->lock);
+
+	power_supply_changed(psy);
+	return 0;
+}
 
 static const struct power_supply_desc sn2400_charger_desc = {
 	.name = "usb",
@@ -505,6 +887,7 @@ static const struct power_supply_desc sn2400_charger_desc = {
 	.properties = sn2400_charger_properties,
 	.num_properties = ARRAY_SIZE(sn2400_charger_properties),
 	.get_property = sn2400_charger_get_property,
+	.set_property = sn2400_charger_set_property,
 };
 
 static int sn2400_charger_stop(struct sn2400_charger *charger)
@@ -516,6 +899,9 @@ static int sn2400_charger_stop(struct sn2400_charger *charger)
 	charger->stopped = true;
 	mutex_unlock(&charger->lock);
 	cancel_delayed_work_sync(&charger->work);
+
+	if (!charger->control)
+		return 0;
 
 	ret = sn2400_disable_input(charger);
 	mutex_lock(&charger->lock);
@@ -574,11 +960,76 @@ static void sn2400_charger_cache_suspend(struct sn2400_charger *charger,
 		power_supply_changed(charger->psy);
 }
 
+/*
+ * In control mode, the charger's own ADC on demand: VBUS, VDD_MAIN (which
+ * iOS also reports as the battery voltage) and the die temperature. A
+ * charge test can watch these when the gauge cannot be read. Each read
+ * starts a conversion (a write to 0x11), so read-only boards have none.
+ */
+static const u8 sn2400_hwmon_in[] = {
+	SN2400_ADC_CHANNEL_VBUS, SN2400_ADC_CHANNEL_VDD_MAIN,
+};
+static const char *const sn2400_hwmon_in_label[] = { "vbus", "vdd_main" };
+
+static umode_t sn2400_hwmon_is_visible(const void *data,
+				       enum hwmon_sensor_types type,
+				       u32 attr, int channel)
+{
+	return 0444;
+}
+
+static int sn2400_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+			     u32 attr, int channel, long *val)
+{
+	struct sn2400_charger *charger = dev_get_drvdata(dev);
+	int result, ret;
+
+	if (type == hwmon_temp) {
+		ret = sn2400_read_adc(charger, SN2400_ADC_CHANNEL_TJUNC,
+				      &result);
+		if (!ret)
+			*val = result;
+		return ret;
+	}
+
+	ret = sn2400_read_adc(charger, sn2400_hwmon_in[channel], &result);
+	if (!ret)
+		*val = result / 1000;
+	return ret;
+}
+
+static int sn2400_hwmon_read_string(struct device *dev,
+				    enum hwmon_sensor_types type, u32 attr,
+				    int channel, const char **str)
+{
+	*str = type == hwmon_temp ? "tjunc" : sn2400_hwmon_in_label[channel];
+	return 0;
+}
+
+static const struct hwmon_ops sn2400_hwmon_ops = {
+	.is_visible = sn2400_hwmon_is_visible,
+	.read = sn2400_hwmon_read,
+	.read_string = sn2400_hwmon_read_string,
+};
+
+static const struct hwmon_channel_info *const sn2400_hwmon_info[] = {
+	HWMON_CHANNEL_INFO(in, HWMON_I_INPUT | HWMON_I_LABEL,
+			   HWMON_I_INPUT | HWMON_I_LABEL),
+	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT | HWMON_T_LABEL),
+	NULL
+};
+
+static const struct hwmon_chip_info sn2400_hwmon_chip = {
+	.ops = &sn2400_hwmon_ops,
+	.info = sn2400_hwmon_info,
+};
+
 static int sn2400_charger_probe(struct platform_device *pdev)
 {
 	struct power_supply_battery_info *battery_info;
 	struct power_supply_config psy_config = {};
 	struct sn2400_charger *charger;
+	struct device *hwmon;
 	u32 input_limit_ua;
 	unsigned int status;
 	int ret;
@@ -613,12 +1064,24 @@ static int sn2400_charger_probe(struct platform_device *pdev)
 		sn2400_decode_input_limit(sn2400_encode_input_limit(input_limit_ua));
 	charger->max_input_ua = input_limit_ua;
 	charger->session_max_input_ua = input_limit_ua;
+	charger->vbus_since = jiffies;
+	charger->usb_host_logged = -1;
 
+	ret = devm_mutex_init(&pdev->dev, &charger->adc_lock);
+	if (ret)
+		return ret;
 	ret = devm_mutex_init(&pdev->dev, &charger->lock);
 	if (ret)
 		return ret;
 
-	INIT_DELAYED_WORK(&charger->work, sn2400_charger_work);
+	if (control >= 0)
+		charger->control = control;
+	else
+		charger->control = !device_property_read_bool(&pdev->dev,
+							      "apple,read-only");
+
+	INIT_DELAYED_WORK(&charger->work, charger->control ?
+			  sn2400_charger_work : sn2400_charger_monitor_work);
 	charger->state = SN2400_FOLDBACK_IDLE;
 	charger->status_error = -EAGAIN;
 	charger->stopped = true;
@@ -645,7 +1108,36 @@ static int sn2400_charger_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, ret,
 				     "failed to get monitored battery limits\n");
 	charger->max_charge_ua = battery_info->constant_charge_current_max_ua;
+	charger->temp_min = battery_info->temp_min == INT_MIN ?
+		INT_MIN + SN2400_THERMAL_HYST_DC : battery_info->temp_min * 10;
+	charger->temp_max = battery_info->temp_max == INT_MAX ?
+		INT_MAX - SN2400_THERMAL_HYST_DC : battery_info->temp_max * 10;
+	charger->temp_alert_min = battery_info->temp_alert_min == INT_MIN ?
+		charger->temp_min : battery_info->temp_alert_min * 10;
+	charger->temp_alert_max = battery_info->temp_alert_max == INT_MAX ?
+		charger->temp_max : battery_info->temp_alert_max * 10;
+	charger->thermal = battery_info->temp_min != INT_MIN ||
+			   battery_info->temp_max != INT_MAX ||
+			   battery_info->temp_alert_min != INT_MIN ||
+			   battery_info->temp_alert_max != INT_MAX;
 	power_supply_put_battery_info(charger->psy, battery_info);
+	if (charger->thermal) {
+		charger->battery = fwnode_find_reference(dev_fwnode(&pdev->dev),
+							 "monitored-battery", 0);
+		if (IS_ERR(charger->battery))
+			return dev_err_probe(&pdev->dev,
+					     PTR_ERR(charger->battery),
+					     "no monitored battery\n");
+		ret = devm_add_action_or_reset(&pdev->dev, sn2400_put_battery,
+					       charger);
+		if (ret)
+			return ret;
+		dev_info(&pdev->dev,
+			 "battery %d..%d C, full input %d..%d C\n",
+			 charger->temp_min / 10, charger->temp_max / 10,
+			 charger->temp_alert_min / 10,
+			 charger->temp_alert_max / 10);
+	}
 	if (charger->max_charge_ua < SN2400_INPUT_REG_STEP_UA ||
 	    charger->max_charge_ua > U8_MAX * SN2400_INPUT_REG_STEP_UA)
 		return dev_err_probe(&pdev->dev, -EINVAL,
@@ -654,14 +1146,65 @@ static int sn2400_charger_probe(struct platform_device *pdev)
 	charger->max_charge_ua -=
 		charger->max_charge_ua % SN2400_INPUT_REG_STEP_UA;
 
-	ret = regmap_write(charger->regmap, SN2400_REG_CHARGE_LIMIT,
-			   charger->max_charge_ua /
-			    SN2400_INPUT_REG_STEP_UA);
-	if (ret)
-		return dev_err_probe(&pdev->dev, ret,
-				     "failed to program battery charge current limit\n");
+	if (!charger->control) {
+		unsigned int input_reg, charge_reg, control_reg, hdq_reg;
+
+		ret = regmap_read(charger->regmap, SN2400_REG_INPUT_LIMIT,
+				  &input_reg);
+		if (!ret)
+			ret = regmap_read(charger->regmap,
+					  SN2400_REG_CHARGE_LIMIT, &charge_reg);
+		if (!ret)
+			ret = regmap_read(charger->regmap, SN2400_REG_CONTROL,
+					  &control_reg);
+		if (!ret)
+			ret = regmap_read(charger->regmap, SN2400_REG_HDQ,
+					  &hdq_reg);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "failed to read charger state\n");
+
+		dev_info(&pdev->dev,
+			 "read-only: status %#04x input %#04x control %#04x charge %#04x hdq %#04x\n",
+			 status, input_reg, control_reg, charge_reg, hdq_reg);
+		/* Report the limit the bootloader left (D111 encoding: 10 mA steps). */
+		charger->max_charge_ua = charge_reg * SN2400_INPUT_REG_STEP_UA;
+		sn2400_cache(charger, 0, status, 0, 0,
+			     sn2400_monitor_input_limit(control_reg,
+							input_reg));
+		goto start;
+	}
+
+	/*
+	 * "apple,keep-charge-limit": leave 0x0d as the bootloader set it, as
+	 * the iPhone 6s Plus's iOS driver does, and report what it holds.
+	 */
+	if (device_property_read_bool(&pdev->dev, "apple,keep-charge-limit")) {
+		unsigned int charge_reg;
+
+		ret = regmap_read(charger->regmap, SN2400_REG_CHARGE_LIMIT,
+				  &charge_reg);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "failed to read charge limit\n");
+		charger->max_charge_ua = charge_reg * SN2400_INPUT_REG_STEP_UA;
+	} else {
+		ret = regmap_write(charger->regmap, SN2400_REG_CHARGE_LIMIT,
+				   charger->max_charge_ua /
+				    SN2400_INPUT_REG_STEP_UA);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "failed to program battery charge current limit\n");
+	}
+
+	hwmon = devm_hwmon_device_register_with_info(&pdev->dev, "sn2400",
+						     charger,
+						     &sn2400_hwmon_chip, NULL);
+	if (IS_ERR(hwmon))
+		dev_warn(&pdev->dev, "no hwmon: %pe\n", hwmon);
 	power_supply_changed(charger->psy);
 
+start:
 	mutex_lock(&charger->lock);
 	charger->stopped = false;
 	mutex_unlock(&charger->lock);
@@ -699,11 +1242,16 @@ static int sn2400_charger_suspend(struct device *dev)
 	mutex_unlock(&charger->lock);
 	cancel_delayed_work_sync(&charger->work);
 
+	if (!charger->control)
+		return 0;
+
 	ret = regmap_read(charger->regmap, SN2400_REG_STATUS, &status);
 	if (ret)
 		goto restart;
 
-	if (status & SN2400_STATUS_VBUS) {
+	/* Asleep the work does not run: a hot or cold battery gets no input. */
+	if ((status & SN2400_STATUS_VBUS) &&
+	    charger->thermal_level != SN2400_THERMAL_OFF) {
 		input_limit_ua = min(charger->session_max_input_ua,
 				     SN2400_INPUT_START_UA);
 		ret = sn2400_set_input_limit(charger, input_limit_ua,

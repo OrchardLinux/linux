@@ -94,6 +94,7 @@ struct macsmc_power {
 	 * (Modern firmware)
 	 */
 	bool fw_ge_27;
+	bool b0rm_swapped; /* B0RM arrives big-endian */
 
 	u32 b0ap_type; /* SMC key type for power now (si16 or si32) */
 
@@ -330,7 +331,7 @@ static int macsmc_battery_get_capacity_level(struct macsmc_power *power)
 static s16 macsmc_swap_b0rm(struct macsmc_power *power, s16 b0rm)
 {
 	/* B0RM was Big Endian, likely pass through from TI gas gauge */
-	return power->fw_ge_27 ? b0rm : (s16)swab16(b0rm);
+	return power->b0rm_swapped ? (s16)swab16(b0rm) : b0rm;
 }
 
 static int macsmc_battery_get_property(struct power_supply *psy,
@@ -774,6 +775,14 @@ static int macsmc_power_probe(struct platform_device *pdev)
 			dev_err(&pdev->dev, "Unexpected BCF0 key size %d\n", info.size);
 			return -EIO;
 		}
+
+		/*
+		 * Older Mac SMC firmware passes B0RM through big-endian. The
+		 * T8015 SMC keeps a 4-byte BCF0 but sends B0RM as a native ui16,
+		 * like B0FC.
+		 */
+		power->b0rm_swapped = !power->fw_ge_27 &&
+			!of_device_is_compatible(dev->parent->of_node, "apple,t8015-smc");
 
 		/* B0AP changed from si16 to si32 in iOS 15.0 so detect it here */
 		ret = apple_smc_get_key_info(smc, SMC_KEY(B0AP), &info);

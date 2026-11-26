@@ -40,6 +40,7 @@ properties:
               - apple,aria-pmic
               - apple,august-pmic
               - apple,autumn-pmic
+              - apple,d2355-pmic
           - const: apple,i2c-pmic
       - items:
           - enum:
@@ -62,15 +63,33 @@ properties:
   gpio:
     $ref: /schemas/gpio/apple,d2365-pmic-gpio.yaml
 
+  cover-switch:
+    type: object
+    description: Magnetic cover switch wired to GPIOs 0 and 10 on the J120 August PMIC.
+    properties:
+      compatible:
+        const: apple,j120-cover-switch
+    required:
+      - compatible
+    additionalProperties: false
+
+  poweroff:
+    $ref: /schemas/power/reset/apple,d2365-poweroff.yaml#
+
 patternProperties:
   "^charger@[0-9a-f]+$":
-    $ref: /schemas/power/supply/apple,d2365-charger.yaml
+    oneOf:
+      - $ref: /schemas/power/supply/apple,d2365-charger.yaml
+      - $ref: /schemas/power/supply/apple,d2355-tristar-charger.yaml
 
   "^backlight(@[0-9a-f]+)?$":
     $ref: /schemas/leds/backlight/apple,pmic-bl.yaml
 
   "^adc(@[0-9a-f]+)?$":
     $ref: /schemas/iio/adc/apple,d2186-adc.yaml
+
+  "^battery(@[0-9a-f]+)?$":
+    $ref: /schemas/power/supply/apple,d2186-battery.yaml
 
   "^rtc(@[0-9a-f]+)?$":
     $ref: /schemas/rtc/apple,pmic-rtc.yaml

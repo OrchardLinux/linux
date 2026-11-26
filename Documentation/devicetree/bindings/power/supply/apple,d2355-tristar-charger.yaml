@@ -1,0 +1,98 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/apple,d2355-tristar-charger.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple D2355 Tristar Lightning charger
+
+maintainers:
+  - Henrik Klee <henrik@goat-code.com>
+
+description: |
+  The D2355 sets the Lightning input current on the iPad Pro 12.9-inch (2017).
+  A Tristar port controller identifies the attached source using the ADC in the
+  August PMIC. The charger controls the role of the USB device controller while
+  identifying the source.
+
+allOf:
+  - $ref: power-supply.yaml#
+
+properties:
+  io-channels:
+    maxItems: 1
+
+  io-channel-names:
+    const: vbus
+
+  compatible:
+    const: apple,d2355-tristar-charger
+
+  reg:
+    items:
+      - description: Charger status register bank.
+      - description: Charger control register bank.
+      - description: ADC register bank in the August PMIC.
+
+  reg-names:
+    items:
+      - const: status
+      - const: control
+      - const: adc
+
+  interrupts-extended:
+    items:
+      - description: D2355 parent-line notification.
+      - description: August ADC conversion complete.
+      - description: D2355 source event 40.
+      - description: D2355 source event 42.
+      - description: D2355 source event 53.
+
+  apple,tristar:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The Tristar port controller.
+
+  apple,adc-pmic:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The August PMIC providing the ADC registers.
+
+  apple,usb-input-limit-calibration-hv:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 84
+    maxItems: 84
+    description:
+      This unit's input-current calibration, the ADT's /charger
+      usb-input-limit-calibration-hv, filled in by the boot loader.
+
+  apple,pack-limits:
+    $ref: /schemas/types.yaml#/definitions/int32-array
+    description: |
+      Minimum and maximum battery temperature in tenths of a degree Celsius,
+      voltage in microvolts, and signed current in microamps, in that order.
+    items:
+      - description: Minimum temperature.
+      - description: Maximum temperature.
+      - description: Minimum voltage.
+      - description: Maximum voltage.
+      - description: Minimum current.
+      - description: Maximum current.
+
+  input-current-limit-microamp:
+    description: Board maximum input current.
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: Link to the USB controller whose role the charger sets.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts-extended
+  - apple,tristar
+  - apple,adc-pmic
+  - apple,pack-limits
+  - input-current-limit-microamp
+  - port
+
+unevaluatedProperties: false

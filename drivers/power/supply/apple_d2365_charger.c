@@ -16,6 +16,9 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
+#include <linux/interrupt.h>
+#include <linux/pm.h>
+#include <linux/pm_wakeup.h>
 #include <linux/workqueue.h>
 
 #define D2365_STATUS_CHARGE	0x0a
@@ -32,18 +35,25 @@
 #define D2365_POLICY_MIN_VOLTAGE_UV	3000000
 #define D2365_POLICY_MAX_VOLTAGE_UV	4350000
 #define D2365_POLICY_INTERVAL_MS	5000
+/*
+ * 500 mA, what USB 2.0 allows a configured device without more evidence.
+ * Nothing on the iPad 7 identifies the source yet or withdraws a grant on
+ * unplug, so a source never gets more than this.
+ */
+#define D2365_FALLBACK_INPUT_LIMIT	0x22
+/* The PMIC applies its attach default shortly after a source attaches. */
+#define D2365_ATTACH_CHECK_MS	100
+#define D2365_ATTACH_WINDOW_MS	15000
 #define D2365_RESTORE_RETRY_MS	100
 #define D2365_STOP_RESTORE_ATTEMPTS	3
 
 struct apple_d2365_config {
 	u8 handoff_input_limit;
-	u8 charging_input_limit;
 	u8 max_charge;
 };
 
 static const struct apple_d2365_config apple_d2365_j172_config = {
 	.handoff_input_limit = 0x02,
-	.charging_input_limit = 0x6c,
 	.max_charge = 0x34,
 };
 
@@ -60,6 +70,7 @@ struct apple_d2365_charger {
 	struct mutex policy_lock;
 	struct delayed_work charge_policy_work;
 	struct device *dev;
+	int plug_irq;			/* wakes the system, 0 without one */
 	struct regmap *regmap;
 	struct power_supply *psy;
 	const struct apple_d2365_config *config;
@@ -71,6 +82,7 @@ struct apple_d2365_charger {
 	int input_limit_error;
 	u8 policy_old_input_limit;
 	bool policy_old_input_valid;
+	unsigned long attach_until;
 	bool policy_enabled;
 	bool restore_pending;
 	bool shutting_down;
@@ -359,7 +371,30 @@ static void apple_d2365_charge_policy_work(struct work_struct *work)
 	}
 
 	if (charger->policy_enabled) {
-		if (input_limit != charger->config->charging_input_limit) {
+		/*
+		 * About 26 ms after a source attaches the D2365 sets the input
+		 * limit to its attach default, which is the handoff value. That
+		 * is not a lower limit from anyone: apply the policy again.
+		 */
+		if (input_limit == charger->config->handoff_input_limit &&
+		    time_before(jiffies, charger->attach_until)) {
+			ret = regmap_write(charger->regmap,
+					   charger->control_base +
+					   D2365_CONTROL_INPUT_LIMIT,
+					   D2365_FALLBACK_INPUT_LIMIT);
+			if (!ret)
+				ret = regmap_read(charger->regmap,
+						  charger->control_base +
+						  D2365_CONTROL_INPUT_LIMIT,
+						  &input_limit);
+			apple_d2365_cache_input_limit(charger, ret,
+						      ret ? 0 : input_limit);
+			if (ret)
+				goto out_write_error;
+			dev_dbg(charger->dev,
+				"input limit restored after the PMIC attach default\n");
+		}
+		if (input_limit != D2365_FALLBACK_INPUT_LIMIT) {
 			reject_reason = "input-limit integrity";
 			goto out_stop;
 		}
@@ -376,7 +411,7 @@ static void apple_d2365_charge_policy_work(struct work_struct *work)
 	charger->restore_pending = true;
 	ret = regmap_write(charger->regmap,
 			   charger->control_base + D2365_CONTROL_INPUT_LIMIT,
-			   charger->config->charging_input_limit);
+			   D2365_FALLBACK_INPUT_LIMIT);
 	if (ret)
 		goto out_write_error;
 
@@ -384,18 +419,26 @@ static void apple_d2365_charge_policy_work(struct work_struct *work)
 			  charger->control_base + D2365_CONTROL_INPUT_LIMIT,
 			  &readback);
 	apple_d2365_cache_input_limit(charger, ret, ret ? 0 : readback);
-	if (ret || readback != charger->config->charging_input_limit) {
+	if (ret || readback != D2365_FALLBACK_INPUT_LIMIT) {
 		if (!ret)
 			ret = -EIO;
 		goto out_write_error;
 	}
 
 	charger->policy_enabled = true;
+	charger->attach_until = jiffies +
+				msecs_to_jiffies(D2365_ATTACH_WINDOW_MS);
 	power_supply_changed(charger->psy);
+	/* Look again soon, in case the attach default follows the write. */
+	if (!charger->shutting_down)
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &charger->charge_policy_work,
+				 msecs_to_jiffies(D2365_ATTACH_CHECK_MS));
+	goto out_unlock;
 
 out_reschedule:
 	if (!charger->shutting_down)
-		mod_delayed_work(system_power_efficient_wq,
+		mod_delayed_work(system_freezable_power_efficient_wq,
 				 &charger->charge_policy_work,
 				 msecs_to_jiffies(D2365_POLICY_INTERVAL_MS));
 	goto out_unlock;
@@ -552,7 +595,7 @@ apple_d2365_charger_external_power_changed(struct power_supply *psy)
 	struct apple_d2365_charger *charger = power_supply_get_drvdata(psy);
 
 	if (charger->config && !READ_ONCE(charger->shutting_down))
-		mod_delayed_work(system_power_efficient_wq,
+		mod_delayed_work(system_freezable_power_efficient_wq,
 				 &charger->charge_policy_work, 0);
 
 	power_supply_changed(psy);
@@ -573,6 +616,43 @@ static const struct power_supply_desc apple_d2365_charger_desc = {
 	.get_property = apple_d2365_charger_get_property,
 	.external_power_changed = apple_d2365_charger_external_power_changed,
 };
+
+/* A plug or unplug: look at the source now, not at the next poll. */
+static irqreturn_t apple_d2365_charger_plug_irq(int irq, void *data)
+{
+	struct apple_d2365_charger *charger = data;
+
+	if (charger->config && !READ_ONCE(charger->shutting_down))
+		mod_delayed_work(system_freezable_power_efficient_wq,
+				 &charger->charge_policy_work, 0);
+	return IRQ_HANDLED;
+}
+
+static int apple_d2365_charger_suspend(struct device *dev)
+{
+	struct apple_d2365_charger *charger = dev_get_drvdata(dev);
+	int ret;
+
+	if (!charger->plug_irq || !device_may_wakeup(dev))
+		return 0;
+	ret = enable_irq_wake(charger->plug_irq);
+	if (ret)
+		dev_warn(dev, "cannot wake on plug events: %d\n", ret);
+	return 0;
+}
+
+static int apple_d2365_charger_resume(struct device *dev)
+{
+	struct apple_d2365_charger *charger = dev_get_drvdata(dev);
+
+	if (charger->plug_irq && device_may_wakeup(dev))
+		disable_irq_wake(charger->plug_irq);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_d2365_charger_pm_ops,
+				apple_d2365_charger_suspend,
+				apple_d2365_charger_resume);
 
 static int apple_d2365_charger_probe(struct platform_device *pdev)
 {
@@ -654,8 +734,25 @@ static int apple_d2365_charger_probe(struct platform_device *pdev)
 				     "failed to read input-current limit\n");
 
 	if (charger->config) {
-		mod_delayed_work(system_power_efficient_wq,
+		mod_delayed_work(system_freezable_power_efficient_wq,
 				 &charger->charge_policy_work, 0);
+	}
+
+	ret = platform_get_irq_optional(pdev, 0);
+	if (ret > 0) {
+		charger->plug_irq = ret;
+		ret = devm_request_threaded_irq(dev, charger->plug_irq, NULL,
+						apple_d2365_charger_plug_irq,
+						IRQF_ONESHOT, dev_name(dev),
+						charger);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to request the plug event\n");
+		ret = device_init_wakeup(dev, true);
+		if (ret)
+			return ret;
+	} else if (ret != -ENXIO) {
+		return ret;
 	}
 
 	power_supply_changed(psy);
@@ -723,6 +820,7 @@ static struct platform_driver apple_d2365_charger_driver = {
 	.driver = {
 		.name = "apple-d2365-charger",
 		.of_match_table = apple_d2365_charger_of_match,
+		.pm = pm_sleep_ptr(&apple_d2365_charger_pm_ops),
 	},
 };
 module_platform_driver(apple_d2365_charger_driver);

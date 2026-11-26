@@ -21,6 +21,7 @@ enum bq27xxx_chip {
 	BQ27521, /* bq27521 */
 	BQ27530, /* bq27530, bq27531 */
 	BQ27531,
+	BQ27540, /* bq27540 with Apple's gauge firmware */
 	BQ27541, /* bq27541, bq27542, bq27546, bq27742 */
 	BQ27542,
 	BQ27546,
@@ -83,6 +84,13 @@ struct bq27xxx_device_info {
 	bool cache_use_remaining_capacity;
 	/* Optional periodic refresh interval for cache-only transports. */
 	unsigned int cache_refresh_ms;
+	/* Optional maximum age of a sample, measured from the first register read. */
+	unsigned int cache_max_age_ms;
+	ktime_t cache_valid_until;
+	/* Bound admission of new register reads during a cached refresh. */
+	unsigned int cache_read_budget_ms;
+	unsigned long cache_read_deadline;
+	bool cache_read_active;
 	int charge_design_full;
 	int voltage_min_design;
 	int voltage_max_design;

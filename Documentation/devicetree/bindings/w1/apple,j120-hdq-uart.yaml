@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/w1/apple,j120-hdq-uart.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple J120 UART HDQ battery bus
+
+maintainers:
+  - tompta1 <546706+tompta1@users.noreply.github.com>
+
+description: |
+  The J120 battery gauge uses an HDQ bus driven by UART symbols. The
+  board-specific compatible selects bounded, read-only telemetry transactions.
+
+properties:
+  compatible:
+    items:
+      - const: apple,j120-hdq-uart
+      - const: ti,hdq-uart
+
+  fuel-gauge:
+    $ref: /schemas/power/supply/apple,j120-bq27540.yaml#
+
+required:
+  - compatible
+  - fuel-gauge
+
+additionalProperties: false

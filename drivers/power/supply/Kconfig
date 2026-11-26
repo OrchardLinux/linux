@@ -337,6 +337,7 @@ config BATTERY_BQ27XXX_HDQ
 config CHARGER_APPLE_SN2400
 	tristate "Apple SN2400 USB charger"
 	depends on MUX_SN2400
+	depends on HWMON
 	help
 	  Say Y here to enable charging and USB input-current foldback for the
 	  Apple SN2400 charger used in devices such as the iPhone 7.
@@ -344,6 +345,11 @@ config CHARGER_APPLE_SN2400
 	  The driver starts at a conservative input current and raises the limit
 	  in small steps while monitoring VBUS droop. Battery telemetry remains
 	  the responsibility of a separate fuel-gauge driver.
+
+	  A board can describe its charger as read-only (apple,read-only) while
+	  it is brought up: the driver then reports cable presence, the charging
+	  state and the input limit the bootloader left, and writes no charger
+	  register. The control module parameter overrides the DT.
 
 config APPLE_BELLATRIX_POWER
 	tristate "Apple Bellatrix USB power status"
@@ -372,6 +378,60 @@ config APPLE_D2365_CHARGER
 
 	  This driver can also be built as a module. If so, the module will be
 	  called apple_d2365_charger.
+
+config BATTERY_APPLE_D2186
+	tristate "Apple D2186 PMIC battery and USB charger"
+	depends on MFD_SIMPLE_MFD_I2C && IIO
+	help
+	  Say Y or M here to enable battery and USB charger status reporting
+	  for Apple devices with a Dialog D2186 PMIC and no standalone
+	  fuel-gauge IC, such as the iPod touch 6 (N102).
+
+	  Battery voltage, charge current, thermistor temperature and USB
+	  input telemetry are read through the D2186 PMIC ADC IIO driver,
+	  and charging status is read from the PMIC status registers. When
+	  the device tree gives a board input-current maximum, the USB input
+	  current limit follows what the USB host grants, as the device
+	  controller reports it. The battery charge current and charge
+	  voltage are never written.
+
+	  This driver can also be built as a module. If so, the module will
+	  be called apple_d2186_battery.
+
+config APPLE_TRISTAR_CHARGER
+	tristate "Apple Tristar Lightning charging"
+	depends on MFD_SIMPLE_MFD_I2C && I2C
+	help
+	  Say Y here to enable charging on Apple devices with a Tristar
+	  (CBTL1610) Lightning port controller, such as the iPad 5 and iPad 6.
+
+	  The driver identifies the attached source (Apple USB-A chargers by
+	  their BrickID, USB-C sources by their CC advertisement, BC1.2
+	  charging ports by primary and secondary detection, USB hosts by
+	  what the USB device controller reports) and raises the PMIC
+	  input-current limit to what the source supports, up to the board
+	  maximum. Unidentified sources get 500 mA. Every source change drops
+	  the limit before the new source is identified. PMU events come from
+	  the PMIC GPIO driver's event interrupt controller.
+
+	  This driver can also be built as a module. If so, the module will be
+	  called apple_tristar_charger.
+
+config APPLE_TRISTAR_ACCESSORY
+	bool "Lightning accessory identification"
+	depends on APPLE_TRISTAR_CHARGER
+	depends on USB_ROLE_SWITCH=y || USB_ROLE_SWITCH=APPLE_TRISTAR_CHARGER
+	depends on USB_ROLES_APPLE_S8000=y || USB_ROLES_APPLE_S8000=APPLE_TRISTAR_CHARGER
+	help
+	  Say Y here to let the Tristar charger identify Lightning
+	  accessories over the Lightning ID bus and make the port a USB host
+	  while a Lightning-to-USB camera adapter is attached, as iOS does.
+	  A charger on the adapter's power port is not identified and is
+	  allowed 500 mA.
+
+	  It needs the port's USB role switch (USB_ROLES_APPLE_S8000) and
+	  is active only on boards whose device tree names that switch for
+	  the charger.
 
 config BATTERY_BQ27XXX_DT_UPDATES_NVM
 	bool "BQ27xxx support for update of NVM/flash data memory"

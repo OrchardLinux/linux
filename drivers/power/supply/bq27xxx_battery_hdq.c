@@ -42,6 +42,30 @@ static const enum power_supply_property bq27545_iphone7_plus_cache_props[] = {
 	POWER_SUPPLY_PROP_MANUFACTURER,
 };
 
+/* RemainingCapacity answers, NominalAvailableCapacity does not. */
+static const enum power_supply_property bq27540_j120_cache_props[] = {
+	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_CHARGE_NOW,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
+};
+
+struct bq27xxx_hdq_data {
+	enum bq27xxx_chip chip;
+	const enum power_supply_property *cache_properties;
+	size_t num_cache_properties;
+	bool use_remaining_capacity;
+	/* Cached telemetry, refreshed periodically (always for the BQ27545) */
+	bool cache_only;
+	unsigned int read_budget_ms;
+};
+
 static int w1_bq27000_read(struct w1_slave *sl, unsigned int reg)
 {
 	u8 val;
@@ -102,20 +126,23 @@ static int bq27xxx_battery_hdq_add_slave(struct w1_slave *sl)
 
 	di->dev = &sl->dev;
 	match = of_match_node(sl->family->of_match_table, sl->dev.of_node);
+	if (sl->master->dev.parent && !match)
+		return -ENODEV;
 	if (match) {
-		di->chip = (uintptr_t)match->data;
+		const struct bq27xxx_hdq_data *data = match->data;
+
+		di->chip = data->chip;
 		di->name = "battery";
-		di->cache_only = true;
-		di->cache_refresh_ms = 30000;
-		if (of_device_is_compatible(sl->dev.of_node,
-					    "apple,d11-bq27545") ||
-		    of_device_is_compatible(sl->dev.of_node,
-					    "apple,d111-bq27545")) {
-			di->cache_properties = bq27545_iphone7_plus_cache_props;
-			di->num_cache_properties =
-				ARRAY_SIZE(bq27545_iphone7_plus_cache_props);
-			di->cache_use_remaining_capacity = true;
+		di->cache_only = di->chip == BQ27545 || data->cache_only;
+		di->cache_refresh_ms = di->cache_only ? 30000 : 0;
+		if (data->cache_properties) {
+			di->cache_properties = data->cache_properties;
+			di->num_cache_properties = data->num_cache_properties;
 		}
+		di->cache_use_remaining_capacity = data->use_remaining_capacity;
+		di->cache_read_budget_ms = data->read_budget_ms;
+		if (data->read_budget_ms)
+			di->cache_max_age_ms = di->cache_refresh_ms + data->read_budget_ms;
 	} else {
 		di->chip = BQ27000;
 		di->name = "bq27000-battery";
@@ -145,10 +172,51 @@ static const struct w1_family_ops bq27xxx_battery_hdq_fops = {
 	.remove_slave	= bq27xxx_battery_hdq_remove_slave,
 };
 
+/*
+ * Apple's gauge firmware on these boards reports a charge-remaining value
+ * that only pairs with FullChargeCapacity when it is read from
+ * RemainingCapacity, not NominalAvailableCapacity.
+ */
+static const struct bq27xxx_hdq_data bq27545_iphone7_plus_data = {
+	.chip = BQ27545,
+	.cache_properties = bq27545_iphone7_plus_cache_props,
+	.num_cache_properties = ARRAY_SIZE(bq27545_iphone7_plus_cache_props),
+	.use_remaining_capacity = true,
+};
+
+static const struct bq27xxx_hdq_data bq27545_ipad_air_data = {
+	.chip = BQ27545,
+	.use_remaining_capacity = true,
+};
+
+static const struct bq27xxx_hdq_data bq27545_data = {
+	.chip = BQ27545,
+};
+
+static const struct bq27xxx_hdq_data bq27540_data = {
+	.chip = BQ27540,
+};
+
+/*
+ * The iPad Pro 12.9 (2017)'s BQ27540 (ADT gas-gauge): the BQ27541 register
+ * layout, RemainingCapacity instead of NominalAvailableCapacity, cached.
+ */
+static const struct bq27xxx_hdq_data bq27540_j120_data = {
+	.chip = BQ27541,
+	.cache_only = true,
+	.read_budget_ms = 5000,
+	.cache_properties = bq27540_j120_cache_props,
+	.num_cache_properties = ARRAY_SIZE(bq27540_j120_cache_props),
+	.use_remaining_capacity = true,
+};
+
 static const struct of_device_id bq27xxx_battery_hdq_of_match[] = {
-	{ .compatible = "apple,d11-bq27545", .data = (void *)BQ27545 },
-	{ .compatible = "apple,d111-bq27545", .data = (void *)BQ27545 },
-	{ .compatible = "ti,bq27545-hdq", .data = (void *)BQ27545 },
+	{ .compatible = "apple,j120-bq27540", .data = &bq27540_j120_data },
+	{ .compatible = "apple,d11-bq27545", .data = &bq27545_iphone7_plus_data },
+	{ .compatible = "apple,d111-bq27545", .data = &bq27545_iphone7_plus_data },
+	{ .compatible = "apple,j72-bq27545", .data = &bq27545_ipad_air_data },
+	{ .compatible = "ti,bq27545-hdq", .data = &bq27545_data },
+	{ .compatible = "ti,bq27540-hdq", .data = &bq27540_data },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, bq27xxx_battery_hdq_of_match);
