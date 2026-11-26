@@ -54,6 +54,7 @@ static const struct mfd_cell apple_smc_t8015_devs[] = {
 	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,t8015-smc-reboot"),
+	MFD_CELL_OF("macsmc-regulator", NULL, NULL, 0, 0, "apple,t8015-smc-regulator"),
 };
 
 static const struct mfd_cell apple_smc_t8103_devs[] = {
