@@ -718,6 +718,16 @@
 			aop_pressure: pressure {
 				compatible = "apple,t8010-aop-pressure";
 			};
+
+			/*
+			 * The A11's own magnetometer service (an Alps HSCDTD601A).
+			 * Its factory sensitivity matrix, which m1n1 copies from the
+			 * ADT, also turns the chip's axes onto the device's, so it
+			 * needs no mount matrix.
+			 */
+			aop_compass: compass {
+				compatible = "apple,t8015-aop-compass";
+			};
 		};
 
 		aop_mbox: mbox@234808000 {
