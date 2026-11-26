@@ -109,6 +109,7 @@ patternProperties:
           - apple,t8010-aop-gyro
           - apple,t8010-aop-compass
           - apple,t8010-aop-pressure
+          - apple,t8015-aop-compass
 
       mount-matrix:
         description: The sensor's mounting rotation in the device.
