@@ -98,6 +98,10 @@ static void dwc2_handle_otg_intr(struct dwc2_hsotg *hsotg)
 		gotgctl = dwc2_readl(hsotg, GOTGCTL);
 
 		if (dwc2_is_device_mode(hsotg)) {
+			/* rare, and the cause of a gadget that stops answering mid-session */
+			dev_info_ratelimited(hsotg->dev,
+					     "VBUS session end in L%d (connected %u)\n",
+					     hsotg->lx_state, hsotg->connected);
 			if (hsotg->params.eusb2_disc) {
 				/* Clear the Gate hclk. */
 				pcgctl = dwc2_readl(hsotg, PCGCTL);
@@ -301,6 +305,10 @@ static void dwc2_handle_session_req_intr(struct dwc2_hsotg *hsotg)
 		hsotg->lx_state);
 
 	if (dwc2_is_device_mode(hsotg)) {
+		if (hsotg->connected)
+			dev_info_ratelimited(hsotg->dev,
+					     "VBUS session request while connected, in L%d: disconnecting\n",
+					     hsotg->lx_state);
 		if (hsotg->lx_state != DWC2_L0) {
 			if (hsotg->in_ppd) {
 				ret = dwc2_exit_partial_power_down(hsotg, 0,
@@ -309,13 +317,9 @@ static void dwc2_handle_session_req_intr(struct dwc2_hsotg *hsotg)
 					dev_err(hsotg->dev,
 						"exit power_down failed\n");
 			}
-
-			/* Exit gadget mode clock gating. */
-			if (hsotg->params.power_down ==
-			    DWC2_POWER_DOWN_PARAM_NONE && hsotg->bus_suspended &&
-			    !hsotg->params.no_clock_gating)
-				dwc2_gadget_exit_clock_gating(hsotg, 0);
 		}
+
+		dwc2_gadget_leave_gating(hsotg, "session request");
 
 		/*
 		 * Report disconnect if there is any previous session
@@ -390,11 +394,11 @@ void dwc2_wakeup_from_lpm_l1(struct dwc2_hsotg *hsotg, bool remotewakeup)
 			return;
 		}
 
-		/* Inform gadget to exit from L1 */
-		call_gadget(hsotg, resume);
-		/* Change to L0 state */
+		/* Change to L0 state before informing the gadget */
 		hsotg->lx_state = DWC2_L0;
 		hsotg->bus_suspended = false;
+		/* Inform gadget to exit from L1 */
+		call_gadget(hsotg, resume);
 fail:		dwc2_gadget_init_lpm(hsotg);
 	} else {
 		/* TODO */
@@ -448,6 +452,7 @@ static void dwc2_handle_wakeup_detected_intr(struct dwc2_hsotg *hsotg)
 			    !hsotg->params.no_clock_gating)
 				dwc2_gadget_exit_clock_gating(hsotg, 0);
 		} else {
+			dwc2_gadget_leave_gating(hsotg, "resume");
 			/* Change to L0 state */
 			hsotg->lx_state = DWC2_L0;
 		}

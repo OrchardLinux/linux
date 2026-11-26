@@ -10,6 +10,7 @@
 
 #include <linux/acpi.h>
 #include <linux/device-id/pci.h>
+#include <linux/notifier.h>
 #include <linux/phy/phy.h>
 #include <linux/regulator/consumer.h>
 #include <linux/usb/gadget.h>
@@ -367,6 +368,15 @@ enum dwc2_ep0_state {
  * @no_clock_gating:	Specifies whether to avoid clock gating feature.
  *			0 - No (use clock gating)
  *			1 - Yes (avoid it)
+ * @s2idle_keep_session: Specifies whether a peripheral session the host
+ *			has addressed stays up over suspend-to-idle: the
+ *			controller and PHY stay powered and the device stays
+ *			connected, instead of disconnecting from the host.
+ *			Needs power domains that stay on for a device on the
+ *			wakeup path; if the controller loses its state anyway,
+ *			it reconnects on resume as without this.
+ *			0 - No (disconnect, default)
+ *			1 - Yes
  * @lpm:		Enable LPM support.
  *			0 - No
  *			1 - Yes
@@ -466,6 +476,7 @@ struct dwc2_core_params {
 #define DWC2_POWER_DOWN_PARAM_PARTIAL		1
 #define DWC2_POWER_DOWN_PARAM_HIBERNATION	2
 	bool no_clock_gating;
+	bool s2idle_keep_session;
 
 	bool lpm;
 	bool lpm_clock_gating;
@@ -867,6 +878,12 @@ struct dwc2_hregs_backup {
  * @role_sw:		usb_role_switch handle
  * @role_sw_default_mode: default operation mode of controller while usb role
  *			is USB_ROLE_NONE
+ * @role_sw_lock:	Serializes role changes against the fallback
+ * @role_sw_fallback:	Connects a peripheral-only controller as a device if
+ *			nothing sets a role in time
+ * @role_sw_driven:	A role has been set through the role switch
+ * @role_sw_hold:	A peripheral-only controller without a default mode
+ *			holds its pull-up off: no role, or no device role, set
  * @hcd_enabled:	Host mode sub-driver initialization indicator.
  * @gadget_enabled:	Peripheral mode sub-driver initialization indicator.
  * @ll_hw_enabled:	Status of low-level hardware resources.
@@ -876,6 +893,8 @@ struct dwc2_hregs_backup {
  * @reset_phy_on_wake:	Quirk saying that we should assert PHY reset on a
  *			remote wakeup.
  * @phy_off_for_suspend: Status of whether we turned the PHY off at suspend.
+ * @session_kept_for_s2idle: The peripheral session was left up over
+ *			suspend-to-idle (params.s2idle_keep_session).
  * @need_phy_for_wake:	Quirk saying that we should keep the PHY on at
  *			suspend if we need USB to wake us up.
  * @frame_number:       Frame number read from the core. For both device
@@ -1052,6 +1071,12 @@ struct dwc2_hregs_backup {
  * @new_connection:	Used in host mode. True if there are new connected
  *			device
  * @enabled:		Indicates the enabling state of controller
+ * @usb_psy_name:	Name of the power supply told what the host allows
+ *			the device to draw (vbus_draw), or NULL
+ * @vbus_draw_work:	Work passing @vbus_draw_ma to that power supply
+ * @vbus_draw_ma:	Current the gadget may draw, from vbus_draw
+ * @vbus_draw_pending:	A new vbus_draw report must reach the supply
+ * @usb_psy_nb:	Re-report the current allowance when the supply changes
  *
  */
 struct dwc2_hsotg {
@@ -1065,6 +1090,10 @@ struct dwc2_hsotg {
 	enum usb_dr_mode dr_mode;
 	struct usb_role_switch *role_sw;
 	enum usb_dr_mode role_sw_default_mode;
+	struct mutex role_sw_lock;
+	struct delayed_work role_sw_fallback;
+	bool role_sw_driven;
+	bool role_sw_hold;
 	unsigned int hcd_enabled:1;
 	unsigned int gadget_enabled:1;
 	unsigned int ll_hw_enabled:1;
@@ -1074,6 +1103,7 @@ struct dwc2_hsotg {
 	unsigned int reset_phy_on_wake:1;
 	unsigned int need_phy_for_wake:1;
 	unsigned int phy_off_for_suspend:1;
+	unsigned int session_kept_for_s2idle:1;
 	u16 frame_number;
 
 	struct phy *phy;
@@ -1225,6 +1255,11 @@ struct dwc2_hsotg {
 	unsigned int remote_wakeup_allowed:1;
 	struct dwc2_hsotg_ep *eps_in[MAX_EPS_CHANNELS];
 	struct dwc2_hsotg_ep *eps_out[MAX_EPS_CHANNELS];
+	const char *usb_psy_name;
+	struct work_struct vbus_draw_work;
+	struct notifier_block usb_psy_nb;
+	unsigned int vbus_draw_ma;
+	bool vbus_draw_pending;
 #endif /* CONFIG_USB_DWC2_PERIPHERAL || CONFIG_USB_DWC2_DUAL_ROLE */
 };
 
@@ -1433,6 +1468,8 @@ int dwc2_gadget_exit_hibernation(struct dwc2_hsotg *hsotg,
 int dwc2_gadget_enter_partial_power_down(struct dwc2_hsotg *hsotg);
 int dwc2_gadget_exit_partial_power_down(struct dwc2_hsotg *hsotg,
 					bool restore);
+bool dwc2_gadget_ungate_clock(struct dwc2_hsotg *hsotg);
+void dwc2_gadget_leave_gating(struct dwc2_hsotg *hsotg, const char *where);
 void dwc2_gadget_enter_clock_gating(struct dwc2_hsotg *hsotg);
 void dwc2_gadget_exit_clock_gating(struct dwc2_hsotg *hsotg,
 				   int rem_wakeup);
@@ -1480,6 +1517,8 @@ static inline int dwc2_gadget_enter_partial_power_down(struct dwc2_hsotg *hsotg)
 static inline int dwc2_gadget_exit_partial_power_down(struct dwc2_hsotg *hsotg,
 						      bool restore)
 { return 0; }
+static inline bool dwc2_gadget_ungate_clock(struct dwc2_hsotg *hsotg) { return false; }
+static inline void dwc2_gadget_leave_gating(struct dwc2_hsotg *hsotg, const char *where) {}
 static inline void dwc2_gadget_enter_clock_gating(struct dwc2_hsotg *hsotg) {}
 static inline void dwc2_gadget_exit_clock_gating(struct dwc2_hsotg *hsotg,
 						 int rem_wakeup) {}

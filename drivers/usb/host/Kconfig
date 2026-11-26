@@ -733,3 +733,17 @@ config USB_XEN_HCD
 	  by the Xen host (usually Dom0).
 	  Only needed if the kernel is running in a Xen guest and generic
 	  access to a USB device is needed.
+
+config APPLE_A7_WLAN
+	tristate "Apple A7 (S5L8960X) internal HSIC Wi-Fi transport"
+	depends on ARCH_APPLE && USB_EHCI_HCD && I2C && GPIOLIB && PM_GENERIC_DOMAINS
+	help
+	  Owns the HSIC PHY, radio reset, HOST_READY and the EHCI root port
+	  of the BCM43241 on the iPad Air and iPad mini 2 and 3, so that
+	  brcmfmac can download its firmware over USB. The radio's wiring
+	  comes from its apple,s5l8960x-hsic-wlan device tree node.
+
+	  The register baseline was measured on an iPad Air (J72). On every
+	  board a value that differs from it is logged, and any write that
+	  depends on it is refused unless the board matches it.
+	  Requires the confirm_native parameter; there is no DT probe.

@@ -22,6 +22,8 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/slab.h>
+#include <linux/power_supply.h>
+#include <linux/property.h>
 
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
@@ -1735,6 +1737,17 @@ static struct dwc2_hsotg_req *get_ep_head(struct dwc2_hsotg_ep *hs_ep)
 					queue);
 }
 
+/*
+ * The core takes OUT packets into the receive FIFO shared by all OUT endpoints
+ * even with no transfer programmed. They then stay at its head, and every OUT
+ * endpoint stops. NAK while no request is queued; starting a request clears it.
+ */
+static void dwc2_hsotg_nak_idle_out(struct dwc2_hsotg *hsotg, struct dwc2_hsotg_ep *hs_ep)
+{
+	if (!hs_ep->dir_in && hs_ep->index && !hs_ep->isochronous)
+		dwc2_set_bit(hsotg, DOEPCTL(hs_ep->index), DXEPCTL_SNAK);
+}
+
 /**
  * dwc2_gadget_start_next_request - Starts next request from ep queue
  * @hs_ep: Endpoint structure
@@ -1754,8 +1767,10 @@ static void dwc2_gadget_start_next_request(struct dwc2_hsotg_ep *hs_ep)
 		dwc2_hsotg_start_req(hsotg, hs_ep, hs_req, false);
 		return;
 	}
-	if (!hs_ep->isochronous)
+	if (!hs_ep->isochronous) {
+		dwc2_hsotg_nak_idle_out(hsotg, hs_ep);
 		return;
+	}
 
 	if (dir_in) {
 		dev_dbg(hsotg->dev, "%s: No more ISOC-IN requests\n",
@@ -3318,6 +3333,8 @@ void dwc2_hsotg_disconnect(struct dwc2_hsotg *hsotg)
 
 	if (!hsotg->connected)
 		return;
+	if (dwc2_gadget_ungate_clock(hsotg))
+		hsotg->bus_suspended = false;
 
 	hsotg->connected = 0;
 	hsotg->test_mode = 0;
@@ -3746,6 +3763,7 @@ irq_retry:
 	if (gintsts & (GINTSTS_USBRST | GINTSTS_RESETDET)) {
 		u32 usb_status = dwc2_readl(hsotg, GOTGCTL);
 		u32 connected = hsotg->connected;
+		enum dwc2_lx_state lx = hsotg->lx_state;
 
 		dev_dbg(hsotg->dev, "%s: USBRst\n", __func__);
 		dev_dbg(hsotg->dev, "GNPTXSTS=%08x\n",
@@ -3753,14 +3771,36 @@ irq_retry:
 
 		dwc2_writel(hsotg, GINTSTS_USBRST, GINTSTS);
 
+		/*
+		 * A reset of a suspended bus: no resume came first, so a core
+		 * that entered clock gating on the suspend is still gated.
+		 */
+		if (!hsotg->in_ppd)
+			dwc2_gadget_leave_gating(hsotg, "USB reset");
+
 		/* Report disconnection if it is not already done. */
 		dwc2_hsotg_disconnect(hsotg);
 
 		/* Reset device address to zero */
 		dwc2_clear_bit(hsotg, DCFG, DCFG_DEVADDR_MASK);
 
-		if (usb_status & GOTGCTL_BSESVLD && connected)
+		/*
+		 * The host resets an attached device.  A device that a session
+		 * event (VBUS session end or request) or a suspend took out of
+		 * L0 is no longer "connected", yet the host never saw it go:
+		 * without the re-initialisation the EP0 setup request that
+		 * enum-done queues is refused outside L0 (-EAGAIN) on this and
+		 * every later reset, until the UDC is rebound.  Re-arm it as
+		 * for a connected device, as Apple's device controller driver
+		 * does on every reset.
+		 */
+		if (usb_status & GOTGCTL_BSESVLD && (connected || lx != DWC2_L0))
 			dwc2_hsotg_core_init_disconnected(hsotg, true);
+		if (lx != DWC2_L0)
+			dev_info_ratelimited(hsotg->dev,
+					     "USB reset in L%d (connected %u, B-session %s): EP0 re-armed\n",
+					     lx, connected,
+					     usb_status & GOTGCTL_BSESVLD ? "valid" : "invalid");
 	}
 
 	if (gintsts & GINTSTS_ENUMDONE) {
@@ -3919,6 +3959,8 @@ static void dwc2_hsotg_ep_stop_xfr(struct dwc2_hsotg *hsotg,
 {
 	u32 epctrl_reg;
 	u32 epint_reg;
+	bool regate = dwc2_gadget_ungate_clock(hsotg) &&
+		hsotg->lx_state == DWC2_L2 && hsotg->bus_suspended;
 
 	epctrl_reg = hs_ep->dir_in ? DIEPCTL(hs_ep->index) :
 		DOEPCTL(hs_ep->index);
@@ -4005,6 +4047,8 @@ static void dwc2_hsotg_ep_stop_xfr(struct dwc2_hsotg *hsotg,
 		/* Remove global NAKs */
 		dwc2_set_bit(hsotg, DCTL, DCTL_CGOUTNAK);
 	}
+	if (regate)
+		dwc2_gadget_enter_clock_gating(hsotg);
 }
 
 /**
@@ -4103,6 +4147,10 @@ static int dwc2_hsotg_ep_enable(struct usb_ep *ep,
 	 * transactions entirely for this endpoint
 	 */
 	epctrl |= DXEPCTL_USBACTEP;
+
+	/* No request yet: dwc2_hsotg_nak_idle_out() */
+	if (!dir_in && index && usb_endpoint_type(desc) != USB_ENDPOINT_XFER_ISOC)
+		epctrl |= DXEPCTL_SNAK;
 
 	/* update the endpoint state */
 	dwc2_hsotg_set_ep_maxpacket(hsotg, hs_ep->index, mps, mc, dir_in);
@@ -4605,12 +4653,9 @@ static int dwc2_hsotg_udc_stop(struct usb_gadget *gadget)
 		return -ENODEV;
 
 	/* Exit clock gating when driver is stopped. */
-	if (hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE &&
-	    hsotg->bus_suspended && !hsotg->params.no_clock_gating) {
-		spin_lock_irqsave(&hsotg->lock, flags);
-		dwc2_gadget_exit_clock_gating(hsotg, 0);
-		spin_unlock_irqrestore(&hsotg->lock, flags);
-	}
+	spin_lock_irqsave(&hsotg->lock, flags);
+	dwc2_gadget_leave_gating(hsotg, "udc stop");
+	spin_unlock_irqrestore(&hsotg->lock, flags);
 
 	/* all endpoints should be shutdown */
 	for (ep = 1; ep < hsotg->num_of_eps; ep++) {
@@ -4692,6 +4737,8 @@ static int dwc2_hsotg_pullup(struct usb_gadget *gadget, int is_on)
 	}
 
 	spin_lock_irqsave(&hsotg->lock, flags);
+	if (dwc2_gadget_ungate_clock(hsotg))
+		hsotg->bus_suspended = false;
 	if (hsotg->in_ppd) {
 		ret = dwc2_exit_partial_power_down(hsotg, 0, true);
 		if (ret) {
@@ -4704,7 +4751,9 @@ static int dwc2_hsotg_pullup(struct usb_gadget *gadget, int is_on)
 		dwc2_hsotg_core_init_disconnected(hsotg, false);
 		/* Enable ACG feature in device mode,if supported */
 		dwc2_enable_acg(hsotg);
-		dwc2_hsotg_core_connect(hsotg);
+		/* A held role switch connects it later (drd.c) */
+		if (!hsotg->role_sw_hold)
+			dwc2_hsotg_core_connect(hsotg);
 	} else {
 		dwc2_hsotg_core_disconnect(hsotg);
 		dwc2_hsotg_disconnect(hsotg);
@@ -4725,6 +4774,8 @@ static int dwc2_hsotg_vbus_session(struct usb_gadget *gadget, int is_active)
 
 	dev_dbg(hsotg->dev, "%s: is_active: %d\n", __func__, is_active);
 	spin_lock_irqsave(&hsotg->lock, flags);
+	if (dwc2_gadget_ungate_clock(hsotg))
+		hsotg->bus_suspended = false;
 
 	/*
 	 * If controller is in partial power down state, it must exit from
@@ -4762,13 +4813,74 @@ static int dwc2_hsotg_vbus_session(struct usb_gadget *gadget, int is_active)
  *
  * Report how much power the device may consume to the phy.
  */
+static void dwc2_hsotg_vbus_draw_work(struct work_struct *work)
+{
+	struct dwc2_hsotg *hsotg = container_of(work, struct dwc2_hsotg,
+						vbus_draw_work);
+	union power_supply_propval val, allowed;
+	struct power_supply *psy;
+	bool pending;
+	int ret;
+
+	psy = power_supply_get_by_name(hsotg->usb_psy_name);
+	if (!psy)
+		return;
+	pending = xchg(&hsotg->vbus_draw_pending, false);
+	val.intval = READ_ONCE(hsotg->vbus_draw_ma) * 1000;
+	if (!pending &&
+	    !power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_MAX, &allowed) &&
+	    allowed.intval == val.intval)
+		goto put;
+	ret = power_supply_set_property(psy, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+					&val);
+	if (ret)
+		dev_dbg(hsotg->dev, "setting VBUS draw (%d uA) failed: %d\n",
+			val.intval, ret);
+put:
+	power_supply_put(psy);
+}
+
+/*
+ * A charger can invalidate a report on a source event without ending the USB
+ * session. Send the current allowance again, not a saved Apple grant. The
+ * composite driver replaces it on reset, disconnect and suspend. Compare the
+ * allowance, not the ramped input limit, to avoid a notification feedback loop.
+ * The notifier must not call into the supply: queue the work that may sleep.
+ */
+static int dwc2_hsotg_psy_changed(struct notifier_block *nb,
+				unsigned long event, void *data)
+{
+	struct dwc2_hsotg *hsotg = container_of(nb, struct dwc2_hsotg, usb_psy_nb);
+	struct power_supply *psy = data;
+
+	if (event == PSY_EVENT_PROP_CHANGED &&
+	    !strcmp(psy->desc->name, hsotg->usb_psy_name))
+		schedule_work(&hsotg->vbus_draw_work);
+	return NOTIFY_OK;
+}
+
+static void dwc2_hsotg_psy_unregister(void *data)
+{
+	struct dwc2_hsotg *hsotg = data;
+
+	power_supply_unreg_notifier(&hsotg->usb_psy_nb);
+	cancel_work_sync(&hsotg->vbus_draw_work);
+}
+
 static int dwc2_hsotg_vbus_draw(struct usb_gadget *gadget, unsigned int mA)
 {
 	struct dwc2_hsotg *hsotg = to_hsotg(gadget);
 
-	if (IS_ERR_OR_NULL(hsotg->uphy))
+	if (!IS_ERR_OR_NULL(hsotg->uphy))
+		return usb_phy_set_power(hsotg->uphy, mA);
+	if (!hsotg->usb_psy_name)
 		return -ENOTSUPP;
-	return usb_phy_set_power(hsotg->uphy, mA);
+
+	/* Called in atomic context; the power supply may sleep. */
+	WRITE_ONCE(hsotg->vbus_draw_ma, mA);
+	WRITE_ONCE(hsotg->vbus_draw_pending, true);
+	schedule_work(&hsotg->vbus_draw_work);
+	return 0;
 }
 
 static void dwc2_gadget_set_speed(struct usb_gadget *g, enum usb_device_speed speed)
@@ -5018,6 +5130,9 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 
 	hsotg->gadget.ops = &dwc2_hsotg_gadget_ops;
 	hsotg->gadget.name = dev_name(dev);
+	if (!device_property_read_string(dev, "usb-psy-name",
+					 &hsotg->usb_psy_name))
+		INIT_WORK(&hsotg->vbus_draw_work, dwc2_hsotg_vbus_draw_work);
 	hsotg->gadget.otg_caps = &hsotg->params.otg_caps;
 	hsotg->remote_wakeup_allowed = 0;
 
@@ -5091,6 +5206,24 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 
 	dwc2_hsotg_dump(hsotg);
 
+	if (hsotg->usb_psy_name && IS_ERR_OR_NULL(hsotg->uphy)) {
+		hsotg->usb_psy_nb.notifier_call = dwc2_hsotg_psy_changed;
+		ret = power_supply_reg_notifier(&hsotg->usb_psy_nb);
+		if (ret) {
+			dwc2_hsotg_ep_free_request(&hsotg->eps_out[0]->ep,
+						 hsotg->ctrl_req);
+			return ret;
+		}
+		ret = devm_add_action_or_reset(dev, dwc2_hsotg_psy_unregister,
+					      hsotg);
+		if (ret) {
+			dwc2_hsotg_ep_free_request(&hsotg->eps_out[0]->ep,
+						 hsotg->ctrl_req);
+			return ret;
+		}
+		/* The named supply may already have registered. */
+		schedule_work(&hsotg->vbus_draw_work);
+	}
 	return 0;
 }
 
@@ -5102,6 +5235,12 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 int dwc2_hsotg_remove(struct dwc2_hsotg *hsotg)
 {
 	usb_del_gadget_udc(&hsotg->gadget);
+	if (hsotg->usb_psy_name) {
+		if (IS_ERR_OR_NULL(hsotg->uphy))
+			devm_release_action(hsotg->dev, dwc2_hsotg_psy_unregister,
+					    hsotg);
+		cancel_work_sync(&hsotg->vbus_draw_work);
+	}
 	dwc2_hsotg_ep_free_request(&hsotg->eps_out[0]->ep, hsotg->ctrl_req);
 
 	return 0;
@@ -5708,6 +5847,50 @@ void dwc2_gadget_enter_clock_gating(struct dwc2_hsotg *hsotg)
 }
 
 /*
+ * Clear PCGCTL.GATEHCLK/STOPPCLK regardless of software link state. No
+ * callbacks or state changes: teardown/reset callers must not resume gadget
+ * functions just before disconnecting them. Caller holds hsotg->lock.
+ */
+bool dwc2_gadget_ungate_clock(struct dwc2_hsotg *hsotg)
+{
+	u32 pcgctl;
+
+	if (hsotg->params.power_down != DWC2_POWER_DOWN_PARAM_NONE ||
+	    hsotg->in_ppd || hsotg->hibernated)
+		return false;
+	pcgctl = dwc2_readl(hsotg, PCGCTL);
+	if (!(pcgctl & (PCGCTL_GATEHCLK | PCGCTL_STOPPCLK)))
+		return false;
+	if (pcgctl & PCGCTL_GATEHCLK) {
+		pcgctl &= ~PCGCTL_GATEHCLK;
+		dwc2_writel(hsotg, pcgctl, PCGCTL);
+		udelay(5);
+	}
+	pcgctl &= ~PCGCTL_STOPPCLK;
+	dwc2_writel(hsotg, pcgctl, PCGCTL);
+	udelay(5);
+	return true;
+}
+
+/* Leave clock gating however the core got there. Caller holds hsotg->lock. */
+void dwc2_gadget_leave_gating(struct dwc2_hsotg *hsotg, const char *where)
+{
+	enum dwc2_lx_state lx = hsotg->lx_state;
+
+	if (lx == DWC2_L2 && hsotg->bus_suspended &&
+	    hsotg->params.power_down == DWC2_POWER_DOWN_PARAM_NONE &&
+	    !hsotg->params.no_clock_gating) {
+		dwc2_gadget_exit_clock_gating(hsotg, 0);
+		return;
+	}
+	if (dwc2_gadget_ungate_clock(hsotg)) {
+		hsotg->bus_suspended = false;
+		dev_info_ratelimited(hsotg->dev,
+				     "%s: PHY clock was gated in L%d: ungated\n", where, lx);
+	}
+}
+
+/*
  * dwc2_gadget_exit_clock_gating() - Exit controller from device clock gating.
  *
  * @hsotg: Programming view of the DWC_otg controller
@@ -5717,22 +5900,11 @@ void dwc2_gadget_enter_clock_gating(struct dwc2_hsotg *hsotg)
  */
 void dwc2_gadget_exit_clock_gating(struct dwc2_hsotg *hsotg, int rem_wakeup)
 {
-	u32 pcgctl;
 	u32 dctl;
 
 	dev_dbg(hsotg->dev, "Exiting device clock gating.\n");
 
-	/* Clear the Gate hclk. */
-	pcgctl = dwc2_readl(hsotg, PCGCTL);
-	pcgctl &= ~PCGCTL_GATEHCLK;
-	dwc2_writel(hsotg, pcgctl, PCGCTL);
-	udelay(5);
-
-	/* Phy Clock bit. */
-	pcgctl = dwc2_readl(hsotg, PCGCTL);
-	pcgctl &= ~PCGCTL_STOPPCLK;
-	dwc2_writel(hsotg, pcgctl, PCGCTL);
-	udelay(5);
+	dwc2_gadget_ungate_clock(hsotg);
 
 	if (rem_wakeup) {
 		/* Set Remote Wakeup Signaling */
@@ -5741,8 +5913,12 @@ void dwc2_gadget_exit_clock_gating(struct dwc2_hsotg *hsotg, int rem_wakeup)
 		dwc2_writel(hsotg, dctl, DCTL);
 	}
 
-	/* Change to L0 state */
-	call_gadget(hsotg, resume);
+	/*
+	 * Change to L0 state before the resume callback: it may queue
+	 * requests right away, and dwc2_hsotg_ep_queue() refuses them
+	 * outside L0.
+	 */
 	hsotg->lx_state = DWC2_L0;
 	hsotg->bus_suspended = false;
+	call_gadget(hsotg, resume);
 }
