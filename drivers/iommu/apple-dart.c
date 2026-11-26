@@ -135,6 +135,20 @@
 #define DART_T8020_TTBR_ADDR_FIELD_SHIFT 0
 #define DART_T8020_TTBR_SHIFT 12
 
+/*
+ * T8015 (A11) "Hx" DART of instance type DART, as iOS's AppleT8015DART
+ * drives it: the T8020 TCR/TTBR/stream select/error layout, its own stream
+ * command encoding, and the error reflector, diag and fetch configuration
+ * at their own offsets. Page tables and the IOVA window behave as on the
+ * S5L8960X family, whose IODARTFamily capabilities it shares.
+ */
+#define DART_T8015_STREAM_COMMAND_INVALIDATE	0x1002
+#define DART_T8015_STREAM_COMMAND_PENDING	GENMASK(31, 12)
+#define DART_T8015_STREAM_COMMAND_BUSY		BIT(3)
+#define DART_T8015_DIAG_CONFIG			0x60
+#define DART_T8015_ERROR_REFLECTOR		0x64
+#define DART_T8015_FETCH_CONFIG			0x68
+
 /* T8110 registers */
 
 #define DART_T8110_PARAMS3 0x08
@@ -204,6 +218,7 @@ struct apple_dart_stream_map;
 
 enum dart_type {
 	DART_S5L8960X,
+	DART_T8015,
 	DART_T8020,
 	DART_T6000,
 	DART_T8110,
@@ -719,6 +734,56 @@ apple_dart_t8020_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 		stream_map, DART_T8020_STREAM_COMMAND_INVALIDATE);
 }
 
+/*
+ * iOS selects the streams, writes the command and waits while the command
+ * is pending (bits 31:12) and busy (bit 3), for up to 1 ms.
+ */
+static int
+apple_dart_t8015_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	unsigned long flags;
+	u32 command_reg;
+	int ret, i;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	for (i = 0; i < BITS_TO_U32(dart->num_streams); i++)
+		writel(stream_map->sidmap[i],
+		       dart->regs + DART_T8020_STREAM_SELECT + 4 * i);
+	writel(DART_T8015_STREAM_COMMAND_INVALIDATE,
+	       dart->regs + DART_T8020_STREAM_COMMAND);
+	ret = readl_poll_timeout_atomic(dart->regs + DART_T8020_STREAM_COMMAND,
+			command_reg,
+			!(command_reg & DART_T8015_STREAM_COMMAND_PENDING) ||
+			!(command_reg & DART_T8015_STREAM_COMMAND_BUSY),
+			1, DART_STREAM_COMMAND_BUSY_TIMEOUT);
+	spin_unlock_irqrestore(&dart->lock, flags);
+
+	if (ret)
+		dev_err(dart->dev,
+			"invalidation did not complete for streams %lx: %08x\n",
+			stream_map->sidmap[0], command_reg);
+	return ret;
+}
+
+/* The error reflector, diag and fetch configuration, from the ADT via the DT */
+static void apple_dart_t8015_set_configs(struct apple_dart *dart)
+{
+	if (dart->has_error_reflector)
+		writel(dart->error_reflector,
+		       dart->regs + DART_T8015_ERROR_REFLECTOR);
+	if (dart->has_diag_config)
+		writel(dart->diag_config, dart->regs + DART_T8015_DIAG_CONFIG);
+	if (dart->has_fetch_config)
+		writel(dart->fetch_config, dart->regs + DART_T8015_FETCH_CONFIG);
+}
+
+/* Page tables and IOVA window of the S5L8960X family */
+static bool apple_dart_s5l8960x_family(struct apple_dart *dart)
+{
+	return dart->hw->type == DART_S5L8960X || dart->hw->type == DART_T8015;
+}
+
 static int
 apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 {
@@ -797,6 +862,12 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 		return 0;
 	}
 
+	/* Like the S5L8960X, its port can still be down: invalidate on attach */
+	if (dart->hw->type == DART_T8015) {
+		apple_dart_t8015_set_configs(dart);
+		return 0;
+	}
+
 	return dart->hw->invalidate_tlb(&stream_map);
 }
 
@@ -871,6 +942,39 @@ apple_dart_s5l8960x_reload_configuration(struct apple_dart *dart, u32 sid)
 	return ret;
 }
 
+/*
+ * iOS's AppleT8015DART reloadConfiguration: rewrite the error reflector and
+ * the retained TTBRs, issue command 2, restore the fetch and diag config,
+ * then invalidate all streams.
+ */
+static int
+apple_dart_t8015_reload_configuration(struct apple_dart *dart, u32 sid)
+{
+	struct apple_dart_stream_map stream_map = { .dart = dart };
+	unsigned int idx, stream;
+	unsigned long flags;
+	u32 val;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	if (dart->has_error_reflector)
+		writel(dart->error_reflector,
+		       dart->regs + DART_T8015_ERROR_REFLECTOR);
+	for (stream = 0; stream < dart->num_streams; stream++)
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			val = readl(dart->regs + DART_TTBR(dart, stream, idx));
+			writel(val, dart->regs + DART_TTBR(dart, stream, idx));
+		}
+	writel(2, dart->regs + DART_T8020_STREAM_COMMAND);
+	if (dart->has_fetch_config)
+		writel(dart->fetch_config, dart->regs + DART_T8015_FETCH_CONFIG);
+	if (dart->has_diag_config)
+		writel(dart->diag_config, dart->regs + DART_T8015_DIAG_CONFIG);
+	spin_unlock_irqrestore(&dart->lock, flags);
+
+	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
+	return apple_dart_t8015_hw_invalidate_tlb(&stream_map);
+}
+
 int apple_dart_reload_configuration(struct device_node *np, u32 sid)
 {
 	struct platform_device *pdev;
@@ -886,7 +990,7 @@ int apple_dart_reload_configuration(struct device_node *np, u32 sid)
 		ret = -EPROBE_DEFER;
 		goto out_put_device;
 	}
-	if (dart->hw->type != DART_S5L8960X) {
+	if (!apple_dart_s5l8960x_family(dart)) {
 		ret = -EOPNOTSUPP;
 		goto out_put_device;
 	}
@@ -898,6 +1002,8 @@ int apple_dart_reload_configuration(struct device_node *np, u32 sid)
 	mutex_lock(&apple_dart_groups_lock);
 	if (dart->sid2group[sid])
 		ret = -EBUSY;
+	else if (dart->hw->type == DART_T8015)
+		ret = apple_dart_t8015_reload_configuration(dart, sid);
 	else
 		ret = apple_dart_s5l8960x_reload_configuration(dart, sid);
 	mutex_unlock(&apple_dart_groups_lock);
@@ -918,7 +1024,7 @@ static void apple_dart_domain_block(struct apple_dart_domain *domain,
 				    struct apple_dart_stream_map *stream_map,
 				    int error)
 {
-	if (stream_map->dart->hw->type != DART_S5L8960X)
+	if (!apple_dart_s5l8960x_family(stream_map->dart))
 		return;
 
 	apple_dart_hw_disable_dma(stream_map);
@@ -1104,6 +1210,42 @@ fail:
 	return ret;
 }
 
+/* As on the S5L8960X, check every write: a powered-down port drops them */
+static int
+apple_dart_t8015_setup_translation(struct apple_dart_domain *domain,
+				   struct apple_dart_stream_map *stream_map,
+				   struct io_pgtable_cfg *pgtbl_cfg)
+{
+	struct apple_dart *dart = stream_map->dart;
+	int i, ret = -EIO;
+
+	apple_dart_hw_disable_dma(stream_map);
+	apple_dart_t8015_set_configs(dart);
+
+	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i)
+		apple_dart_hw_set_ttbr(stream_map, i,
+				       pgtbl_cfg->apple_dart_cfg.ttbr[i]);
+	for (; i < dart->hw->ttbr_count; ++i)
+		apple_dart_hw_clear_ttbr(stream_map, i);
+	if (!apple_dart_streams_ttbrs_are(stream_map, pgtbl_cfg))
+		goto fail;
+
+	apple_dart_hw_enable_translation(stream_map,
+					 pgtbl_cfg->apple_dart_cfg.n_levels);
+	if (!apple_dart_streams_tcr_is(stream_map, dart->hw->tcr_enabled))
+		goto fail;
+
+	ret = dart->hw->invalidate_tlb(stream_map);
+	if (!ret)
+		return 0;
+
+fail:
+	dev_err(dart->dev, "translation setup for streams %lx failed: %d\n",
+		stream_map->sidmap[0], ret);
+	apple_dart_domain_block(domain, stream_map, ret);
+	return ret;
+}
+
 static int
 apple_dart_setup_translation(struct apple_dart_domain *domain,
 			     struct apple_dart_stream_map *stream_map)
@@ -1116,6 +1258,9 @@ apple_dart_setup_translation(struct apple_dart_domain *domain,
 	if (dart->hw->type == DART_S5L8960X)
 		return apple_dart_s5l8960x_setup_translation(domain, stream_map,
 							     pgtbl_cfg);
+	if (dart->hw->type == DART_T8015)
+		return apple_dart_t8015_setup_translation(domain, stream_map,
+							  pgtbl_cfg);
 
 	for (i = 0; i < pgtbl_cfg->apple_dart_cfg.n_ttbrs; ++i)
 		apple_dart_hw_set_ttbr(stream_map, i,
@@ -1152,7 +1297,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	 * by masking the base off below, which equals subtracting it only if
 	 * the base is aligned beyond the window size.
 	 */
-	if (dart->hw->type == DART_S5L8960X && cfg->dma_min &&
+	if (apple_dart_s5l8960x_family(dart) && cfg->dma_min &&
 	    cfg->dma_max - cfg->dma_min >= (cfg->dma_min & -cfg->dma_min)) {
 		dev_err(dart->dev, "DMA window %pad..%pad is not base-aligned\n",
 			&cfg->dma_min, &cfg->dma_max);
@@ -1174,7 +1319,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		.coherent_walk = 1,
 		.iommu_dev = dart->dev,
 	};
-	if (dart->hw->type == DART_S5L8960X)
+	if (apple_dart_s5l8960x_family(dart))
 		pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_APPLE_DART_S5L8960X;
 	if (dart->hw->no_perms)
 		pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_NO_PERMS;
@@ -1186,7 +1331,7 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		goto done;
 	}
 
-	if (dart->hw->type == DART_S5L8960X)
+	if (apple_dart_s5l8960x_family(dart))
 		dart_domain->mask = ~cfg->dma_min;
 	else
 		dart_domain->mask = DMA_BIT_MASK(pgtbl_cfg.ias);
@@ -1893,6 +2038,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 		 * possible on these types of DART.
 		 */
 		dart->supports_bypass = 0;
+	} else if (dart->hw->type == DART_T8015) {
+		/* No PARAMS registers; same window limits as the S5L8960X */
+		dart->pgsize = SZ_4K;
+		dart->supports_bypass = 0;
 	} else {
 		dart_params[0] = readl(dart->regs + DART_PARAMS1);
 		dart_params[1] = readl(dart->regs + DART_PARAMS2);
@@ -1902,6 +2051,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 
 	switch (dart->hw->type) {
 	case DART_S5L8960X:
+	case DART_T8015:
 	case DART_T8020:
 	case DART_T6000:
 		dart->ias = 32;
@@ -1926,7 +2076,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 		goto err_clk_disable;
 	}
 
-	if (dart->hw->type == DART_S5L8960X) {
+	if (apple_dart_s5l8960x_family(dart)) {
 		ret = apple_dart_s5l8960x_parse_config(dart);
 		if (ret)
 			goto err_clk_disable;
@@ -2018,6 +2168,34 @@ static const struct apple_dart_hw apple_dart_hw_s5l8960x = {
 	.tcr_bypass = 0,
 
 	.ttbr = DART_S5L8960X_TTBR,
+	.ttbr_valid = DART_T8020_TTBR_VALID,
+	.ttbr_addr_field_shift = DART_T8020_TTBR_ADDR_FIELD_SHIFT,
+	.ttbr_shift = DART_T8020_TTBR_SHIFT,
+	.ttbr_count = 4,
+};
+
+static const struct apple_dart_hw apple_dart_hw_t8015 = {
+	.type = DART_T8015,
+	.irq_handler = apple_dart_t8020_irq,
+	.invalidate_tlb = apple_dart_t8015_hw_invalidate_tlb,
+	.read_tcr = apple_dart_t8020_read_tcr,
+	.write_tcr = apple_dart_t8020_write_tcr,
+	.oas = 36,
+	.fmt = APPLE_DART,
+	.max_sid_count = 16,
+
+	.enable_streams = 0,
+	.lock = 0,
+	.lock_bit = 0,
+
+	.error = DART_T8020_ERROR,
+
+	.tcr = DART_T8020_TCR,
+	.tcr_enabled = DART_T8020_TCR_TRANSLATE_ENABLE,
+	.tcr_disabled = 0,
+	.tcr_bypass = 0,
+
+	.ttbr = DART_T8020_TTBR,
 	.ttbr_valid = DART_T8020_TTBR_VALID,
 	.ttbr_addr_field_shift = DART_T8020_TTBR_ADDR_FIELD_SHIFT,
 	.ttbr_shift = DART_T8020_TTBR_SHIFT,
@@ -2254,6 +2432,7 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dar
 static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,s5l8960x-dart", .data = &apple_dart_hw_s5l8960x },
 	{ .compatible = "apple,t7000-dart", .data = &apple_dart_hw_t7000 },
+	{ .compatible = "apple,t8015-dart", .data = &apple_dart_hw_t8015 },
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
