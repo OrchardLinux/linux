@@ -37,13 +37,32 @@ properties:
               - apple,t7000-dart
               - apple,s8000-dart
               - apple,t8010-dart
+              - apple,t8011-dart
+              - apple,t8015-dart
           - const: apple,s5l8960x-dart
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: dart
+      - const: smmu
+    description:
+      The SMMU window of display DARTs; translation must be enabled per
+      stream in both units. Only S5L8960X display DARTs have this window.
 
   interrupts:
-    maxItems: 1
+    minItems: 1
+    maxItems: 2
+
+  interrupt-names:
+    minItems: 1
+    items:
+      - const: dart
+      - const: smmu
 
   clocks:
     description:
@@ -61,11 +80,74 @@ properties:
   power-domains:
     maxItems: 1
 
+  apple,error-reflector:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Physical address of the page that faulting transactions are redirected
+      to, so that they complete instead of stalling the master. From the
+      Apple device tree property "error-reflector" of the same DART.
+
+  apple,fetch-config:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Value of the table fetch configuration register, from the Apple device
+      tree property "fetch-config" of the same DART.
+
+  apple,diag-config:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Value of the diagnostic configuration register, from the Apple device
+      tree property "diag-config" of the same DART.
+
 required:
   - compatible
   - reg
   - '#iommu-cells'
   - interrupts
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,s5l8960x-dart
+    then:
+      properties:
+        apple,error-reflector: false
+        apple,fetch-config: false
+        apple,diag-config: false
+        reg:
+          maxItems: 1
+        reg-names: false
+        interrupts:
+          maxItems: 1
+        interrupt-names: false
+
+  - if:
+      properties:
+        reg:
+          minItems: 2
+    then:
+      required:
+        - reg-names
+        - interrupt-names
+      properties:
+        reg-names:
+          minItems: 2
+        interrupts:
+          minItems: 2
+        interrupt-names:
+          minItems: 2
+
+  - if:
+      properties:
+        interrupts:
+          minItems: 2
+    then:
+      properties:
+        reg:
+          minItems: 2
 
 additionalProperties: false
 
@@ -98,4 +180,15 @@ examples:
 
     master2 {
       iommus = <&dart2a 0>, <&dart2b 1>;
+    };
+
+  - |+
+    dart3: iommu@1008000 {
+      compatible = "apple,s8000-dart", "apple,s5l8960x-dart";
+      reg = <0x1008000 0x4000>;
+      interrupts = <1 245 4>;
+      #iommu-cells = <5>;
+      apple,error-reflector = /bits/ 64 <0x20fffc000>;
+      apple,fetch-config = <0x000e0303>;
+      apple,diag-config = <0x00000100>;
     };

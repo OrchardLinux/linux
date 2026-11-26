@@ -2243,6 +2243,7 @@ int iommu_deferred_attach(struct device *dev, struct iommu_domain *domain)
 		return -EBUSY;
 	return __iommu_attach_device(domain, dev, NULL);
 }
+EXPORT_SYMBOL_GPL(iommu_deferred_attach);
 
 void iommu_detach_device(struct iommu_domain *domain, struct device *dev)
 {
