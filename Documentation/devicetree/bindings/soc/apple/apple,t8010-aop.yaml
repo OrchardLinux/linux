@@ -23,6 +23,7 @@ properties:
       - apple,s8000-aop
       - apple,t8010-aop
       - apple,t8011-aop
+      - apple,t8015-aop
 
   reg:
     items:
