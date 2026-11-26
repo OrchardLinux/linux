@@ -2,6 +2,7 @@
 
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/string.h>
 
 #include "tsl2583.h"
 
@@ -188,6 +189,140 @@ static void ct819_lux_dark_counts_test(struct kunit *test)
 					   1000, 5000, 3, 2));
 }
 
+/*
+ * LSCI record sets made up for the tests: the header and each record's
+ * placement, orientation, data size and version are set, the record data is
+ * a fill byte, and the header's checksum word makes the 16-bit words sum to
+ * 0xffff.
+ */
+#define TEST_LSCI_MAX	256
+
+static size_t test_lsci(u8 *data, size_t len, u8 version, u8 count,
+			size_t record_size, u8 record_len,
+			const u8 (*position)[2])
+{
+	size_t rec_len = APPLE_ALS_CAL_HEADER_SIZE + count * record_size;
+	u32 sum = 0;
+	size_t i;
+
+	memset(data, 0, len);
+	data[0] = 1;
+	data[1] = version;
+	data[2] = count;
+	data[3] = APPLE_ALS_CAL_HEADER_SIZE;
+	data[4] = rec_len & 0xff;
+	data[5] = rec_len >> 8;
+	for (i = 0; i < count; i++) {
+		u8 *record = data + APPLE_ALS_CAL_HEADER_SIZE + i * record_size;
+
+		memset(record, 0x11 * (i + 1), record_size);
+		record[0] = 0;
+		record[APPLE_ALS_REC_PLACEMENT] = position[i][0];
+		record[APPLE_ALS_REC_ORIENTATION] = position[i][1];
+		record[3] = record_len;
+		record[4] = 1;
+	}
+	for (i = 0; i < rec_len; i += 2)
+		sum += data[i] | (data[i + 1] << 8);
+	sum = (u16)(U16_MAX - (u16)sum);
+	data[6] = sum & 0xff;
+	data[7] = sum >> 8;
+
+	return rec_len;
+}
+
+static const u8 test_one_sensor[][2] = { { 1, 1 } };
+/* The iPad Air 2's ADT: als1 (0x49) is 1/6, als2 (0x29) is 1/5 */
+static const u8 test_two_sensors[][2] = { { 1, 6 }, { 1, 5 } };
+
+static void lsci_one_record_test(struct kunit *test)
+{
+	u8 data[TEST_LSCI_MAX];
+
+	/* The iPad mini 2: 72 bytes of records in a 200-byte property */
+	KUNIT_ASSERT_EQ(test, 72,
+			test_lsci(data, 200, 2, 1, 0x40, 0x40, test_one_sensor));
+	KUNIT_EXPECT_EQ(test, 1, apple_als_check_records(data, 200, 2, 0x40));
+	KUNIT_EXPECT_EQ(test, 1, apple_als_check_records(data, 72, 2, 0x40));
+	/* A single record serves its sensor whatever position it names */
+	KUNIT_EXPECT_EQ(test, 0, apple_als_find_record(data, 1, 0x40, 1, 1));
+	KUNIT_EXPECT_EQ(test, 0, apple_als_find_record(data, 1, 0x40, 1, 6));
+
+	/* The iPhone 6s's CT821: one 0x54-byte v3 record, 92 bytes */
+	KUNIT_ASSERT_EQ(test, 92,
+			test_lsci(data, 92, 3, 1, 0x54, 0x52, test_one_sensor));
+	KUNIT_EXPECT_EQ(test, 1, apple_als_check_records(data, 92, 3, 0x54));
+}
+
+static void lsci_two_records_test(struct kunit *test)
+{
+	u8 data[TEST_LSCI_MAX];
+
+	/* The iPad Air 2: two records, 136 bytes in a 200-byte property */
+	KUNIT_ASSERT_EQ(test, 136,
+			test_lsci(data, 200, 2, 2, 0x40, 0x40, test_two_sensors));
+	KUNIT_EXPECT_EQ(test, 2, apple_als_check_records(data, 200, 2, 0x40));
+	KUNIT_EXPECT_EQ(test, 0, apple_als_find_record(data, 2, 0x40, 1, 6));
+	KUNIT_EXPECT_EQ(test, 1, apple_als_find_record(data, 2, 0x40, 1, 5));
+	/* iOS's default position matches neither */
+	KUNIT_EXPECT_EQ(test, -ENOENT,
+			apple_als_find_record(data, 2, 0x40, 1, 1));
+	KUNIT_EXPECT_EQ(test, -ENOENT,
+			apple_als_find_record(data, 2, 0x40, 2, 5));
+}
+
+static void lsci_bad_header_test(struct kunit *test)
+{
+	u8 data[TEST_LSCI_MAX];
+
+	test_lsci(data, 200, 2, 2, 0x40, 0x40, test_two_sensors);
+	/* Too short for the header, the wrong version or record size */
+	KUNIT_EXPECT_EQ(test, -EINVAL, apple_als_check_records(data, 7, 2, 0x40));
+	KUNIT_EXPECT_EQ(test, -EINVAL, apple_als_check_records(data, 200, 3, 0x40));
+	KUNIT_EXPECT_EQ(test, -EINVAL, apple_als_check_records(data, 200, 2, 0x54));
+	/* The property ends inside the records */
+	KUNIT_EXPECT_EQ(test, -EINVAL, apple_als_check_records(data, 135, 2, 0x40));
+
+	/* One record counted in a two-record length */
+	data[2] = 1;
+	KUNIT_EXPECT_EQ(test, -EINVAL, apple_als_check_records(data, 200, 2, 0x40));
+	data[2] = 0;
+	KUNIT_EXPECT_EQ(test, -EINVAL, apple_als_check_records(data, 200, 2, 0x40));
+	data[2] = 2;
+
+	/* The records do not start right after the header */
+	data[3] = 16;
+	KUNIT_EXPECT_EQ(test, -EINVAL, apple_als_check_records(data, 200, 2, 0x40));
+	data[3] = APPLE_ALS_CAL_HEADER_SIZE;
+
+	/* Something other than zeros after the records */
+	data[150] = 1;
+	KUNIT_EXPECT_EQ(test, -EINVAL, apple_als_check_records(data, 200, 2, 0x40));
+}
+
+static void lsci_bad_checksum_test(struct kunit *test)
+{
+	u8 data[TEST_LSCI_MAX];
+
+	test_lsci(data, 200, 2, 2, 0x40, 0x40, test_two_sensors);
+	data[8 + 0x40 + 0x20] ^= 1;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			apple_als_check_records(data, 200, 2, 0x40));
+}
+
+static struct kunit_case lsci_record_test_cases[] = {
+	KUNIT_CASE(lsci_one_record_test),
+	KUNIT_CASE(lsci_two_records_test),
+	KUNIT_CASE(lsci_bad_header_test),
+	KUNIT_CASE(lsci_bad_checksum_test),
+	{}
+};
+
+static struct kunit_suite lsci_record_test_suite = {
+	.name = "apple-als-lsci-records",
+	.test_cases = lsci_record_test_cases,
+};
+
 static struct kunit_case ct819_gain_factor_test_cases[] = {
 	KUNIT_CASE(ct819_gain_factor_valid_test),
 	{}
@@ -226,9 +361,10 @@ static struct kunit_suite ct821_gain_factor_test_suite = {
 	.test_cases = ct821_gain_factor_test_cases,
 };
 
-kunit_test_suites(&ct819_gain_factor_test_suite,
+kunit_test_suites(&lsci_record_test_suite,
+		  &ct819_gain_factor_test_suite,
 		  &ct819_lux_test_suite,
 		  &ct821_gain_factor_test_suite);
 
-MODULE_DESCRIPTION("KUnit tests for the Apple ALS calibration gain factors and lux computation");
+MODULE_DESCRIPTION("KUnit tests for the Apple ALS calibration records, gain factors and lux computation");
 MODULE_LICENSE("GPL");

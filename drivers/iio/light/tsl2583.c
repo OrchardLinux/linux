@@ -17,6 +17,7 @@
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/nvmem-consumer.h>
+#include <linux/of.h>
 #include <linux/overflow.h>
 #include <linux/property.h>
 #include <linux/iio/iio.h>
@@ -71,8 +72,6 @@
 #define TSL2583_INTEGRATION_CYCLE_US	2700
 
 /* The LSCI record layout is versioned; see tsl2583.h for what they share. */
-#define APPLE_ALS_CAL_HEADER_SIZE	8
-
 #define CT819_CAL_RECORD_SIZE_V2	0x40
 #define CT819_CAL_GAIN_COUNT		4
 #define CT819_CAL_RATIO_OFF		0x30
@@ -302,8 +301,10 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 	struct device *dev = &chip->client->dev;
 	struct apple_als_calibration *cal = &chip->cal;
 	const u8 *record;
-	size_t len, rec_len;
-	u32 checksum = 0;
+	u32 placement = 1, orientation = 1;
+	bool positioned;
+	int count, index, alias;
+	size_t len;
 	u8 *data;
 	int gain_index;
 	int ret;
@@ -320,34 +321,54 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 	}
 
 	/*
-	 * The header gives the record's length. The copy can be longer, padded
-	 * with zeros: the iPad mini 2's 200-byte alsCalibration holds a 72-byte
-	 * LSCI v2 record.
+	 * The header gives the length of the record set. The copy can be
+	 * longer, padded with zeros: the iPad mini 2's 200-byte alsCalibration
+	 * holds a 72-byte LSCI v2 record set.
 	 */
-	if (len < APPLE_ALS_CAL_HEADER_SIZE + info->cal_record_size) {
-		dev_err(dev, "invalid LSCI v%u calibration header\n",
-			info->cal_version);
-		goto invalid;
-	}
-	rec_len = get_unaligned_le16(data + 4);
-	if (rec_len < APPLE_ALS_CAL_HEADER_SIZE + info->cal_record_size ||
-	    rec_len > len || rec_len & 1 ||
-	    data[1] != info->cal_version || data[2] != 1 ||
-	    data[3] != APPLE_ALS_CAL_HEADER_SIZE ||
-	    memchr_inv(data + rec_len, 0, len - rec_len)) {
-		dev_err(dev, "invalid LSCI v%u calibration header\n",
-			info->cal_version);
-		goto invalid;
-	}
-
-	for (i = 0; i < rec_len; i += 2)
-		checksum += get_unaligned_le16(data + i);
-	if ((u16)checksum != U16_MAX) {
+	count = apple_als_check_records(data, len, info->cal_version,
+					info->cal_record_size);
+	if (count == -EBADMSG) {
 		dev_err(dev, "invalid LSCI calibration checksum\n");
 		goto invalid;
 	}
+	if (count < 0) {
+		dev_err(dev, "invalid LSCI v%u calibration header\n",
+			info->cal_version);
+		goto invalid;
+	}
 
-	record = data + data[3];
+	/*
+	 * Several sensors share a record set, one record each: iOS gives a
+	 * sensor the record of its placement and orientation, 1 and 1 when
+	 * its node names none.
+	 */
+	positioned = device_property_present(dev, "apple,als-placement") ||
+		     device_property_present(dev, "apple,als-orientation");
+	device_property_read_u32(dev, "apple,als-placement", &placement);
+	device_property_read_u32(dev, "apple,als-orientation", &orientation);
+	index = apple_als_find_record(data, count, info->cal_record_size,
+				      placement, orientation);
+	if (index < 0 && !positioned) {
+		/*
+		 * A tree without the sensor's position: take the record of
+		 * the sensor's als alias, the order the loader names the
+		 * sensors in.
+		 */
+		alias = of_alias_get_id(dev_of_node(dev), "als");
+		if (alias >= 0 && alias < count) {
+			dev_warn(dev, "no sensor position, LSCI record %d of %d by the als%d alias\n",
+				 alias + 1, count, alias);
+			index = alias;
+		}
+	}
+	if (index < 0) {
+		dev_err(dev, "no LSCI record for placement %u, orientation %u\n",
+			placement, orientation);
+		goto invalid;
+	}
+
+	record = data + APPLE_ALS_CAL_HEADER_SIZE +
+		 index * info->cal_record_size;
 	if (!apple_als_record_is_supported(info, record)) {
 		dev_err(dev, "unsupported LSCI v%u calibration record\n",
 			info->cal_version);
@@ -408,8 +429,10 @@ static int apple_als_load_calibration(struct tsl2583_chip *chip)
 
 	chip->als_settings.als_time = cal->integration_time;
 	chip->als_settings.als_gain = cal->gain;
-	dev_info(dev, "loaded LSCI v%u ambient-light calibration\n",
-		 info->cal_version);
+	dev_info(dev, "loaded LSCI v%u ambient-light calibration, record %d of %d (placement %u, orientation %u)\n",
+		 info->cal_version, index + 1, count,
+		 record[APPLE_ALS_REC_PLACEMENT],
+		 record[APPLE_ALS_REC_ORIENTATION]);
 	kfree(data);
 
 	return 0;

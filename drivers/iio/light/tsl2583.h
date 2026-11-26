@@ -45,8 +45,102 @@ static inline int apple_als_calculate_gain_factor(u32 previous, u16 ratio,
  * calibrated gain steps.
  */
 #define APPLE_ALS_CAL_SCALE		65536
+#define APPLE_ALS_CAL_HEADER_SIZE	8
 #define APPLE_ALS_LUX_FUDGE_SCALE	255
 #define APPLE_ALS_MAX_GAIN_COUNT	8
+
+/*
+ * The LSCI record set, as iOS's AppleCT819 and AppleCT821 read it: an 8 byte
+ * header (minor version, major version, number of sensor records, offset of
+ * the first record, the length of header and records as le16, a checksum
+ * word) and then one record per sensor. A record starts with its sensor
+ * type, placement, orientation, data size and record version.
+ *
+ * Boards with one sensor have one record (the iPad mini 2: 72 bytes, the
+ * iPhone 6s: 92). The iPad Air 2 has two CT819s and two records in 136
+ * bytes. iOS walks the records and takes the one whose placement and
+ * orientation match the sensor's device-tree node.
+ */
+#define APPLE_ALS_REC_PLACEMENT		1
+#define APPLE_ALS_REC_ORIENTATION	2
+
+/**
+ * apple_als_check_records - validate an LSCI record set
+ * @data:	the calibration property
+ * @len:	its length, which may include zero padding after the records
+ * @version:	the major version the part uses
+ * @record_size: size of one record of that version
+ *
+ * The header's length must be exactly the header and its records, every
+ * byte after it zero, and the 16-bit little-endian words up to that length
+ * must sum to 0xffff.
+ *
+ * Return: the number of records, -EINVAL for a bad header or length,
+ * -EBADMSG for a bad checksum.
+ */
+static inline int apple_als_check_records(const u8 *data, size_t len,
+					  u8 version, size_t record_size)
+{
+	size_t rec_len, i;
+	u32 checksum = 0;
+	u8 count;
+
+	if (len < APPLE_ALS_CAL_HEADER_SIZE || !record_size)
+		return -EINVAL;
+
+	count = data[2];
+	rec_len = data[4] | (data[5] << 8);
+	if (data[1] != version || data[3] != APPLE_ALS_CAL_HEADER_SIZE ||
+	    !count ||
+	    rec_len != APPLE_ALS_CAL_HEADER_SIZE + count * record_size ||
+	    rec_len > len || rec_len & 1)
+		return -EINVAL;
+	for (i = rec_len; i < len; i++)
+		if (data[i])
+			return -EINVAL;
+
+	for (i = 0; i < rec_len; i += 2)
+		checksum += data[i] | (data[i + 1] << 8);
+	if ((u16)checksum != U16_MAX)
+		return -EBADMSG;
+
+	return count;
+}
+
+/**
+ * apple_als_find_record - the record of one sensor in a checked record set
+ * @data:	the calibration property
+ * @count:	its number of records, from apple_als_check_records()
+ * @record_size: size of one record
+ * @placement:	the sensor's placement (IOHIDPlacementType)
+ * @orientation: the sensor's orientation (IOHIDOrientationType)
+ *
+ * A single record is the sensor's whatever it names. Of several, the
+ * sensor's is the first whose placement and orientation match, as iOS
+ * chooses.
+ *
+ * Return: the record's index, or -ENOENT if none matches.
+ */
+static inline int apple_als_find_record(const u8 *data, unsigned int count,
+					size_t record_size, u32 placement,
+					u32 orientation)
+{
+	unsigned int i;
+
+	if (count == 1)
+		return 0;
+
+	for (i = 0; i < count; i++) {
+		const u8 *record = data + APPLE_ALS_CAL_HEADER_SIZE +
+				   i * record_size;
+
+		if (record[APPLE_ALS_REC_PLACEMENT] == placement &&
+		    record[APPLE_ALS_REC_ORIENTATION] == orientation)
+			return i;
+	}
+
+	return -ENOENT;
+}
 
 /* ADC counts per integration cycle of the CT819 (a TSL2581 clone) */
 #define CT819_COUNTS_PER_CYCLE		1024
