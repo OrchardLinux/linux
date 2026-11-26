@@ -11,6 +11,8 @@
 	chassis-type = "tablet";
 
 	aliases {
+		als0 = &als49;	/* the loader copies the ADT's alsCalibration here */
+		als1 = &als29;	/* the same record, for the sensor at 0x29 */
 		bluetooth0 = &bluetooth;
 		serial3 = &serial3;
 		touchscreen0 = &touchscreen;
@@ -261,6 +263,33 @@
 				dai-tdm-slot-rx-mask = <0 1>;		/* slot 1 */
 			};
 		};
+	};
+};
+
+/*
+ * The ambient light sensor: a CT819 on i2c2. The device trees of the J81
+ * and J82 list it twice, as i2c2/als1 at 0x49 (interrupt GPIO 103) and
+ * i2c2/als2 at 0x29 (interrupt GPIO 110), both "probe-for-hardware": iOS
+ * uses the one that answers. Both are described; the absent one fails its
+ * chip ID read. Both name the unit's SysCfg LSCI record as alsCalibration,
+ * which the loader copies into each through the als0 and als1 aliases.
+ * i2c2 has nothing else on it.
+ */
+&i2c2 {
+	status = "okay";
+
+	/* m1n1 adds apple,als-calibration from the ADT */
+	als29: light-sensor@29 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x29>;
+		interrupts-extended = <&pinctrl 110 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	/* m1n1 adds apple,als-calibration from the ADT */
+	als49: light-sensor@49 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x49>;
+		interrupts-extended = <&pinctrl 103 IRQ_TYPE_LEVEL_LOW>;
 	};
 };
 
