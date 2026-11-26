@@ -1175,6 +1175,8 @@ static const struct of_device_id apple_aop_of_match[] = {
 	{ .compatible = "apple,s8000-aop", .data = &apple_aop_s8000_hw },
 	{ .compatible = "apple,t8010-aop", .data = &apple_aop_t8010_hw },
 	{ .compatible = "apple,t8011-aop", .data = &apple_aop_t8011_hw },
+	/* The A11's AOP takes the A10's loader and interface. */
+	{ .compatible = "apple,t8015-aop", .data = &apple_aop_t8010_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_aop_of_match);
