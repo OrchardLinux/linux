@@ -13,6 +13,16 @@ menuconfig INPUT_MISC
 
 if INPUT_MISC
 
+config INPUT_APPLE_J120_COVER
+	tristate "Apple J120 magnetic cover switch"
+	depends on OF && MFD_SIMPLE_MFD_I2C
+	help
+	  Report the magnetic cover on the 2017 12.9-inch Wi-Fi iPad Pro.
+	  This driver reads the two Hall inputs through the August PMIC.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-j120-cover.
+
 config INPUT_88PM860X_ONKEY
 	tristate "88PM860x ONKEY support"
 	depends on MFD_88PM860X
