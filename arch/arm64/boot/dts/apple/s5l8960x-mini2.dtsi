@@ -92,3 +92,320 @@
 		};
 	};
 };
+
+/*
+ * Lightning charging, at the D2089's registers as iOS 12
+ * AppleD2089PMUPowerSource uses them: connection and charger state at
+ * 0x60, the input-current limit at 0x4c0, the ADC at 0x500.
+ */
+&{/soc/i2c@20a110000/pmic@3c} {
+	/* The PMU event line, from the ADT pmu node: AP GPIO 21. */
+	pmu_events: interrupt-controller {
+		compatible = "apple,d2089-pmic-gpio";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupts-extended = <&pinctrl 21 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	/*
+	 * The ADT's charger node allows 0x960 = 2400 mA of input on every iPad mini 2 and 3.
+	 * The maximum here is the highest input limit measured on an A7
+	 * so far: 1500 mA (0x72) charged an iPad mini 2's battery at +958 mA
+	 * from a Mac's CDP port, at 31 C. Before that, 1050 mA (0x4e)
+	 * charged a J72's battery at +279 to +423 mA under the desktop, at
+	 * 36 C, in thisiscamk's ten-minute run.
+	 */
+	tristar_charger: charger@60 {
+		compatible = "apple,d2089-tristar-charger";
+		reg = <0x60 0x0d>, <0x4c0 0x01>, <0x500 0x04>;
+		reg-names = "status", "control", "adc";
+		interrupt-parent = <&pmu_events>;
+		/*
+		 * The PMU line, ADC done and the D2089's plug event (event 0),
+		 * which wakes the system when the source changes during sleep.
+		 */
+		interrupts = <112 IRQ_TYPE_EDGE_RISING>,
+			     <89 IRQ_TYPE_EDGE_RISING>,
+			     <0 IRQ_TYPE_EDGE_RISING>;
+		apple,tristar = <&tristar>;
+		input-current-limit-microamp = <1500000>;
+
+		/* The charger decides when USB data may come on. */
+		port {
+			tristar_charger_usb: endpoint {
+				remote-endpoint = <&usbdev_role>;
+			};
+		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+
+	/* The Lightning port controller, from the ADT i2c0/tristar node. */
+	tristar: port-controller@1a {
+		compatible = "nxp,cbtl1610";
+		reg = <0x1a>;
+	};
+};
+
+/* Tell the Lightning charger what the USB host allows. */
+&usbdev {
+	usb-psy-name = "lightning";
+	usb-role-switch;
+
+	port {
+		usbdev_role: endpoint {
+			remote-endpoint = <&tristar_charger_usb>;
+		};
+	};
+};
+
+/ {
+	/*
+	 * The BCM43241 Wi-Fi radio on HSIC, where the device trees of
+	 * the J85-J87 and J85m-J87m put it (/arm-io/usb-complex/usb-ehci1/wlan):
+	 * EHCI1 root port 1, its HSIC PHY at usb-complex +0x60, HOST_READY
+	 * on GPIO 163, DEVICE_READY on GPIO 164 and the reset on the D2089's
+	 * GPIO3. apple-a7-wlan owns it.
+	 */
+	wifi@20c000060 {
+		compatible = "apple,s5l8960x-hsic-wlan";
+		reg = <0x2 0x0c000060 0x0 0x10>, <0x2 0x0c400000 0x0 0x10000>;
+		reg-names = "phy", "ehci";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 165 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_hsic2_phy>;
+		apple,ehci-port = <1>;
+		host-ready-gpios = <&pinctrl 163 GPIO_ACTIVE_HIGH>;
+		device-ready-gpios = <&pinctrl 164 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+
+/*
+ * The touchscreen: an N1 on SPI1, the same in the device trees of every
+ * iPad mini 2 and 3 (J85-J87, J85m-J87m: /arm-io/spi1/multi-touch,
+ * multi-touch,j85): chip select GPIO 71, attention GPIO 15, reset GPIO 23,
+ * display sync GPIO 119, the D2089's analog supply and core LDO. The J85,
+ * J86 and J87 ship the same J85.mtprops, and the iPad mini 3, whose tree
+ * names the j85 controller, has none of its own, so the firmware is the
+ * j85 one on each. The loader adds the unit's calibration through the
+ * touchscreen0 alias.
+ */
+/ {
+	aliases {
+		touchscreen0 = &touchscreen; /* Used by loader */
+	};
+};
+
+&pinctrl {
+	spi1_sleep_pins: spi1-sleep-pins {
+		pinmux = <APPLE_PINMUX(71, 0)>;
+	};
+
+	touch_sync_active: touch-sync-active-pins {
+		pinmux = <APPLE_PINMUX(119, 1)>;
+	};
+
+	touch_sync_inactive: touch-sync-inactive-pins {
+		pinmux = <APPLE_PINMUX(119, 0)>;
+	};
+};
+
+&{/soc/i2c@20a110000/pmic@3c} {
+	touch_analog: regulator-touch-analog {
+		compatible = "apple,d2089-touch-analog-regulator";
+		regulator-name = "touch-analog";
+	};
+
+	/* The N1 runtime switches only the analog supply; keep the LDO on. */
+	touch_core: regulator-touch-core {
+		compatible = "apple,d2089-touch-core-regulator";
+		regulator-name = "touch-core";
+		regulator-always-on;
+	};
+};
+
+&touchclk {
+	status = "okay";
+};
+
+&spi1 {
+	pinctrl-names = "default", "sleep";
+	pinctrl-1 = <&spi1_sleep_pins>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,j85-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <1000000>;
+		interrupt-parent = <&pinctrl>;
+		interrupts = <15 IRQ_TYPE_EDGE_FALLING>;
+		attn-gpios = <&pinctrl 15 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&pinctrl 23 GPIO_ACTIVE_LOW>;
+		clocks = <&touchclk>;
+		ana-supply = <&touch_analog>;
+		pinctrl-names = "display-sync-active", "display-sync-inactive";
+		pinctrl-0 = <&touch_sync_active>;
+		pinctrl-1 = <&touch_sync_inactive>;
+		touchscreen-size-x = <1536>;
+		touchscreen-size-y = <2048>;
+		touchscreen-inverted-y;
+		firmware-name = "apple/j85-fwstart.z2fw";
+		/* apple,z2-cal-blob: the unit's calibration, filled in by the loader */
+	};
+};
+
+/*
+ * Speakers, the same on every iPad mini 2 and 3 (IPSW device trees of
+ * J85, J86, J87, J85m, J86m and J87m): two CS35L19 amplifiers on I2C2,
+ * audio-speaker0 at 0x40 and its secondary at 0x41, sharing the reset on
+ * GPIO 114, fed by MCA1 (aud1 to pin1) over TDM, 8 x 16-bit slots,
+ * amplifier n in slot n. The MCA is a consumer: the first amplifier
+ * drives the frame from MCA1's 12 MHz MCLK. SmartIO endpoint 0x2a carries
+ * the samples. speaker-config is the IPSW's record, the same for both.
+ * Full scale is bounded to -12 dB in the MCA; there is no speaker
+ * protection. iOS feeds the amplifiers' alive watchdog on GPIO 161; the
+ * driver keeps it off instead, so it is not described.
+ */
+&mca1 {
+	status = "okay";
+
+	mca1_port: port {
+		mca1_ep: endpoint {
+			remote-endpoint = <&speakers_cpu_ep>;
+			format = "dsp_a";
+		};
+	};
+};
+
+&i2c2 {
+	status = "okay";
+
+	speaker_amp0: amplifier@40 {
+		compatible = "cirrus,cs35l19";
+		reg = <0x40>;
+		reset-gpios = <&pinctrl 114 GPIO_ACTIVE_LOW>;
+		clocks = <&mca1>;
+		clock-names = "mclk";
+		apple,speaker-config = /bits/ 8 <
+			0x49 0x30 0x02 0x70 0x6a 0x80 0x30 0x1e 0x02 0x04
+			0x14 0x89 0x8a 0x10 0x74 0x03 0x05 0x00 0x00 0x40>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left";
+
+		port {
+			amp0_ep: endpoint {
+				remote-endpoint = <&speaker_amp0_ep>;
+				dai-tdm-slot-num = <8>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <1>;		/* slot 0 */
+				bitclock-master;
+				frame-master;
+			};
+		};
+	};
+
+	speaker_amp1: amplifier@41 {
+		compatible = "cirrus,cs35l19";
+		reg = <0x41>;
+		reset-gpios = <&pinctrl 114 GPIO_ACTIVE_LOW>;
+		clocks = <&mca1>;
+		clock-names = "mclk";
+		apple,speaker-config = /bits/ 8 <
+			0x49 0x30 0x02 0x70 0x6a 0x80 0x30 0x1e 0x02 0x04
+			0x14 0x89 0x8a 0x10 0x74 0x03 0x05 0x00 0x00 0x40>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right";
+
+		port {
+			amp1_ep: endpoint {
+				remote-endpoint = <&speaker_amp1_ep>;
+				dai-tdm-slot-num = <8>;
+				dai-tdm-slot-width = <16>;
+				dai-tdm-slot-rx-mask = <0 1>;		/* slot 1 */
+			};
+		};
+	};
+};
+
+/ {
+	sound-speakers {
+		compatible = "audio-graph-card2";
+		label = "iPad mini Speakers";
+		links = <&mca1_port>;
+
+		multi {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ports@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					speakers_cpu_ep: endpoint {
+						remote-endpoint = <&mca1_ep>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					speaker_amp0_ep: endpoint {
+						remote-endpoint = <&amp0_ep>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+					speaker_amp1_ep: endpoint {
+						remote-endpoint = <&amp1_ep>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/*
+ * The ambient light sensor, the same in the device trees of every iPad
+ * mini 2 and 3 (J85-J87, J85m-J87m: i2c3/als, als,ct819 at 0x39, interrupt
+ * GPIO 17). Its alsCalibration refers to the unit's SysCfg LSCI record,
+ * which the loader copies through the als0 alias.
+ */
+/ {
+	aliases {
+		als0 = &als;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	/* m1n1 adds apple,als-calibration from the ADT */
+	als: light-sensor@39 {
+		compatible = "apple,ct819", "amstaos,tsl2581";
+		reg = <0x39>;
+		interrupts-extended = <&pinctrl 17 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+
+/*
+ * The battery gauge on UART5's HDQ line: a BQ27540 by Apple's device tree
+ * (/arm-io/uart5/gas-gauge), the same on every A7 iPad. It runs the gauge
+ * firmware profile measured on the J72.
+ */
+&serial5 {
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		fuel-gauge {
+			compatible = "apple,j72-bq27545", "ti,bq27545-hdq";
+		};
+	};
+};

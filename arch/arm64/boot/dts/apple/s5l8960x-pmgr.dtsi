@@ -588,6 +588,12 @@
 		#reset-cells = <0>;
 		label = "ans_dll";
 		power-domains = <&ps_ans>;
+		/*
+		 * The NAND interface's DLL (ADT clock gate ANS_DLL). Nothing
+		 * in Linux claims it, and with it off the ANS slows to
+		 * seconds per command after it wakes from sleep.
+		 */
+		apple,always-on;
 	};
 
 	ps_gfx: power-controller@20218 {

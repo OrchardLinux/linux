@@ -26,6 +26,31 @@
 		clock-output-names = "clkref";
 	};
 
+	spi1_clk: clock-spi1 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <60000000>;
+		clock-output-names = "spi1";
+	};
+
+	spi2_clk: clock-spi2 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <60000000>;
+		clock-output-names = "spi2";
+	};
+
+	/*
+	 * SPI3's rate is in the clock table iBoot fills in (clock-id 0x135);
+	 * 60 MHz as for SPI2, the rate the iPad Air's codec link ran at.
+	 */
+	spi3_clk: clock-spi3 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <60000000>;
+		clock-output-names = "spi3";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -77,6 +102,76 @@
 			#performance-domain-cells = <0>;
 		};
 
+		ans: block@208040000 {
+			compatible = "apple,s5l8960x-ans";
+			reg = <0x2 0x08040000 0x0 0x1000>;
+			mboxes = <&ans_mbox>;
+			power-domains = <&ps_ans>;
+			resets = <&ps_ans>;
+			status = "disabled";
+		};
+
+		ans_mbox: mbox@208041000 {
+			compatible = "apple,s5l8960x-akf-mailbox-v1", "apple,akf-mailbox-v1";
+			reg = <0x2 0x08041000 0x0 0x1000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 52 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 53 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 54 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 55 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_ans>;
+		};
+
+		/* Apple's i2s-switch,s5l8960x: AppleAE2I2SSwitch3, as on S8000 */
+		i2s_switch: syscon@20a003000 {
+			compatible = "apple,s5l8960x-i2s-switch", "syscon";
+			reg = <0x2 0x0a003000 0x0 0x1000>;
+		};
+
+		spi1: spi@20a084000 {
+			compatible = "apple,s5l8960x-spi";
+			reg = <0x2 0x0a084000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 137 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&spi1_clk>;
+			pinctrl-0 = <&spi1_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_spi1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi2: spi@20a088000 {
+			compatible = "apple,s5l8960x-spi";
+			reg = <0x2 0x0a088000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 138 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&spi2_clk>;
+			pinctrl-0 = <&spi2_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/* Pins as the boot loader leaves them */
+		spi3: spi@20a08c000 {
+			compatible = "apple,s5l8960x-spi";
+			reg = <0x2 0x0a08c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 139 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&spi3_clk>;
+			power-domains = <&ps_spi3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@20a0a0000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x0a0a0000 0x0 0x4000>;
@@ -87,6 +182,61 @@
 			clocks = <&clkref>, <&clkref>;
 			clock-names = "uart", "clk_uart_baud0";
 			power-domains = <&ps_uart0>;
+			status = "disabled";
+		};
+
+		serial5: serial@20a0b4000 {
+			compatible = "apple,s5l-uart";
+			reg = <0x2 0x0a0b4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 145 IRQ_TYPE_LEVEL_HIGH>;
+			/* Use the bootloader-enabled clocks for now. */
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart5>;
+			status = "disabled";
+		};
+
+		/*
+		 * MCA0: Apple's mca,s5l8960x, mca-version 1. Its i2s_route, aud0 to
+		 * pin0, is the same in the device tree of every A7 iPad.
+		 */
+		mca0: mca@20a0c0000 {
+			compatible = "apple,s5l8960x-mca";
+			reg = <0x2 0x0a0c0000 0x0 0x4000>,
+			      <0x2 0x0a002000 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 147 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca0>;
+			dmas = <&sio 0x28>;
+			dma-names = "tx";
+			apple,i2s-switch = <&i2s_switch 0 0>;
+			#clock-cells = <0>;
+			clock-output-names = "mca0-mclk";
+			#sound-dai-cells = <0>;
+		};
+
+		/*
+		 * MCA1: Apple's mca,s5l8960x, mca-version 1, the speaker link of
+		 * the iPad mini 2 (J85 ADT, iOS 12.5.8: aud1 to pin1, SmartIO
+		 * 0x2a TX, its MCLK word at 0x20a002004).
+		 */
+		mca1: mca@20a0c4000 {
+			compatible = "apple,s5l8960x-mca-tdm";
+			reg = <0x2 0x0a0c4000 0x0 0x4000>,
+			      <0x2 0x0a002004 0x0 0x4>;
+			reg-names = "mca", "mclk";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 148 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_mca1>;
+			dmas = <&sio 0x2a>;
+			dma-names = "tx";
+			apple,i2s-switch = <&i2s_switch 1 1>;
+			#clock-cells = <0>;
+			clock-output-names = "mca1-mclk";
+			#sound-dai-cells = <0>;
 			status = "disabled";
 		};
 
@@ -144,6 +294,32 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
+		};
+
+		touchclk: clock-controller@20a118000 {
+			compatible = "apple,s5l8960x-touch-clock";
+			reg = <0x2 0x0a118000 0x0 0x4000>;
+			clocks = <&clkref>;
+			power-domains = <&ps_pwm0>;
+			#clock-cells = <0>;
+			clock-frequency = <32768>;
+			status = "disabled";
+		};
+
+		/* SmartIO: AppleA7IOP version 1, the DMA engine of the MCAs */
+		sio: dma-controller@20ae00000 {
+			compatible = "apple,s5l8960x-sio";
+			reg = <0x2 0x0ae00000 0x0 0x2000>;
+			reg-names = "a7iop";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 133 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 132 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 135 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 134 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_sio>;
+			firmware-name = "apple/s5l8960x-smartio.bin";
+			dma-channels = <64>;
+			#dma-cells = <1>;
 		};
 
 		bus@20c000000 {
@@ -278,6 +454,20 @@
 			i2c3_pins: i2c3-pins {
 				pinmux = <APPLE_PINMUX(172, 1)>,
 					 <APPLE_PINMUX(171, 1)>;
+			};
+
+			spi1_pins: spi1-pins {
+				pinmux = <APPLE_PINMUX(68, 1)>,
+					 <APPLE_PINMUX(69, 1)>,
+					 <APPLE_PINMUX(70, 1)>,
+					 <APPLE_PINMUX(71, 1)>;
+			};
+
+			spi2_pins: spi2-pins {
+				pinmux = <APPLE_PINMUX(76, 1)>,
+					 <APPLE_PINMUX(77, 1)>,
+					 <APPLE_PINMUX(78, 1)>,
+					 <APPLE_PINMUX(79, 1)>;
 			};
 		};
 	};
