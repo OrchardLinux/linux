@@ -26,6 +26,22 @@
 		clock-output-names = "clkref";
 	};
 
+	spi1_clk: clock-spi1 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		/* ADT clock ID 0x12d: clock-frequencies[45]. */
+		clock-frequency = <60000000>;
+		clock-output-names = "spi1";
+	};
+
+	spi2_clk: clock-spi2 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		/* ADT clock ID 0x12e: clock-frequencies[46]. */
+		clock-frequency = <60000000>;
+		clock-output-names = "spi2";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
@@ -113,10 +129,111 @@
 		nonposted-mmio;
 		ranges;
 
+		gpu: gpu@201000000 {
+			compatible = "apple,t7000-gpu";
+			reg = <0x2 0x01000000 0x0 0x100000>,
+			      <0x2 0x01e00000 0x0 0x100000>,
+			      <0x2 0x0e000000 0x0 0x40000>,
+			      <0x2 0x01f00000 0x0 0x81000>;
+			reg-names = "rgx", "fender", "pmgr", "bridges";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 134 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 135 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 136 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 137 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 138 IRQ_TYPE_LEVEL_HIGH>;
+			firmware-name = "apple/gfx-t7000.bin";
+			status = "disabled";
+		};
+
+		/*
+		 * ADT disp0 ("adbe0,t7000"). iBoot leaves the pipe, the panel
+		 * link and the panel running, reading through dart-disp0 in
+		 * bypass. The second domain is the panel link: MIPI DSI on the
+		 * iPhone 6 and iPod touch 6; the iPad mini 4 (eDP) would use
+		 * ps_dp instead.
+		 */
+		disp0: display-controller@206200000 {
+			compatible = "apple,t7000-display-pipe";
+			reg = <0x2 0x06200000 0x0 0x100000>,
+			      <0x2 0x06304000 0x0 0x4000>,
+			      <0x2 0x06300000 0x0 0x4000>;
+			reg-names = "adp", "dart0", "dart1";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 103 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 108 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 109 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 110 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 111 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_disp0>, <&ps_mipi_dsi>;
+			status = "disabled";
+
+			/*
+			 * The pipe's reads as a DMA master behind dart-disp0,
+			 * every stream of it. The display driver enables the
+			 * DART below and creates this device itself, after it
+			 * has mapped the live boot framebuffer, and verifies
+			 * translated scanout before it uses it.
+			 */
+			scanout {
+				iommus = <&disp0_dart 0>, <&disp0_dart 1>,
+					 <&disp0_dart 2>, <&disp0_dart 3>;
+				apple,dart-deferred-attach;
+			};
+		};
+
+		/*
+		 * ADT dart-disp0: the DART and its SMMU front end, with their
+		 * error reflector, fetch and diag configuration. Its ADT power
+		 * gate (36) is the one the A9's dart-disp0 has, which is
+		 * described with disp0's domain; so is this one. Disabled
+		 * until the display driver has mapped the live scanout.
+		 */
+		disp0_dart: iommu@206304000 {
+			compatible = "apple,t7000-dart", "apple,s5l8960x-dart";
+			reg = <0x2 0x06304000 0x0 0x4000>,
+			      <0x2 0x06300000 0x0 0x4000>;
+			reg-names = "dart", "smmu";
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 106 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 107 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "dart", "smmu";
+			power-domains = <&ps_disp0>;
+			apple,error-reflector = /bits/ 64 <0x20ffff000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x00000100>;
+			status = "disabled";
+		};
+
 		cpufreq: performance-controller@202220000 {
 			compatible = "apple,t7000-cluster-cpufreq", "apple,s5l8960x-cluster-cpufreq";
 			reg = <0x2 0x02220000 0 0x1000>;
 			#performance-domain-cells = <0>;
+		};
+
+		ans: block@208040000 {
+			compatible = "apple,t7000-ans", "apple,s5l8960x-ans";
+			reg = <0x2 0x08040000 0x0 0x1000>;
+			mboxes = <&ans_mbox>;
+			power-domains = <&ps_ans>;
+			resets = <&ps_ans>;
+			status = "disabled";
+		};
+
+		ans_mbox: mbox@208041000 {
+			compatible = "apple,t7000-akf-mailbox-v1", "apple,akf-mailbox-v1";
+			reg = <0x2 0x08041000 0x0 0x1000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 36 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 37 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 38 IRQ_TYPE_LEVEL_HIGH>,
+				<AIC_IRQ 39 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+				"recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_ans>;
+			status = "disabled";
 		};
 
 		serial0: serial@20a0c0000 {
@@ -129,6 +246,30 @@
 			clocks = <&clkref>, <&clkref>;
 			clock-names = "uart", "clk_uart_baud0";
 			power-domains = <&ps_uart0>;
+			status = "disabled";
+		};
+
+		serial1: serial@20a0c4000 {
+			compatible = "apple,t7000-uart", "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0c4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 159 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart1>;
+			status = "disabled";
+		};
+
+		serial5: serial@20a0d4000 {
+			compatible = "apple,t7000-uart", "apple,t8010-uart", "apple,s5l-uart";
+			reg = <0x2 0x0a0d4000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 163 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart5>;
 			status = "disabled";
 		};
 
@@ -196,6 +337,30 @@
 			pinctrl-0 = <&i2c3_pins>;
 			pinctrl-names = "default";
 			power-domains = <&ps_i2c3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi1: spi@20a084000 {
+			compatible = "apple,t7000-spi", "apple,spi";
+			reg = <0x2 0x0a084000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 153 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&spi1_clk>;
+			power-domains = <&ps_spi1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi2: spi@20a088000 {
+			compatible = "apple,t7000-spi", "apple,spi";
+			reg = <0x2 0x0a088000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 154 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&spi2_clk>;
+			power-domains = <&ps_spi2>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
@@ -334,6 +499,61 @@
 				pinmux = <APPLE_PINMUX(87, 1)>,
 					 <APPLE_PINMUX(86, 1)>;
 			};
+
+			uart1_pins: uart1-pins {
+				pinmux = <APPLE_PINMUX(173, 1)>,
+					 <APPLE_PINMUX(174, 1)>,
+					 <APPLE_PINMUX(175, 1)>,
+					 <APPLE_PINMUX(176, 1)>;
+			};
+
+			uart5_pins: uart5-pins {
+				pinmux = <APPLE_PINMUX(57, 1)>;
+			};
+		};
+
+		/*
+		 * The ADT gives this DART 8 KiB at 0x602002000, inside the PCIe
+		 * port 1 block; its registers end below 0x100.
+		 */
+		pcie_dart1: iommu@602002000 {
+			compatible = "apple,t7000-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x02002000 0x0 0x2000>;
+			#iommu-cells = <5>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 216 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_pcie>;
+			/* ADT dart-apcie1: error-reflector, fetch-config, diag-config */
+			apple,error-reflector = /bits/ 64 <0x20ffff000>;
+			apple,fetch-config = <0x000e0303>;
+			apple,diag-config = <0x00000100>;
+			status = "disabled";
+		};
+
+		/* The A8 root complex has two root ports; the A8X has four. */
+		pcie: pcie@610000000 {
+			compatible = "apple,t7000-pcie";
+			device_type = "pci";
+			reg = <0x6 0x10000000 0x0 0x1000000>,
+			      <0x6 0x00000000 0x0 0x2000>,
+			      <0x6 0x01004000 0x0 0x1000>,
+			      <0x6 0x02004000 0x0 0x1000>;
+			reg-names = "config", "rc", "port0", "port1";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 212 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 215 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "port0", "port1";
+			msi-controller;
+			msi-parent = <&pcie>;
+			msi-ranges = <&aic AIC_IRQ 224 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-doorbell = <0xbffff000>;
+			bus-range = <0 8>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x6 0x20000000 0x6 0x20000000 0x1 0xa0000000>,
+				 <0x02000000 0x0 0xc0000000 0x7 0xc0000000 0x0 0x40000000>;
+			power-domains = <&ps_pcie>, <&ps_pcie_ref>, <&ps_pcie_aux>;
+			status = "disabled";
 		};
 	};
 

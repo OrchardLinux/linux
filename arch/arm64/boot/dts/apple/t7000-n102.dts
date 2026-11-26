@@ -16,6 +16,23 @@
 	model = "Apple iPod touch 6";
 	chassis-type = "handset";
 
+	aliases {
+		bluetooth0 = &bluetooth;
+		serial1 = &serial1;
+		wifi0 = &wifi0;
+		spi2 = &spi2;
+		touchscreen0 = &touchscreen;
+	};
+
+	/* Wi-Fi REG_ON is D2186 GPIO 10 (ADT uart4/wlan function-reg_on). */
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&pmu_gpio 10 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <100000>;
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -45,20 +62,219 @@
 			linux,code = <KEY_VOLUMEUP>;
 		};
 	};
+
+	/*
+	 * Design capacity (1080 mAh) and shutdown voltage (3400 mV) come from
+	 * the board's firmware device tree (battery-family 6). The OCV curve
+	 * comes from AppleARMPMUCharger battery-data["0006-default"].
+	 */
+	n102_battery: battery {
+		compatible = "simple-battery";
+		device-chemistry = "lithium-ion";
+		charge-full-design-microamp-hours = <1080000>;
+		voltage-min-design-microvolt = <3400000>;
+		voltage-max-design-microvolt = <4350000>;
+		factory-internal-resistance-micro-ohms = <200000>;
+		ocv-capacity-celsius = <20>;
+		ocv-capacity-table-0 = <4275000 99>,
+				       <4176000 90>,
+				       <4075000 80>,
+				       <3970000 70>,
+				       <3897000 60>,
+				       <3835000 50>,
+				       <3797000 40>,
+				       <3771000 30>,
+				       <3741000 20>,
+				       <3689000 10>,
+				       <3669000 5>,
+				       <3460000 1>,
+				       <3400000 0>;
+	};
+};
+
+/*
+ * Internal NAND through the ANS1 storage processor. The
+ * boot loader started its firmware and iOS never shuts it down
+ * (no-shutdown in the ADT), so keep its power domain on, as on the A7.
+ */
+&ans {
+	status = "okay";
+};
+
+&ans_mbox {
+	status = "okay";
+};
+
+&ps_ans {
+	apple,always-on;
+};
+
+&dwi_bl {
+	apple,led-driver = <&backlight_driver>;
+};
+
+&pcie_dart1 {
+	status = "okay";
+};
+
+/*
+ * The BCM4345 on root port 1 (ADT apcie/pci-bridge1): PERST# GPIO 77,
+ * DEVICE_WAKE GPIO 200, Gen1. Port 0 has nothing attached. CLKREQ#
+ * (GPIO 41) is not described, as on the T7001 and mini 4.
+ */
+&pcie {
+	/* ADT dart-apcie1 vm-offset and vm-size; SID 0 */
+	iommu-map = <0x100 &pcie_dart1 0 0x0 0x80000000 0x0 0x3ffff000 1>;
+	iommu-map-mask = <0xff00>;
+	status = "okay";
+
+	pci@1,0 {
+		device_type = "pci";
+		reg = <0x800 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		reset-gpios = <&pinctrl 77 GPIO_ACTIVE_LOW>;
+		max-link-speed = <1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,43ab";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl 200 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+			brcm,board-type = "apple,bacchus";
+			brcm,ccode-map-trivial;
+		};
+	};
+};
+
+/*
+ * The BCM4345B1's Bluetooth on UART1, from the ADT uart1/bluetooth node:
+ * power enable on D2186 GPIO 8, BT_WAKE on GPIO 50. m1n1 adds the device
+ * address. Starts at 115,200 baud; the ADT allows 3 Mbit/s.
+ */
+&serial1 {
+	pinctrl-0 = <&uart1_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "apple,n102-bcm4345b1-bt";
+		current-speed = <115200>;
+		shutdown-gpios = <&pmu_gpio 8 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl 50 GPIO_ACTIVE_HIGH>;
+		apple,wlan = <&wifi0>;
+	};
 };
 
 &framebuffer0 {
 	power-domains = <&ps_disp0 &ps_mipi_dsi>;
 };
 
+/*
+ * The display pipe takes the 640x1136 panel over from simpledrm. No panel
+ * supply is given: the panel stays on in system sleep.
+ */
+&disp0 {
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+};
+
+/* Tell the USB input supply what the USB host allows. */
+&usbdev {
+	usb-psy-name = "apple-d2186-usb";
+};
+
+&spi2 {
+	cs-gpios = <&pinctrl 185 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,n102-touchscreen";
+		reg = <0>;
+		/* The N1 driver requests an 83 ns SPI bit period. */
+		spi-max-frequency = <12048192>;
+		interrupts-extended = <&pinctrl 3 IRQ_TYPE_EDGE_FALLING>;
+		attn-gpios = <&pinctrl 3 GPIO_ACTIVE_LOW>;
+		reset-gpios = <&pinctrl 2 GPIO_ACTIVE_LOW>;
+		ana-supply = <&touch_ana>;
+		core-supply = <&touch_core>;
+		clocks = <&touchclk>;
+		firmware-name = "apple/n102-fwstart.z2fw";
+		touchscreen-size-x = <640>;
+		touchscreen-size-y = <1136>;
+		touchscreen-inverted-y;
+	};
+};
+
+&touchclk {
+	status = "okay";
+};
 &i2c0 {
 	status = "okay";
+
+
+	backlight_driver: led-controller@63 {
+		compatible = "ti,lm3534";
+		reg = <0x63>;
+	};
+
+	display-pmu@27 {
+		compatible = "apple,chestnut-pmic";
+		reg = <0x27>;
+
+		touch_ana: regulator-touch-hv {
+			compatible = "apple,chestnut-touch-hv-regulator";
+			regulator-name = "touch-analog";
+		};
+	};
 
 	pmic@74 {
 		compatible = "apple,adi-pmic", "apple,i2c-pmic";
 		reg = <0x74>;
 		#address-cells = <1>;
 		#size-cells = <1>;
+
+		pmu_gpio: gpio {
+			compatible = "apple,d2186-pmic-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			/* Only Bluetooth (8) and Wi-Fi (10) REG_ON are used; the others stay as iBoot left them. */
+			gpio-reserved-ranges = <0 8>, <9 1>, <11 10>;
+		};
+
+		touch_core: regulator-touch-core {
+			compatible = "apple,d2186-touch-core-regulator";
+			regulator-name = "touch-core";
+		};
+
+		pmu_adc: adc@500 {
+			compatible = "apple,d2186-adc";
+			reg = <0x500 0x24>;
+			#io-channel-cells = <1>;
+		};
+
+		battery {
+			compatible = "apple,d2186-battery";
+			monitored-battery = <&n102_battery>;
+			io-channels = <&pmu_adc 4>,
+				      <&pmu_adc 1>,
+				      <&pmu_adc 2>,
+				      <&pmu_adc 15>,
+				      <&pmu_adc 9>;
+			io-channel-names = "vbat",
+					   "ich",
+					   "tbat",
+					   "vbus",
+					   "ibus";
+			/* The most an Apple host has granted this iPod: 500 + 1000 mA. */
+			input-current-limit-microamp = <1500000>;
+		};
 
 		rtc@5c0 {
 			compatible = "apple,adi-pmic-rtc", "apple,amber-pmic-rtc";

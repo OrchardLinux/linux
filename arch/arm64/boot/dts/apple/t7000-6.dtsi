@@ -12,6 +12,10 @@
 / {
 	chassis-type = "handset";
 
+	aliases {
+		serial5 = &serial5;
+	};
+
 	gpio-keys {
 		compatible = "gpio-keys";
 
@@ -49,8 +53,27 @@
 	};
 };
 
+/* The bq27540 gauge on UART5's HDQ line (ADT uart5/gas-gauge). */
+&serial5 {
+	pinctrl-0 = <&uart5_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	onewire {
+		compatible = "ti,hdq-uart";
+
+		fuel-gauge {
+			compatible = "ti,bq27540-hdq";
+		};
+	};
+};
+
 &framebuffer0 {
 	power-domains = <&ps_disp0 &ps_mipi_dsi>;
+};
+
+&gpu {
+	status = "okay";
 };
 
 &typhoon_opp06 {
@@ -71,6 +94,18 @@
 			reg = <0x5c0 0x10>;
 			nvmem-cells = <&rtc_offset>;
 			nvmem-cell-names = "rtc_offset";
+		};
+
+		/*
+		 * The PMIC's housekeeping ADC, as on the iPod touch 6. The
+		 * iPhone 6 has a bq27540 gauge for the battery, so no
+		 * apple,d2186-battery node: it would report the same battery
+		 * a second time.
+		 */
+		pmu_adc: adc@500 {
+			compatible = "apple,d2186-adc";
+			reg = <0x500 0x24>;
+			#io-channel-cells = <1>;
 		};
 
 		nvmem@4000 {
