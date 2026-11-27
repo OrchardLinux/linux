@@ -545,6 +545,9 @@ pvr_gpu_support_level(const struct pvr_gpu_id *gpu_id)
 	case PVR_PACKED_BVNC(3, 10, 4, 5):	/* Apple A8 (T7000) */
 		return PVR_GPU_SUPPORTED;
 
+	case PVR_PACKED_BVNC(1, 70, 4, 3):	/* Apple A7 (S5L8960X), the J71's */
+		return PVR_GPU_EXPERIMENTAL;
+
 	default:
 		return PVR_GPU_UNKNOWN;
 	}
