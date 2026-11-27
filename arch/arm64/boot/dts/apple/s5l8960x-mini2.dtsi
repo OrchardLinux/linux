@@ -105,6 +105,16 @@
 		interrupt-controller;
 		#interrupt-cells = <2>;
 		interrupts-extended = <&pinctrl 21 IRQ_TYPE_LEVEL_LOW>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		/*
+		 * Of the 17 lines only the Bluetooth power enable (2) is
+		 * exposed. The others stay as iBoot left them: the Wi-Fi
+		 * reset (3, apple-a7-wlan owns it), the battery gauge (5) and,
+		 * on the cellular boards, the baseband's, by Apple's device
+		 * trees.
+		 */
+		gpio-reserved-ranges = <0 2>, <3 14>;
 	};
 
 	/*
@@ -179,6 +189,38 @@
 		apple,ehci-port = <1>;
 		host-ready-gpios = <&pinctrl 163 GPIO_ACTIVE_HIGH>;
 		device-ready-gpios = <&pinctrl 164 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/*
+ * The BCM4324B5's Bluetooth on UART1, from the bluetooth node below
+ * /arm-io/uart1 in the J85, J86, J87, J85m, J86m and J87m device trees,
+ * which agree: the iPad Air's node (power enable on the D2089's GPIO 2,
+ * H4 at a transport-speed of 3 Mbit/s), except that BT_WAKE is AP GPIO
+ * 115 here instead of 7. The controller starts at 115,200 baud, where the
+ * Patchram loads; hci_bcm then switches the link to 1.5 Mbit/s, as on the
+ * iPad Air. m1n1 adds the device address through the bluetooth0 alias.
+ */
+/ {
+	aliases {
+		bluetooth0 = &bluetooth;
+		serial1 = &serial1;
+		serial5 = &serial5;
+	};
+};
+
+&serial1 {
+	pinctrl-0 = <&uart1_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "apple,s5l8960x-bcm4324b5-bt";
+		current-speed = <115200>;
+		max-speed = <1500000>;
+		shutdown-gpios = <&pmu_events 2 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl 115 GPIO_ACTIVE_HIGH>;
 	};
 };
 
