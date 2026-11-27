@@ -140,6 +140,7 @@ struct apple_hidspi_finger {
  * @hbpp_version: the ADT's hbpp-version
  * @hbpp_chunk: most payload bytes of a blob the driver builds; 0: no limit
  * @hbpp_ack_delay_ms: wait between a packet and its acknowledge
+ * @reset_settle_ms: wait after releasing reset; 0: 100 ms
  * @cs_delay_us: MTFW "CS Delay"
  * @status_stage: HIDSPI packets are followed by the status stage
  * @idle_fill: what the host clocks out while it only reads
@@ -160,6 +161,7 @@ struct ahts_variant {
 	u16 hbpp_version;
 	unsigned int hbpp_chunk;
 	unsigned int hbpp_ack_delay_ms;
+	unsigned int reset_settle_ms;
 	u16 cs_delay_us;
 	bool status_stage;
 	u8 idle_fill;
@@ -195,10 +197,14 @@ struct apple_hidspi_ts {
 	DECLARE_BITMAP(prev, 256);	/* finger ids of the last report */
 	unsigned int bootloader_seen;
 	struct work_struct recover;
+	struct work_struct resume_work;
+	bool irq_on;		/* interrupt variants: enabled */
 	struct completion booted;
 	struct completion surface;
 	s16 min_x, max_x, min_y, max_y;
 };
+
+static void ahts_resume_work(struct work_struct *work);
 
 static int ahts_set_mode(struct apple_hidspi_ts *ts, u32 mode)
 {
@@ -246,6 +252,24 @@ static int ahts_hbpp_send(struct apple_hidspi_ts *ts, const u8 *pkt,
 			return ret;
 		if (!want)
 			return 0;
+		/*
+		 * Polling the acknowledge instead of waiting the whole delay
+		 * loads the XR's firmware in 0.34 s instead of 2.2 s. The last
+		 * packet, which starts the firmware and takes any answer,
+		 * still gets the full wait.
+		 */
+		if (ts->variant->hbpp_ack_delay_ms && want != HBPP_ACK_ANY) {
+			unsigned long end = jiffies + msecs_to_jiffies(
+				2 * ts->variant->hbpp_ack_delay_ms + 20);
+
+			do {
+				usleep_range(200, 300);
+				ret = ahts_hbpp_ack(ts, &reply);
+				if (!ret && (want == HBPP_ACK_ANY || reply == want))
+					return 0;
+			} while (time_before(jiffies, end));
+			continue;
+		}
 		if (ts->variant->hbpp_ack_delay_ms)
 			msleep(ts->variant->hbpp_ack_delay_ms);
 		ret = ahts_hbpp_ack(ts, &reply);
@@ -537,7 +561,7 @@ static int ahts_power_on(struct apple_hidspi_ts *ts)
 	ts->powered = true;
 	msleep(50);
 	gpiod_set_value_cansleep(ts->reset, 0);
-	msleep(100);
+	msleep(ts->variant->reset_settle_ms ?: 100);
 	return 0;
 }
 
@@ -545,6 +569,7 @@ static int ahts_boot(struct apple_hidspi_ts *ts)
 {
 	struct device *dev = &ts->spi->dev;
 	const struct firmware *fw;
+	ktime_t t0 = ktime_get();
 	int ret, try;
 
 	ret = request_firmware(&fw, ts->fw_name, dev);
@@ -568,6 +593,11 @@ static int ahts_boot(struct apple_hidspi_ts *ts)
 		ret = ahts_set_mode(ts, ts->variant->hbpp_mode);
 		if (ret)
 			break;
+		/*
+		 * On the XR the first power-up after the supplies were off
+		 * answers 3e 02 instead of the bootloader, whatever the delays;
+		 * the second always works.
+		 */
 		ret = ahts_hbpp_detect(ts);
 		if (ret)
 			continue;
@@ -580,7 +610,8 @@ static int ahts_boot(struct apple_hidspi_ts *ts)
 	ts->pkt = NULL;
 	if (ret)
 		return dev_err_probe(dev, ret, "firmware load failed\n");
-	dev_info(dev, "firmware loaded (try %d)\n", try + 1);
+	dev_info(dev, "firmware loaded in %lld ms (try %d)\n",
+		 ktime_ms_delta(ktime_get(), t0), try + 1);
 	memset(ts->last, 0, HIDSPI_XFER);
 	msleep(10);
 	return ahts_set_mode(ts, SPI_MODE_0);
@@ -978,6 +1009,7 @@ static void ahts_power_off_action(void *data)
 {
 	struct apple_hidspi_ts *ts = data;
 
+	cancel_work_sync(&ts->resume_work);
 	if (ts->thread)
 		kthread_stop(ts->thread);
 	cancel_work_sync(&ts->recover);
@@ -1010,6 +1042,7 @@ static int ahts_probe(struct spi_device *spi)
 	init_completion(&ts->booted);
 	init_completion(&ts->surface);
 	INIT_WORK(&ts->recover, ahts_recover_work);
+	INIT_WORK(&ts->resume_work, ahts_resume_work);
 	mutex_init(&ts->lock);
 	ts->tx = devm_kzalloc(dev, HIDSPI_XFER, GFP_KERNEL);
 	ts->rx = devm_kzalloc(dev, HIDSPI_XFER + 16, GFP_KERNEL);
@@ -1090,6 +1123,7 @@ static int ahts_probe(struct spi_device *spi)
 						IRQF_ONESHOT, "apple-hidspi-ts", ts);
 		if (ret)
 			return dev_err_probe(dev, ret, "no IRQ\n");
+		ts->irq_on = true;
 	}
 	if (!wait_for_completion_timeout(&ts->booted, msecs_to_jiffies(1000)))
 		dev_warn(dev, "no boot message from the firmware\n");
@@ -1119,11 +1153,13 @@ static int ahts_suspend(struct device *dev)
 {
 	struct apple_hidspi_ts *ts = dev_get_drvdata(dev);
 
+	cancel_work_sync(&ts->resume_work);
 	if (ts->thread) {
 		kthread_stop(ts->thread);
 		ts->thread = NULL;
-	} else {
+	} else if (ts->irq_on) {
 		disable_irq(ts->spi->irq);
+		ts->irq_on = false;
 	}
 	cancel_work_sync(&ts->recover);
 	if (ts->fingers)
@@ -1132,9 +1168,12 @@ static int ahts_suspend(struct device *dev)
 	return 0;
 }
 
-static int ahts_resume(struct device *dev)
+/* Loading the firmware takes about 2 s; resume does not wait for it. */
+static void ahts_resume_work(struct work_struct *work)
 {
-	struct apple_hidspi_ts *ts = dev_get_drvdata(dev);
+	struct apple_hidspi_ts *ts = container_of(work, struct apple_hidspi_ts,
+						  resume_work);
+	struct device *dev = &ts->spi->dev;
 	int ret;
 
 	reinit_completion(&ts->booted);
@@ -1142,17 +1181,23 @@ static int ahts_resume(struct device *dev)
 	ret = ahts_boot(ts);
 	if (ret) {
 		dev_err(dev, "firmware not loaded after resume: %d\n", ret);
-		return 0;
+		return;
 	}
 	if (ts->variant->polled) {
 		ts->thread = kthread_run(ahts_poll_thread, ts, "apple-hidspi-ts");
-		if (IS_ERR(ts->thread)) {
+		if (IS_ERR(ts->thread))
 			ts->thread = NULL;
-			return 0;
-		}
 	} else {
 		enable_irq(ts->spi->irq);
+		ts->irq_on = true;
 	}
+}
+
+static int ahts_resume(struct device *dev)
+{
+	struct apple_hidspi_ts *ts = dev_get_drvdata(dev);
+
+	queue_work(system_unbound_wq, &ts->resume_work);
 	return 0;
 }
 
@@ -1196,6 +1241,7 @@ static const struct ahts_variant ahts_n841 = {
 	.hbpp_version = 0x103,
 	.hbpp_chunk = 0x3f0,
 	.hbpp_ack_delay_ms = 20,
+	.reset_settle_ms = 30,
 	.cs_delay_us = 300,
 	.status_stage = true,
 	.idle_fill = 0xff,
