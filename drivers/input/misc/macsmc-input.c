@@ -53,10 +53,13 @@ static void macsmc_input_event_button(struct macsmc_input *smcin, unsigned long 
 	case BTN_TOUCHID:
 		pm_wakeup_dev_event(smcin->dev, 0, (smcin->wakeup_mode && state));
 
-		/* Suppress KEY_POWER event to prevent immediate shutdown on wake */
-		if (smcin->wakeup_mode)
-			return;
-
+		/*
+		 * Report the press that woke the system too, as gpio-keys does
+		 * for its wake keys: on the iPhones the session's power service
+		 * lights the screen on it, and without it the first press only
+		 * woke the kernel and a second one was needed. The service owns
+		 * the button; logind ignores it there.
+		 */
 		input_report_key(smcin->input, KEY_POWER, state);
 		input_sync(smcin->input);
 		break;
