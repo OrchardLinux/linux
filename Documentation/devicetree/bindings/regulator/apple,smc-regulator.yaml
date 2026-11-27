@@ -10,13 +10,16 @@ maintainers:
   - Dugs <dugahol@protonmail.com>
 
 description:
-  On the A11 iPhones the SMC switches some peripheral supplies on and off.
-  Which supplies exist depends on the SMC firmware, so the compatible
-  selects them; each one is described by a child node named after it.
+  On the A11 and A12 iPhones the SMC switches some peripheral supplies on
+  and off. Which supplies exist depends on the SMC firmware, so the
+  compatible selects them; each one is described by a child node named
+  after it.
 
 properties:
   compatible:
-    const: apple,t8015-smc-regulator
+    enum:
+      - apple,t8015-smc-regulator
+      - apple,t8020-smc-regulator
 
 patternProperties:
   "^mesa-(1v8|3v0)$":
@@ -25,8 +28,28 @@ patternProperties:
     unevaluatedProperties: false
     description: Touch ID sensor 1.8 V and 3 V supplies
 
+  "^touch-(core|clock)$":
+    type: object
+    $ref: regulator.yaml#
+    unevaluatedProperties: false
+    description:
+      Touch controller core supply, and the switch of the touch
+      controller's clock
+
 required:
   - compatible
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t8015-smc-regulator
+    then:
+      patternProperties:
+        "^touch-(core|clock)$": false
+    else:
+      patternProperties:
+        "^mesa-(1v8|3v0)$": false
 
 additionalProperties: false
 

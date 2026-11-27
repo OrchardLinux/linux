@@ -46,6 +46,7 @@
 
 #define SMC_TYPE_T8012		0x8012
 #define SMC_TYPE_T8015		0x8015
+#define SMC_TYPE_T8020		0x8020
 #define SMC_TYPE_T8103		0x8103
 
 static const struct mfd_cell apple_smc_t8015_devs[] = {
@@ -55,6 +56,16 @@ static const struct mfd_cell apple_smc_t8015_devs[] = {
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,t8015-smc-reboot"),
 	MFD_CELL_OF("macsmc-regulator", NULL, NULL, 0, 0, "apple,t8015-smc-regulator"),
+};
+
+/* As the A11's, with the A12's own switched rails */
+static const struct mfd_cell apple_smc_t8020_devs[] = {
+	MFD_CELL_NAME("macsmc-input"),
+	MFD_CELL_NAME("macsmc-power"),
+	MFD_CELL_OF("macsmc-gpio", NULL, NULL, 0, 0, "apple,smc-gpio"),
+	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
+	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,t8015-smc-reboot"),
+	MFD_CELL_OF("macsmc-regulator", NULL, NULL, 0, 0, "apple,t8020-smc-regulator"),
 };
 
 static const struct mfd_cell apple_smc_t8103_devs[] = {
@@ -440,6 +451,10 @@ static int apple_smc_probe(struct platform_device *pdev)
 			devs = apple_smc_t8015_devs;
 			dev_cnt = ARRAY_SIZE(apple_smc_t8015_devs);
 			break;
+		case SMC_TYPE_T8020:
+			devs = apple_smc_t8020_devs;
+			dev_cnt = ARRAY_SIZE(apple_smc_t8020_devs);
+			break;
 		case SMC_TYPE_T8103:
 			devs = apple_smc_t8103_devs;
 			dev_cnt = ARRAY_SIZE(apple_smc_t8103_devs);
@@ -526,7 +541,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8012-smc", .data = (void*)SMC_TYPE_T8012 },
 	{ .compatible = "apple,t8015-smc", .data = (void*)SMC_TYPE_T8015 },
-	{ .compatible = "apple,t8020-smc", .data = (void*)SMC_TYPE_T8015 },
+	{ .compatible = "apple,t8020-smc", .data = (void*)SMC_TYPE_T8020 },
 	{ .compatible = "apple,t8103-smc", .data = (void*)SMC_TYPE_T8103 },
 	{ .compatible = "apple,smc", .data = (void*)SMC_TYPE_T8103 },
 	{},
