@@ -103,6 +103,7 @@
  */
 / {
 	aliases {
+		bluetooth0 = &bluetooth;
 		wifi0 = &wifi0;
 	};
 
@@ -185,7 +186,8 @@
 	status = "okay";
 
 	bluetooth: bluetooth {
-		compatible = "brcm,bcm4329-bt";
+		compatible = "brcm,bcm4357-bt";
+		local-bd-address = [00 00 00 00 00 00]; /* To be filled by loader */
 		current-speed = <115200>;
 		max-speed = <3000000>;
 		shutdown-gpios = <&smc_gpio 9 GPIO_ACTIVE_HIGH>;
