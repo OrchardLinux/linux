@@ -141,3 +141,33 @@
 		pinmux = <APPLE_PINMUX(101, 1)>;
 	};
 };
+
+/*
+ * Bluetooth (ADT /arm-io/uart1/bluetooth, "bluetooth,n88"): on UART1 at
+ * 3 Mbaud, its supply on SMC PMU GPIO 9 ("gP09"), wake on AP GPIO 6. The
+ * ADT names TX (30) and RTS (32); iBoot leaves 31 and 33 muxed to the same
+ * function, which makes them RX and CTS.
+ */
+&pinctrl_ap {
+	bluetooth_uart1_pins: bluetooth-uart1-pins {
+		pinmux = <APPLE_PINMUX(30, 1)>,
+			 <APPLE_PINMUX(31, 1)>,
+			 <APPLE_PINMUX(32, 1)>,
+			 <APPLE_PINMUX(33, 1)>;
+	};
+};
+
+&serial1 {
+	pinctrl-0 = <&bluetooth_uart1_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "brcm,bcm4329-bt";
+		current-speed = <115200>;
+		max-speed = <3000000>;
+		shutdown-gpios = <&smc_gpio 9 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl_ap 6 GPIO_ACTIVE_HIGH>;
+	};
+};
