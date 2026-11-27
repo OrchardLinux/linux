@@ -140,6 +140,20 @@ static void sart2_set_entry(struct apple_sart *sart, int index, u8 flags,
 	writel(cfg, sart->regs + APPLE_SART2_CONFIG(index));
 }
 
+/*
+ * The A12 (sart-version 1) has SART2's registers. iBoot never writes all
+ * flag bits there: it leaves 0x6f on the entries for data buffers, so that
+ * is what an allowed region gets.
+ */
+static struct apple_sart_ops sart_ops_v1 = {
+	.get_entry = sart2_get_entry,
+	.set_entry = sart2_set_entry,
+	.flags_allow = 0x6f,
+	.size_shift = APPLE_SART2_CONFIG_SIZE_SHIFT,
+	.paddr_shift = APPLE_SART2_PADDR_SHIFT,
+	.size_max = APPLE_SART2_CONFIG_SIZE_MAX,
+};
+
 static struct apple_sart_ops sart_ops_v2 = {
 	.get_entry = sart2_get_entry,
 	.set_entry = sart2_set_entry,
@@ -359,6 +373,10 @@ static const struct of_device_id apple_sart_of_match[] = {
 	{
 		.compatible = "apple,t8103-sart",
 		.data = &sart_ops_v2,
+	},
+	{
+		.compatible = "apple,t8020-sart",
+		.data = &sart_ops_v1,
 	},
 	{
 		.compatible = "apple,t8015-sart",

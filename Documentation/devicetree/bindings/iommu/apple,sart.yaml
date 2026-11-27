@@ -21,7 +21,8 @@ description:
   up to 24 bit.
 
   SART2, first seen in A14 and M1, allows 36 bit of physical address space
-  and filter entry size up to 36 bit.
+  and filter entry size up to 36 bit. The A12 (iPhone XS, XR) already has
+  its registers, with a narrower set of flags.
 
   SART3, first seen in M1 Pro/Max, extends both the address space and filter
   entry size to 42 bit.
@@ -37,6 +38,7 @@ properties:
       - enum:
           - apple,t6000-sart
           - apple,t8015-sart
+          - apple,t8020-sart
           - apple,t8103-sart
 
   reg:
