@@ -106,6 +106,15 @@ config APPLE_SART
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_MIPI_DSI_PANEL_PM
+	tristate "Apple MIPI DSI panel power over system sleep"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && GPIOLIB && REGULATOR
+	help
+	  Switches the built-in panel of A12 iPhones off for system sleep and
+	  on again on wake, the way iOS does, on displays the boot loader set
+	  up. Without it the panel stays powered while the phone sleeps.
+
 config APPLE_TUNABLE
 	tristate
 	depends on ARCH_APPLE || COMPILE_TEST

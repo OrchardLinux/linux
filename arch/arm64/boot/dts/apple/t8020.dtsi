@@ -584,6 +584,20 @@
 			status = "disabled";
 		};
 
+		/*
+		 * DSI host (Synopsys DesignWare 1.32a) between disp0 and the
+		 * panel. Only its sleep handling is driven; the boot loader set
+		 * the link up.
+		 */
+		mipi_dsi: dsi@230400000 {
+			compatible = "apple,t8020-mipi-dsi";
+			reg = <0x2 0x30400000 0x0 0x1000>,
+			      <0x2 0x30048000 0x0 0x1000>;
+			reg-names = "dsi", "timing";
+			power-domains = <&ps_mipi_dsi>;
+			status = "disabled";
+		};
+
 		wdt: watchdog@23d2b0000 {
 			compatible = "apple,t8020-wdt", "apple,wdt";
 			reg = <0x2 0x3d2b0000 0x0 0x4000>;

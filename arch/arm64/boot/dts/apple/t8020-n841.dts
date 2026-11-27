@@ -38,6 +38,13 @@
  * Two LM3539 LED drivers light the panel, one on each of i2c0 and i2c2;
  * both take their level from DWI, and the loader leaves them enabled.
  */
+/* ADT lcd function-reset = pKW4('gP12'): SMC GPIO 0x12. */
+&mipi_dsi {
+	reset-gpios = <&smc_gpio 18 GPIO_ACTIVE_HIGH>;
+	lcd-supply = <&lcd_ldo>;
+	status = "okay";
+};
+
 &dwi_bl {
 	status = "okay";
 };
@@ -52,6 +59,13 @@
 		/* ADT multi-touch function-power_ana = dpLE(0x302) */
 		touch_hv: regulator-touch-hv {
 			compatible = "apple,chestnut-touch-hv-regulator";
+		};
+
+		/* ADT lcd function-lcd_ldo = dpLE(0x201) */
+		lcd_ldo: regulator-lcd {
+			compatible = "apple,chestnut-lcd-regulator";
+			regulator-name = "lcd";
+			regulator-boot-on;
 		};
 	};
 };
