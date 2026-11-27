@@ -377,6 +377,17 @@ config SENSORS_FAM15H_POWER
 	  This driver can also be built as a module. If so, the module
 	  will be called fam15h_power.
 
+config SENSORS_APPLE_SOC_TEMP
+	tristate "Apple SoC die temperature sensors"
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  This driver reads the die temperature sensors built into Apple
+	  SoCs, both the ones in the power manager and the ones in the CPU
+	  clusters. They are separate from anything the SMC reports.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called apple-soc-temp.
+
 config SENSORS_APPLESMC
 	tristate "Apple SMC (Motion sensor, light sensor, keyboard backlight)"
 	depends on INPUT && X86
