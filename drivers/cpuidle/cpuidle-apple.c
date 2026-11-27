@@ -59,6 +59,7 @@ static const char *const apple_cpuidle_socs[] __initconst = {
 	"apple,t8010",
 	"apple,t8011",
 	"apple,t8015",
+	"apple,t8020",
 	NULL
 };
 
