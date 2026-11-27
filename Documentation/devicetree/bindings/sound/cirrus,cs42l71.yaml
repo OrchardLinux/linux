@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/cirrus,cs42l71.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Cirrus Logic CS42L71 audio codec
+
+maintainers:
+  - ricktav <82380971+ricktav@users.noreply.github.com>
+
+description: |
+  Apple-specific Cirrus Logic headset codec used on the iPhone 6s and 6s
+  Plus. It is controlled over SPI with Apple's SPIv2 framed protocol
+  (24-bit little-endian register addresses). Headset PCM is the main
+  port (XSP) on pad 0 / MCA0. The codec's ASP on pad 2 is shared with
+  the loudspeaker amplifier; Linux must not make that port a clock
+  provider. MCLK, when present, is 12 MHz from MCA0.
+
+allOf:
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: cirrus,cs42l71
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: mclk
+
+  interrupts:
+    maxItems: 1
+    description:
+      Jack and headset events, level low.
+
+  cirrus,ldo-pulldown-gpios:
+    maxItems: 1
+    description:
+      The PMU line that pulls the codec's digital LDO down; driven low
+      before the codec is used.
+
+  '#sound-dai-cells':
+    const: 0
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    spi {
+      #address-cells = <1>;
+      #size-cells = <0>;
+
+      audio-codec@0 {
+        compatible = "cirrus,cs42l71";
+        reg = <0>;
+        spi-max-frequency = <1000000>;
+      };
+    };
