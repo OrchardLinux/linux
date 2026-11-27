@@ -12,7 +12,7 @@ maintainers:
 description: |
   Charging on Apple devices whose Lightning port uses a Tristar (NXP CBTL1610)
   port controller and a D2365-family PMIC, such as the iPad 5 and iPad 6 (D2365),
-  the iPad Air 2 (D2207) and the iPad Air and iPad mini 2 and 3 (D2089). The PMICs have the same charger functions at
+  the iPad Air 2 and iPad mini 4 (D2207) and the iPad Air and iPad mini 2 and 3 (D2089). The PMICs have the same charger functions at
   different register addresses, so the compatible names the PMIC. The
   node is a child of the PMIC. It identifies the attached source through the
   Tristar and the PMIC ADC and sets the PMIC input-current limit, which iBoot
@@ -36,7 +36,9 @@ properties:
               - apple,j71t-tristar-charger
           - const: apple,tristar-charger
       - items:
-          - const: apple,j81-tristar-charger
+          - enum:
+              - apple,j81-tristar-charger
+              - apple,j96-tristar-charger
           - const: apple,d2207-tristar-charger
       - const: apple,d2089-tristar-charger
 
