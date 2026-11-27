@@ -14,3 +14,69 @@
 	model = "Apple iPhone XR";
 	chassis-type = "handset";
 };
+
+/*
+ * Wi-Fi (ADT /arm-io/apcie/pci-bridge2/wlan and /arm-io/uart2/wlan): a
+ * BCM4357 on PCIe port 2 behind dart-apcie2, PERST# on AP GPIO 106, CLKREQ#
+ * on 101, device-wake on 43, and REG_ON on SMC PMU GPIO 14 ("gP0e").
+ * brcmfmac takes the module from the ADT's module-instance.
+ */
+/ {
+	aliases {
+		wifi0 = &wifi0;
+	};
+
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&smc_gpio 14 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <2500>;
+	};
+};
+
+&pcie0 {
+	iommu-map = <0x100 &dart_apcie2 0 1>;
+	iommu-map-mask = <0xff00>;
+	pinctrl-0 = <&wifi_clkreq>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	port02: pci@2,0 {
+		device_type = "pci";
+		reg = <0x1000 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		max-link-speed = <2>;
+		reset-gpios = <&pinctrl_ap 106 GPIO_ACTIVE_LOW>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+				<0 0 0 2 &port02 0 0 0 1>,
+				<0 0 0 3 &port02 0 0 0 2>,
+				<0 0 0 4 &port02 0 0 0 3>;
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,440a";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl_ap 43 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+			brcm,ccode-map-trivial;
+		};
+	};
+};
+
+&dart_apcie2 {
+	status = "okay";
+};
+
+&pinctrl_ap {
+	wifi_clkreq: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(101, 1)>;
+	};
+};
