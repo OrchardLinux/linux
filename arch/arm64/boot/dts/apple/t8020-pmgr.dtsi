@@ -772,7 +772,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "apcie_gp";
-		power-domains = <&ps_apcie>;
+		/* The PCIe complex's reference clock. */
+		power-domains = <&ps_apcie>, <&ps_pcie_ref>;
 	};
 
 	ps_ans2: power-controller@80378 {
@@ -791,10 +792,10 @@
 		label = "apcie_st";
 		/*
 		 * The storage link runs through the PCIe complex: with its
-		 * reference clock or its general block off, the ANS firmware
+		 * general block or its reference clock off, the ANS firmware
 		 * faults on the first PCIe register it reads.
 		 */
-		power-domains = <&ps_apcie>, <&ps_ans2>, <&ps_apcie_gp>, <&ps_pcie_ref>;
+		power-domains = <&ps_apcie>, <&ps_ans2>, <&ps_apcie_gp>;
 	};
 
 	ps_gfx: power-controller@80388 {
