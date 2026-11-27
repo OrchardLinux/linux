@@ -1,23 +1,26 @@
-Orchard's kernel: upstream Linux with HoolockLinux's A7-A11 work and Orchard's
-changes on top, the kernel Orchard runs on iPhones and iPads (branch main for
-arm64, armv7 for 32-bit). Kernel work for Orchard is a pull request here, not in
-the orchard repository (https://github.com/OrchardLinux/orchard). See AGENTS.md.
+OrchardLinux kernel (32-bit)
+============================
 
-Linux kernel
-============
+The kernel Orchard runs on iPads with A5 to A6X chips (iPad 2, iPad 3, iPad
+mini): upstream Linux v6.12 with the Apple 32-bit work on top. The A7 and
+later boards are on branch main.
 
-There are several guides for kernel developers and users. These guides can
-be rendered in a number of formats, like HTML and PDF. Please read
-Documentation/admin-guide/README.rst first.
+The branch is upstream plus one merge commit per layer: import/cascadia,
+armv7/<subsystem>, configs. The work comes from Project Cascadia (rzxvx and
+its contributors), Corellium's Project Sandcastle drivers as Cascadia ported
+them, and Orchard's contributors; every commit keeps its author.
 
-In order to build the documentation, use ``make htmldocs`` or
-``make pdfdocs``.  The formatted documentation can also be read online at:
+Contributing
+------------
 
-    https://www.kernel.org/doc/html/latest/
+Kernel work for Orchard is a pull request here, against armv7; the orchard
+repository (https://github.com/OrchardLinux/orchard) holds no kernel patches.
+The checks compile the branch with orchard's recipe and run orchard's kernel
+tests. Build your branch with:
 
-There are various text files in the Documentation/ subdirectory,
-several of them using the reStructuredText markup notation.
+    orchard build --device <board> --kernel-tree <dir>
 
-Please read the Documentation/process/changes.rst file, as it contains the
-requirements for building and running the kernel, and information about
-the problems which may result by upgrading your kernel.
+Commit style: AGENTS.md. Orchard builds the commit named in its
+kernel/upstream-armv7.lock; a pull request there takes a newer one.
+
+Upstream's README: Documentation/admin-guide/README.rst.
