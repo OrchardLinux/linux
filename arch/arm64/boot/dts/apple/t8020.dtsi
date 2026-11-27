@@ -227,6 +227,86 @@
 			#performance-domain-cells = <0>;
 		};
 
+		i2c0: i2c@235010000 {
+			compatible = "apple,t8020-i2c", "apple,i2c";
+			reg = <0x2 0x35010000 0x0 0x1000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 408 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c0_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_i2c0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c1: i2c@235014000 {
+			compatible = "apple,t8020-i2c", "apple,i2c";
+			reg = <0x2 0x35014000 0x0 0x1000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 409 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c1_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_i2c1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c2: i2c@235018000 {
+			compatible = "apple,t8020-i2c", "apple,i2c";
+			reg = <0x2 0x35018000 0x0 0x1000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 410 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c2_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_i2c2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c3: i2c@23501c000 {
+			compatible = "apple,t8020-i2c", "apple,i2c";
+			reg = <0x2 0x3501c000 0x0 0x1000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 411 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c3_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_i2c3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi1: spi@235104000 {
+			compatible = "apple,t8020-spi", "apple,t8010-spi", "apple,spi";
+			reg = <0x2 0x35104000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 396 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi3: spi@23510c000 {
+			compatible = "apple,t8020-spi", "apple,t8010-spi", "apple,spi";
+			reg = <0x2 0x3510c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 398 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@235200000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x35200000 0x0 0x4000>;
@@ -332,6 +412,26 @@
 				     <AIC_IRQ 99 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 100 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 101 IRQ_TYPE_LEVEL_HIGH>;
+
+			i2c0_pins: i2c0-pins {
+				pinmux = <APPLE_PINMUX(205, 1)>,
+					 <APPLE_PINMUX(204, 1)>;
+			};
+
+			i2c1_pins: i2c1-pins {
+				pinmux = <APPLE_PINMUX(9, 1)>,
+					 <APPLE_PINMUX(4, 1)>;
+			};
+
+			i2c2_pins: i2c2-pins {
+				pinmux = <APPLE_PINMUX(128, 1)>,
+					 <APPLE_PINMUX(120, 1)>;
+			};
+
+			i2c3_pins: i2c3-pins {
+				pinmux = <APPLE_PINMUX(11, 1)>,
+					 <APPLE_PINMUX(10, 1)>;
+			};
 		};
 
 		/* The always-on processor's GPIOs, 52 pins. */
