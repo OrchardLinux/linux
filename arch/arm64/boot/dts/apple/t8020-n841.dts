@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iPhone XR, N841 iPhone11,8 (A1984/A2105/A2106/A2107/A2108)
+ * Copyright (c) 2026, dr1408
+ */
+
+/dts-v1/;
+
+#include "t8020.dtsi"
+#include "t8020-common.dtsi"
+
+/ {
+	compatible = "apple,n841", "apple,t8020", "apple,arm-platform";
+	model = "Apple iPhone XR";
+	chassis-type = "handset";
+};
