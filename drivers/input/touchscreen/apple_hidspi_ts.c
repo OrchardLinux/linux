@@ -20,6 +20,12 @@
  * an all-zero packet (its CRC is valid) as a command and falls back to its
  * bootloader, so the host clocks out 0xff while it reads.
  *
+ * The iPhone X's firmware holds its interrupt line low for every packet and
+ * hands each one out once. The iPhone XR's hands out its newest packet on
+ * every read, again and again, and its line announces nothing: there a
+ * thread reads at the intervals of Project Cascadia's driver and tells a new
+ * packet from a repeated one by comparing.
+ *
  * Apple's firmware comes in variants ("personalities"), and each unit's ADT
  * names the one it needs. m1n1 passes that on as apple,hid-merge-personality;
  * the file is <firmware-name>-<personality>.bin. If it isn't there, the
@@ -41,6 +47,7 @@
 #include <linux/completion.h>
 #include <linux/crc16.h>
 #include <linux/delay.h>
+#include <linux/bitmap.h>
 #include <linux/cleanup.h>
 #include <linux/firmware.h>
 #include <linux/property.h>
@@ -50,6 +57,7 @@
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
 #include <linux/interrupt.h>
+#include <linux/kthread.h>
 #include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -75,6 +83,8 @@
 #define FINGERS_OFFSET		24
 #define TOUCH_STARTED		3
 #define TOUCH_MOVED		4
+#define TOUCH_LIFTED		7
+#define TOUCH_GONE		0
 #define MAX_SLOTS		10
 
 #define HBPP_ACK_TRIES		5
@@ -87,7 +97,14 @@
 #define HIDSPI_STATUS_LEN	(HIDSPI_PAD + 4)
 #define HIDSPI_STATUS_OK	0xd56827ac
 #define HIDSPI_STATUS_NAK	0x0e4fb139
+#define HIDSPI_PAD_WORD		0xdeadbeef	/* in front of the firmware's packets */
 #define RECOVER_AFTER		20
+/* Where the host reads unasked, as Project Cascadia's driver does: */
+#define POLL_IDLE_US		8000	/* between reads; a report takes 8 ms */
+#define POLL_ACTIVE_US		4000	/* the same, for ... */
+#define POLL_ACTIVE_MS		300	/* ... this long after a new packet */
+#define POLL_DRAIN		8	/* new packets taken without a pause */
+#define RELEASE_MS		60	/* no report for this long: fingers are up */
 #define MAX_SUPPLIES		3
 
 static const u8 hidspi_booted[4] = { 0xa0, 0x80, 0x00, 0x00 };
@@ -126,6 +143,8 @@ struct apple_hidspi_finger {
  * @cs_delay_us: MTFW "CS Delay"
  * @status_stage: HIDSPI packets are followed by the status stage
  * @idle_fill: what the host clocks out while it only reads
+ * @polled: the firmware repeats its newest packet on every read and its
+ *	interrupt line announces none: no interrupt is used, a thread reads
  * @max_x: largest X reported, unless the device tree gives the size
  * @max_y: largest Y reported, unless the device tree gives the size
  * @min_sx: left edge of the sensor, if the firmware sends no surface descriptor
@@ -144,6 +163,7 @@ struct ahts_variant {
 	u16 cs_delay_us;
 	bool status_stage;
 	u8 idle_fill;
+	bool polled;
 	unsigned int max_x, max_y;
 	s16 min_sx, max_sx, min_sy, max_sy;
 };
@@ -162,13 +182,17 @@ struct apple_hidspi_ts {
 	u8 *rx;
 	u8 *irq_tx;
 	u8 *irq_rx;
+	u8 *last;		/* the transfer before, where the host polls */
 	u8 *status;
 	u8 *pkt;
 	size_t pkt_size;
-	struct mutex lock;	/* requests, and exchanges with a status stage */
+	struct mutex lock;	/* requests, polled reads and their reload */
 	u8 msg_id;
 	bool powered;
 	bool input_ready;
+	struct task_struct *thread;
+	unsigned int fingers;	/* down in the last report */
+	DECLARE_BITMAP(prev, 256);	/* finger ids of the last report */
 	unsigned int bootloader_seen;
 	struct work_struct recover;
 	struct completion booted;
@@ -557,6 +581,7 @@ static int ahts_boot(struct apple_hidspi_ts *ts)
 	if (ret)
 		return dev_err_probe(dev, ret, "firmware load failed\n");
 	dev_info(dev, "firmware loaded (try %d)\n", try + 1);
+	memset(ts->last, 0, HIDSPI_XFER);
 	msleep(10);
 	return ahts_set_mode(ts, SPI_MODE_0);
 }
@@ -685,11 +710,60 @@ static unsigned int ahts_scale(int v, int lo, int hi, unsigned int max)
 	return clamp(n, 0L, (long)max);
 }
 
+static bool ahts_finger_on(const struct apple_hidspi_finger *f)
+{
+	return f->state == TOUCH_STARTED || f->state == TOUCH_MOVED;
+}
+
+static void ahts_finger(struct apple_hidspi_ts *ts,
+			const struct apple_hidspi_finger *f, bool on)
+{
+	struct input_dev *input = ts->input;
+	unsigned int x, y;
+	int slot;
+
+	slot = input_mt_get_slot_by_key(input, f->finger);
+	if (slot < 0)
+		return;
+	input_mt_slot(input, slot);
+	if (!input_mt_report_slot_state(input, MT_TOOL_FINGER, on))
+		return;
+	x = ahts_scale((s16)le16_to_cpu(f->abs_x), ts->min_x, ts->max_x,
+		       ts->props.max_x);
+	y = ahts_scale((s16)le16_to_cpu(f->abs_y), ts->min_y, ts->max_y,
+		       ts->props.max_y);
+	touchscreen_report_pos(input, &ts->props, x, ts->props.max_y - y, true);
+	input_report_abs(input, ABS_MT_TOUCH_MAJOR, le16_to_cpu(f->touch_major));
+	input_report_abs(input, ABS_MT_TOUCH_MINOR, le16_to_cpu(f->touch_minor));
+	input_report_abs(input, ABS_MT_WIDTH_MAJOR, le16_to_cpu(f->tool_major));
+	input_report_abs(input, ABS_MT_WIDTH_MINOR, le16_to_cpu(f->tool_minor));
+	input_report_abs(input, ABS_MT_ORIENTATION, (s16)le16_to_cpu(f->orientation));
+}
+
+/*
+ * A finger that is already up (lifted or gone) in the first report read of
+ * it: where reports are read rather than handed out one by one, a tap's down
+ * reports can pass unread.
+ */
+static bool ahts_finger_missed(struct apple_hidspi_ts *ts,
+			       const struct apple_hidspi_finger *f)
+{
+	int slot;
+
+	if ((f->state != TOUCH_LIFTED && f->state != TOUCH_GONE) ||
+	    test_bit(f->finger, ts->prev))
+		return false;
+	slot = input_mt_get_slot_by_key(ts->input, f->finger);
+	return slot >= 0 && !input_mt_is_active(&ts->input->mt->slots[slot]);
+}
+
 static void ahts_touch(struct apple_hidspi_ts *ts, const u8 *pl, size_t len)
 {
 	const struct apple_hidspi_finger *f;
 	struct input_dev *input = ts->input;
-	int i, nf, slot;
+	unsigned int on = 0;
+	bool missed = false;
+	int i, nf;
 
 	if (!ts->input_ready || len <= NUM_FINGERS_OFFSET)
 		return;
@@ -697,31 +771,36 @@ static void ahts_touch(struct apple_hidspi_ts *ts, const u8 *pl, size_t len)
 	if (len < FINGERS_OFFSET || nf > (len - FINGERS_OFFSET) / sizeof(*f))
 		return;
 	f = (const struct apple_hidspi_finger *)(pl + FINGERS_OFFSET);
-	for (i = 0; i < nf; i++) {
-		bool on = f[i].state == TOUCH_STARTED || f[i].state == TOUCH_MOVED;
-		unsigned int x, y;
+	if (nf)
+		dev_dbg(&ts->spi->dev, "frame: %d fingers, id %u state %u x %d y %d\n",
+			nf, f->finger, f->state, (s16)le16_to_cpu(f->abs_x),
+			(s16)le16_to_cpu(f->abs_y));
+	else
+		dev_dbg(&ts->spi->dev, "frame: no fingers\n");
 
-		slot = input_mt_get_slot_by_key(input, f[i].finger);
-		if (slot < 0)
-			continue;
-		input_mt_slot(input, slot);
-		if (!input_mt_report_slot_state(input, MT_TOOL_FINGER, on))
-			continue;
-		x = ahts_scale((s16)le16_to_cpu(f[i].abs_x), ts->min_x, ts->max_x,
-			       ts->props.max_x);
-		y = ahts_scale((s16)le16_to_cpu(f[i].abs_y), ts->min_y, ts->max_y,
-			       ts->props.max_y);
-		touchscreen_report_pos(input, &ts->props, x, ts->props.max_y - y,
-				       true);
-		input_report_abs(input, ABS_MT_TOUCH_MAJOR, le16_to_cpu(f[i].touch_major));
-		input_report_abs(input, ABS_MT_TOUCH_MINOR, le16_to_cpu(f[i].touch_minor));
-		input_report_abs(input, ABS_MT_WIDTH_MAJOR, le16_to_cpu(f[i].tool_major));
-		input_report_abs(input, ABS_MT_WIDTH_MINOR, le16_to_cpu(f[i].tool_minor));
-		input_report_abs(input, ABS_MT_ORIENTATION,
-				 (s16)le16_to_cpu(f[i].orientation));
+	if (ts->variant->polled) {
+		/* Such a tap goes down where it was lifted, then up below. */
+		for (i = 0; i < nf; i++)
+			missed |= ahts_finger_missed(ts, &f[i]);
+		if (missed) {
+			for (i = 0; i < nf; i++)
+				ahts_finger(ts, &f[i], ahts_finger_on(&f[i]) ||
+					    ahts_finger_missed(ts, &f[i]));
+			input_mt_sync_frame(input);
+			input_sync(input);
+		}
+		bitmap_zero(ts->prev, 256);
+		for (i = 0; i < nf; i++)
+			set_bit(f[i].finger, ts->prev);
+	}
+
+	for (i = 0; i < nf; i++) {
+		ahts_finger(ts, &f[i], ahts_finger_on(&f[i]));
+		on += ahts_finger_on(&f[i]);
 	}
 	input_mt_sync_frame(input);
 	input_sync(input);
+	ts->fingers = on;
 }
 
 /* The packet the interrupt announces, into irq_rx. */
@@ -729,10 +808,6 @@ static int ahts_read(struct apple_hidspi_ts *ts, bool *ok)
 {
 	int ret;
 
-	if (ts->variant->status_stage) {
-		guard(mutex)(&ts->lock);
-		return ahts_exchange(ts, ts->irq_tx, ts->irq_rx, ok);
-	}
 	ret = ahts_xfer(ts, ts->irq_tx, ts->irq_rx, HIDSPI_XFER);
 	if (ret)
 		return ret;
@@ -741,11 +816,128 @@ static int ahts_read(struct apple_hidspi_ts *ts, bool *ok)
 	return 0;
 }
 
+/* The valid packet in irq_rx. */
+static void ahts_handle(struct apple_hidspi_ts *ts)
+{
+	u8 *p = ts->irq_rx + HIDSPI_PAD, *m = p + 8;
+	size_t len, mlen;
+
+	len = get_unaligned_le16(p + 6);
+	if (len > HIDSPI_PKT - 10)
+		return;
+	dev_dbg(&ts->spi->dev, "packet %*ph\n", 24, p);
+
+	if (p[1] == HIDSPI_DEV_INFO && len == sizeof(hidspi_booted) &&
+	    !memcmp(m, hidspi_booted, len)) {
+		complete(&ts->booted);
+		return;
+	}
+	if (len < 10)
+		return;
+	mlen = get_unaligned_le16(m + 6);
+	if (mlen + 10 > len || !mlen)
+		return;
+
+	if (p[0] == HIDSPI_WRITE && m[0] == HIDSPI_MSG_GET_REPORT &&
+	    m[1] == SURFACE_REPORT && m[8] == SURFACE_REPORT)
+		ahts_surface(ts, m + 9, mlen - 1);
+	else if (p[0] == HIDSPI_READ && p[1] == HIDSPI_DEV_TOUCH &&
+		 m[0] == HIDSPI_MSG_INPUT && m[1] == TOUCH_REPORT)
+		ahts_touch(ts, m + 8, mlen);
+}
+
+/*
+ * One read where the host polls: 1 if it brought a new packet, 0 if the one
+ * before again, an error if what came is not a packet of the firmware (its
+ * padding is 0xdeadbeef; the bootloader answers with its status words there).
+ */
+static int ahts_poll(struct apple_hidspi_ts *ts)
+{
+	bool ok;
+	int ret;
+
+	guard(mutex)(&ts->lock);
+	/*
+	 * A plain read: with a status word after every packet read the
+	 * firmware hands out its boot message for ever.
+	 */
+	ret = ahts_read(ts, &ok);
+	if (ret)
+		return ret;
+	if (!ok || get_unaligned_le32(ts->irq_rx) != HIDSPI_PAD_WORD) {
+		dev_dbg(&ts->spi->dev, "read rejected: pad %*ph, packet %*ph\n",
+			HIDSPI_PAD, ts->irq_rx, 8, ts->irq_rx + HIDSPI_PAD);
+		return -EBADMSG;
+	}
+	ts->bootloader_seen = 0;
+	if (!memcmp(ts->irq_rx, ts->last, HIDSPI_XFER))
+		return 0;
+	memcpy(ts->last, ts->irq_rx, HIDSPI_XFER);
+	ahts_handle(ts);
+	return 1;
+}
+
+/* No report although fingers were down: their last reports passed unread. */
+static void ahts_release(struct apple_hidspi_ts *ts)
+{
+	guard(mutex)(&ts->lock);
+	input_mt_sync_frame(ts->input);
+	input_sync(ts->input);
+	ts->fingers = 0;
+}
+
+/* The firmware stopped answering: load it again, every 5 s until it runs. */
+static void ahts_reload(struct apple_hidspi_ts *ts)
+{
+	dev_warn(&ts->spi->dev, "controller stopped answering; reloading\n");
+	while (!kthread_should_stop()) {
+		scoped_guard(mutex, &ts->lock) {
+			ts->bootloader_seen = 0;
+			ahts_power_off(ts);
+			if (!ahts_boot(ts))
+				return;
+		}
+		msleep_interruptible(5000);
+	}
+}
+
+/*
+ * The iPhone XR's interrupt line (AOP pin 19) was measured not to move with
+ * this firmware, whatever waits in it; the ADT's function-set_int_config may
+ * be the step that is missing. Until that is known the reports are read on a
+ * timer, which costs these reads while nothing touches the screen.
+ */
+static int ahts_poll_thread(void *data)
+{
+	struct apple_hidspi_ts *ts = data;
+	unsigned long last = jiffies;
+	unsigned int n, us;
+	int ret = 0;
+
+	while (!kthread_should_stop()) {
+		for (n = 0; n < POLL_DRAIN; n++) {
+			ret = ahts_poll(ts);
+			if (ret <= 0)
+				break;
+			last = jiffies;
+		}
+		if (ret < 0 && ++ts->bootloader_seen >= RECOVER_AFTER) {
+			ahts_reload(ts);
+			continue;
+		}
+		if (ts->fingers &&
+		    time_after(jiffies, last + msecs_to_jiffies(RELEASE_MS)))
+			ahts_release(ts);
+		us = time_before(jiffies, last + msecs_to_jiffies(POLL_ACTIVE_MS)) ?
+		     POLL_ACTIVE_US : POLL_IDLE_US;
+		usleep_range(us, us + 500);
+	}
+	return 0;
+}
+
 static irqreturn_t ahts_irq(int irq, void *data)
 {
 	struct apple_hidspi_ts *ts = data;
-	u8 *p = ts->irq_rx + HIDSPI_PAD, *m = p + 8;
-	size_t len, mlen;
 	bool ok;
 
 	if (ahts_read(ts, &ok))
@@ -764,28 +956,7 @@ static irqreturn_t ahts_irq(int irq, void *data)
 		return IRQ_HANDLED;
 	}
 	ts->bootloader_seen = 0;
-	len = get_unaligned_le16(p + 6);
-	if (len > HIDSPI_PKT - 10)
-		return IRQ_HANDLED;
-	dev_dbg(&ts->spi->dev, "packet %*ph\n", 24, p);
-
-	if (p[1] == HIDSPI_DEV_INFO && len == sizeof(hidspi_booted) &&
-	    !memcmp(m, hidspi_booted, len)) {
-		complete(&ts->booted);
-		return IRQ_HANDLED;
-	}
-	if (len < 10)
-		return IRQ_HANDLED;
-	mlen = get_unaligned_le16(m + 6);
-	if (mlen + 10 > len || !mlen)
-		return IRQ_HANDLED;
-
-	if (p[0] == HIDSPI_WRITE && m[0] == HIDSPI_MSG_GET_REPORT &&
-	    m[1] == SURFACE_REPORT && m[8] == SURFACE_REPORT)
-		ahts_surface(ts, m + 9, mlen - 1);
-	else if (p[0] == HIDSPI_READ && p[1] == HIDSPI_DEV_TOUCH &&
-		 m[0] == HIDSPI_MSG_INPUT && m[1] == TOUCH_REPORT)
-		ahts_touch(ts, m + 8, mlen);
+	ahts_handle(ts);
 	return IRQ_HANDLED;
 }
 
@@ -807,6 +978,8 @@ static void ahts_power_off_action(void *data)
 {
 	struct apple_hidspi_ts *ts = data;
 
+	if (ts->thread)
+		kthread_stop(ts->thread);
 	cancel_work_sync(&ts->recover);
 	ahts_power_off(ts);
 }
@@ -841,8 +1014,10 @@ static int ahts_probe(struct spi_device *spi)
 	ts->rx = devm_kzalloc(dev, HIDSPI_XFER + 16, GFP_KERNEL);
 	ts->irq_tx = devm_kzalloc(dev, HIDSPI_XFER, GFP_KERNEL);
 	ts->irq_rx = devm_kzalloc(dev, HIDSPI_XFER, GFP_KERNEL);
+	ts->last = devm_kzalloc(dev, HIDSPI_XFER, GFP_KERNEL);
 	ts->status = devm_kzalloc(dev, 2 * HIDSPI_STATUS_LEN, GFP_KERNEL);
-	if (!ts->tx || !ts->rx || !ts->irq_tx || !ts->irq_rx || !ts->status)
+	if (!ts->tx || !ts->rx || !ts->irq_tx || !ts->irq_rx || !ts->last ||
+	    !ts->status)
 		return -ENOMEM;
 	memset(ts->irq_tx, v->idle_fill, HIDSPI_XFER);
 
@@ -902,10 +1077,19 @@ static int ahts_probe(struct spi_device *spi)
 	if (ret)
 		return ret;
 
-	ret = devm_request_threaded_irq(dev, spi->irq, NULL, ahts_irq,
-					IRQF_ONESHOT, "apple-hidspi-ts", ts);
-	if (ret)
-		return dev_err_probe(dev, ret, "no IRQ\n");
+	if (v->polled) {
+		ts->thread = kthread_run(ahts_poll_thread, ts, "apple-hidspi-ts");
+		if (IS_ERR(ts->thread)) {
+			ret = PTR_ERR(ts->thread);
+			ts->thread = NULL;
+			return ret;
+		}
+	} else {
+		ret = devm_request_threaded_irq(dev, spi->irq, NULL, ahts_irq,
+						IRQF_ONESHOT, "apple-hidspi-ts", ts);
+		if (ret)
+			return dev_err_probe(dev, ret, "no IRQ\n");
+	}
 	if (!wait_for_completion_timeout(&ts->booted, msecs_to_jiffies(1000)))
 		dev_warn(dev, "no boot message from the firmware\n");
 	if (ahts_request(ts, HIDSPI_DEV_TOUCH, HIDSPI_MSG_GET_REPORT,
@@ -951,8 +1135,9 @@ static const struct ahts_variant ahts_d221 = {
  * which runs this controller: blobs of at most 0x3f0 bytes, 20 ms before each
  * acknowledge, a 300 us CS delay, 0xff while reading and the status stage.
  * The bootloader answers in SPI mode 3, as the iPhone X's; in mode 0 its
- * words arrive shifted by one bit. The panel has 828 x 1792 pixels; the
- * sensor's edges come from the firmware's surface descriptor only.
+ * words arrive shifted by one bit. The panel has 828 x 1792 pixels. Measured
+ * on an n841: every read returns the newest packet again, and the interrupt
+ * line stays low with the boot message, a reply or touch reports waiting.
  */
 static const struct ahts_variant ahts_n841 = {
 	.name = "Apple iPhone XR Touchscreen",
@@ -964,8 +1149,14 @@ static const struct ahts_variant ahts_n841 = {
 	.cs_delay_us = 300,
 	.status_stage = true,
 	.idle_fill = 0xff,
+	.polled = true,
 	.max_x = 827,
 	.max_y = 1791,
+	/* What the firmware's surface descriptor gives on an iPhone XR. */
+	.min_sx = -226,
+	.max_sx = 6223,
+	.min_sy = -228,
+	.max_sy = 13739,
 };
 
 static const struct of_device_id ahts_of_match[] = {

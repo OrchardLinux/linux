@@ -30,6 +30,7 @@ allOf:
         core-supply: false
         clken-supply: false
       required:
+        - interrupts
         - ana-supply
         - clocks
     else:
@@ -52,6 +53,11 @@ properties:
 
   interrupts:
     maxItems: 1
+    description:
+      The controller's interrupt line, low while a packet waits on the
+      iPhone X. Not used on the iPhone XR: its line (AOP pin 19) was measured
+      not to move for the firmware's boot message, replies or touch reports,
+      so the driver reads on a timer there.
 
   reset-gpios:
     maxItems: 1
@@ -100,7 +106,6 @@ patternProperties:
 required:
   - compatible
   - reg
-  - interrupts
   - reset-gpios
   - firmware-name
   - apple,hid-merge-personality
