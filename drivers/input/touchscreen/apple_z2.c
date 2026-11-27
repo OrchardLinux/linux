@@ -1117,7 +1117,7 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 			 * late, leaving only the low checksum byte.
 			 */
 			if (!z2->info->shifted_reply_header ||
-			    z2->rx_buf[0] > 1 ||
+			    z2->rx_buf[0] > 3 ||
 			    z2->rx_buf[1] != APPLE_Z2_REPLY_INTERRUPT_DATA)
 				return -EBADMSG;
 			for (i = 1; i < APPLE_Z2_CMD_SIZE - 1; i++)
@@ -5073,8 +5073,8 @@ static const struct apple_z2_chip_info apple_z2_j81_info = {
  * "AppleMultitouchSPI - J96" in iPadOS 15.8.3). It overrides the same two
  * N1 defaults as the iPad 5's C1F15,1 with the same values, fll-mval
  * 0x17c9 and clk32-clock-enable 1, and loads the same calibration size
- * at the same addresses with the same entry point. Its family, sensor
- * and surface reports have not been read yet.
+ * at the same addresses with the same entry point. On a J96 it reports
+ * family 20, a 32x24 sensor and a 11980x15974 surface.
  */
 static const struct apple_z2_n1_info apple_z2_j96_n1 = {
 	.calib_regs = apple_z2_j71t_calib_regs,
@@ -5090,6 +5090,11 @@ static const struct apple_z2_n1_info apple_z2_j96_n1 = {
 	.device_info_attempts = 4,
 	.device_info_retry_us = 3000,
 	.interface = 1,
+	.family = 20,
+	.rows = 32,
+	.columns = 24,
+	.surface_width = 11980,
+	.surface_height = 15974,
 };
 
 /* The iPad 5's N1 runtime, SPI timing and power sequence. */
@@ -5099,6 +5104,7 @@ static const struct apple_z2_chip_info apple_z2_j96_info = {
 	.cs_setup_us = 10,
 	.cs_hold_us = 10,
 	.n1 = &apple_z2_j96_n1,
+	.shifted_reply_header = true,
 };
 
 /*
