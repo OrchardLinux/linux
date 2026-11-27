@@ -15,10 +15,14 @@
 	chassis-type = "tablet";
 
 	/*
-	 * The speakers: the CS42L81 on SPI3 (control) and MCA0 (data), as in
-	 * Apple's /arm-io/spi3/audio-codec and /arm-io/mca0/audio-codec, the
-	 * same in the J71, J72 and J73 trees. The codec drives both speakers
-	 * as one stereo pair. Headphones and microphones are not described
+	 * The speakers and the built-in microphones: the CS42L81 on SPI3
+	 * (control) and MCA0 (data), as in Apple's /arm-io/spi3/audio-codec
+	 * and /arm-io/mca0/audio-codec. The codec drives both speakers as one
+	 * stereo pair. The two microphones are digital ones on the codec's
+	 * DMIC1 pair: the audio-codec node names them dmic1a-intmic ("imic")
+	 * and dmic1b-intmic ("smic"), the same in the J71 and J72 trees and
+	 * the same pair the iPad 5 records from. Headphones (ADT hpout-hp,
+	 * with the headset switches ext_sw1 and ext_sw2) are not described
 	 * yet.
 	 */
 	sound {
@@ -27,8 +31,11 @@
 		simple-audio-card,format = "i2s";
 		simple-audio-card,bitclock-master = <&codec_dai>;
 		simple-audio-card,frame-master = <&codec_dai>;
-		simple-audio-card,widgets = "Speaker", "Speakers";
-		simple-audio-card,routing = "Speakers", "SPKOUT";
+		simple-audio-card,widgets = "Speaker", "Speakers",
+					    "Microphone", "Internal Mic";
+		simple-audio-card,routing = "Speakers", "SPKOUT",
+					    "DMIC1A", "Internal Mic",
+					    "DMIC1B", "Internal Mic";
 		simple-audio-card,pin-switches = "Speakers";
 
 		simple-audio-card,cpu {
