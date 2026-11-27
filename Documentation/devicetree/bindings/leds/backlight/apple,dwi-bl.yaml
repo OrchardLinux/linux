@@ -29,6 +29,7 @@ properties:
           - apple,s8000-dwi-bl
           - apple,t8010-dwi-bl
           - apple,t8015-dwi-bl
+          - apple,t8020-dwi-bl
       - const: apple,dwi-bl
 
   reg:

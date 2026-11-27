@@ -572,6 +572,18 @@
 			reg = <0x2 0x3d200000 0 0x8c000>;
 		};
 
+		/*
+		 * The backlight level goes out over DWI. Only the devices
+		 * with an LCD have a backlight on it; the OLED phones set
+		 * their brightness at the panel.
+		 */
+		dwi_bl: backlight@23b200080 {
+			compatible = "apple,t8020-dwi-bl", "apple,dwi-bl";
+			reg = <0x2 0x3b200080 0x0 0x8>;
+			power-domains = <&ps_dwi>;
+			status = "disabled";
+		};
+
 		wdt: watchdog@23d2b0000 {
 			compatible = "apple,t8020-wdt", "apple,wdt";
 			reg = <0x2 0x3d2b0000 0x0 0x4000>;
