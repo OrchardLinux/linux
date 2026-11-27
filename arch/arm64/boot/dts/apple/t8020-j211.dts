@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iPad mini 5 (Cellular), J211 iPad11,2
+ * Copyright (c) 2026, Henrik Klee <henrik@goat-code.com>
+ */
+
+/dts-v1/;
+
+#include "t8020.dtsi"
+#include "t8020-common.dtsi"
+
+/ {
+	compatible = "apple,j211", "apple,t8020", "apple,arm-platform";
+	model = "Apple iPad mini 5 (Cellular)";
+	chassis-type = "tablet";
+};
