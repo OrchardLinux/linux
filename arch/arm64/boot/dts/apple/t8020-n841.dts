@@ -15,6 +15,67 @@
 	chassis-type = "handset";
 };
 
+/ {
+	/* The loader copies the ADT's touch calibration and firmware variant here. */
+	aliases {
+		touchscreen0 = &touchscreen;
+	};
+};
+
+/* The display PMU, ADT "display-pmu,chestnut". */
+&i2c2 {
+	status = "okay";
+
+	pmic@27 {
+		compatible = "apple,chestnut-pmic";
+		reg = <0x27>;
+
+		/* ADT multi-touch function-power_ana = dpLE(0x302) */
+		touch_hv: regulator-touch-hv {
+			compatible = "apple,chestnut-touch-hv-regulator";
+		};
+	};
+};
+
+&smc {
+	regulators {
+		compatible = "apple,t8020-smc-regulator";
+
+		/* ADT multi-touch function-power_ldo = pKW4('rBK3', 0x5020000) */
+		touch_core: touch-core {
+			regulator-name = "touch-core";
+		};
+
+		/* ADT multi-touch function-clock_enable = pKW4('gP00', 0x8000000) */
+		touch_clken: touch-clock {
+			regulator-name = "touch-clock";
+		};
+	};
+};
+
+/*
+ * The touch controller (ADT /arm-io/spi1/multi-touch, "hid-transport,spi"):
+ * chip select on AP GPIO 67, reset on 5, interrupt on AOP GPIO 19.
+ */
+&spi1 {
+	cs-gpios = <&pinctrl_ap 67 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,n841-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		interrupts-extended = <&pinctrl_aop 19 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&pinctrl_ap 5 GPIO_ACTIVE_LOW>;
+		hv-supply = <&touch_hv>;
+		core-supply = <&touch_core>;
+		clken-supply = <&touch_clken>;
+		firmware-name = "apple/n841-touch";
+		touchscreen-size-x = <828>;
+		touchscreen-size-y = <1792>;
+	};
+};
+
 /*
  * Wi-Fi (ADT /arm-io/apcie/pci-bridge2/wlan and /arm-io/uart2/wlan): a
  * BCM4357 on PCIe port 2 behind dart-apcie2, PERST# on AP GPIO 106, CLKREQ#
