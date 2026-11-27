@@ -29,6 +29,7 @@ select:
           - apple,s5l8960x-usb-complex
           - apple,t8011-usb-complex
           - apple,t8015-usb-complex
+          - apple,t8020-usb-complex
   required:
     - compatible
 
@@ -47,6 +48,7 @@ properties:
               - apple,s5l8960x-usb-complex
               - apple,t8011-usb-complex
               - apple,t8015-usb-complex
+              - apple,t8020-usb-complex
           - const: simple-pm-bus
 
   reg:

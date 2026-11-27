@@ -291,6 +291,13 @@ properties:
           - const: apple,t8015
           - const: apple,arm-platform
 
+      - description: Apple A12 SoC based platforms
+        items:
+          - enum:
+              - apple,n841 # iPhone XR
+          - const: apple,t8020
+          - const: apple,arm-platform
+
       - description: Apple M1 SoC based platforms
         items:
           - enum:

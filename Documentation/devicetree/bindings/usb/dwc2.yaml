@@ -76,6 +76,7 @@ properties:
               - apple,t7000-dwc2
               - apple,t8010-dwc2
               - apple,t8015-dwc2
+              - apple,t8020-dwc2
           - const: apple,dwc2
 
   reg:
