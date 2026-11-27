@@ -45,6 +45,7 @@ properties:
       - items:
           - enum:
               - apple,agnes-pmic
+              - apple,d2542-pmic
               - apple,calpe-pmic
           - const: apple,spmi-pmic
       - enum:

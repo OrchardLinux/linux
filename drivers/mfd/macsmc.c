@@ -526,6 +526,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8012-smc", .data = (void*)SMC_TYPE_T8012 },
 	{ .compatible = "apple,t8015-smc", .data = (void*)SMC_TYPE_T8015 },
+	{ .compatible = "apple,t8020-smc", .data = (void*)SMC_TYPE_T8015 },
 	{ .compatible = "apple,t8103-smc", .data = (void*)SMC_TYPE_T8103 },
 	{ .compatible = "apple,smc", .data = (void*)SMC_TYPE_T8103 },
 	{},
