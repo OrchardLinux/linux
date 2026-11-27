@@ -308,7 +308,8 @@
 		};
 
 		serial0: serial@235200000 {
-			compatible = "apple,s5l-uart";
+			compatible = "apple,t8020-uart", "apple,t8010-uart",
+				     "apple,s5l-uart";
 			reg = <0x2 0x35200000 0x0 0x4000>;
 			reg-io-width = <4>;
 			interrupt-parent = <&aic>;
@@ -320,7 +321,8 @@
 		};
 
 		serial1: serial@235204000 {
-			compatible = "apple,s5l-uart";
+			compatible = "apple,t8020-uart", "apple,t8010-uart",
+				     "apple,s5l-uart";
 			reg = <0x2 0x35204000 0x0 0x4000>;
 			reg-io-width = <4>;
 			interrupt-parent = <&aic>;
