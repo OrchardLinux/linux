@@ -442,6 +442,13 @@ static void __exception_irq_entry aic_handle_irq(struct pt_regs *regs)
 	}
 }
 
+/*
+ * AIC numbers the CPUs itself, and not always as the kernel does: the A12
+ * starts on its first performance core, which is logical CPU 0 but not AIC's
+ * CPU 0. Each CPU reads its AIC number from AIC_WHOAMI when it comes up.
+ */
+static DEFINE_PER_CPU(u32, aic_cpu_index);
+
 static int aic_irq_set_affinity(struct irq_data *d,
 				const struct cpumask *mask_val, bool force)
 {
@@ -456,7 +463,8 @@ static int aic_irq_set_affinity(struct irq_data *d,
 	else
 		cpu = cpumask_any_and(mask_val, cpu_online_mask);
 
-	aic_ic_write(ic, ic->info.target_cpu + AIC_HWIRQ_IRQ(hwirq) * 4, BIT(cpu));
+	aic_ic_write(ic, ic->info.target_cpu + AIC_HWIRQ_IRQ(hwirq) * 4,
+		     BIT(per_cpu(aic_cpu_index, cpu)));
 	irq_data_update_effective_affinity(d, cpumask_of(cpu));
 
 	return IRQ_SET_MASK_OK;
@@ -892,12 +900,7 @@ static int aic_init_cpu(unsigned int cpu)
 	isb();
 
 	if (aic_irqc->info.version == 1) {
-		/*
-		 * Make sure the kernel's idea of logical CPU order is the same as AIC's
-		 * If we ever end up with a mismatch here, we will have to introduce
-		 * a mapping table similar to what other irqchip drivers do.
-		 */
-		WARN_ON(aic_ic_read(aic_irqc, AIC_WHOAMI) != smp_processor_id());
+		__this_cpu_write(aic_cpu_index, aic_ic_read(aic_irqc, AIC_WHOAMI));
 
 		/*
 		 * Always keep IPIs unmasked at the hardware level (except auto-masking
@@ -1070,15 +1073,28 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	set_handle_irq(aic_handle_irq);
 	set_handle_fiq(aic_handle_fiq);
 
+	/* A CPU that has not come up yet is taken to be numbered as the kernel does. */
+	for_each_possible_cpu(i)
+		per_cpu(aic_cpu_index, i) = i;
+
 	off = 0;
 	for (die = 0; die < irqc->nr_die; die++) {
 		for (i = 0; i < BITS_TO_U32(irqc->nr_irq); i++)
 			aic_ic_write(irqc, irqc->info.mask_set + off + i * 4, U32_MAX);
 		for (i = 0; i < BITS_TO_U32(irqc->nr_irq); i++)
 			aic_ic_write(irqc, irqc->info.sw_clr + off + i * 4, U32_MAX);
-		if (irqc->info.target_cpu)
+		/*
+		 * Route every interrupt to the boot CPU. The target is a mask
+		 * over AIC's CPU numbers, not the kernel's.
+		 */
+		if (irqc->info.target_cpu) {
+			u32 self = BIT(aic_ic_read(irqc, AIC_WHOAMI));
+
 			for (i = 0; i < irqc->nr_irq; i++)
-				aic_ic_write(irqc, irqc->info.target_cpu + off + i * 4, 1);
+				aic_ic_write(irqc,
+					     irqc->info.target_cpu + off + i * 4,
+					     self);
+		}
 		off += irqc->info.die_stride;
 	}
 
