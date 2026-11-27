@@ -352,6 +352,7 @@ struct brcmf_pciedev_info {
 	wait_queue_head_t mbdata_resp_wait;
 	bool mbdata_completed;
 	bool reload_on_resume;
+	bool reload_queued;
 	bool irq_allocated;
 	bool wowl_enabled;
 	u8 dma_idx_sz;
@@ -2715,6 +2716,43 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 #ifdef CONFIG_PM
 
+/*
+ * A chip whose firmware did not acknowledge HOST_D3_INFORM once is not asked
+ * again: the 2 s wait would hold up every later suspend.
+ */
+static u32 brcmf_pcie_d3_unacked_chip;
+
+struct brcmf_pcie_reload {
+	struct work_struct work;
+	struct pci_dev *pdev;
+};
+
+/* Loading the firmware again takes most of a second; resume does not wait. */
+static void brcmf_pcie_reload_work(struct work_struct *work)
+{
+	struct brcmf_pcie_reload *r = container_of(work, struct brcmf_pcie_reload,
+						   work);
+	struct pci_dev *pdev = r->pdev;
+	struct brcmf_bus *bus;
+	int err;
+
+	device_lock(&pdev->dev);
+	bus = dev_get_drvdata(&pdev->dev);
+	if (bus && bus->bus_priv.pcie->devinfo->reload_on_resume) {
+		struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+
+		brcmf_chip_detach(devinfo->ci);
+		devinfo->ci = NULL;
+		brcmf_pcie_remove(pdev);
+		err = brcmf_pcie_probe(pdev, NULL);
+		if (err)
+			__brcmf_err(NULL, __func__,
+				    "probe after resume failed, err=%d\n", err);
+	}
+	device_unlock(&pdev->dev);
+	pci_dev_put(pdev);
+	kfree(r);
+}
 
 static int brcmf_pcie_pm_enter_D3(struct device *dev)
 {
@@ -2730,14 +2768,22 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	if (!pci_device_is_present(devinfo->pdev))
 		return 0;
 
+	/* Still stopped from the last sleep: the reload has not run yet. */
+	if (devinfo->reload_on_resume)
+		return 0;
+
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
 	devinfo->mbdata_completed = false;
-	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
-
-	wait_event_timeout(devinfo->mbdata_resp_wait, devinfo->mbdata_completed,
-			   BRCMF_PCIE_MBDATA_TIMEOUT);
+	if (devinfo->ci->chip != brcmf_pcie_d3_unacked_chip) {
+		brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
+		wait_event_timeout(devinfo->mbdata_resp_wait,
+				   devinfo->mbdata_completed,
+				   BRCMF_PCIE_MBDATA_TIMEOUT);
+		if (!devinfo->mbdata_completed)
+			brcmf_pcie_d3_unacked_chip = devinfo->ci->chip;
+	}
 	if (!devinfo->mbdata_completed) {
 		/*
 		 * Some firmware (the BCM4357 in the iPhone XR) never
@@ -2788,8 +2834,9 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	 */
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
 
+	/* Loaded again from brcmf_pcie_pm_complete(), once resume is over. */
 	if (devinfo->reload_on_resume)
-		goto cleanup;
+		return 0;
 
 	/* Check if device is still up and running, if so we are ready */
 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
@@ -2820,9 +2867,34 @@ cleanup:
 }
 
 
+/*
+ * The reload takes the device lock, which the PM core holds for this device
+ * until its complete step; started earlier, it would hold up resume.
+ */
+static void brcmf_pcie_pm_complete(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo;
+	struct brcmf_pcie_reload *r;
+
+	if (!bus)
+		return;
+	devinfo = bus->bus_priv.pcie->devinfo;
+	if (!devinfo->reload_on_resume || devinfo->reload_queued)
+		return;
+	r = kzalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return;
+	INIT_WORK(&r->work, brcmf_pcie_reload_work);
+	r->pdev = pci_dev_get(devinfo->pdev);
+	devinfo->reload_queued = true;
+	queue_work(system_unbound_wq, &r->work);
+}
+
 static const struct dev_pm_ops brcmf_pciedrvr_pm = {
 	.suspend = brcmf_pcie_pm_enter_D3,
 	.resume = brcmf_pcie_pm_leave_D3,
+	.complete = brcmf_pcie_pm_complete,
 	.freeze = brcmf_pcie_pm_enter_D3,
 	.restore = brcmf_pcie_pm_leave_D3,
 };
