@@ -303,6 +303,13 @@ static void dwc2_set_stm32mp15_hsotg_params(struct dwc2_hsotg *hsotg)
 	p->hird_threshold_en = false;
 }
 
+/* Boards whose charger wakes the system when the Lightning source goes away */
+static const char *const dwc2_wake_on_unplug[] = {
+	"apple,j71", "apple,j72", "apple,j73",
+	"apple,j85", "apple,j86", "apple,j87",
+	NULL
+};
+
 static void dwc2_set_apple_silicon_params(struct dwc2_hsotg *hsotg)
 {
 	struct dwc2_core_params *p = &hsotg->params;
@@ -315,6 +322,13 @@ static void dwc2_set_apple_silicon_params(struct dwc2_hsotg *hsotg)
 	 * for power-off and restart, never for sleep.
 	 */
 	p->s2idle_keep_session = true;
+	/*
+	 * The iPad Air and iPad mini 2 wake when their Lightning source
+	 * disappears.  The session is no longer valid then, so use the
+	 * normal disconnect and reset path.
+	 */
+	if (of_machine_compatible_match(dwc2_wake_on_unplug))
+		p->s2idle_keep_session = false;
 	p->g_rx_fifo_size = 539;
 	p->host_nperio_tx_fifo_size = 16;
 	p->g_np_tx_fifo_size = 16;
