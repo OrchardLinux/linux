@@ -176,13 +176,13 @@
 		gpio-controller;
 		#gpio-cells = <2>;
 		/*
-		 * Of the 17 lines only the Smart Cover hall sensors, 10 and
-		 * 12, are exposed. The others stay as iBoot left them: the
-		 * Bluetooth power enable (2), the Wi-Fi reset (3, apple-a7-wlan
+		 * Of the 17 lines only the Bluetooth power enable (2) and the
+		 * Smart Cover hall sensors, 10 and 12, are exposed. The others
+		 * stay as iBoot left them: the Wi-Fi reset (3, apple-a7-wlan
 		 * owns it), the battery gauge (5) and, on the cellular boards,
 		 * the baseband's (4, 8, 16), by Apple's device trees.
 		 */
-		gpio-reserved-ranges = <0 10>, <11 1>, <13 4>;
+		gpio-reserved-ranges = <0 2>, <3 7>, <11 1>, <13 4>;
 	};
 
 	/*
@@ -260,6 +260,40 @@
 	};
 };
 
+
+/*
+ * The BCM4324B5's Bluetooth on UART1, from the bluetooth node below
+ * /arm-io/uart1 in the J71, J72 and J73 device trees, which agree:
+ * power enable on the D2089's GPIO 2, BT_WAKE on AP GPIO 7, H4 at a
+ * transport-speed of 3 Mbit/s. The controller starts at 115,200 baud,
+ * where the Patchram loads; hci_bcm then switches the link to 1.5 Mbit/s,
+ * the fastest the A7 UART reaches exactly from its 24 MHz reference with
+ * 16x oversampling. The ADT names no host wake line; the D2089's PMU
+ * event 7 is named "bluetooth" and is not used.
+ * m1n1 adds the device address through the bluetooth0 alias.
+ */
+/ {
+	aliases {
+		bluetooth0 = &bluetooth;
+		serial1 = &serial1;
+		serial5 = &serial5;
+	};
+};
+
+&serial1 {
+	pinctrl-0 = <&uart1_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "apple,s5l8960x-bcm4324b5-bt";
+		current-speed = <115200>;
+		max-speed = <1500000>;
+		shutdown-gpios = <&pmu_events 2 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl 7 GPIO_ACTIVE_HIGH>;
+	};
+};
 
 /*
  * The touchscreen: an N1 on SPI2, the same in the J71, J72 and J73 device

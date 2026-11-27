@@ -39,6 +39,7 @@ properties:
           - apple,j81-bcm4350c2-bt
           - apple,n66-bcm4350c5-bt
           - apple,n102-bcm4345b1-bt
+          - apple,s5l8960x-bcm4324b5-bt
           - brcm,bcm20702a1
           - brcm,bcm4329-bt
           - brcm,bcm4330-bt

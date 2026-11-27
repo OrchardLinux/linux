@@ -1971,6 +1971,15 @@ static struct bcm_device_data bcm4355_j172_device_data = {
 	.fixup_le_adv_report_evt_type = true,
 };
 
+/*
+ * The A7 iPads' BCM4324B5 reports legacy advertising with reserved bits set
+ * in the event type (0x10, 0x13, 0x14, 0x20, 0x22-0x24 seen on a J71), as
+ * the iPad 6's BCM4355C1 does.
+ */
+static struct bcm_device_data bcm4324b5_a7_device_data = {
+	.fixup_le_adv_report_evt_type = true,
+};
+
 static struct bcm_device_data bcm43438_device_data = {
 	.drive_rts_on_open = true,
 };
@@ -2003,6 +2012,9 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
 	{ .compatible = "apple,n66-bcm4350c5-bt" },
 	/* The iPod touch 6 BCM4345B1 uses the plain sequence at 115,200 baud. */
 	{ .compatible = "apple,n102-bcm4345b1-bt" },
+	/* The A7 iPads' BCM4324B5: the plain sequence, Patchram at 115,200 baud. */
+	{ .compatible = "apple,s5l8960x-bcm4324b5-bt",
+	  .data = &bcm4324b5_a7_device_data },
 	{ .compatible = "apple,j120-bcm4355c0-bt",
 	  .data = &bcm4355c0_ipad_pro2_device_data },
 	{ .compatible = "apple,j121-bcm4355c0-bt",
