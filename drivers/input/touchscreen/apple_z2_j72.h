@@ -15,12 +15,28 @@
 #define APPLE_Z2_J72_MAX_PAYLOAD 2454
 #define APPLE_Z2_J72_RECOVERIES 6
 #define APPLE_Z2_J72_RECOVERY_MS 60000ULL
+/* Refused reports in a row before the controller is reset. */
+#define APPLE_Z2_J72_LAYOUT_DROPS 8
+/* Supplies stay off this long before a reset boots the controller again. */
+#define APPLE_Z2_J72_RESET_DELAY_MS 500
 
 struct apple_z2_j72_contact {
 	u8 id;
 	u8 state;
 	s16 x;
 	s16 y;
+};
+
+/*
+ * The check behind the last J72 fault: a name, two values whose meaning
+ * depends on it, and the first bytes of the reply it refused.
+ */
+struct apple_z2_j72_fault {
+	const char *why;
+	unsigned int a;
+	unsigned int b;
+	u8 raw[16];
+	u8 len;
 };
 
 struct apple_z2_j72_recovery {
@@ -61,20 +77,27 @@ static inline int apple_z2_j72_length(const u8 *p, u16 *length)
 	return 0;
 }
 
-static inline bool apple_z2_j72_packet(const u8 *p, size_t len)
+/* NULL for a whole EA/EB report, else the check it fails. */
+static inline const char *apple_z2_j72_packet_fault(const u8 *p, size_t len)
 {
 	unsigned int header = 0;
 	unsigned int i;
 	u16 inner;
 
-	if (len < 7 || len > APPLE_Z2_J72_MAX_PAYLOAD + 5 ||
-	    (p[0] != 0xea && p[0] != 0xeb))
-		return false;
+	if (len < 7 || len > APPLE_Z2_J72_MAX_PAYLOAD + 5)
+		return "eb-size";
+	if (p[0] != 0xea && p[0] != 0xeb)
+		return "eb-type";
 	for (i = 0; i < 5; i++)
 		header += p[i];
+	if (header & 0xff)
+		return "eb-header-sum";
 	inner = get_unaligned_le16(p + 2);
-	return !(header & 0xff) && inner >= 2 && (size_t)inner + 5 == len &&
-	       apple_z2_j72_checksum(p + 5, inner);
+	if (inner < 2 || (size_t)inner + 5 != len)
+		return "eb-inner-length";
+	if (!apple_z2_j72_checksum(p + 5, inner))
+		return "eb-checksum";
+	return NULL;
 }
 
 /* Validate the whole native report before the caller changes any input slot. */
@@ -94,6 +117,7 @@ static inline int apple_z2_j72_contacts(const u8 *p, size_t len,
 		return -EMSGSIZE;
 	for (i = 0; i < n; i++) {
 		contact = p + 24 + i * 30;
+		/* Only 3 and 4 touch; 6 sits between 5 and 7 around a lift. */
 		switch (contact[1]) {
 		case 0:
 		case 1:
@@ -101,6 +125,7 @@ static inline int apple_z2_j72_contacts(const u8 *p, size_t len,
 		case 3:
 		case 4:
 		case 5:
+		case 6:
 		case 7:
 			break;
 		default:
