@@ -12,7 +12,8 @@ maintainers:
 description:
   Fixed touchscreen supply switches provided by the D2089, D2186, D2207, Adelyn,
   Angel, August, Chestnut and Acorn PMICs. The compatible identifies both the PMIC and the physical supply;
-  register layout is an implementation detail of the regulator driver.
+  register layout is an implementation detail of the regulator driver. The
+  D2089 also switches the supplies of the A7 iPads' M7 motion coprocessor.
 
 allOf:
   - $ref: regulator.yaml#
@@ -26,6 +27,9 @@ properties:
       - apple,antigua-touch-core-regulator
       - apple,august-touch-analog-regulator
       - apple,chestnut-touch-hv-regulator
+      - apple,d2089-oscar-core-regulator
+      - apple,d2089-oscar-io-regulator
+      - apple,d2089-oscar-sensors-regulator
       - apple,d2089-touch-analog-regulator
       - apple,d2089-touch-core-regulator
       - apple,d2186-touch-core-regulator

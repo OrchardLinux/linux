@@ -65,6 +65,49 @@ static const struct regulator_desc apple_d2089_touch_core = {
 };
 
 /*
+ * D2089 supplies of the M7 motion coprocessor on the A7 iPads (Apple's
+ * /arm-io/uart4/oscar): oscar_power1 pmuL(0x212), LDO index 18, and
+ * oscar_power2 pmuL(0x214), LDO index 20, are enable-only switches at
+ * register 0x85 bits 2 and 5; sensor_power pmuL(0x202), LDO index 2 (LDO3),
+ * is register 0x82 bit 3. iOS 12.5.8's D2089 LDO table (_setLDO at
+ * 0xfffffff008689bb8, 12-byte entries at 0xfffffff00715b848) gives these;
+ * the same table gives the two touchscreen supplies above. iOS never sets
+ * the LDO3 voltage (enable only), so neither does this driver.
+ */
+static const struct regulator_desc apple_d2089_oscar_core = {
+	.name = "d2089-oscar-core",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x85,
+	.enable_mask = 0x04,
+	.enable_val = 0x04,
+	.disable_val = 0,
+};
+
+static const struct regulator_desc apple_d2089_oscar_io = {
+	.name = "d2089-oscar-io",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x85,
+	.enable_mask = 0x20,
+	.enable_val = 0x20,
+	.disable_val = 0,
+};
+
+static const struct regulator_desc apple_d2089_oscar_sensors = {
+	.name = "d2089-oscar-sensors",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x82,
+	.enable_mask = 0x08,
+	.enable_val = 0x08,
+	.disable_val = 0,
+};
+
+/*
  * August (D2400, J120) pmuL(0x30c) encodes LDO index 12 and options 3,
  * not a register address. In iPadOS 17.7.11 (21H461), _setLDO at
  * 0xfffffff0064bd8b0 indexes 12-byte entries at 0xfffffff005551a54.
@@ -265,6 +308,18 @@ static const struct of_device_id apple_pmic_touch_regulator_of_match[] = {
 	{
 		.compatible = "apple,d2089-touch-core-regulator",
 		.data = &apple_d2089_touch_core,
+	},
+	{
+		.compatible = "apple,d2089-oscar-core-regulator",
+		.data = &apple_d2089_oscar_core,
+	},
+	{
+		.compatible = "apple,d2089-oscar-io-regulator",
+		.data = &apple_d2089_oscar_io,
+	},
+	{
+		.compatible = "apple,d2089-oscar-sensors-regulator",
+		.data = &apple_d2089_oscar_sensors,
 	},
 	{
 		.compatible = "apple,august-touch-analog-regulator",

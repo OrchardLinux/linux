@@ -202,6 +202,23 @@
 			status = "disabled";
 		};
 
+		/*
+		 * UART4, the link to the M7 motion coprocessor (Apple's
+		 * /arm-io/uart4, which carries the oscar node, the same on
+		 * every A7 iPad), disabled until a board enables it.
+		 */
+		serial4: serial@20a0b0000 {
+			compatible = "apple,s5l-uart";
+			reg = <0x2 0x0a0b0000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 144 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart4>;
+			status = "disabled";
+		};
+
 		serial5: serial@20a0b4000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x0a0b4000 0x0 0x4000>;
@@ -498,6 +515,17 @@
 					 <APPLE_PINMUX(33, 1)>,
 					 <APPLE_PINMUX(34, 1)>,
 					 <APPLE_PINMUX(35, 1)>;
+			};
+
+			/*
+			 * TX from the ADT uart4 function-tx (pin 64, the same
+			 * 0x102 flags as the UART1 TX pin, so function 1); RX is
+			 * the pin after it, as on UART1. UART4 has no flow
+			 * control (ADT no-flow-control).
+			 */
+			uart4_pins: uart4-pins {
+				pinmux = <APPLE_PINMUX(64, 1)>,
+					 <APPLE_PINMUX(65, 1)>;
 			};
 		};
 	};
