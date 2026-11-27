@@ -189,6 +189,7 @@ static const struct tristar_pmic tristar_d2355 = {
 #define CBTL_CAP_LEN			8
 
 #define TRISTAR_POLL_MS			100
+#define TRISTAR_IDLE_POLL_MS		500
 /* Identify this long after an attach or a source event. */
 #define TRISTAR_LOOK_MS			300
 /*
@@ -1375,8 +1376,15 @@ static void tristar_poll(struct work_struct *work)
 again:
 	ramp_delay = tristar_ramp_delay(chg, now);
 	tristar_accessory_report(chg->acc, chg->usb_ma, chg->phase == TRISTAR_FAULT);
-	mod_delayed_work(chg->wq, &chg->poll_work,
-			 msecs_to_jiffies(TRISTAR_POLL_MS));
+	{
+		unsigned int poll_ms = TRISTAR_POLL_MS;
+
+		if ((chg->phase == TRISTAR_EMPTY || chg->phase == TRISTAR_CHARGING) &&
+		    !ramp_delay && !READ_ONCE(chg->line_ns))
+			poll_ms = TRISTAR_IDLE_POLL_MS;
+		mod_delayed_work(chg->wq, &chg->poll_work,
+				 msecs_to_jiffies(poll_ms));
+	}
 	if (chg->code != old_code || chg->online != old_online ||
 	    chg->present != old_present || chg->usb_on != old_usb_on)
 		power_supply_changed(chg->psy);
