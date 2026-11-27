@@ -765,6 +765,10 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	dev_dbg(&pdev->dev, "added to bus %s, index %d\n",
 		pci_name(pdev->bus->self), port->idx);
 
+	/* A port without a RID to SID table has its stream wired up. */
+	if (!port->sid_map_sz)
+		return 0;
+
 	err = of_map_iommu_id(port->pcie->dev->of_node, rid, &iommu_spec);
 	if (err)
 		return err;
