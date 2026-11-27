@@ -1001,6 +1001,7 @@ static int ahts_probe(struct spi_device *spi)
 	if (!ts)
 		return -ENOMEM;
 	ts->spi = spi;
+	spi_set_drvdata(spi, ts);
 	ts->variant = v;
 	ts->min_x = v->min_sx;
 	ts->max_x = v->max_sx;
@@ -1109,6 +1110,55 @@ static int ahts_probe(struct spi_device *spi)
 }
 
 /*
+ * The controller is switched off for sleep and its firmware loaded again on
+ * resume, as on the iPads' Z2 controllers. Reading over a suspended SPI
+ * controller takes an SError, so the poll thread or the interrupt stops
+ * first.
+ */
+static int ahts_suspend(struct device *dev)
+{
+	struct apple_hidspi_ts *ts = dev_get_drvdata(dev);
+
+	if (ts->thread) {
+		kthread_stop(ts->thread);
+		ts->thread = NULL;
+	} else {
+		disable_irq(ts->spi->irq);
+	}
+	cancel_work_sync(&ts->recover);
+	if (ts->fingers)
+		ahts_release(ts);
+	ahts_power_off(ts);
+	return 0;
+}
+
+static int ahts_resume(struct device *dev)
+{
+	struct apple_hidspi_ts *ts = dev_get_drvdata(dev);
+	int ret;
+
+	reinit_completion(&ts->booted);
+	ts->bootloader_seen = 0;
+	ret = ahts_boot(ts);
+	if (ret) {
+		dev_err(dev, "firmware not loaded after resume: %d\n", ret);
+		return 0;
+	}
+	if (ts->variant->polled) {
+		ts->thread = kthread_run(ahts_poll_thread, ts, "apple-hidspi-ts");
+		if (IS_ERR(ts->thread)) {
+			ts->thread = NULL;
+			return 0;
+		}
+	} else {
+		enable_irq(ts->spi->irq);
+	}
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(ahts_pm_ops, ahts_suspend, ahts_resume);
+
+/*
  * iPhone X. HBPP 0x105 in mode 3 and the 200 us CS delay of its MTFW, as
  * measured on a d221; the sizes are the panel's pixels and the surface
  * descriptor that unit's firmware sent.
@@ -1177,6 +1227,7 @@ static struct spi_driver ahts_driver = {
 	.driver = {
 		.name = "apple-hidspi-ts",
 		.of_match_table = ahts_of_match,
+		.pm = pm_sleep_ptr(&ahts_pm_ops),
 	},
 	.id_table = ahts_spi_id,
 	.probe = ahts_probe,
