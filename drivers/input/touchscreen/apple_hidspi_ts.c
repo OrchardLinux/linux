@@ -948,15 +948,16 @@ static const struct ahts_variant ahts_d221 = {
  * iPhone XR. The ADT's multi-touch node: hbpp-version 0x103, and
  * function-power_ana (hv), function-power_ldo (core) and function-clock_enable
  * (clken), the last two switched by the SMC. From Project Cascadia's driver,
- * which runs this controller: the bootloader in the bus' mode 0, blobs of at
- * most 0x3f0 bytes, 20 ms before each acknowledge, a 300 us CS delay, 0xff
- * while reading and the status stage. The panel has 828 x 1792 pixels; the
+ * which runs this controller: blobs of at most 0x3f0 bytes, 20 ms before each
+ * acknowledge, a 300 us CS delay, 0xff while reading and the status stage.
+ * The bootloader answers in SPI mode 3, as the iPhone X's; in mode 0 its
+ * words arrive shifted by one bit. The panel has 828 x 1792 pixels; the
  * sensor's edges come from the firmware's surface descriptor only.
  */
 static const struct ahts_variant ahts_n841 = {
 	.name = "Apple iPhone XR Touchscreen",
 	.supplies = { "hv", "core", "clken" },
-	.hbpp_mode = SPI_MODE_0,
+	.hbpp_mode = SPI_MODE_3,
 	.hbpp_version = 0x103,
 	.hbpp_chunk = 0x3f0,
 	.hbpp_ack_delay_ms = 20,
