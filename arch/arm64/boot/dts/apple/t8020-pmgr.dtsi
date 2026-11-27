@@ -902,7 +902,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "debug";
-		apple,always-on;
 	};
 
 	ps_spmi: power-controller@80060 {
@@ -956,7 +955,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "debug_usb";
-		apple,always-on;
 		power-domains = <&ps_debug>;
 	};
 
