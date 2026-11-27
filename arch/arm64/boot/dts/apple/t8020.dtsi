@@ -14,6 +14,7 @@
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/phy/phy.h>
 #include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	interrupt-parent = <&aic>;
@@ -280,6 +281,89 @@
 			clocks = <&clkref>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 232 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		spmi: spmi@23d180700 {
+			compatible = "apple,t8020-spmi", "apple,t8103-spmi";
+			reg = <0x2 0x3d180700 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			pmic@f {
+				compatible = "apple,d2542-pmic", "apple,spmi-pmic";
+				reg = <0xf SPMI_USID>;
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/* The scratchpad iBoot keeps its boot state in. */
+				nvmem@6000 {
+					compatible = "apple,pmic-nvmem";
+					reg = <0x6000 0x300>;
+
+					nvmem-layout {
+						compatible = "fixed-layout";
+						#address-cells = <1>;
+						#size-cells = <1>;
+
+						boot_stage: boot-stage@1 {
+							reg = <0x1 0x1>;
+						};
+
+						boot_error_count: boot-error-count@2,0 {
+							reg = <0x2 0x1>;
+							bits = <0 4>;
+						};
+
+						panic_count: panic-count@2,4 {
+							reg = <0x2 0x1>;
+							bits = <4 4>;
+						};
+
+						shutdown_flag: shutdown-flag@f {
+							reg = <0xf 0x1>;
+						};
+					};
+				};
+			};
+		};
+
+		smc: smc@23e400000 {
+			compatible = "apple,t8020-smc", "apple,t8103-smc";
+			reg = <0x2 0x3e400000 0x0 0x20000>,
+			      <0x2 0x3fe00000 0x0 0x50000>;
+			reg-names = "smc", "sram";
+			mboxes = <&smc_mbox>;
+
+			smc_gpio: gpio {
+				compatible = "apple,smc-gpio";
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			smc_hwmon: hwmon {
+				compatible = "apple,smc-hwmon";
+			};
+
+			smc_reboot: reboot {
+				compatible = "apple,t8015-smc-reboot";
+				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+					<&boot_error_count>, <&panic_count>;
+				nvmem-cell-names = "shutdown_flag", "boot_stage",
+					"boot_error_count", "panic_count";
+			};
+		};
+
+		smc_mbox: mbox@23e408000 {
+			compatible = "apple,t8020-asc-mailbox", "apple,t8015-asc-mailbox";
+			reg = <0x2 0x3e408000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 253 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 254 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 255 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 256 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
 		};
 
 		ans_mbox: mbox@277408000 {
