@@ -394,6 +394,51 @@
 };
 
 /*
+ * The M7 motion coprocessor on UART4 (Apple's /arm-io/uart4/oscar, the same
+ * on every A7 iPad), with the accelerometer, gyroscope and compass behind
+ * it. Its supplies are D2089 switches (ADT oscar_power1, oscar_power2 and
+ * sensor_power) and its reset is AP GPIO 66, active low (ADT flags 0x1;
+ * seen on the J71).
+ */
+&{/soc/i2c@20a110000/pmic@3c} {
+	oscar_core: regulator-oscar-core {
+		compatible = "apple,d2089-oscar-core-regulator";
+		regulator-name = "oscar-core";
+	};
+
+	oscar_io: regulator-oscar-io {
+		compatible = "apple,d2089-oscar-io-regulator";
+		regulator-name = "oscar-io";
+	};
+
+	oscar_sensors: regulator-oscar-sensors {
+		compatible = "apple,d2089-oscar-sensors-regulator";
+		regulator-name = "oscar-sensors";
+	};
+};
+
+&serial4 {
+	status = "okay";
+	pinctrl-0 = <&uart4_pins>;
+	pinctrl-names = "default";
+
+	motion-coprocessor {
+		compatible = "apple,s5l8960x-oscar";
+		core-supply = <&oscar_core>;
+		io-supply = <&oscar_io>;
+		sensors-supply = <&oscar_sensors>;
+		reset-gpios = <&pinctrl 66 GPIO_ACTIVE_LOW>;
+		/*
+		 * As measured on the iPad Air (J71); the mini's own placement
+		 * has not been checked yet.
+		 */
+		mount-matrix = "1", "0", "0",
+			       "0", "1", "0",
+			       "0", "0", "1";
+	};
+};
+
+/*
  * The battery gauge on UART5's HDQ line: a BQ27540 by Apple's device tree
  * (/arm-io/uart5/gas-gauge), the same on every A7 iPad. It runs the gauge
  * firmware profile measured on the J72.
