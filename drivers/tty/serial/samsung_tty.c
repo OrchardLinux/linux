@@ -1280,7 +1280,13 @@ static int apple_s5l_serial_startup(struct uart_port *port)
 	uart_port_lock_irqsave(port, &flags);
 
 	ufcon = rd_regl(port, S3C2410_UFCON);
-	ufcon |= S3C2410_UFCON_RESETRX | S5PV210_UFCON_RXTRIG8;
+	/*
+	 * Replace the RX trigger level rather than OR into it: the default
+	 * UFCON already carries 1 << 4, so ORing 2 << 4 gave field 3, and at
+	 * 1.5 Mbaud the 16-byte RX FIFO overran before the interrupt came.
+	 */
+	ufcon &= ~(3 << 4);
+	ufcon |= S3C2410_UFCON_RESETRX | S5PV210_UFCON_RXTRIG4;
 	if (!uart_console(port))
 		ufcon |= S3C2410_UFCON_RESETTX;
 	wr_regl(port, S3C2410_UFCON, ufcon);
