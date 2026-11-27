@@ -1,0 +1,110 @@
+# Orchard's checks for this kernel: every platform built from this branch is
+# compiled with orchard's own recipe (kernel/build --kernel-tree), and
+# orchard's tests that compile or read kernel source run against this tree.
+# https://github.com/OrchardLinux/orchard
+name: Orchard kernel
+
+on:
+  pull_request:
+  push:
+    branches: [main, armv7]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orchard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  platforms:
+    # The platforms orchard builds from the branch this run is for.
+    runs-on: ubuntu-24.04
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+      names: ${{ steps.list.outputs.names }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: OrchardLinux/orchard
+          persist-credentials: false
+      - id: list
+        env:
+          BRANCH: ${{ github.base_ref || github.ref_name }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, pathlib, tomllib
+          names = sorted(path.stem for path in pathlib.Path('platforms').glob('*.toml')
+                         if tomllib.loads(path.read_text())['kernel']['branch'] == os.environ['BRANCH'])
+          print('list=' + json.dumps(names))
+          print('names=' + ' '.join(names))
+          PY
+
+  build:
+    needs: platforms
+    if: needs.platforms.outputs.list != '[]'
+    runs-on: ubuntu-24.04-arm
+    container: debian:bookworm
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.platforms.outputs.list) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      ORCHARD_BUILD_NATIVE: '1'
+      ORCHARD_BUILD_ENV_ID: debian-bookworm-arm64-llvm19
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - run: apt-get update && apt-get install -y git ca-certificates python3 pigz
+      - uses: actions/checkout@v4
+        with:
+          path: linux
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: OrchardLinux/orchard
+          path: orchard
+          persist-credentials: false
+      - name: Install the kernel toolchain
+        run: bash orchard/kernel/install-toolchain
+      - uses: actions/cache@v4
+        with:
+          path: out/cache/ccache/kernel
+          key: kernel-ccache-v1-${{ matrix.platform }}-${{ github.sha }}
+          restore-keys: kernel-ccache-v1-${{ matrix.platform }}-
+      - name: Build the platform kernel, modules and all device trees
+        run: |
+          git config --global --add safe.directory '*'
+          export ORCHARD_CACHE_DIR="$PWD/out/cache" CCACHE_DIR="$PWD/out/cache/ccache/kernel"
+          mkdir -p "$CCACHE_DIR"
+          bash orchard/kernel/build "$PLATFORM" --kernel-tree "$PWD/linux" --output "$PWD/out/kernel"
+          { echo "Compiler cache, $PLATFORM:"; echo '```'; ccache --show-stats; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  source-tests:
+    needs: platforms
+    if: needs.platforms.outputs.list != '[]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: linux
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: OrchardLinux/orchard
+          path: orchard
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Run orchard's tests of this kernel source
+        env:
+          ORCHARD_KERNEL_PLATFORMS: ${{ needs.platforms.outputs.names }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          export ORCHARD_KERNEL_SOURCE="$PWD/linux"
+          cd orchard
+          PYTHONPATH="$PWD/src" python -m unittest discover -s tests -p 'test_source_*.py' -v
