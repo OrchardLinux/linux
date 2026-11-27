@@ -1353,6 +1353,45 @@ static const struct s8000_mca_hw s8000_mca_hw = {
 };
 
 /*
+ * N66 (iPhone 6s Plus) MCA0 to the CS42L71 headset codec's main port, from
+ * the ADT's /arm-io/mca0/audio-codec iisConfig (the phone's live ADT, iOS 15):
+ *
+ *   10 13 00 00 04 00 01 00  00 1b b7 00 00 00 01 00
+ *   30 00 01 00 0f 00 00 00  0f 00 00 00 04 04 10 10
+ *
+ * The codec provides the clocks (byte 0 bit 0 clear): 4 slots of 16 bits
+ * with a 1-bit sync pulse and one bit of data delay, format flags 0x13, a
+ * 12 MHz MCLK output (the codec's MCLK). For flags 0x13 in the consumer
+ * role _setIISConfig_v4 sets the polarity bit and leaves the format bit
+ * clear, and bit 4 puts the 0x4 in RX_CFG. iOS sends four channels; this
+ * link fills slots 0 and 1 with stereo. The SmartIO shim words are the
+ * ADT's dma-channels for endpoint 0x28 (FIFO 0x180, trigger 0xc0).
+ *
+ * No attenuation here: the codec's headphone gain stops at 0 dB.
+ */
+static const struct s8000_mca_hw s8000_codec_mca_hw = {
+	.version = 4,
+	.regs = &mca_v4_regs,
+	.dai_format = SND_SOC_DAIFMT_DSP_A,
+	.channels = 2,
+	.slots = 4,
+	.tx_slots = 0x3,
+	.tx_cfg = 0x133,
+	.rx_cfg = 0x137,
+	.rx_slots = 0x3,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.frame_flags = MCA_FRAME_POL,
+	.sync_bits = 1,
+	.mclk_ctl = 0x58,
+	.mclk_rate = 12000000,
+	.sio_xfer16 = 0x21,
+	.sio_xfer32 = 0x22,
+	.sio_timeout = 0,
+	.sio_fifo = 0x180,
+	.sio_trigger = 0xc0,
+};
+
+/*
  * N66 (iPhone 6s Plus) MCA2 TX to the CS35L19 speaker amplifier, from the
  * ADT's /arm-io/mca2/audio-speaker iisConfig (the phone's live ADT, iOS 15):
  *
@@ -1582,6 +1621,7 @@ static const struct of_device_id s8000_mca_of_match[] = {
 	{ .compatible = "apple,s5l8960x-mca", .data = &s5l8960x_mca_hw },
 	{ .compatible = "apple,s5l8960x-mca-tdm", .data = &s5l8960x_tdm_mca_hw },
 	{ .compatible = "apple,s8000-mca", .data = &s8000_mca_hw },
+	{ .compatible = "apple,s8000-mca-codec", .data = &s8000_codec_mca_hw },
 	{ .compatible = "apple,s8000-mca-tdm", .data = &s8000_tdm_mca_hw },
 	{ .compatible = "apple,t7001-mca", .data = &t7001_mca_hw },
 	{ .compatible = "apple,t8011-mca", .data = &t8011_mca_hw },
