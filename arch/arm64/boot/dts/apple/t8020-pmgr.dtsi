@@ -192,6 +192,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "sio_busif";
+		/* A child cannot start while this is clock gated automatically. */
+		apple,manual-pm;
 	};
 
 	ps_sio: power-controller@80170 {
@@ -200,6 +202,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "sio";
+		apple,manual-pm; /* As sio_busif */
 		power-domains = <&ps_sio_busif>;
 	};
 
