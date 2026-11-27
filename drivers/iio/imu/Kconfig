@@ -65,6 +65,20 @@ config ADIS16550
 	  To compile this driver as a module, choose M here: the module will be
 	  called adis16550.
 
+config APPLE_OSCAR
+	tristate "Apple M7 motion coprocessor (A7 iPads)"
+	depends on SERIAL_DEV_BUS
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF
+	help
+	  Say yes here for the accelerometer, gyroscope and compass of the
+	  Apple A7 iPads, which sit behind the M7 motion coprocessor on a
+	  UART. The driver powers the M7, uploads its firmware and reads
+	  the sensors.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called apple-oscar.
+
 source "drivers/iio/imu/bmi160/Kconfig"
 source "drivers/iio/imu/bmi270/Kconfig"
 source "drivers/iio/imu/bmi323/Kconfig"
