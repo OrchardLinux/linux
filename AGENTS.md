@@ -1,8 +1,8 @@
 # Agent instructions
 
-This is Orchard's kernel: upstream Linux with Hoolock's A7-A11 work and
-Orchard's changes on top (branch `main` for the arm64 boards, `armv7` for the
-32-bit ones). It is the source of the kernel Orchard builds. Kernel work
+This is Orchard's kernel for the 32-bit boards (A5 to A6X): upstream Linux
+v6.12 with Project Cascadia's work and Orchard's changes on top (branch
+`main` has the arm64 boards). It is the source of the kernel Orchard builds. Kernel work
 happens here: branch from `main` or `armv7`, commit, and open the pull request
 in OrchardLinux/linux. Never add kernel patch files to the orchard repository.
 
