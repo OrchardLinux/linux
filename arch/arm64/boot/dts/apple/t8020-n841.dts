@@ -23,6 +23,17 @@
 };
 
 /* The display PMU, ADT "display-pmu,chestnut". */
+/*
+ * The loader's framebuffer is in Apple's extended range and the display
+ * pipe takes it as linear light: iOS's driver runs the pipe linear to the
+ * panel (enableLinearToPanel) behind a degamma that the loader leaves off.
+ * A grey ramp written to it shows every value up to 372 as black and the
+ * two values above 895 alike.
+ */
+&framebuffer0 {
+	apple,extended-range-linear;
+};
+
 &i2c2 {
 	status = "okay";
 
