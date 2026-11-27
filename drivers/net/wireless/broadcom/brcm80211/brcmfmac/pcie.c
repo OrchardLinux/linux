@@ -351,6 +351,7 @@ struct brcmf_pciedev_info {
 	struct brcmf_pcie_shared_info shared;
 	wait_queue_head_t mbdata_resp_wait;
 	bool mbdata_completed;
+	bool reload_on_resume;
 	bool irq_allocated;
 	bool wowl_enabled;
 	u8 dma_idx_sz;
@@ -2738,9 +2739,17 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	wait_event_timeout(devinfo->mbdata_resp_wait, devinfo->mbdata_completed,
 			   BRCMF_PCIE_MBDATA_TIMEOUT);
 	if (!devinfo->mbdata_completed) {
-		brcmf_err(bus, "Timeout on response for entering D3 substate\n");
-		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
-		return -EIO;
+		/*
+		 * Some firmware (the BCM4357 in the iPhone XR) never
+		 * acknowledges HOST_D3_INFORM. Rather than refusing to
+		 * sleep, stop the chip so it cannot write to host memory
+		 * while we sleep, and load its firmware again on resume,
+		 * the path a chip reset over sleep already takes.
+		 */
+		brcmf_dbg(PCIE, "no D3 acknowledge, resetting chip for sleep\n");
+		brcmf_pcie_intr_disable(devinfo);
+		brcmf_pcie_reset_device(devinfo);
+		devinfo->reload_on_resume = true;
 	}
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
@@ -2778,6 +2787,9 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	 * another core, and the test below would read that core's register.
 	 */
 	brcmf_pcie_select_core(devinfo, BCMA_CORE_PCIE2);
+
+	if (devinfo->reload_on_resume)
+		goto cleanup;
 
 	/* Check if device is still up and running, if so we are ready */
 	if (brcmf_pcie_read_reg32(devinfo, devinfo->reginfo->intmask) != 0) {
