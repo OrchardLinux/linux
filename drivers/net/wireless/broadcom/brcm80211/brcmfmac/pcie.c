@@ -2130,11 +2130,15 @@ static int brcmf_pcie_read_otp(struct brcmf_pciedev_info *devinfo)
 		break;
 	case BRCM_CC_4357_CHIP_ID:
 		/*
-		 * The A11 iPhones' BCM4357: reading the ChipCommon OTP shadow
-		 * at 0x8c0 takes the SoC down, and where else its OTP sits is
-		 * not known. Use the board-type firmware names.
+		 * The BCM4357 of the A11 and A12 iPhones shadows its OTP in
+		 * the GCI core from 0x1000, as the BCM4378 does; reading the
+		 * ChipCommon shadow at 0x8c0 takes the SoC down. Apple's
+		 * records start at 0x1110.
 		 */
-		return 0;
+		coreid = BCMA_CORE_GCI;
+		base = 0x1110;
+		words = 0x170;
+		break;
 	case BRCM_CC_4364_CHIP_ID:
 		coreid = BCMA_CORE_CHIPCOMMON;
 		base = 0x8c0;
