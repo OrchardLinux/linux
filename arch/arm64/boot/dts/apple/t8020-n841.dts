@@ -171,5 +171,6 @@
 		max-speed = <3000000>;
 		shutdown-gpios = <&smc_gpio 9 GPIO_ACTIVE_HIGH>;
 		device-wakeup-gpios = <&pinctrl_ap 6 GPIO_ACTIVE_HIGH>;
+		apple,wlan = <&wifi0>;
 	};
 };
