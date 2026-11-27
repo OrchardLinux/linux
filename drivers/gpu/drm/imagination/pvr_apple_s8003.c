@@ -5385,10 +5385,10 @@ static void t7000_pm_feedback(struct pvr_apple *apple, struct s8003_vm *vm)
 		/* read only, at most once a second a VM: what the A8 reports */
 		if (!vm->fb_at || ktime_ms_delta(ktime_get(), vm->fb_at) >= 1000) {
 			vm->fb_at = ktime_get();
-			dev_info(apple_dev(apple),
-				 "A8 PM usage (pool %u blocks): %u %u %u %u\n", blocks, high,
-				 margin, get32(list + T7000_PM_FEEDBACK + 8),
-				 get32(list + T7000_PM_FEEDBACK + 12));
+			dev_dbg(apple_dev(apple),
+				"A8 PM usage (pool %u blocks): %u %u %u %u\n", blocks, high,
+				margin, get32(list + T7000_PM_FEEDBACK + 8),
+				get32(list + T7000_PM_FEEDBACK + 12));
 		}
 		return;
 	}
@@ -6526,7 +6526,8 @@ const struct pvr_apple_chip pvr_apple_chip_t7000 = {
 	.frag_ext_mask = PVR_STREAM_EXTHDR_FRAG_G5P_REGS,
 	.compute_stream = &pvr_apple_g5p_cmd_compute_stream,
 	.own_pm_pages = true,
-	.gate_off_ms = 10,
+	/* Keep the core awake across consecutive 60 Hz (16.7 ms) frames. */
+	.gate_off_ms = 40,
 	.wait_deadline = true,
 	.fault_skips_done = true,
 	.irq_thread = true,
