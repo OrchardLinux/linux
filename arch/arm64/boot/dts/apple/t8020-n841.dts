@@ -55,7 +55,8 @@
 
 /*
  * The touch controller (ADT /arm-io/spi1/multi-touch, "hid-transport,spi"):
- * chip select on AP GPIO 67, reset on 5, interrupt on AOP GPIO 19.
+ * chip select on AP GPIO 67, reset on 5. Its interrupt line, AOP GPIO 19,
+ * does not signal reports with this firmware and is left out.
  */
 &spi1 {
 	cs-gpios = <&pinctrl_ap 67 GPIO_ACTIVE_LOW>;
@@ -65,7 +66,6 @@
 		compatible = "apple,n841-touchscreen";
 		reg = <0>;
 		spi-max-frequency = <8000000>;
-		interrupts-extended = <&pinctrl_aop 19 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&pinctrl_ap 5 GPIO_ACTIVE_LOW>;
 		hv-supply = <&touch_hv>;
 		core-supply = <&touch_core>;
@@ -127,6 +127,8 @@
 			reg = <0x10000 0x0 0x0 0x0 0x0>;
 			device-wake-gpios = <&pinctrl_ap 43 GPIO_ACTIVE_HIGH>;
 			vdd-supply = <&wlan_vdd>;
+			/* ADT /arm-io/uart2/wlan module-instance */
+			brcm,board-type = "apple,yodak";
 			brcm,ccode-map-trivial;
 		};
 	};
