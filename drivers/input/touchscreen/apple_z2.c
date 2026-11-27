@@ -252,13 +252,13 @@ struct apple_z2 {
 	struct gpio_desc *attn_gpio;
 	struct delayed_work rearm_work;
 	struct delayed_work j72_work;
-	struct delayed_work j72_reset_work;
+	struct delayed_work reset_work;
 	struct apple_z2_j72_recovery j72_recovery;
-	struct apple_z2_j72_recovery j72_resets;
+	struct apple_z2_j72_recovery resets;
 	unsigned int j72_bad_frames;
 	unsigned int j72_layout_drops;
-	unsigned int j72_reset_attempt;
-	unsigned int j72_reset_count;
+	unsigned int reset_attempt;
+	unsigned int reset_count;
 	unsigned long j72_bad_since;
 	struct apple_z2_j72_fault j72_fault;
 	struct apple_z2_j72_fault j72_bad;
@@ -2512,27 +2512,106 @@ static void apple_z2_k1_quiesce_irq(struct apple_z2 *z2)
 		synchronize_irq(z2->spidev->irq);
 }
 
-/* No IRQ may queue stop_work after cancellation returns. */
+/*
+ * No IRQ may queue stop_work, and no K1 reset be queued, after cancellation
+ * returns. Both are queued only under io_lock while not stopping, so setting
+ * stopping first lets a reset boot in flight see it and leave the controller
+ * off; the interrupt is quiesced once no reset can enable it again.
+ */
 static void apple_z2_cancel_runtime_stop(struct apple_z2 *z2)
 {
-	if (apple_z2_is_k1(z2))
-		apple_z2_k1_quiesce_irq(z2);
-	cancel_delayed_work_sync(&z2->stop_work);
-}
-
-static void apple_z2_k1_runtime_stop(struct work_struct *work)
-{
-	struct apple_z2 *z2 = container_of(to_delayed_work(work),
-					   struct apple_z2, stop_work);
-
+	if (!apple_z2_is_k1(z2))
+		return;
 	mutex_lock(&z2->io_lock);
 	z2->stopping = true;
 	mutex_unlock(&z2->io_lock);
+	cancel_delayed_work_sync(&z2->stop_work);
+	cancel_delayed_work_sync(&z2->reset_work);
+	apple_z2_k1_quiesce_irq(z2);
+}
+
+/*
+ * A K1 runtime read or a reset boot failed and the interrupt is masked:
+ * release every contact, power the controller off and boot it again from
+ * apple_z2_k1_reset_work(), at most APPLE_Z2_J72_RECOVERIES times a minute,
+ * as the J72 path does. Past that, touch stays stopped until the next resume.
+ */
+static void apple_z2_k1_runtime_error(struct work_struct *work)
+{
+	struct apple_z2 *z2 = container_of(to_delayed_work(work),
+					   struct apple_z2, stop_work);
+	u64 now = div_u64(ktime_get_ns(), NSEC_PER_MSEC);
+	bool reset;
+
+	/* The handler which queued us must finish before changing power. */
 	synchronize_irq(z2->spidev->irq);
-	apple_z2_stop(z2);
+	mutex_lock(&z2->io_lock);
+	if (z2->stopping) {
+		/* Suspend or unbind stops the controller itself. */
+		mutex_unlock(&z2->io_lock);
+		return;
+	}
+	reset = apple_z2_j72_recovery_admit(&z2->resets, now);
+	if (reset)
+		z2->reset_attempt++;
+	else
+		z2->stopping = true;
+	if (z2->k1_input_registered)
+		apple_z2_release_contacts(z2);
+	z2->booted = false;
+	mutex_unlock(&z2->io_lock);
+
+	gpiod_direction_output(z2->reset_gpio, 1);
+	apple_z2_platform_power_off(z2);
+	apple_z2_reset_protocol(z2);
+	if (!reset) {
+		dev_err(&z2->spidev->dev,
+			"touch stopped after runtime error %d, restarts on resume\n",
+			z2->runtime_error);
+		return;
+	}
 	dev_warn(&z2->spidev->dev,
-		 "touch stopped after runtime error %d, restarts on resume\n",
-		 z2->runtime_error);
+		 "touch runtime error %d; resetting the controller (attempt %u)\n",
+		 z2->runtime_error, z2->reset_attempt);
+
+	mutex_lock(&z2->io_lock);
+	if (!z2->stopping)
+		schedule_delayed_work(&z2->reset_work,
+				      msecs_to_jiffies(APPLE_Z2_J72_RESET_DELAY_MS));
+	mutex_unlock(&z2->io_lock);
+}
+
+/*
+ * Boot outside io_lock, as probe and resume do. A boot that finds the driver
+ * stopping leaves the controller off; a failed one counts as another error.
+ */
+static void apple_z2_k1_reset_work(struct work_struct *work)
+{
+	struct apple_z2 *z2 = container_of(to_delayed_work(work),
+					   struct apple_z2, reset_work);
+	int error;
+
+	mutex_lock(&z2->io_lock);
+	if (z2->stopping || z2->booted) {
+		mutex_unlock(&z2->io_lock);
+		return;
+	}
+	mutex_unlock(&z2->io_lock);
+
+	error = apple_z2_boot(z2);
+
+	mutex_lock(&z2->io_lock);
+	if (!error) {
+		z2->reset_count++;
+		dev_info(&z2->spidev->dev,
+			 "touch restarted after attempt %u (%u resets since probe)\n",
+			 z2->reset_attempt, z2->reset_count);
+		z2->reset_attempt = 0;
+	} else if (!z2->stopping) {
+		z2->runtime_error = error;
+		mod_delayed_work(system_wq, &z2->stop_work, 0);
+	}
+	mutex_unlock(&z2->io_lock);
 }
 
 static irqreturn_t apple_z2_irq(int irq, void *data)
@@ -2550,7 +2629,7 @@ static irqreturn_t apple_z2_irq(int irq, void *data)
 			error = apple_z2_k1_read_packet(z2);
 			z2->runtime_error = error;
 			if (error) {
-				z2->stopping = true;
+				/* apple_z2_k1_runtime_error() resets it. */
 				z2->irq_on = false;
 				disable_irq_nosync(z2->spidev->irq);
 				mod_delayed_work(system_wq, &z2->stop_work, 0);
@@ -4222,7 +4301,11 @@ static int apple_z2_upload_firmware(struct apple_z2 *z2)
 			z2->k1_input_registered = true;
 		}
 		mutex_lock(&z2->io_lock);
-		z2->stopping = false;
+		/* Stopped while this boot ran (suspend, unbind): stay off. */
+		if (z2->stopping) {
+			mutex_unlock(&z2->io_lock);
+			return -ESHUTDOWN;
+		}
 		z2->booted = true;
 		z2->upload_irq_masked = false;
 		apple_z2_irq_on(z2);
@@ -4986,16 +5069,16 @@ static void apple_z2_j72_fail_locked(struct apple_z2 *z2, int error)
 	apple_z2_reset_protocol(z2);
 	if (z2->stopping)
 		return;
-	if (!apple_z2_j72_recovery_admit(&z2->j72_resets, now)) {
+	if (!apple_z2_j72_recovery_admit(&z2->resets, now)) {
 		z2->stopping = true;
 		scnprintf(what, sizeof(what),
 			  "J72 touch stopped after error %d (layout %d)",
 			  error, z2->j72_layout_error);
 	} else {
-		z2->j72_reset_attempt++;
+		z2->reset_attempt++;
 		scnprintf(what, sizeof(what),
 			  "J72 touch error %d; resetting the controller (attempt %u)",
-			  error, z2->j72_reset_attempt);
+			  error, z2->reset_attempt);
 	}
 	/*
 	 * One line per reset, at most APPLE_Z2_J72_RECOVERIES a minute: the
@@ -5010,7 +5093,7 @@ static void apple_z2_j72_fail_locked(struct apple_z2 *z2, int error)
 			jiffies_to_msecs(jiffies - z2->j72_bad_since) : 0,
 		   bad->why ?: "-", bad->a, bad->b, bad->len, bad->raw);
 	if (!z2->stopping)
-		schedule_delayed_work(&z2->j72_reset_work,
+		schedule_delayed_work(&z2->reset_work,
 				      msecs_to_jiffies(APPLE_Z2_J72_RESET_DELAY_MS));
 }
 
@@ -5018,7 +5101,7 @@ static void apple_z2_j72_fail_locked(struct apple_z2 *z2, int error)
 static void apple_z2_j72_reset_work(struct work_struct *work)
 {
 	struct apple_z2 *z2 = container_of(to_delayed_work(work), struct apple_z2,
-					   j72_reset_work);
+					   reset_work);
 	int error;
 
 	mutex_lock(&z2->io_lock);
@@ -5035,11 +5118,11 @@ static void apple_z2_j72_reset_work(struct work_struct *work)
 	if (error && !z2->j72_fault.why)
 		apple_z2_j72_note(z2, "boot", 0, 0, NULL, 0);
 	if (!error) {
-		z2->j72_reset_count++;
+		z2->reset_count++;
 		dev_info(&z2->spidev->dev,
 			 "J72 touch restarted after attempt %u (%u resets since probe)\n",
-			 z2->j72_reset_attempt, z2->j72_reset_count);
-		z2->j72_reset_attempt = 0;
+			 z2->reset_attempt, z2->reset_count);
+		z2->reset_attempt = 0;
 	} else {
 		apple_z2_j72_fail_locked(z2, error);
 	}
@@ -5526,9 +5609,10 @@ static int apple_z2_probe(struct spi_device *spi)
 	INIT_DELAYED_WORK(&z2->rearm_work, info->recover_control_stall ?
 			  apple_z2_control_rearm_work : apple_z2_n1_rearm_work);
 	INIT_DELAYED_WORK(&z2->j72_work, apple_z2_j72_work);
-	INIT_DELAYED_WORK(&z2->j72_reset_work, apple_z2_j72_reset_work);
+	INIT_DELAYED_WORK(&z2->reset_work, apple_z2_is_k1(z2) ?
+			  apple_z2_k1_reset_work : apple_z2_j72_reset_work);
 	INIT_WORK(&z2->resume_work, apple_z2_resume_work);
-	INIT_DELAYED_WORK(&z2->stop_work, apple_z2_k1_runtime_stop);
+	INIT_DELAYED_WORK(&z2->stop_work, apple_z2_k1_runtime_error);
 	spi_set_drvdata(spi, z2);
 
 	z2->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
@@ -5812,7 +5896,7 @@ static void apple_z2_stop(struct apple_z2 *z2)
 		cancel_delayed_work_sync(&z2->rearm_work);
 		if (apple_z2_is_j72(z2)) {
 			/* A reset boot in flight sees stopping and powers off. */
-			cancel_delayed_work_sync(&z2->j72_reset_work);
+			cancel_delayed_work_sync(&z2->reset_work);
 			cancel_delayed_work_sync(&z2->j72_work);
 		}
 	}
@@ -5925,9 +6009,7 @@ static int apple_z2_resume(struct device *dev)
 
 	if (apple_z2_spi_is_d21(to_spi_device(dev)))
 		return apple_z2_d21_resume(dev);
-	/* K1 clears stopping when firmware setup reaches runtime. */
-	if (!apple_z2_is_k1(z2))
-		z2->stopping = false;
+	z2->stopping = false;
 	z2->recovering = false;
 	z2->boot_due = true;
 	return 0;
