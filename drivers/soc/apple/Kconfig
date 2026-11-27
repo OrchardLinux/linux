@@ -61,6 +61,14 @@ config APPLE_MESA
 
 	  Say 'y' or 'm' here if you have an iPhone 8 Plus.
 
+config APPLE_PMP_T8020
+	tristate "Apple T8020 PMP"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_RTKIT
+	help
+	  Boots the A12's power management coprocessor with its firmware,
+	  which lets the SoC lower its power.
+
 config APPLE_PMP_T8015_V1
 	tristate "Apple T8015 PMP"
 	depends on ARCH_APPLE || COMPILE_TEST

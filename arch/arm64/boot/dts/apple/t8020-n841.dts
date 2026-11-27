@@ -45,6 +45,32 @@
 	status = "okay";
 };
 
+/*
+ * The PMP's DRAM configuration: the first entry of the ADT's
+ * energy-model-dram-configs (DRAM capacity 3, any vendor).
+ */
+&pmp {
+	apple,dram-config = [
+		03 00 00 00 00 00 00 00 33 b3 1c 00 99 19 01 00
+		cc cc 08 00 cc 4c 03 00 cc cc 0b 00 cc cc 5e 00
+		99 99 56 00 cc 4c 0d 00 00 00 01 00 cc 4c 0b 00
+		cc cc 22 00 99 19 01 00 99 99 0e 00 66 66 03 00
+		cc cc 11 00 33 b3 b3 00 99 99 ae 00 00 00 13 00
+		00 00 01 00 66 66 17 00 66 e6 28 00 99 19 01 00
+		99 19 13 00 66 66 03 00 33 b3 16 00 cc cc 02 01
+		33 33 e8 00 00 00 18 00 00 00 01 00 99 19 22 00
+	];
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&dart_pmp {
+	status = "okay";
+};
+
 &dwi_bl {
 	status = "okay";
 };
