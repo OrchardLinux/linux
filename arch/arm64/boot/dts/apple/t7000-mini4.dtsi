@@ -203,6 +203,12 @@
 &i2c0 {
 	status = "okay";
 
+	/* The Lightning port controller, from the ADT i2c0/tristar node. */
+	tristar: port-controller@1a {
+		compatible = "nxp,cbtl1610";
+		reg = <0x1a>;
+	};
+
 	pmic@3c {
 		compatible = "apple,arabela-pmic", "apple,i2c-pmic";
 		reg = <0x3c>;
@@ -248,6 +254,50 @@
 			interrupts-extended = <&pinctrl 107 IRQ_TYPE_LEVEL_LOW>;
 			/* Smart Cover front hall sensor (line 12): wake only. */
 			apple,wake-events = <0x24>;
+		};
+
+		/*
+		 * Lightning charging, at the D2207's registers as iOS 15.8
+		 * AppleD2207PMU uses them: connection and charger state at
+		 * 0x60, the input-current limit at 0x4c0, the ADC at 0x500
+		 * (BrickID on channel 6, ADT tristar/function-brick_id_voltage).
+		 * The ADT's charger node allows 0x960 = 2400 mA of input.
+		 */
+		tristar_charger: charger@60 {
+			compatible = "apple,j96-tristar-charger", "apple,d2207-tristar-charger";
+			reg = <0x60 0x0d>, <0x4c0 0x01>, <0x500 0x04>;
+			reg-names = "status", "control", "adc";
+			interrupt-parent = <&pmu_gpio>;
+			/*
+			 * The PMU line and ADC done. No source events: the plug
+			 * event (0) stays unmasked across a reset that bypasses
+			 * iBoot (DFU entered from Linux), latches on the replugs
+			 * of the next boot and froze that boot. The charger's
+			 * 100 ms poll of 0x60 sees plug and unplug.
+			 */
+			interrupts = <112 IRQ_TYPE_EDGE_RISING>,
+				     <89 IRQ_TYPE_EDGE_RISING>;
+			apple,tristar = <&tristar>;
+			input-current-limit-microamp = <2400000>;
+
+			/* The charger decides when USB data may come on. */
+			port {
+				tristar_charger_usb: endpoint {
+					remote-endpoint = <&usbdev_role>;
+				};
+			};
+		};
+	};
+};
+
+/* Tell the Lightning charger what the USB host allows. */
+&usbdev {
+	usb-psy-name = "lightning";
+	usb-role-switch;
+
+	port {
+		usbdev_role: endpoint {
+			remote-endpoint = <&tristar_charger_usb>;
 		};
 	};
 };
