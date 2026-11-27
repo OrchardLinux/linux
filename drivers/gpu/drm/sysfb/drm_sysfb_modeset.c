@@ -267,6 +267,10 @@ int drm_sysfb_plane_helper_begin_fb_access(struct drm_plane *plane,
 		goto err_drm_gem_end_shadow_fb_access;
 	blit_to_crtc = drm_sysfb_get_blit_func(sysfb_crtc_state->format->format,
 					       fb->format->format);
+	if (to_drm_sysfb_device(dev)->fb_apple_linear &&
+	    sysfb_crtc_state->format->format == DRM_FORMAT_XRGB2101010)
+		blit_to_crtc = fb->format->format == DRM_FORMAT_XRGB8888 ?
+			       drm_fb_xrgb8888_to_xrgb2101010_apple_linear : NULL;
 	if (!blit_to_crtc) {
 		drm_warn_once(dev, "No blit helper from %p4cc to %p4cc found.\n",
 			      &fb->format->format, &sysfb_crtc_state->format->format);

@@ -763,6 +763,7 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	struct drm_connector *connector;
 	unsigned long max_width, max_height;
 	size_t nformats;
+	u32 native_format;
 	int ret;
 
 	sdev = devm_drm_dev_alloc(&pdev->dev, drv, struct simpledrm_device, sysfb.dev);
@@ -960,7 +961,20 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 
 	/* Primary plane */
 
-	nformats = drm_sysfb_build_fourcc_list(dev, &format->format, 1,
+	/*
+	 * A client's XRGB2101010 would be full-range sRGB, which a linear
+	 * extended-range framebuffer shows with crushed blacks and clipped
+	 * whites, so there only XRGB8888 is offered, and converted.
+	 */
+	native_format = format->format;
+	if (of_node && format->format == DRM_FORMAT_XRGB2101010 &&
+	    of_property_read_bool(of_node, "apple,extended-range-linear")) {
+		sysfb->fb_apple_linear = true;
+		native_format = DRM_FORMAT_XRGB8888;
+		dev->mode_config.preferred_depth = 24;
+	}
+
+	nformats = drm_sysfb_build_fourcc_list(dev, &native_format, 1,
 					       sdev->formats, ARRAY_SIZE(sdev->formats));
 
 	primary_plane = &sdev->primary_plane;
