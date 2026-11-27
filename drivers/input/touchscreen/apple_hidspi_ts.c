@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Apple HIDSPI touchscreen (iPhone X, "hid-transport,k1").
+ * Apple HIDSPI touchscreens: iPhone X ("hid-transport,k1") and iPhone XR
+ * ("hid-transport,spi").
  *
  * The controller starts in its HBPP bootloader. The host loads the firmware
- * with HBPP packets in SPI mode 3, following the steps of Apple's MTFW
- * personality (converted by Orchard into an op list, see below). The firmware
- * then speaks HIDSPI in SPI mode 0: every transfer is 4 bytes of padding and a
- * 512-byte packet framed as in Asahi's spi-hid-apple (flags, device, offset,
- * remain, length, data, CRC-16). Touches arrive on interface 0 as report 0x44
- * with apple_z2 finger records.
+ * with HBPP packets, following the steps of Apple's MTFW personality
+ * (converted by Orchard into an op list, see below). The firmware then speaks
+ * HIDSPI in SPI mode 0: every transfer is 4 bytes of padding and a 512-byte
+ * packet framed as in Asahi's spi-hid-apple (flags, device, offset, remain,
+ * length, data, CRC-16). Touches arrive on interface 0 as report 0x44 with
+ * apple_z2 finger records.
+ *
+ * What differs between the controllers is in struct ahts_variant: the
+ * supplies, the bootloader's SPI mode and HBPP version (before 0x104 a blob
+ * counts its words, since then its words minus one), the largest blob and the
+ * wait before a packet's acknowledge, and whether HIDSPI has iOS's status
+ * stage: 200 us after a packet, with chip select still asserted, 4 bytes of
+ * padding and a status word both ways. A controller that wants it also takes
+ * an all-zero packet (its CRC is valid) as a command and falls back to its
+ * bootloader, so the host clocks out 0xff while it reads.
  *
  * Apple's firmware comes in variants ("personalities"), and each unit's ADT
  * names the one it needs. m1n1 passes that on as apple,hid-merge-personality;
@@ -16,14 +26,15 @@
  * touchscreen stays off and the log names the variant.
  *
  * Firmware file ("D221OPS2" + ops, little endian):
- *   'T' u32 len, label       'S' u16 ack (0: none), u32 len, HBPP packet
+ *   'T' u32 len, label       'S' u16 ack (0: none, 0xffff: any reply),
+ *                                u32 len, HBPP packet
  *   'P' u32 addr, mask, value, timeout_ms        'R' u32 addr
  *   'C' u32 addr, u32 max, u32 len, DT property name, u32 len, default: the
  *       unit's calibration, copied from the ADT by m1n1, sent as an HBPP blob
  *       at addr; Apple's default from the firmware if the unit has none
  *
- * The CS-to-clock delay of iOS (200 us, "CS Delay") is a zero-length transfer
- * with a delay in front of each message.
+ * The CS-to-clock delay of iOS ("CS Delay") is a zero-length transfer with a
+ * delay in front of each message.
  */
 
 #include <linux/clk.h>
@@ -39,6 +50,7 @@
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
 #include <linux/interrupt.h>
+#include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -66,10 +78,17 @@
 #define MAX_SLOTS		10
 
 #define HBPP_ACK_TRIES		5
+#define HBPP_ACK_BLOB		0x4bc1
+#define HBPP_ACK_ANY		0xffff
 #define HBPP_READ_STATUS	0x4c39
 #define HBPP_ERROR		0x4f81
+#define HIDSPI_STAGE_US		200	/* MTFW "Inter Stage Us" */
 #define HIDSPI_GAP_US		250	/* MTFW "Inter Transaction Us" */
+#define HIDSPI_STATUS_LEN	(HIDSPI_PAD + 4)
+#define HIDSPI_STATUS_OK	0xd56827ac
+#define HIDSPI_STATUS_NAK	0x0e4fb139
 #define RECOVER_AFTER		20
+#define MAX_SUPPLIES		3
 
 static const u8 hidspi_booted[4] = { 0xa0, 0x80, 0x00, 0x00 };
 static const u8 hbpp_nop[16] = {
@@ -95,11 +114,47 @@ struct apple_hidspi_finger {
 	__le16 multi;
 } __packed;
 
+/**
+ * struct ahts_variant - what differs between the controllers
+ * @name: name of the input device
+ * @supplies: the supplies, in the order they turn on
+ * @clk: the touch clock is a clock of the device tree
+ * @hbpp_mode: SPI mode of the bootloader
+ * @hbpp_version: the ADT's hbpp-version
+ * @hbpp_chunk: most payload bytes of a blob the driver builds; 0: no limit
+ * @hbpp_ack_delay_ms: wait between a packet and its acknowledge
+ * @cs_delay_us: MTFW "CS Delay"
+ * @status_stage: HIDSPI packets are followed by the status stage
+ * @idle_fill: what the host clocks out while it only reads
+ * @max_x: largest X reported, unless the device tree gives the size
+ * @max_y: largest Y reported, unless the device tree gives the size
+ * @min_sx: left edge of the sensor, if the firmware sends no surface descriptor
+ * @max_sx: right edge; equal to @min_sx if the descriptor is required
+ * @min_sy: bottom edge
+ * @max_sy: top edge
+ */
+struct ahts_variant {
+	const char *name;
+	const char *supplies[MAX_SUPPLIES];
+	bool clk;
+	u32 hbpp_mode;
+	u16 hbpp_version;
+	unsigned int hbpp_chunk;
+	unsigned int hbpp_ack_delay_ms;
+	u16 cs_delay_us;
+	bool status_stage;
+	u8 idle_fill;
+	unsigned int max_x, max_y;
+	s16 min_sx, max_sx, min_sy, max_sy;
+};
+
 struct apple_hidspi_ts {
 	struct spi_device *spi;
+	const struct ahts_variant *variant;
 	struct input_dev *input;
 	struct touchscreen_properties props;
-	struct regulator *ana;
+	struct regulator *supplies[MAX_SUPPLIES];
+	unsigned int num_supplies;
 	struct clk *clk;
 	struct gpio_desc *reset;
 	const char *fw_name;
@@ -107,9 +162,10 @@ struct apple_hidspi_ts {
 	u8 *rx;
 	u8 *irq_tx;
 	u8 *irq_rx;
+	u8 *status;
 	u8 *pkt;
 	size_t pkt_size;
-	struct mutex lock;	/* the bootloader exchanges and requests */
+	struct mutex lock;	/* requests, and exchanges with a status stage */
 	u8 msg_id;
 	bool powered;
 	bool input_ready;
@@ -131,14 +187,15 @@ static int ahts_xfer(struct apple_hidspi_ts *ts, const void *tx, void *rx,
 		     size_t len)
 {
 	struct spi_transfer t[2] = {
-		{ .delay = { .value = 200, .unit = SPI_DELAY_UNIT_USECS } },
+		{ .delay = { .value = ts->variant->cs_delay_us,
+			     .unit = SPI_DELAY_UNIT_USECS } },
 		{ .tx_buf = tx, .rx_buf = rx, .len = len },
 	};
 
 	return spi_sync_transfer(ts->spi, t, ARRAY_SIZE(t));
 }
 
-/* HBPP bootloader (mode 3) */
+/* HBPP bootloader */
 
 static int ahts_hbpp_ack(struct apple_hidspi_ts *ts, u16 *reply)
 {
@@ -165,8 +222,10 @@ static int ahts_hbpp_send(struct apple_hidspi_ts *ts, const u8 *pkt,
 			return ret;
 		if (!want)
 			return 0;
+		if (ts->variant->hbpp_ack_delay_ms)
+			msleep(ts->variant->hbpp_ack_delay_ms);
 		ret = ahts_hbpp_ack(ts, &reply);
-		if (!ret && reply == want)
+		if (!ret && (want == HBPP_ACK_ANY || reply == want))
 			return 0;
 	}
 	dev_err(&ts->spi->dev, "HBPP packet of %zu bytes: ACK %#06x, want %#06x\n",
@@ -240,11 +299,12 @@ static int ahts_hbpp_detect(struct apple_hidspi_ts *ts)
 
 /*
  * HBPP blob loading @len bytes at @addr (z2fw.encode_blob): 18 e1 30 01, the
- * BE16 word count minus one, the address (BE16 halves, low first), the BE16
- * sum of those six bytes, the payload with each byte pair swapped, and the
- * sum of the payload bytes as the address is encoded.
+ * BE16 word count (minus one since HBPP 0x104), the address (BE16 halves, low
+ * first), the BE16 sum of those six bytes, the payload with each byte pair
+ * swapped, and the sum of the payload bytes as the address is encoded.
  */
-static size_t ahts_build_blob(u8 *out, u32 addr, const u8 *data, size_t len)
+static size_t ahts_build_blob(struct apple_hidspi_ts *ts, u8 *out, u32 addr,
+			      const u8 *data, size_t len)
 {
 	size_t padded = ALIGN(len, 4), k;
 	u32 sum = 0;
@@ -253,7 +313,8 @@ static size_t ahts_build_blob(u8 *out, u32 addr, const u8 *data, size_t len)
 	out[1] = 0xe1;
 	out[2] = 0x30;
 	out[3] = 0x01;
-	put_unaligned_be16(padded / 4 - 1, out + 4);
+	put_unaligned_be16(padded / 4 - (ts->variant->hbpp_version >= 0x104),
+			   out + 4);
 	put_unaligned_be16(addr, out + 6);
 	put_unaligned_be16(addr >> 16, out + 8);
 	put_unaligned_be16(out[4] + out[5] + out[6] + out[7] + out[8] + out[9], out + 10);
@@ -265,6 +326,27 @@ static size_t ahts_build_blob(u8 *out, u32 addr, const u8 *data, size_t len)
 	put_unaligned_be16(sum, out + 12 + padded);
 	put_unaligned_be16(sum >> 16, out + 14 + padded);
 	return 16 + padded;
+}
+
+/* @len bytes at @addr, as one blob or as many as the bootloader's limit asks. */
+static int ahts_send_blob(struct apple_hidspi_ts *ts, u32 addr, const u8 *data,
+			  size_t len)
+{
+	size_t chunk = ts->variant->hbpp_chunk ?: len, off, n;
+	int ret;
+
+	for (off = 0; off < len; off += n) {
+		n = min(len - off, chunk);
+		if (16 + ALIGN(n, 4) > ts->pkt_size)
+			return -EINVAL;
+		ret = ahts_hbpp_send(ts, ts->pkt,
+				     ahts_build_blob(ts, ts->pkt, addr + off,
+						     data + off, n),
+				     HBPP_ACK_BLOB);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 static int ahts_send_calibration(struct apple_hidspi_ts *ts, u32 addr,
@@ -282,23 +364,16 @@ static int ahts_send_calibration(struct apple_hidspi_ts *ts, u32 addr,
 			return 0;
 		}
 		dev_info(dev, "no %s; using the firmware's default\n", name);
-		len = min_t(size_t, def_len, max);
-		if (16 + ALIGN(len, 4) > ts->pkt_size)
-			return -EINVAL;
-		return ahts_hbpp_send(ts, ts->pkt,
-				      ahts_build_blob(ts->pkt, addr, def, len), 0x4bc1);
+		return ahts_send_blob(ts, addr, def, min_t(size_t, def_len, max));
 	}
 	len = min_t(size_t, count, max);
-	if (16 + ALIGN(len, 4) > ts->pkt_size)
-		return -EINVAL;
 	u8 *cal __free(kfree) = kmalloc(count, GFP_KERNEL);
 	if (!cal)
 		return -ENOMEM;
 	ret = device_property_read_u8_array(dev, name, cal, count);
 	if (ret)
 		return ret;
-	return ahts_hbpp_send(ts, ts->pkt, ahts_build_blob(ts->pkt, addr, cal, len),
-			      0x4bc1);
+	return ahts_send_blob(ts, addr, cal, len);
 }
 
 static int ahts_run_ops(struct apple_hidspi_ts *ts, const u8 *d, size_t n)
@@ -401,29 +476,39 @@ static int ahts_run_ops(struct apple_hidspi_ts *ts, const u8 *d, size_t n)
 	return 0;
 }
 
+static void ahts_supplies_off(struct apple_hidspi_ts *ts, unsigned int n)
+{
+	while (n--)
+		regulator_disable(ts->supplies[n]);
+}
+
 static void ahts_power_off(struct apple_hidspi_ts *ts)
 {
 	gpiod_set_value_cansleep(ts->reset, 1);
 	if (!ts->powered)
 		return;
 	clk_disable_unprepare(ts->clk);
-	regulator_disable(ts->ana);
+	ahts_supplies_off(ts, ts->num_supplies);
 	ts->powered = false;
 }
 
-/* Reset held, supply and clock on, reset released: the HBPP bootloader. */
+/* Reset held, clock and supplies on, reset released: the HBPP bootloader. */
 static int ahts_power_on(struct apple_hidspi_ts *ts)
 {
+	unsigned int i;
 	int ret;
 
 	gpiod_set_value_cansleep(ts->reset, 1);
 	ret = clk_prepare_enable(ts->clk);
 	if (ret)
 		return ret;
-	ret = regulator_enable(ts->ana);
-	if (ret) {
-		clk_disable_unprepare(ts->clk);
-		return ret;
+	for (i = 0; i < ts->num_supplies; i++) {
+		ret = regulator_enable(ts->supplies[i]);
+		if (ret) {
+			ahts_supplies_off(ts, i);
+			clk_disable_unprepare(ts->clk);
+			return ret;
+		}
 	}
 	ts->powered = true;
 	msleep(50);
@@ -456,7 +541,7 @@ static int ahts_boot(struct apple_hidspi_ts *ts)
 		ret = ahts_power_on(ts);
 		if (ret)
 			break;
-		ret = ahts_set_mode(ts, SPI_MODE_3);
+		ret = ahts_set_mode(ts, ts->variant->hbpp_mode);
 		if (ret)
 			break;
 		ret = ahts_hbpp_detect(ts);
@@ -478,16 +563,75 @@ static int ahts_boot(struct apple_hidspi_ts *ts)
 
 /* HIDSPI (mode 0) */
 
+/*
+ * A packet whose CRC holds. Where the host sends status words, its packets
+ * leave their bytes behind the device's shorter ones, and only the CRC of the
+ * message is good; a 4-byte message has none.
+ */
+static bool ahts_packet_ok(struct apple_hidspi_ts *ts, const u8 *p)
+{
+	size_t len, mlen;
+
+	if (crc16(0, p, HIDSPI_PKT - 2) == get_unaligned_le16(p + HIDSPI_PKT - 2))
+		return true;
+	if (!ts->variant->status_stage)
+		return false;
+	len = get_unaligned_le16(p + 6);
+	if (len == 4)
+		return p[0] == HIDSPI_READ;
+	if (len < 10 || len > HIDSPI_PKT - 10)
+		return false;
+	mlen = get_unaligned_le16(p + 14);
+	return mlen + 10 <= len &&
+	       crc16(0, p + 8, 8 + mlen) == get_unaligned_le16(p + 16 + mlen);
+}
+
+/*
+ * A packet each way, then the status stage in the same chip-select window:
+ * the host's word says whether the device's packet arrived whole.
+ */
+static int ahts_exchange(struct apple_hidspi_ts *ts, const u8 *tx, u8 *rx,
+			 bool *ok)
+{
+	struct spi_transfer t[2] = {
+		{ .delay = { .value = ts->variant->cs_delay_us,
+			     .unit = SPI_DELAY_UNIT_USECS } },
+		{ .tx_buf = tx, .rx_buf = rx, .len = HIDSPI_XFER, .cs_change = 1 },
+	};
+	struct spi_transfer st = {
+		.tx_buf = ts->status,
+		.rx_buf = ts->status + HIDSPI_STATUS_LEN,
+		.len = HIDSPI_STATUS_LEN,
+	};
+	int ret;
+
+	lockdep_assert_held(&ts->lock);
+	ret = spi_sync_transfer(ts->spi, t, ARRAY_SIZE(t));
+	if (ret)
+		return ret;
+	*ok = ahts_packet_ok(ts, rx + HIDSPI_PAD);
+	usleep_range(HIDSPI_STAGE_US, HIDSPI_STAGE_US + 50);
+	memset(ts->status, ts->variant->idle_fill, HIDSPI_PAD);
+	put_unaligned_le32(*ok ? HIDSPI_STATUS_OK : HIDSPI_STATUS_NAK,
+			   ts->status + HIDSPI_PAD);
+	ret = spi_sync_transfer(ts->spi, &st, 1);
+	usleep_range(HIDSPI_GAP_US, HIDSPI_GAP_US + 50);
+	return ret;
+}
+
 static int ahts_request(struct apple_hidspi_ts *ts, u8 dev, u8 u0, u8 u1,
 			u8 u2, u16 rsplen)
 {
 	struct spi_transfer t[3] = {
-		{ .delay = { .value = 200, .unit = SPI_DELAY_UNIT_USECS } },
+		{ .delay = { .value = ts->variant->cs_delay_us,
+			     .unit = SPI_DELAY_UNIT_USECS } },
 		{ .tx_buf = ts->tx, .len = HIDSPI_XFER,
-		  .delay = { .value = 200, .unit = SPI_DELAY_UNIT_USECS } },
-		{ .rx_buf = ts->rx, .len = 8 },
+		  .delay = { .value = HIDSPI_STAGE_US,
+			     .unit = SPI_DELAY_UNIT_USECS } },
+		{ .rx_buf = ts->rx, .len = HIDSPI_STATUS_LEN },
 	};
 	u8 *pkt = ts->tx + HIDSPI_PAD, *h = pkt + 8;
+	bool ok;
 	u16 crc;
 	int ret;
 
@@ -505,6 +649,8 @@ static int ahts_request(struct apple_hidspi_ts *ts, u8 dev, u8 u0, u8 u1,
 	put_unaligned_le16(crc, h + 8);
 	crc = crc16(0, pkt, HIDSPI_PKT - 2);
 	put_unaligned_le16(crc, pkt + HIDSPI_PKT - 2);
+	if (ts->variant->status_stage)
+		return ahts_exchange(ts, ts->tx, ts->rx, &ok);
 	ret = spi_sync_transfer(ts->spi, t, ARRAY_SIZE(t));
 	usleep_range(HIDSPI_GAP_US, HIDSPI_GAP_US + 50);
 	return ret;
@@ -578,16 +724,33 @@ static void ahts_touch(struct apple_hidspi_ts *ts, const u8 *pl, size_t len)
 	input_sync(input);
 }
 
+/* The packet the interrupt announces, into irq_rx. */
+static int ahts_read(struct apple_hidspi_ts *ts, bool *ok)
+{
+	int ret;
+
+	if (ts->variant->status_stage) {
+		guard(mutex)(&ts->lock);
+		return ahts_exchange(ts, ts->irq_tx, ts->irq_rx, ok);
+	}
+	ret = ahts_xfer(ts, ts->irq_tx, ts->irq_rx, HIDSPI_XFER);
+	if (ret)
+		return ret;
+	usleep_range(HIDSPI_GAP_US, HIDSPI_GAP_US + 50);
+	*ok = ahts_packet_ok(ts, ts->irq_rx + HIDSPI_PAD);
+	return 0;
+}
+
 static irqreturn_t ahts_irq(int irq, void *data)
 {
 	struct apple_hidspi_ts *ts = data;
 	u8 *p = ts->irq_rx + HIDSPI_PAD, *m = p + 8;
 	size_t len, mlen;
+	bool ok;
 
-	if (ahts_xfer(ts, ts->irq_tx, ts->irq_rx, HIDSPI_XFER))
+	if (ahts_read(ts, &ok))
 		return IRQ_HANDLED;
-	usleep_range(HIDSPI_GAP_US, HIDSPI_GAP_US + 50);
-	if (crc16(0, p, HIDSPI_PKT - 2) != get_unaligned_le16(p + HIDSPI_PKT - 2)) {
+	if (!ok) {
 		/* Back in the HBPP bootloader: the firmware is gone. */
 		if (get_unaligned_be16(ts->irq_rx) == HBPP_ERROR &&
 		    ++ts->bootloader_seen == RECOVER_AFTER) {
@@ -604,6 +767,7 @@ static irqreturn_t ahts_irq(int irq, void *data)
 	len = get_unaligned_le16(p + 6);
 	if (len > HIDSPI_PKT - 10)
 		return IRQ_HANDLED;
+	dev_dbg(&ts->spi->dev, "packet %*ph\n", 24, p);
 
 	if (p[1] == HIDSPI_DEV_INFO && len == sizeof(hidspi_booted) &&
 	    !memcmp(m, hidspi_booted, len)) {
@@ -651,18 +815,24 @@ static int ahts_probe(struct spi_device *spi)
 {
 	struct device *dev = &spi->dev;
 	struct apple_hidspi_ts *ts;
+	const struct ahts_variant *v;
 	struct input_dev *input;
 	const char *fw_prefix, *personality;
+	unsigned int i;
 	int ret;
 
+	v = spi_get_device_match_data(spi);
+	if (!v)
+		return -ENODEV;
 	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
 	if (!ts)
 		return -ENOMEM;
 	ts->spi = spi;
-	ts->min_x = -218;
-	ts->max_x = 6003;
-	ts->min_y = -220;
-	ts->max_y = 13270;
+	ts->variant = v;
+	ts->min_x = v->min_sx;
+	ts->max_x = v->max_sx;
+	ts->min_y = v->min_sy;
+	ts->max_y = v->max_sy;
 	init_completion(&ts->booted);
 	init_completion(&ts->surface);
 	INIT_WORK(&ts->recover, ahts_recover_work);
@@ -671,15 +841,23 @@ static int ahts_probe(struct spi_device *spi)
 	ts->rx = devm_kzalloc(dev, HIDSPI_XFER + 16, GFP_KERNEL);
 	ts->irq_tx = devm_kzalloc(dev, HIDSPI_XFER, GFP_KERNEL);
 	ts->irq_rx = devm_kzalloc(dev, HIDSPI_XFER, GFP_KERNEL);
-	if (!ts->tx || !ts->rx || !ts->irq_tx || !ts->irq_rx)
+	ts->status = devm_kzalloc(dev, 2 * HIDSPI_STATUS_LEN, GFP_KERNEL);
+	if (!ts->tx || !ts->rx || !ts->irq_tx || !ts->irq_rx || !ts->status)
 		return -ENOMEM;
+	memset(ts->irq_tx, v->idle_fill, HIDSPI_XFER);
 
-	ts->ana = devm_regulator_get(dev, "ana");
-	if (IS_ERR(ts->ana))
-		return dev_err_probe(dev, PTR_ERR(ts->ana), "no ana supply\n");
-	ts->clk = devm_clk_get(dev, NULL);
-	if (IS_ERR(ts->clk))
-		return dev_err_probe(dev, PTR_ERR(ts->clk), "no clock\n");
+	for (i = 0; i < MAX_SUPPLIES && v->supplies[i]; i++) {
+		ts->supplies[i] = devm_regulator_get(dev, v->supplies[i]);
+		if (IS_ERR(ts->supplies[i]))
+			return dev_err_probe(dev, PTR_ERR(ts->supplies[i]),
+					     "no %s supply\n", v->supplies[i]);
+	}
+	ts->num_supplies = i;
+	if (v->clk) {
+		ts->clk = devm_clk_get(dev, NULL);
+		if (IS_ERR(ts->clk))
+			return dev_err_probe(dev, PTR_ERR(ts->clk), "no clock\n");
+	}
 	ts->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(ts->reset))
 		return dev_err_probe(dev, PTR_ERR(ts->reset), "no reset GPIO\n");
@@ -700,12 +878,12 @@ static int ahts_probe(struct spi_device *spi)
 	if (!input)
 		return -ENOMEM;
 	ts->input = input;
-	input->name = "Apple iPhone X Touchscreen";
+	input->name = v->name;
 	input->phys = "apple_hidspi_ts";
 	input->id.bustype = BUS_SPI;
 	input->id.vendor = 0x05ac;
-	input_set_abs_params(input, ABS_MT_POSITION_X, 0, 1124, 0, 0);
-	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, 2435, 0, 0);
+	input_set_abs_params(input, ABS_MT_POSITION_X, 0, v->max_x, 0, 0);
+	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, v->max_y, 0, 0);
 	touchscreen_parse_properties(input, true, &ts->props);
 	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, 65535, 0, 0);
 	input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, 65535, 0, 0);
@@ -732,8 +910,12 @@ static int ahts_probe(struct spi_device *spi)
 		dev_warn(dev, "no boot message from the firmware\n");
 	if (ahts_request(ts, HIDSPI_DEV_TOUCH, HIDSPI_MSG_GET_REPORT,
 			 SURFACE_REPORT, 0x00, 64) ||
-	    !wait_for_completion_timeout(&ts->surface, msecs_to_jiffies(500)))
+	    !wait_for_completion_timeout(&ts->surface, msecs_to_jiffies(500))) {
+		if (ts->max_x <= ts->min_x)
+			return dev_err_probe(dev, -ENODEV,
+					     "no surface descriptor: touchscreen left off\n");
 		dev_warn(dev, "no surface descriptor; using defaults\n");
+	}
 
 	ret = input_register_device(input);
 	if (ret)
@@ -742,14 +924,59 @@ static int ahts_probe(struct spi_device *spi)
 	return 0;
 }
 
+/*
+ * iPhone X. HBPP 0x105 in mode 3 and the 200 us CS delay of its MTFW, as
+ * measured on a d221; the sizes are the panel's pixels and the surface
+ * descriptor that unit's firmware sent.
+ */
+static const struct ahts_variant ahts_d221 = {
+	.name = "Apple iPhone X Touchscreen",
+	.supplies = { "ana" },
+	.clk = true,
+	.hbpp_mode = SPI_MODE_3,
+	.hbpp_version = 0x105,
+	.cs_delay_us = 200,
+	.max_x = 1124,
+	.max_y = 2435,
+	.min_sx = -218,
+	.max_sx = 6003,
+	.min_sy = -220,
+	.max_sy = 13270,
+};
+
+/*
+ * iPhone XR. The ADT's multi-touch node: hbpp-version 0x103, and
+ * function-power_ana (hv), function-power_ldo (core) and function-clock_enable
+ * (clken), the last two switched by the SMC. From Project Cascadia's driver,
+ * which runs this controller: the bootloader in the bus' mode 0, blobs of at
+ * most 0x3f0 bytes, 20 ms before each acknowledge, a 300 us CS delay, 0xff
+ * while reading and the status stage. The panel has 828 x 1792 pixels; the
+ * sensor's edges come from the firmware's surface descriptor only.
+ */
+static const struct ahts_variant ahts_n841 = {
+	.name = "Apple iPhone XR Touchscreen",
+	.supplies = { "hv", "core", "clken" },
+	.hbpp_mode = SPI_MODE_0,
+	.hbpp_version = 0x103,
+	.hbpp_chunk = 0x3f0,
+	.hbpp_ack_delay_ms = 20,
+	.cs_delay_us = 300,
+	.status_stage = true,
+	.idle_fill = 0xff,
+	.max_x = 827,
+	.max_y = 1791,
+};
+
 static const struct of_device_id ahts_of_match[] = {
-	{ .compatible = "apple,d221-touchscreen" },
+	{ .compatible = "apple,d221-touchscreen", .data = &ahts_d221 },
+	{ .compatible = "apple,n841-touchscreen", .data = &ahts_n841 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ahts_of_match);
 
 static const struct spi_device_id ahts_spi_id[] = {
-	{ "d221-touchscreen" },
+	{ "d221-touchscreen", (kernel_ulong_t)&ahts_d221 },
+	{ "n841-touchscreen", (kernel_ulong_t)&ahts_n841 },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, ahts_spi_id);
@@ -764,6 +991,7 @@ static struct spi_driver ahts_driver = {
 };
 module_spi_driver(ahts_driver);
 
-MODULE_DESCRIPTION("Apple HIDSPI touchscreen (iPhone X)");
+MODULE_DESCRIPTION("Apple HIDSPI touchscreen (iPhone X, iPhone XR)");
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE("apple/d221-touch-*.bin");
+MODULE_FIRMWARE("apple/n841-touch-*.bin");
