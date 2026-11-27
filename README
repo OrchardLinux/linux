@@ -1,7 +1,7 @@
-> **Orchard's kernel.** Upstream Linux with HoolockLinux's A7-A11 work and
-> [Orchard](https://github.com/OrchardLinux/orchard)'s changes on top, the kernel Orchard
-> runs on iPhones and iPads (`main` for arm64, `armv7` for 32-bit). Kernel work for Orchard
-> is a pull request here, not in the orchard repository. See [AGENTS.md](AGENTS.md).
+Orchard's kernel: upstream Linux with HoolockLinux's A7-A11 work and Orchard's
+changes on top, the kernel Orchard runs on iPhones and iPads (branch main for
+arm64, armv7 for 32-bit). Kernel work for Orchard is a pull request here, not in
+the orchard repository (https://github.com/OrchardLinux/orchard). See AGENTS.md.
 
 Linux kernel
 ============
