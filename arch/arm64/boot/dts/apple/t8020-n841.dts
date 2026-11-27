@@ -34,6 +34,14 @@
 	apple,extended-range-linear;
 };
 
+/*
+ * Two LM3539 LED drivers light the panel, one on each of i2c0 and i2c2;
+ * both take their level from DWI, and the loader leaves them enabled.
+ */
+&dwi_bl {
+	status = "okay";
+};
+
 &i2c2 {
 	status = "okay";
 
