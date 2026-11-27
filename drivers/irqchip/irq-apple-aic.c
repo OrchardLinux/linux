@@ -316,6 +316,10 @@ static const struct of_device_id aic_info_match[] = {
 		.data = &aic1_fipi_info,
 	},
 	{
+		.compatible = "apple,t8020-aic",
+		.data = &aic1_fipi_info,
+	},
+	{
 		.compatible = "apple,aic",
 		.data = &aic1_info,
 	},
