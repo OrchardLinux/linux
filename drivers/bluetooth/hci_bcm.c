@@ -2017,11 +2017,13 @@ static struct bcm_device_data bcm4324b5_a7_device_data = {
 /*
  * The BCM4357 of the A12 iPhones (ADT module-instance yodak on the iPhone
  * XR): its firmware lists LE Set Extended Scan Parameters among its
- * commands and then fails it, so nothing is ever found. The unit's address
- * comes from the loader.
+ * commands and then fails it, so nothing is ever found, and it sets
+ * reserved bits in the event type of its advertising reports, as the
+ * BCM4355 does. The unit's address comes from the loader.
  */
 static struct bcm_device_data bcm4357_device_data = {
 	.broken_ext_scan = true,
+	.fixup_le_adv_report_evt_type = true,
 	.use_bdaddr_property = true,
 };
 
