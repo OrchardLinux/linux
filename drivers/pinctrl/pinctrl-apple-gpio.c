@@ -49,6 +49,7 @@ struct apple_gpio_pinctrl {
 
 	struct pinctrl_desc pinctrl_desc;
 	struct gpio_chip gpio_chip;
+	u32 irq_group;
 	u8 irqgrps[];
 };
 
@@ -338,7 +339,7 @@ static unsigned int apple_gpio_irq_startup(struct irq_data *data)
 	struct apple_gpio_pinctrl *pctl = gpiochip_get_data(chip);
 
 	apple_gpio_set_reg(pctl, data->hwirq, REG_GPIOx_GRP,
-			   FIELD_PREP(REG_GPIOx_GRP, 0));
+			   FIELD_PREP(REG_GPIOx_GRP, pctl->irq_group));
 
 	apple_gpio_direction_input(chip, data->hwirq);
 	apple_gpio_irq_unmask(data);
@@ -500,6 +501,12 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 	if (of_property_read_u32(pdev->dev.of_node, "apple,npins", &npins))
 		return dev_err_probe(&pdev->dev, -EINVAL,
 				     "apple,npins property not found\n");
+
+	/*
+	 * Some blocks route only some interrupt groups to the AP: the A12's
+	 * AOP GPIOs offer groups 4-6 (ADT supported-int-groups), 0 is not one.
+	 */
+	of_property_read_u32(pdev->dev.of_node, "apple,irq-group", &pctl->irq_group);
 
 	pins = devm_kmalloc_array(&pdev->dev, npins, sizeof(pins[0]),
 				  GFP_KERNEL);

@@ -526,6 +526,8 @@
 			#gpio-cells = <2>;
 			gpio-ranges = <&pinctrl_aop 0 0 52>;
 			apple,npins = <52>;
+			/* ADT aop-gpio supported-int-groups = 4, 5, 6 */
+			apple,irq-group = <6>;
 
 			interrupt-controller;
 			#interrupt-cells = <2>;
