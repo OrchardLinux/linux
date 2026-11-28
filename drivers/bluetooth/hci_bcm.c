@@ -57,6 +57,10 @@
  * @set_baudrate_before_patch: switch to operational speed before Patchram
  * @broken_read_transmit_power: controller cannot read LE min/max TX power
  * @fixup_le_adv_report_evt_type: controller uses reserved advertising bits
+ * @broken_ext_scan: controller lists the LE extended scan commands but
+ *	rejects them
+ * @broken_ext_create_conn: controller lists LE Extended Create Connection
+ *	but rejects it
  * @use_bdaddr_property: require the unit address supplied by firmware
  * @power_off_on_close: power-cycle and repeat setup across HCI opens
  * @no_uart_clock_set: UART clock set command for >3Mbps mode is unavailable
@@ -72,6 +76,8 @@ struct bcm_device_data {
 	bool	set_baudrate_before_patch;
 	bool	broken_read_transmit_power;
 	bool	fixup_le_adv_report_evt_type;
+	bool	broken_ext_scan;
+	bool	broken_ext_create_conn;
 	bool	use_bdaddr_property;
 	bool	power_off_on_close;
 	bool	no_uart_clock_set;
@@ -131,6 +137,10 @@ struct bcm_apple_data {
  * @set_baudrate_before_patch: switch to operational speed before Patchram
  * @broken_read_transmit_power: controller cannot read LE min/max TX power
  * @fixup_le_adv_report_evt_type: controller uses reserved advertising bits
+ * @broken_ext_scan: controller lists the LE extended scan commands but
+ *	rejects them
+ * @broken_ext_create_conn: controller lists LE Extended Create Connection
+ *	but rejects it
  * @use_bdaddr_property: require the unit address supplied by firmware
  * @no_uart_clock_set: UART clock set command for >3Mbps mode is unavailable
  * @pcm_int_params: keep the initial PCM configuration
@@ -183,6 +193,8 @@ struct bcm_device {
 	bool			set_baudrate_before_patch;
 	bool			broken_read_transmit_power;
 	bool			fixup_le_adv_report_evt_type;
+	bool			broken_ext_scan;
+	bool			broken_ext_create_conn;
 	bool			use_bdaddr_property;
 	bool			power_off_on_close;
 	int			(*hci_open)(struct hci_dev *hdev);
@@ -770,6 +782,12 @@ static int bcm_setup(struct hci_uart *hu)
 	if (bcm->dev && bcm->dev->fixup_le_adv_report_evt_type)
 		hci_set_quirk(hu->hdev,
 			      HCI_QUIRK_FIXUP_LE_ADV_REPORT_EVT_TYPE);
+
+	if (bcm->dev && bcm->dev->broken_ext_scan)
+		hci_set_quirk(hu->hdev, HCI_QUIRK_BROKEN_EXT_SCAN);
+
+	if (bcm->dev && bcm->dev->broken_ext_create_conn)
+		hci_set_quirk(hu->hdev, HCI_QUIRK_BROKEN_EXT_CREATE_CONN);
 
 	if (bcm->dev && bcm->dev->use_bdaddr_property)
 		hci_set_quirk(hu->hdev, HCI_QUIRK_USE_BDADDR_PROPERTY);
@@ -1911,6 +1929,8 @@ static int bcm_serdev_probe(struct serdev_device *serdev)
 			data->broken_read_transmit_power;
 		bcmdev->fixup_le_adv_report_evt_type =
 			data->fixup_le_adv_report_evt_type;
+		bcmdev->broken_ext_scan = data->broken_ext_scan;
+		bcmdev->broken_ext_create_conn = data->broken_ext_create_conn;
 		bcmdev->use_bdaddr_property = data->use_bdaddr_property;
 		bcmdev->power_off_on_close = data->power_off_on_close;
 		bcmdev->no_uart_clock_set = data->no_uart_clock_set;
