@@ -234,7 +234,8 @@
 
 		/*
 		 * MCA0: Apple's mca,s5l8960x, mca-version 1. Its i2s_route, aud0 to
-		 * pin0, is the same in the device tree of every A7 iPad.
+		 * pin0, is the same in the device tree of every A7 iPad, and so
+		 * are its SmartIO endpoints (ADT dma-channels): 0x28 TX, 0x29 RX.
 		 */
 		mca0: mca@20a0c0000 {
 			compatible = "apple,s5l8960x-mca";
@@ -244,8 +245,8 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 147 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_mca0>;
-			dmas = <&sio 0x28>;
-			dma-names = "tx";
+			dmas = <&sio 0x28>, <&sio 0x29>;
+			dma-names = "tx", "rx";
 			apple,i2s-switch = <&i2s_switch 0 0>;
 			#clock-cells = <0>;
 			clock-output-names = "mca0-mclk";
