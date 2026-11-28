@@ -3,12 +3,13 @@
  * GPIO and PMU event interrupt driver for Apple/Dialog PMICs used with the
  * A7, A8, A8X, A9 and A10 SoCs.
  *
- * The D2365 latches 240 PMU events and the D2207 112 in a read-to-clear
- * block. Any unmasked pending event pulls the PMU interrupt line to the AP
- * low; reading the block acknowledges everything and releases the line.
- * Every PMU client shares that block, so this driver owns it and hands each
- * event to its consumer as an ordinary interrupt. PMIC GPIO line N is event
- * 0x30 + N on the D2365 and 0x18 + N on the D2207.
+ * The D2365 latches 240 PMU events, the D2207 112 and the D2186 104 in a
+ * read-to-clear block. Any unmasked pending event pulls the PMU interrupt
+ * line to the AP low; reading the block acknowledges everything and
+ * releases the line. Every PMU client shares that block, so this driver
+ * owns it and hands each event to its consumer as an ordinary interrupt.
+ * PMIC GPIO line N is event 0x30 + N on the D2365 and 0x18 + N on the
+ * D2207 and D2186.
  * One more interrupt, numbered after the last event, is the line itself: its
  * consumers run before the block is read, for a consumer that must act
  * within the shortest time after an assertion (charger withdrawal).
@@ -52,6 +53,19 @@
 #define D2186_GPIO_MODE_MASK	GENMASK(7, 4)
 #define D2186_GPIO_OUTPUT	0
 #define D2186_GPIO_INPUT	BIT(7)
+
+/*
+ * D2186 PMU events, laid out as on the D2207 with one byte less. iOS
+ * AppleD2186PMU reads the 13 bytes at 0x50 to take (and so clear) the
+ * events, sets the 13 mask bytes at 0x70 (set = masked) and masks or
+ * unmasks one event with a single byte write to 0x70 + n / 8. GPIO line n
+ * is event 0x18 + n: its wake reason decoding names event 0x18 + n
+ * "gpio(n + 1)" and maps it back to the configuration byte of line n.
+ */
+#define D2186_EVENTS		0x50
+#define D2186_EVENT_MASK	0x70
+#define D2186_EVENT_BYTES	13
+#define D2186_GPIO_EVENT	0x18
 
 /*
  * D2207, as iOS AppleD2207PMU accesses it: the configuration byte of line n
@@ -1172,6 +1186,13 @@ static const struct apple_pmic_gpio_info d2089_gpio_info = {
 	.events = &d2089_event_info,
 };
 
+static const struct apple_pmic_event_info d2186_event_info = {
+	.status_base = D2186_EVENTS,
+	.mask_base = D2186_EVENT_MASK,
+	.bytes = D2186_EVENT_BYTES,
+	.gpio_event = D2186_GPIO_EVENT,
+};
+
 static const struct apple_pmic_gpio_info d2186_gpio_info = {
 	.label = "d2186-pmic-gpio",
 	.ngpio = 21,
@@ -1181,6 +1202,7 @@ static const struct apple_pmic_gpio_info d2186_gpio_info = {
 	.input_mode = D2186_GPIO_INPUT,
 	.output_mode = D2186_GPIO_OUTPUT,
 	.config_reg = d2186_gpio_config_reg,
+	.events = &d2186_event_info,
 };
 
 static const struct apple_pmic_event_info d2207_event_info = {
