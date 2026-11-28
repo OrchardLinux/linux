@@ -2497,7 +2497,12 @@ void pvr_apple_device_info_init(struct pvr_device *pvr_dev)
 	pvr_dev->features.has_cdm_control_stream_format = true;
 	pvr_dev->features.cdm_control_stream_format = 1;
 	pvr_dev->features.has_num_clusters = true;
-	pvr_dev->features.num_clusters = 6;
+	/*
+	 * The A7 (S5L8960X, BVNC 1.70.4.3) has 4 clusters (CORE_ID); with 6,
+	 * the GPU info reported 2 phantoms and Mesa's Rogue render path, which
+	 * expects one on a 4-cluster core, refused to record a draw.
+	 */
+	pvr_dev->features.num_clusters = pvr_dev->gpu_id.b == 1 ? 4 : 6;
 	pvr_dev->features.has_phys_bus_width = true;
 	pvr_dev->features.phys_bus_width = 40;
 	pvr_dev->features.has_virtual_address_space_bits = true;
