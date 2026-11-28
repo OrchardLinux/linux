@@ -118,6 +118,7 @@ static struct gpio_desc *host_ready;
 static bool lookup_installed, host_touched, host_restored, gpio_released;
 static u32 host_high_cfg, host_after, high_window_samples, high_window_ready;
 static u32 low_window_samples, low_window_ready;
+static bool device_ready_stale;
 static u32 ehci_caps[3], ehci_initial[7], ehci_high[7], ehci_low[7], ehci_reset_state[7];
 static bool ehci_valid;
 static bool retain_controller;
@@ -264,7 +265,8 @@ static int status_get(char *buf, const struct kernel_param *unused)
         "high_window_samples=%u\nhigh_window_ready=%u\nlow_window_samples=%u\nlow_window_ready=%u\n"
         "dma_checked=%u\nhcd_attempted=%u\nhcd_stopped=%u\ncontroller_restored=%u\nretain_controller=%u\n"
         "enumerate_result=%d\nradio_vid=%04x\nradio_pid=%04x\nradio_speed=%u\nrom_result=%d\n"
-        "rom_identity=%08x,%08x,%08x,%08x,%08x,%08x\n",
+        "rom_identity=%08x,%08x,%08x,%08x,%08x,%08x\n"
+        "device_ready_stale=%u\n",
 		board ? board->name : "none",
 		result, observed, restored, consumer_removed, phy_touched, phy_restored, original_control, running_control,
         reset_touched, reset_restored, pmu_before, pmu_released, pmu_after,
@@ -273,7 +275,8 @@ static int status_get(char *buf, const struct kernel_param *unused)
         high_window_samples, high_window_ready, low_window_samples, low_window_ready,
         dma_checked, hcd_attempted, hcd_stopped, controller_restored, retain_controller,
         enumerate_result, radio_vid, radio_pid, radio_speed, rom_result,
-        rom_words[0],rom_words[1],rom_words[2],rom_words[3],rom_words[4],rom_words[5]);
+        rom_words[0],rom_words[1],rom_words[2],rom_words[3],rom_words[4],rom_words[5],
+        device_ready_stale);
 
 	len = ports_get(buf, len, "saved_ports", saved_ports);
 	len = ports_get(buf, len, "live_ports", live_ports);
@@ -544,16 +547,29 @@ static int __init observer_init(void)
     /* The reset write 0b is only known from the 09 baseline. */
     if (!gate("PMU GPIO3", pmu_before, J72_PMU_RESET) ||
         !observe("HOST_READY config", host_ready_before, J72_HOST_READY_CFG) ||
-        !observe("DEVICE_READY config", device_ready_before, J72_DEVICE_READY_CFG)) {
+        !observe("DEVICE_READY config", device_ready_before & ~1U, J72_DEVICE_READY_CFG)) {
         result = -EPROTO;
         goto cleanup;
     }
-    /* Both lines must start low: HOST_READY is restored to this word. */
-    if ((host_ready_before & 1) || (device_ready_before & 1)) {
-        pr_warn(DRV_NAME ": %s HOST_READY/DEVICE_READY not low (%08x/%08x)\n",
+    /* HOST_READY must start low: it is restored to this word. */
+    if (host_ready_before & 1) {
+        pr_warn(DRV_NAME ": %s HOST_READY not low (%08x/%08x)\n",
                 board->name, host_ready_before, device_ready_before);
         result = -EPROTO;
         goto cleanup;
+    }
+    /* DEVICE_READY is the radio's output and only describes the starting
+     * state. With HOST_READY low and the radio in reset (PMU GPIO3 09,
+     * gated above), a high level is left from an earlier session in this
+     * boot: the BCM4324's Bluetooth half keeps the combo chip powered, so
+     * the WLAN reset does not lower it (J71, 2026-11-28; with Bluetooth
+     * unbound it went low). Releasing the reset does: the radio must read
+     * low before HOST_READY rises, checked after the low window below.
+     */
+    if (device_ready_before & 1) {
+        device_ready_stale = true;
+        pr_info(DRV_NAME ": %s DEVICE_READY high (%08x) with the radio in reset and HOST_READY low: left from an earlier session\n",
+                board->name, device_ready_before);
     }
     reset_restored = true;
     host_restored = true;
@@ -615,6 +631,13 @@ static int __init observer_init(void)
      */
     result = ready_window(gpio, host_ready_before, &ready_samples, &ready_high_samples);
     if (result) goto cleanup;
+    /* A stale DEVICE_READY must have dropped with the reset release. */
+    if (device_ready_stale && (last_device_ready & 1)) {
+        pr_warn(DRV_NAME ": %s DEVICE_READY still high %u/%u after the radio left reset; not raising HOST_READY\n",
+                board->name, ready_high_samples, ready_samples);
+        result = -EPROTO;
+        goto cleanup;
+    }
     host_touched = true;
     host_pending = true;
     host_restored = false;
@@ -624,8 +647,8 @@ static int __init observer_init(void)
     if (host_high_cfg != (host_ready_before | 1)) { result = -EIO; goto cleanup; }
     result = ready_window(gpio, host_ready_before | 1, &high_window_samples, &high_window_ready);
     if (result) goto cleanup;
-    pr_info(DRV_NAME ": %s DEVICE_READY high in %u/%u samples after HOST_READY (J72: 45/50)\n",
-            board->name, high_window_ready, high_window_samples);
+    pr_info(DRV_NAME ": %s DEVICE_READY high in %u/%u samples before and %u/%u after HOST_READY (J72: 0/50, 45/50)\n",
+            board->name, ready_high_samples, ready_samples, high_window_ready, high_window_samples);
     result = hcd_enumerate(ehci);
     ehci_state(ehci, ehci_high);
     if (!result && keep_active) {
