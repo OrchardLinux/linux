@@ -16,6 +16,14 @@
 		spi2 = &spi2;
 		touchscreen0 = &touchscreen;
 	};
+
+	battery_info: battery {
+		compatible = "simple-battery";
+		/* ADT charger charge-limits[0] (0x4ab = 1195 mA) */
+		constant-charge-current-max-microamp = <1195000>;
+		operating-range-celsius = <0 45>;
+		alert-celsius = <10 40>;
+	};
 };
 
 &spi2 {
@@ -77,4 +85,46 @@
 /* ADT uart4/wlan module-instance */
 &wifi0 {
 	brcm,board-type = "apple,tempranillo";
+};
+
+/*
+ * SN2400 (Tigris) charger at i2c1 0x75 owns the battery HDQ mux; uart5's
+ * bq27540 gauge answers through it (ADT uart5/gas-gauge
+ * function-battery_swi_request -> i2c1/tigris).
+ */
+&i2c1 {
+	status = "okay";
+
+	charger@75 {
+		compatible = "apple,sn2400";
+		reg = <0x75>;
+
+		sn2400_charger: charger {
+			compatible = "apple,sn2400-charger";
+			monitored-battery = <&battery_info>;
+			/* ADT charger usb-input-limit-max */
+			input-current-limit-microamp = <2000000>;
+			mux-states = <&hdq_mux 0>;
+			mux-state-names = "hdq";
+		};
+
+		hdq_mux: hdq-mux {
+			compatible = "apple,sn2400-hdq-mux";
+			#mux-state-cells = <1>;
+		};
+	};
+};
+
+&hdq_onewire {
+	mux-states = <&hdq_mux 1>;
+	mux-state-names = "hdq";
+};
+
+&fuel_gauge {
+	monitored-battery = <&battery_info>;
+};
+
+/* The USB device controller tells the SN2400 driver what the USB host allows. */
+&usbdev {
+	usb-psy-name = "usb";
 };

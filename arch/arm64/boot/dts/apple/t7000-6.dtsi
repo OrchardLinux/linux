@@ -60,10 +60,10 @@
 	pinctrl-names = "default";
 	status = "okay";
 
-	onewire {
+	hdq_onewire: onewire {
 		compatible = "ti,hdq-uart";
 
-		fuel-gauge {
+		fuel_gauge: fuel-gauge {
 			compatible = "ti,bq27540-hdq";
 		};
 	};
