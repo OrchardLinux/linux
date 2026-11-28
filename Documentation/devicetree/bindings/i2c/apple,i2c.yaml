@@ -36,6 +36,7 @@ properties:
               - apple,s8000-i2c
               - apple,t8010-i2c
               - apple,t8015-i2c
+              - apple,t8020-i2c
               - apple,t8103-i2c
               - apple,t8112-i2c
               - apple,t6000-i2c

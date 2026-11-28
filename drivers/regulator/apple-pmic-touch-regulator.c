@@ -232,6 +232,22 @@ static const struct regulator_desc apple_chestnut_touch_hv = {
 };
 
 /*
+ * Chestnut's panel rail: the ADT's lcd node has function-lcd_ldo = dpLE(0x201),
+ * which iOS's AppleChestnutDisplayPMU::setLDO turns into bit (4 << 1) of
+ * register 0x05. iOS waits 10 ms after enabling it before releasing reset.
+ */
+static const struct regulator_desc apple_chestnut_lcd = {
+	.name = "chestnut-lcd",
+	.ops = &apple_pmic_touch_regulator_ops,
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.enable_reg = 0x05,
+	.enable_mask = 0x08,
+	.enable_val = 0x08,
+	.disable_val = 0,
+};
+
+/*
  * Acorn (iPhone X display PMU, I2C 0x2a): the touch controller's supply is
  * register 0x05. The ADT's multi-touch node has function-power_ana = dpLE(0x6)
  * and function-power_pulldown = dpLE(0x40); its power-sequence turns the
@@ -352,6 +368,10 @@ static const struct of_device_id apple_pmic_touch_regulator_of_match[] = {
 	{
 		.compatible = "apple,chestnut-touch-hv-regulator",
 		.data = &apple_chestnut_touch_hv,
+	},
+	{
+		.compatible = "apple,chestnut-lcd-regulator",
+		.data = &apple_chestnut_lcd,
 	},
 	{ }
 };

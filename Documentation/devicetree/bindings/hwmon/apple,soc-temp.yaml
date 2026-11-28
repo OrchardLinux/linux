@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/hwmon/apple,soc-temp.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SoC die temperature sensors
+
+maintainers:
+  - Henrik Klee <henrik@goat-code.com>
+
+description: |
+  The die temperature sensors of the Apple A12 (T8020), called
+  "tempsensor,t8020" in the Apple device tree. They sit in three register
+  blocks, one node each: five sensors in the power manager, three in the
+  performance cluster (the cluster and its two cores) and one in the
+  efficiency cluster.
+
+  The sensor specifier is the sensor's index within its block.
+
+allOf:
+  - $ref: /schemas/thermal/thermal-sensor.yaml#
+
+properties:
+  compatible:
+    enum:
+      - apple,t8020-pmgr-tempsensor
+      - apple,t8020-acc-tempsensor
+      - apple,t8020-acce-tempsensor
+
+  reg:
+    maxItems: 1
+
+  '#thermal-sensor-cells':
+    const: 1
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        tempsensor@211e30000 {
+            compatible = "apple,t8020-acc-tempsensor";
+            reg = <0x2 0x11e30000 0x0 0x8000>;
+            #thermal-sensor-cells = <1>;
+        };
+    };

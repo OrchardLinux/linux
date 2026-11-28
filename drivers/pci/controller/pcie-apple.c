@@ -30,6 +30,7 @@
 #include <linux/msi.h>
 #include <linux/of_irq.h>
 #include <linux/pci-ecam.h>
+#include <linux/pci-pwrctrl.h>
 
 #include "pci-host-common.h"
 
@@ -765,6 +766,10 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	dev_dbg(&pdev->dev, "added to bus %s, index %d\n",
 		pci_name(pdev->bus->self), port->idx);
 
+	/* A port without a RID to SID table has its stream wired up. */
+	if (!port->sid_map_sz)
+		return 0;
+
 	err = of_map_iommu_id(port->pcie->dev->of_node, rid, &iommu_spec);
 	if (err)
 		return err;
@@ -874,7 +879,29 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	return pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+	/*
+	 * A device whose supply the host switches, such as the Wi-Fi module
+	 * of an iPhone, has to be on before its port trains the link.
+	 */
+	ret = pci_pwrctrl_create_devices(dev);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "failed to create PCI power controls\n");
+
+	ret = pci_pwrctrl_power_on_devices(dev);
+	if (ret) {
+		pci_pwrctrl_destroy_devices(dev);
+		return dev_err_probe(dev, ret,
+				     "failed to power on PCI devices\n");
+	}
+
+	ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+	if (ret) {
+		pci_pwrctrl_power_off_devices(dev);
+		pci_pwrctrl_destroy_devices(dev);
+	}
+
+	return ret;
 }
 
 static const struct of_device_id apple_pcie_of_match[] = {

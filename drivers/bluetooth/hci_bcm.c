@@ -2014,6 +2014,19 @@ static struct bcm_device_data bcm4324b5_a7_device_data = {
 	.fixup_le_adv_report_evt_type = true,
 };
 
+/*
+ * The BCM4357 of the A12 iPhones (ADT module-instance yodak on the iPhone
+ * XR): its firmware lists LE Set Extended Scan Parameters among its
+ * commands and then fails it, so nothing is ever found, and it sets
+ * reserved bits in the event type of its advertising reports, as the
+ * BCM4355 does. The unit's address comes from the loader.
+ */
+static struct bcm_device_data bcm4357_device_data = {
+	.broken_ext_scan = true,
+	.fixup_le_adv_report_evt_type = true,
+	.use_bdaddr_property = true,
+};
+
 static struct bcm_device_data bcm43438_device_data = {
 	.drive_rts_on_open = true,
 };
@@ -2065,6 +2078,7 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
 	{ .compatible = "apple,j172-bcm4355c1-bt",
 	  .data = &bcm4355_j172_device_data },
 	{ .compatible = "brcm,bcm4355c1-bt", .data = &bcm4355_device_data },
+	{ .compatible = "brcm,bcm4357-bt", .data = &bcm4357_device_data },
 	{ .compatible = "brcm,bcm4335a0" },
 	{ .compatible = "cypress,cyw4373a0-bt", .data = &cyw4373a0_device_data },
 	{ .compatible = "infineon,cyw55572-bt", .data = &cyw55572_device_data },

@@ -291,6 +291,22 @@ properties:
           - const: apple,t8015
           - const: apple,arm-platform
 
+      - description: Apple A12 SoC based platforms
+        items:
+          - enum:
+              - apple,d321  # iPhone XS
+              - apple,d331  # iPhone XS Max (China)
+              - apple,d331p # iPhone XS Max
+              - apple,j171a # iPad 8 (Wi-Fi)
+              - apple,j172a # iPad 8 (Cellular)
+              - apple,j210  # iPad mini 5 (Wi-Fi)
+              - apple,j211  # iPad mini 5 (Cellular)
+              - apple,j217  # iPad Air 3 (Wi-Fi)
+              - apple,j218  # iPad Air 3 (Cellular)
+              - apple,n841  # iPhone XR
+          - const: apple,t8020
+          - const: apple,arm-platform
+
       - description: Apple M1 SoC based platforms
         items:
           - enum:

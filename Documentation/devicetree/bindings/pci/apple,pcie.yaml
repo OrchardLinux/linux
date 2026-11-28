@@ -37,6 +37,7 @@ properties:
     oneOf:
       - items:
           - enum:
+              - apple,t8020-pcie
               - apple,t8103-pcie
               - apple,t8112-pcie
               - apple,t6000-pcie

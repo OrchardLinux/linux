@@ -4,37 +4,80 @@
 $id: http://devicetree.org/schemas/input/touchscreen/apple,d221-touchscreen.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple iPhone X HIDSPI touchscreen
+title: Apple iPhone X and iPhone XR HIDSPI touchscreens
 
 maintainers:
   - Eduardo Martins <eduardo@martins.ws>
 
 description:
-  The iPhone X touch controller (ADT "hid-transport,k1") on an SPI bus. It
-  starts in an HBPP bootloader that loads its firmware from the host, then
-  reports touches over Apple's HIDSPI transport. Its per-unit calibrations
-  come from the ADT's multi-touch node; the bootloader copies them through
-  the touchscreen0 alias.
+  The touch controllers of the iPhone X (ADT "hid-transport,k1") and the
+  iPhone XR (ADT "hid-transport,spi") on an SPI bus. They start in an HBPP
+  bootloader that loads the firmware from the host, then report touches over
+  Apple's HIDSPI transport. The per-unit calibrations come from the ADT's
+  multi-touch node; the bootloader copies them through the touchscreen0
+  alias.
 
 allOf:
   - $ref: touchscreen.yaml#
   - $ref: /schemas/spi/spi-peripheral-props.yaml#
+  - if:
+      properties:
+        compatible:
+          const: apple,d221-touchscreen
+    then:
+      properties:
+        hv-supply: false
+        core-supply: false
+        clken-supply: false
+      required:
+        - interrupts
+        - ana-supply
+        - clocks
+    else:
+      properties:
+        ana-supply: false
+        clocks: false
+      required:
+        - hv-supply
+        - core-supply
+        - clken-supply
 
 properties:
   compatible:
-    const: apple,d221-touchscreen
+    enum:
+      - apple,d221-touchscreen
+      - apple,n841-touchscreen
 
   reg:
     maxItems: 1
 
   interrupts:
     maxItems: 1
+    description:
+      The controller's interrupt line, low while a packet waits on the
+      iPhone X. Not used on the iPhone XR: its line (AOP pin 19) was measured
+      not to move for the firmware's boot message, replies or touch reports,
+      so the driver reads on a timer there.
 
   reset-gpios:
     maxItems: 1
 
   ana-supply:
     description: Analog supply of the touch controller.
+
+  hv-supply:
+    description:
+      Analog supply of the touch controller from the display PMU, the ADT's
+      function-power_ana.
+
+  core-supply:
+    description:
+      Core supply of the touch controller, the ADT's function-power_ldo.
+
+  clken-supply:
+    description:
+      Switch of the touch controller's clock, the ADT's
+      function-clock_enable, where the SMC provides it.
 
   clocks:
     maxItems: 1
@@ -63,10 +106,7 @@ patternProperties:
 required:
   - compatible
   - reg
-  - interrupts
   - reset-gpios
-  - ana-supply
-  - clocks
   - firmware-name
   - apple,hid-merge-personality
 

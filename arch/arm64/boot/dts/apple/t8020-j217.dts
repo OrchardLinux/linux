@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iPad Air 3 (Wi-Fi), J217 iPad11,3
+ * Copyright (c) 2026, Henrik Klee <henrik@goat-code.com>
+ */
+
+/dts-v1/;
+
+#include "t8020.dtsi"
+#include "t8020-common.dtsi"
+
+/ {
+	compatible = "apple,j217", "apple,t8020", "apple,arm-platform";
+	model = "Apple iPad Air 3 (Wi-Fi)";
+	chassis-type = "tablet";
+};

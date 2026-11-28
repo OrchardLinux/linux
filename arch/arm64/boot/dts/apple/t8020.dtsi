@@ -1,0 +1,905 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8020 "A12" SoC
+ *
+ * Other names: H11
+ *
+ * Addresses and interrupts are those of Apple's device tree for the chip.
+ *
+ * Copyright (c) 2026, kiki <kieran@lavato.net>
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/spmi/spmi.h>
+#include <dt-bindings/thermal/thermal.h>
+
+/ {
+	interrupt-parent = <&aic>;
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
+	cpus {
+		/* PMGR CPU start block (m1n1 smp.c, A12: 0xd4000) */
+		apple,cpu-start = <0x2 0x3b0d4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu_e0>;
+				};
+				core1 {
+					cpu = <&cpu_e1>;
+				};
+				core2 {
+					cpu = <&cpu_e2>;
+				};
+				core3 {
+					cpu = <&cpu_e3>;
+				};
+			};
+
+			cluster1 {
+				core0 {
+					cpu = <&cpu_p0>;
+				};
+				core1 {
+					cpu = <&cpu_p1>;
+				};
+			};
+		};
+
+		/*
+		 * reg is the core's MPIDR_EL1 affinity, which the loader matches: the
+		 * performance cluster has Aff2 set as well as Aff1.
+		 */
+		cpu_e0: cpu@0 {
+			compatible = "apple,tempest";
+			reg = <0x0 0x0>;
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&tempest_opp>;
+			enable-method = "spin-table";
+			device_type = "cpu";
+			next-level-cache = <&l2_cache_0>;
+			#cooling-cells = <2>;
+		};
+
+		cpu_e1: cpu@1 {
+			compatible = "apple,tempest";
+			reg = <0x0 0x1>;
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&tempest_opp>;
+			enable-method = "spin-table";
+			device_type = "cpu";
+			next-level-cache = <&l2_cache_0>;
+			#cooling-cells = <2>;
+		};
+
+		cpu_e2: cpu@2 {
+			compatible = "apple,tempest";
+			reg = <0x0 0x2>;
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&tempest_opp>;
+			enable-method = "spin-table";
+			device_type = "cpu";
+			next-level-cache = <&l2_cache_0>;
+			#cooling-cells = <2>;
+		};
+
+		cpu_e3: cpu@3 {
+			compatible = "apple,tempest";
+			reg = <0x0 0x3>;
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			performance-domains = <&cpufreq_e>;
+			operating-points-v2 = <&tempest_opp>;
+			enable-method = "spin-table";
+			device_type = "cpu";
+			next-level-cache = <&l2_cache_0>;
+			#cooling-cells = <2>;
+		};
+
+		cpu_p0: cpu@10100 {
+			compatible = "apple,vortex";
+			reg = <0x0 0x10100>;
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			performance-domains = <&cpufreq_p>;
+			operating-points-v2 = <&vortex_opp>;
+			enable-method = "spin-table";
+			device_type = "cpu";
+			next-level-cache = <&l2_cache_1>;
+			#cooling-cells = <2>;
+		};
+
+		cpu_p1: cpu@10101 {
+			compatible = "apple,vortex";
+			reg = <0x0 0x10101>;
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			performance-domains = <&cpufreq_p>;
+			operating-points-v2 = <&vortex_opp>;
+			enable-method = "spin-table";
+			device_type = "cpu";
+			next-level-cache = <&l2_cache_1>;
+			#cooling-cells = <2>;
+		};
+
+		l2_cache_0: l2-cache-0 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x200000>;
+		};
+
+		l2_cache_1: l2-cache-1 {
+			compatible = "cache";
+			cache-level = <2>;
+			cache-unified;
+			cache-size = <0x800000>;
+		};
+	};
+
+	/*
+	 * The frequencies of the performance states as iBoot fills them into
+	 * Apple's device tree at boot; opp-level is the state's number. State
+	 * 1 of each cluster is left out: a switch to it never reports done.
+	 * The performance cluster's states 7 and 8 are boost states.
+	 */
+	tempest_opp: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp02 {
+			opp-hz = /bits/ 64 <792000000>;
+			opp-level = <2>;
+			clock-latency-ns = <140000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1056000000>;
+			opp-level = <3>;
+			clock-latency-ns = <105000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1308000000>;
+			opp-level = <4>;
+			clock-latency-ns = <115000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <1572000000>;
+			opp-level = <5>;
+			clock-latency-ns = <125000>;
+		};
+	};
+
+	vortex_opp: opp-table-1 {
+		compatible = "operating-points-v2";
+		opp02 {
+			opp-hz = /bits/ 64 <744000000>;
+			opp-level = <2>;
+			clock-latency-ns = <140000>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1176000000>;
+			opp-level = <3>;
+			clock-latency-ns = <110000>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <1704000000>;
+			opp-level = <4>;
+			clock-latency-ns = <110000>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2136000000>;
+			opp-level = <5>;
+			clock-latency-ns = <125000>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2376000000>;
+			opp-level = <6>;
+			clock-latency-ns = <130000>;
+		};
+	};
+
+	/*
+	 * Nothing else throttles the CPUs. Under full load the P cluster went
+	 * from 69 to 82 C in 24 s. The sensors have no interrupt, so the zones
+	 * poll. Channel 0 of each CPU block is the cluster sensor.
+	 *
+	 * The die sensor answers within a poll: one step down from 2376 MHz
+	 * drops it by about 10 C. With a small hysteresis step_wise lets go on
+	 * the next poll and P runs at full speed most of the time, so the
+	 * hysteresis is wider than that swing.
+	 */
+	thermal-zones {
+		pcpu-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tempsensor_acc 0>;
+
+			trips {
+				pcpu_alert: pcpu-alert {
+					temperature = <85000>;
+					hysteresis = <10000>;
+					type = "passive";
+				};
+
+				pcpu-crit {
+					temperature = <105000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&pcpu_alert>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		ecpu-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tempsensor_acce 0>;
+
+			trips {
+				ecpu_alert: ecpu-alert {
+					temperature = <85000>;
+					hysteresis = <10000>;
+					type = "passive";
+				};
+
+				ecpu-crit {
+					temperature = <105000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&ecpu_alert>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		nonposted-mmio;
+		ranges;
+
+		/*
+		 * The second register is the cluster's voltage rail in the
+		 * power manager, which the loader hands to software.
+		 */
+		cpufreq_e: performance-controller@210e20000 {
+			compatible = "apple,t8020-cluster-cpufreq";
+			reg = <0x2 0x10e20000 0 0x60000>,
+			      <0x2 0x3b0a0024 0 0x4>;
+			#performance-domain-cells = <0>;
+		};
+
+		cpufreq_p: performance-controller@211e20000 {
+			compatible = "apple,t8020-cluster-cpufreq";
+			reg = <0x2 0x11e20000 0 0x60000>,
+			      <0x2 0x3b0a0020 0 0x4>;
+			#performance-domain-cells = <0>;
+		};
+
+		i2c0: i2c@235010000 {
+			compatible = "apple,t8020-i2c", "apple,i2c";
+			reg = <0x2 0x35010000 0x0 0x1000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 408 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c0_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_i2c0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c1: i2c@235014000 {
+			compatible = "apple,t8020-i2c", "apple,i2c";
+			reg = <0x2 0x35014000 0x0 0x1000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 409 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c1_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_i2c1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c2: i2c@235018000 {
+			compatible = "apple,t8020-i2c", "apple,i2c";
+			reg = <0x2 0x35018000 0x0 0x1000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 410 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c2_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_i2c2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		i2c3: i2c@23501c000 {
+			compatible = "apple,t8020-i2c", "apple,i2c";
+			reg = <0x2 0x3501c000 0x0 0x1000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 411 IRQ_TYPE_LEVEL_HIGH>;
+			pinctrl-0 = <&i2c3_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_i2c3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi1: spi@235104000 {
+			compatible = "apple,t8020-spi", "apple,t8010-spi", "apple,spi";
+			reg = <0x2 0x35104000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 396 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		spi3: spi@23510c000 {
+			compatible = "apple,t8020-spi", "apple,t8010-spi", "apple,spi";
+			reg = <0x2 0x3510c000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 398 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		serial0: serial@235200000 {
+			compatible = "apple,t8020-uart", "apple,t8010-uart",
+				     "apple,s5l-uart";
+			reg = <0x2 0x35200000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 386 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart0>;
+			status = "disabled";
+		};
+
+		serial1: serial@235204000 {
+			compatible = "apple,t8020-uart", "apple,t8010-uart",
+				     "apple,s5l-uart";
+			reg = <0x2 0x35204000 0x0 0x4000>;
+			reg-io-width = <4>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 387 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			power-domains = <&ps_uart1>;
+			status = "disabled";
+		};
+
+		/*
+		 * The USB controllers reach memory only through this DART:
+		 * stream 0 is the device controller.
+		 */
+		dart_usb: iommu@239900000 {
+			compatible = "apple,t8020-dart", "apple,t8103-dart";
+			reg = <0x2 0x39900000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 454 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+		};
+
+		bus@239000000 {
+			compatible = "apple,t8020-usb-complex", "simple-pm-bus";
+			#address-cells = <2>;
+			#size-cells = <2>;
+
+			nonposted-mmio;
+			ranges;
+
+			reg = <0x2 0x39000000 0x0 0x60>;
+			power-domains = <&ps_usb>;
+
+			ausbphy0: phy@239000060 {
+				compatible = "apple,t8020-ausb-phy", "apple,ausb-phy";
+				reg = <0x2 0x39000060 0x0 0x20>;
+				power-domains = <&ps_usbctlreg>;
+				#phy-cells = <1>;
+			};
+
+			usbdev: usbdev@239100000 {
+				compatible = "apple,t8020-dwc2", "apple,dwc2";
+				reg = <0x2 0x39100000 0x0 0x10000>;
+				interrupts = <AIC_IRQ 451 IRQ_TYPE_LEVEL_HIGH>;
+				clocks = <&clkref>;
+				clock-names = "otg";
+				phys = <&ausbphy0 PHY_TYPE_USB2>;
+				phy-names = "usb2-phy";
+				power-domains = <&ps_usb2dev>;
+				resets = <&ps_usb2dev>;
+				iommus = <&dart_usb 0>;
+				dr_mode = "peripheral";
+			};
+		};
+
+		aic: interrupt-controller@23b100000 {
+			compatible = "apple,t8020-aic", "apple,aic";
+			reg = <0x2 0x3b100000 0x0 0x8000>;
+			#interrupt-cells = <3>;
+			interrupt-controller;
+			power-domains = <&ps_aic>;
+		};
+
+		pmgr: power-management@23b000000 {
+			compatible = "apple,t8020-pmgr", "apple,pmgr", "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			reg = <0x2 0x3b000000 0 0x8c000>;
+		};
+
+		pinctrl_ap: pinctrl@23c100000 {
+			compatible = "apple,t8020-pinctrl", "apple,pinctrl";
+			reg = <0x2 0x3c100000 0x0 0x1000>;
+			power-domains = <&ps_gpio>;
+
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_ap 0 0 222>;
+			apple,npins = <222>;
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 95 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 96 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 97 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 98 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 99 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 100 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 101 IRQ_TYPE_LEVEL_HIGH>;
+
+			i2c0_pins: i2c0-pins {
+				pinmux = <APPLE_PINMUX(205, 1)>,
+					 <APPLE_PINMUX(204, 1)>;
+			};
+
+			i2c1_pins: i2c1-pins {
+				pinmux = <APPLE_PINMUX(9, 1)>,
+					 <APPLE_PINMUX(4, 1)>;
+			};
+
+			i2c2_pins: i2c2-pins {
+				pinmux = <APPLE_PINMUX(128, 1)>,
+					 <APPLE_PINMUX(120, 1)>;
+			};
+
+			i2c3_pins: i2c3-pins {
+				pinmux = <APPLE_PINMUX(11, 1)>,
+					 <APPLE_PINMUX(10, 1)>;
+			};
+		};
+
+		/* The always-on processor's GPIOs, 52 pins. */
+		pinctrl_aop: pinctrl@24a820000 {
+			compatible = "apple,t8020-pinctrl", "apple,pinctrl";
+			reg = <0x2 0x4a820000 0x0 0x4000>;
+
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_aop 0 0 52>;
+			apple,npins = <52>;
+			/* ADT aop-gpio supported-int-groups = 4, 5, 6 */
+			apple,irq-group = <6>;
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 176 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 177 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 178 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 179 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 180 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 181 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 182 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/*
+		 * Die temperature sensors. The ADT has nine of them, all
+		 * tempsensor,t8020, in three blocks: /arm-io/tempsensor0 to 4
+		 * share one block in the power manager, 5 to 7 are the P
+		 * cluster, and 8 is the E cluster. One node per block, because
+		 * the sensors inside a block share a register range.
+		 *
+		 * The reg sizes cover the averaged reads as well, which sit
+		 * 0x20000 up for the PMGR block and 0x4000 up for the clusters.
+		 */
+		tempsensor_pmgr: tempsensor@23b288000 {
+			compatible = "apple,t8020-pmgr-tempsensor";
+			reg = <0x2 0x3b288000 0x0 0x34000>;
+		};
+
+		tempsensor_acc: tempsensor@211e30000 {
+			compatible = "apple,t8020-acc-tempsensor";
+			reg = <0x2 0x11e30000 0x0 0x8000>;
+			#thermal-sensor-cells = <1>;
+		};
+
+		tempsensor_acce: tempsensor@210e30000 {
+			compatible = "apple,t8020-acce-tempsensor";
+			reg = <0x2 0x10e30000 0x0 0x8000>;
+			#thermal-sensor-cells = <1>;
+		};
+
+		pmgr_mini: power-management@23d200000 {
+			compatible = "apple,t8020-pmgr", "apple,pmgr", "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			reg = <0x2 0x3d200000 0 0x8c000>;
+		};
+
+		/*
+		 * The backlight level goes out over DWI. Only the devices
+		 * with an LCD have a backlight on it; the OLED phones set
+		 * their brightness at the panel.
+		 */
+		dwi_bl: backlight@23b200080 {
+			compatible = "apple,t8020-dwi-bl", "apple,dwi-bl";
+			reg = <0x2 0x3b200080 0x0 0x8>;
+			power-domains = <&ps_dwi>;
+			status = "disabled";
+		};
+
+		/*
+		 * DSI host (Synopsys DesignWare 1.32a) between disp0 and the
+		 * panel. Only its sleep handling is driven; the boot loader set
+		 * the link up.
+		 */
+		mipi_dsi: dsi@230400000 {
+			compatible = "apple,t8020-mipi-dsi";
+			reg = <0x2 0x30400000 0x0 0x1000>,
+			      <0x2 0x30048000 0x0 0x1000>;
+			reg-names = "dsi", "timing";
+			power-domains = <&ps_mipi_dsi>;
+			status = "disabled";
+		};
+
+		/*
+		 * Memory controller: non-plane (global) block and plane block,
+		 * ADT mcc reg[0] and reg[1]; 16 ways is config-data's first entry.
+		 */
+		mcc: memory-controller@200100000 {
+			compatible = "apple,t8020-mcc";
+			reg = <0x2 0x00100000 0x0 0x4000>,
+			      <0x2 0x00000000 0x0 0x100000>;
+			reg-names = "global", "plane";
+			apple,cache-ways = <16>;
+		};
+
+		wdt: watchdog@23d2b0000 {
+			compatible = "apple,t8020-wdt", "apple,wdt";
+			reg = <0x2 0x3d2b0000 0x0 0x4000>;
+			clocks = <&clkref>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 232 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		spmi: spmi@23d180700 {
+			compatible = "apple,t8020-spmi", "apple,t8103-spmi";
+			reg = <0x2 0x3d180700 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			pmic@f {
+				compatible = "apple,d2542-pmic", "apple,spmi-pmic";
+				reg = <0xf SPMI_USID>;
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/* The scratchpad iBoot keeps its boot state in. */
+				nvmem@6000 {
+					compatible = "apple,pmic-nvmem";
+					reg = <0x6000 0x300>;
+
+					nvmem-layout {
+						compatible = "fixed-layout";
+						#address-cells = <1>;
+						#size-cells = <1>;
+
+						boot_stage: boot-stage@1 {
+							reg = <0x1 0x1>;
+						};
+
+						boot_error_count: boot-error-count@2,0 {
+							reg = <0x2 0x1>;
+							bits = <0 4>;
+						};
+
+						panic_count: panic-count@2,4 {
+							reg = <0x2 0x1>;
+							bits = <4 4>;
+						};
+
+						shutdown_flag: shutdown-flag@f {
+							reg = <0xf 0x1>;
+						};
+					};
+				};
+			};
+		};
+
+		smc: smc@23e400000 {
+			compatible = "apple,t8020-smc", "apple,t8103-smc";
+			reg = <0x2 0x3e400000 0x0 0x20000>,
+			      <0x2 0x3fe00000 0x0 0x50000>;
+			reg-names = "smc", "sram";
+			mboxes = <&smc_mbox>;
+
+			smc_gpio: gpio {
+				compatible = "apple,smc-gpio";
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			smc_hwmon: hwmon {
+				compatible = "apple,smc-hwmon";
+			};
+
+			smc_reboot: reboot {
+				compatible = "apple,t8015-smc-reboot";
+				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+					<&boot_error_count>, <&panic_count>;
+				nvmem-cell-names = "shutdown_flag", "boot_stage",
+					"boot_error_count", "panic_count";
+			};
+		};
+
+		/*
+		 * Power management coprocessor. Unlike on the A11 it sits in an
+		 * ASC wrapper (as the SMC) behind its own DART. iOS loads its
+		 * firmware from the kernelcache (AppleT8020PMPFirmware); the
+		 * boot loader leaves it stopped.
+		 */
+		dart_pmp: iommu@23b300000 {
+			compatible = "apple,t8020-dart", "apple,t8103-dart";
+			reg = <0x2 0x3b300000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 304 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_pmp>;
+			status = "disabled";
+		};
+
+		pmp_mbox: mbox@23bc08000 {
+			compatible = "apple,t8020-asc-mailbox", "apple,t8015-asc-mailbox";
+			reg = <0x2 0x3bc08000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 300 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 301 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 302 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 303 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_pmp>;
+			status = "disabled";
+		};
+
+		pmp: pmp@23bc00000 {
+			compatible = "apple,t8020-pmp";
+			reg = <0x2 0x3bc00000 0x0 0x8000>,
+			      <0x2 0x3b850000 0x0 0x4000>,
+			      <0x2 0x3b500000 0x0 0x40000>;
+			reg-names = "asc", "rvbar", "sram";
+			/* ADT pmp reg[3..37], in order: the PMP finds each by index. */
+			apple,pio-windows = <0x2 0x00020000 0x0 0x4000>,
+					    <0x2 0x00060000 0x0 0x4000>,
+					    <0x2 0x000a0000 0x0 0x4000>,
+					    <0x2 0x000e0000 0x0 0x4000>,
+					    <0x2 0x00154000 0x0 0x4000>,
+					    <0x2 0x00204000 0x0 0x4000>,
+					    <0x2 0x00244000 0x0 0x4000>,
+					    <0x2 0x00284000 0x0 0x4000>,
+					    <0x2 0x002c4000 0x0 0x4000>,
+					    <0x0 0x0 0x0 0x0>,
+					    <0x0 0x0 0x0 0x0>,
+					    <0x0 0x0 0x0 0x0>,
+					    <0x0 0x0 0x0 0x0>,
+					    <0x0 0x0 0x0 0x0>,
+					    <0x0 0x0 0x0 0x0>,
+					    <0x2 0x10058000 0x0 0x4000>,
+					    <0x2 0x10158000 0x0 0x4000>,
+					    <0x2 0x10258000 0x0 0x4000>,
+					    <0x2 0x10358000 0x0 0x4000>,
+					    <0x2 0x10e20000 0x0 0x60000>,
+					    <0x2 0x10e48000 0x0 0x4000>,
+					    <0x2 0x11058000 0x0 0x4000>,
+					    <0x2 0x11158000 0x0 0x4000>,
+					    <0x0 0x0 0x0 0x0>,
+					    <0x0 0x0 0x0 0x0>,
+					    <0x2 0x11e20000 0x0 0x60000>,
+					    <0x2 0x11e48000 0x0 0x4000>,
+					    <0x2 0x3d100000 0x0 0x14000>,
+					    <0x2 0x3d128000 0x0 0x30000>,
+					    <0x2 0x3d180000 0x0 0x4000>,
+					    <0x2 0x6b854000 0x0 0x4000>,
+					    <0x0 0x0 0x0 0x0>,
+					    <0x2 0x00170000 0x0 0x4000>,
+					    <0x2 0x3500c000 0x0 0x4000>,
+					    <0x2 0x3c100000 0x0 0x4000>;
+			mboxes = <&pmp_mbox>;
+			mbox-names = "mbox";
+			iommus = <&dart_pmp 0>;
+			power-domains = <&ps_pmp>, <&ps_pms_sram>;
+			power-domain-names = "pmp", "sram";
+			firmware-name = "apple/pmp-t8020.bin";
+			status = "disabled";
+		};
+
+		smc_mbox: mbox@23e408000 {
+			compatible = "apple,t8020-asc-mailbox", "apple,t8015-asc-mailbox";
+			reg = <0x2 0x3e408000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 253 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 254 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 255 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 256 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		ans_mbox: mbox@277408000 {
+			compatible = "apple,t8020-asc-mailbox", "apple,t8015-asc-mailbox";
+			reg = <0x2 0x77408000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 364 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 365 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 366 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 367 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			power-domains = <&ps_ans2>;
+		};
+
+		sart: iommu@27ac50000 {
+			compatible = "apple,t8020-sart";
+			reg = <0x2 0x7ac50000 0x0 0x8000>;
+			power-domains = <&ps_ans2>;
+		};
+
+		/*
+		 * The mailbox and the coprocessor's control register share the
+		 * ASC wrapper, as on the M1, while the mailbox itself is the
+		 * A11's.
+		 */
+		nvme@27acc0000 {
+			compatible = "apple,t8020-nvme-ans2";
+			reg = <0x2 0x7acc0000 0x0 0x60000>,
+			      <0x2 0x77400000 0x0 0x4000>;
+			reg-names = "nvme", "ans";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 371 IRQ_TYPE_LEVEL_HIGH>;
+			mboxes = <&ans_mbox>;
+			apple,sart = <&sart>;
+			power-domains = <&ps_ans2>, <&ps_apcie_st>;
+			power-domain-names = "ans", "apcie0";
+			resets = <&ps_ans2>;
+		};
+
+		/*
+		 * The four ports' registers follow the root complex; a
+		 * port's PHY registers are named for the driver. Ports 2
+		 * and 3 are those the devices use, for Wi-Fi and the
+		 * cellular modem. Apple's device tree gives a 64-bit window
+		 * that runs over the 32-bit one, so it is cut short here.
+		 */
+		pcie0: pcie@610000000 {
+			compatible = "apple,t8020-pcie", "apple,pcie";
+			device_type = "pci";
+
+			reg = <0x6 0x10000000 0x0 0x1000000>,
+			      <0x6 0x00000000 0x0 0x80000>,
+			      <0x6 0x01000000 0x0 0x4000>,
+			      <0x6 0x02000000 0x0 0x4000>,
+			      <0x6 0x03000000 0x0 0x4000>,
+			      <0x6 0x04000000 0x0 0x4000>,
+			      <0x6 0x00088000 0x0 0x4000>,
+			      <0x6 0x0008c000 0x0 0x4000>,
+			      <0x6 0x00090000 0x0 0x4000>,
+			      <0x6 0x00094000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "port1", "port2", "port3",
+				    "phy0", "phy1", "phy2", "phy3";
+
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 468 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 471 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 474 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 477 IRQ_TYPE_LEVEL_HIGH>;
+
+			msi-controller;
+			msi-parent = <&pcie0>;
+			msi-ranges = <&aic AIC_IRQ 480 IRQ_TYPE_EDGE_RISING 32>;
+
+			bus-range = <0 4>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x6 0x20000000 0x6 0x20000000 0x0 0x20000000>,
+				 <0x02000000 0x0 0x40000000 0x6 0x40000000 0x0 0x40000000>;
+
+			power-domains = <&ps_apcie_gp>;
+			status = "disabled";
+		};
+
+		dart_apcie2: iommu@603008000 {
+			compatible = "apple,t8020-dart", "apple,t8103-dart";
+			reg = <0x6 0x03008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 475 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_apcie_gp>;
+			status = "disabled";
+		};
+
+		dart_apcie3: iommu@604008000 {
+			compatible = "apple,t8020-dart", "apple,t8103-dart";
+			reg = <0x6 0x04008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 478 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_apcie_gp>;
+			status = "disabled";
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&aic>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+	};
+};
+
+#include "t8020-pmgr.dtsi"

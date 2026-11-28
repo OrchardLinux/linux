@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iPad Air 3 (Cellular), J218 iPad11,4
+ * Copyright (c) 2026, Henrik Klee <henrik@goat-code.com>
+ */
+
+/dts-v1/;
+
+#include "t8020.dtsi"
+#include "t8020-common.dtsi"
+
+/ {
+	compatible = "apple,j218", "apple,t8020", "apple,arm-platform";
+	model = "Apple iPad Air 3 (Cellular)";
+	chassis-type = "tablet";
+};

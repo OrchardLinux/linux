@@ -1040,6 +1040,101 @@ void drm_fb_xrgb8888_to_xrgb2101010(struct iosys_map *dst, const unsigned int *d
 }
 EXPORT_SYMBOL(drm_fb_xrgb8888_to_xrgb2101010);
 
+/*
+ * Apple's extended-range framebuffer as its boot loader leaves it: ten bits
+ * per channel in which 384 is black and 895 is white, and which the display
+ * pipe takes as linear light, since nothing in front of it undoes the sRGB
+ * encoding. An sRGB value v therefore becomes 384 + 511 * EOTF(v / 255),
+ * held here with four more bits.
+ *
+ * Linear light leaves the dark values few steps: the first ten sRGB values
+ * share two of them. The remainder of each pixel is carried on to the next
+ * one of the line, so that an area comes out at its value on average.
+ */
+static const u16 drm_srgb_to_apple_linear[256] = {
+	 6144,  6146,  6149,  6151,  6154,  6156,  6159,  6161,
+	 6164,  6166,  6169,  6171,  6174,  6177,  6180,  6183,
+	 6186,  6190,  6193,  6197,  6201,  6205,  6210,  6214,
+	 6219,  6223,  6228,  6234,  6239,  6244,  6250,  6256,
+	 6262,  6268,  6275,  6281,  6288,  6295,  6302,  6310,
+	 6317,  6325,  6333,  6342,  6350,  6359,  6367,  6376,
+	 6386,  6395,  6405,  6415,  6425,  6435,  6446,  6456,
+	 6467,  6479,  6490,  6502,  6513,  6526,  6538,  6550,
+	 6563,  6576,  6589,  6603,  6617,  6631,  6645,  6659,
+	 6674,  6689,  6704,  6719,  6735,  6751,  6767,  6783,
+	 6800,  6817,  6834,  6851,  6869,  6887,  6905,  6923,
+	 6942,  6961,  6980,  6999,  7019,  7039,  7059,  7080,
+	 7100,  7121,  7143,  7164,  7186,  7208,  7230,  7253,
+	 7276,  7299,  7322,  7346,  7370,  7394,  7419,  7444,
+	 7469,  7494,  7520,  7546,  7572,  7598,  7625,  7652,
+	 7680,  7707,  7735,  7763,  7792,  7821,  7850,  7879,
+	 7909,  7939,  7969,  8000,  8031,  8062,  8093,  8125,
+	 8157,  8189,  8222,  8255,  8288,  8322,  8356,  8390,
+	 8424,  8459,  8494,  8530,  8565,  8601,  8638,  8674,
+	 8711,  8748,  8786,  8824,  8862,  8901,  8939,  8979,
+	 9018,  9058,  9098,  9138,  9179,  9220,  9262,  9303,
+	 9345,  9388,  9431,  9474,  9517,  9561,  9605,  9649,
+	 9694,  9739,  9784,  9830,  9876,  9922,  9969, 10016,
+	10063, 10111, 10159, 10207, 10256, 10305, 10354, 10404,
+	10454, 10504, 10555, 10606, 10657, 10709, 10761, 10814,
+	10866, 10919, 10973, 11027, 11081, 11135, 11190, 11246,
+	11301, 11357, 11413, 11470, 11527, 11584, 11642, 11700,
+	11758, 11817, 11876, 11936, 11996, 12056, 12116, 12177,
+	12238, 12300, 12362, 12424, 12487, 12550, 12614, 12677,
+	12742, 12806, 12871, 12936, 13002, 13068, 13134, 13201,
+	13268, 13336, 13404, 13472, 13541, 13609, 13679, 13749,
+	13819, 13889, 13960, 14031, 14103, 14175, 14247, 14320,
+};
+
+static void drm_fb_xrgb8888_to_xrgb2101010_apple_linear_line(void *dbuf, const void *sbuf,
+							     unsigned int pixels)
+{
+	__le32 *dbuf32 = dbuf;
+	const __le32 *sbuf32 = sbuf;
+	const u16 *lut = drm_srgb_to_apple_linear;
+	u32 r = 8, g = 8, b = 8;
+
+	while (pixels--) {
+		u32 pix = le32_to_cpup(sbuf32++);
+
+		r = (r & 15) + lut[(pix >> 16) & 0xff];
+		g = (g & 15) + lut[(pix >> 8) & 0xff];
+		b = (b & 15) + lut[pix & 0xff];
+		*dbuf32++ = cpu_to_le32((r >> 4) << 20 | (g >> 4) << 10 | (b >> 4));
+	}
+}
+
+/**
+ * drm_fb_xrgb8888_to_xrgb2101010_apple_linear - Convert XRGB8888 to Apple's linear
+ *                                                extended-range XRGB2101010
+ * @dst: Array of XRGB2101010 destination buffers
+ * @dst_pitch: Array of numbers of bytes between the start of two consecutive scanlines
+ *             within @dst; can be NULL if scanlines are stored next to each other.
+ * @src: Array of XRGB8888 source buffers
+ * @fb: DRM framebuffer
+ * @clip: Clip rectangle area to copy
+ * @state: Transform and conversion state
+ *
+ * This function copies parts of a framebuffer to display memory and converts the
+ * color format during the process, as drm_fb_xrgb8888_to_xrgb2101010() does, for
+ * display memory that holds linear light between 384 for black and 895 for white.
+ */
+void drm_fb_xrgb8888_to_xrgb2101010_apple_linear(struct iosys_map *dst,
+						 const unsigned int *dst_pitch,
+						 const struct iosys_map *src,
+						 const struct drm_framebuffer *fb,
+						 const struct drm_rect *clip,
+						 struct drm_format_conv_state *state)
+{
+	static const u8 dst_pixsize[DRM_FORMAT_MAX_PLANES] = {
+		4,
+	};
+
+	drm_fb_xfrm(dst, dst_pitch, dst_pixsize, src, fb, clip, false, state,
+		    drm_fb_xrgb8888_to_xrgb2101010_apple_linear_line);
+}
+EXPORT_SYMBOL(drm_fb_xrgb8888_to_xrgb2101010_apple_linear);
+
 static void drm_fb_xrgb8888_to_argb2101010_line(void *dbuf, const void *sbuf, unsigned int pixels)
 {
 	drm_fb_xfrm_line_32to32(dbuf, sbuf, pixels, drm_pixel_xrgb8888_to_argb2101010);

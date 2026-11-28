@@ -388,6 +388,11 @@ struct apple_dart_hw {
 	bool early_error_reflector;
 	/* S5L8960X family: map leaves without no-read/no-write bits */
 	bool no_perms;
+	/*
+	 * A12: the same for a DART with 4K pages, which takes the no-write
+	 * bit as no-read as well.
+	 */
+	bool no_perms_4k;
 };
 
 /*
@@ -1321,7 +1326,8 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	};
 	if (apple_dart_s5l8960x_family(dart))
 		pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_APPLE_DART_S5L8960X;
-	if (dart->hw->no_perms)
+	if (dart->hw->no_perms ||
+	    (dart->hw->no_perms_4k && dart->pgsize == SZ_4K))
 		pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_NO_PERMS;
 
 	dart_domain->pgtbl_ops = alloc_io_pgtable_ops(dart->hw->fmt, &pgtbl_cfg,
@@ -2247,6 +2253,36 @@ static const struct apple_dart_hw apple_dart_hw_t7000 = {
 	.no_perms = false,
 };
 
+static const struct apple_dart_hw apple_dart_hw_t8020 = {
+	.type = DART_T8020,
+	.irq_handler = apple_dart_t8020_irq,
+	.invalidate_tlb = apple_dart_t8020_hw_invalidate_tlb,
+	.read_tcr = apple_dart_t8020_read_tcr,
+	.write_tcr = apple_dart_t8020_write_tcr,
+	.oas = 36,
+	.fmt = APPLE_DART,
+	.max_sid_count = 16,
+
+	.enable_streams = DART_T8020_STREAMS_ENABLE,
+	.lock = DART_T8020_CONFIG,
+	.lock_bit = DART_T8020_CONFIG_LOCK,
+
+	.error = DART_T8020_ERROR,
+
+	.tcr = DART_T8020_TCR,
+	.tcr_enabled = DART_T8020_TCR_TRANSLATE_ENABLE,
+	.tcr_disabled = 0,
+	.tcr_bypass = DART_T8020_TCR_BYPASS_DAPF | DART_T8020_TCR_BYPASS_DART,
+
+	.ttbr = DART_T8020_TTBR,
+	.ttbr_valid = DART_T8020_TTBR_VALID,
+	.ttbr_addr_field_shift = DART_T8020_TTBR_ADDR_FIELD_SHIFT,
+	.ttbr_shift = DART_T8020_TTBR_SHIFT,
+	.ttbr_count = 4,
+
+	.no_perms_4k = true,
+};
+
 static const struct apple_dart_hw apple_dart_hw_t8103 = {
 	.type = DART_T8020,
 	.irq_handler = apple_dart_t8020_irq,
@@ -2433,6 +2469,7 @@ static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,s5l8960x-dart", .data = &apple_dart_hw_s5l8960x },
 	{ .compatible = "apple,t7000-dart", .data = &apple_dart_hw_t7000 },
 	{ .compatible = "apple,t8015-dart", .data = &apple_dart_hw_t8015 },
+	{ .compatible = "apple,t8020-dart", .data = &apple_dart_hw_t8020 },
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },

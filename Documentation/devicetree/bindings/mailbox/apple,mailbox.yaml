@@ -39,8 +39,11 @@ properties:
           of the AKF mailbox with similar behaviours are found on T2 and
           A11 and is used for the NVMe coprocessor and system management
           coprocessor.
-        items:
+        oneOf:
           - const: apple,t8015-asc-mailbox
+          - items:
+              - const: apple,t8020-asc-mailbox
+              - const: apple,t8015-asc-mailbox
 
       - description:
           M3 mailboxes are an older variant with a slightly different MMIO

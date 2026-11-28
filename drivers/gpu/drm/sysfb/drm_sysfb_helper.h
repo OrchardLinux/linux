@@ -77,6 +77,11 @@ struct drm_sysfb_device {
 	const struct drm_format_info *fb_format;
 	unsigned int fb_pitch;
 	unsigned int fb_gamma_lut_size;
+	/*
+	 * An XRGB2101010 framebuffer in Apple's extended range, taken as
+	 * linear light: 384 is black and 895 is white.
+	 */
+	bool fb_apple_linear;
 
 	/* hardware-framebuffer kernel address */
 	struct iosys_map fb_addr;

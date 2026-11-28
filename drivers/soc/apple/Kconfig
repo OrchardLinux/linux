@@ -61,6 +61,21 @@ config APPLE_MESA
 
 	  Say 'y' or 'm' here if you have an iPhone 8 Plus.
 
+config APPLE_MCC_T8020
+	bool "Apple A12 memory controller system level cache"
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  Turns on the A12's system level cache, which the boot loader
+	  leaves off, and turns it off again before a restart.
+
+config APPLE_PMP_T8020
+	tristate "Apple T8020 PMP"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_RTKIT
+	help
+	  Boots the A12's power management coprocessor with its firmware,
+	  which lets the SoC lower its power.
+
 config APPLE_PMP_T8015_V1
 	tristate "Apple T8015 PMP"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -105,6 +120,15 @@ config APPLE_SART
 	  not use a proper IOMMU.
 
 	  Say 'y' here if you have an Apple SoC.
+
+config APPLE_MIPI_DSI_PANEL_PM
+	tristate "Apple MIPI DSI panel power over system sleep"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF && GPIOLIB && REGULATOR
+	help
+	  Switches the built-in panel of A12 iPhones off for system sleep and
+	  on again on wake, the way iOS does, on displays the boot loader set
+	  up. Without it the panel stays powered while the phone sleeps.
 
 config APPLE_TUNABLE
 	tristate

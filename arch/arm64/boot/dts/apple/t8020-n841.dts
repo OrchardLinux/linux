@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iPhone XR, N841 iPhone11,8
+ * Copyright (c) 2026, dr1408
+ */
+
+/dts-v1/;
+
+#include "t8020.dtsi"
+#include "t8020-common.dtsi"
+
+/ {
+	compatible = "apple,n841", "apple,t8020", "apple,arm-platform";
+	model = "Apple iPhone XR";
+	chassis-type = "handset";
+};
+
+/ {
+	/* The loader copies the ADT's touch calibration and firmware variant here. */
+	aliases {
+		touchscreen0 = &touchscreen;
+	};
+};
+
+/* The display PMU, ADT "display-pmu,chestnut". */
+/*
+ * The loader's framebuffer is in Apple's extended range and the display
+ * pipe takes it as linear light: iOS's driver runs the pipe linear to the
+ * panel (enableLinearToPanel) behind a degamma that the loader leaves off.
+ * A grey ramp written to it shows every value up to 372 as black and the
+ * two values above 895 alike.
+ */
+&framebuffer0 {
+	apple,extended-range-linear;
+};
+
+/*
+ * Two LM3539 LED drivers light the panel, one on each of i2c0 and i2c2;
+ * both take their level from DWI, and the loader leaves them enabled.
+ */
+/* ADT lcd function-reset = pKW4('gP12'): SMC GPIO 0x12. */
+&mipi_dsi {
+	reset-gpios = <&smc_gpio 18 GPIO_ACTIVE_HIGH>;
+	lcd-supply = <&lcd_ldo>;
+	status = "okay";
+};
+
+/*
+ * The PMP's DRAM configuration: the first entry of the ADT's
+ * energy-model-dram-configs (DRAM capacity 3, any vendor).
+ */
+&pmp {
+	apple,dram-config = [
+		03 00 00 00 00 00 00 00 33 b3 1c 00 99 19 01 00
+		cc cc 08 00 cc 4c 03 00 cc cc 0b 00 cc cc 5e 00
+		99 99 56 00 cc 4c 0d 00 00 00 01 00 cc 4c 0b 00
+		cc cc 22 00 99 19 01 00 99 99 0e 00 66 66 03 00
+		cc cc 11 00 33 b3 b3 00 99 99 ae 00 00 00 13 00
+		00 00 01 00 66 66 17 00 66 e6 28 00 99 19 01 00
+		99 19 13 00 66 66 03 00 33 b3 16 00 cc cc 02 01
+		33 33 e8 00 00 00 18 00 00 00 01 00 99 19 22 00
+	];
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
+
+&dart_pmp {
+	status = "okay";
+};
+
+&dwi_bl {
+	status = "okay";
+};
+
+&i2c2 {
+	status = "okay";
+
+	pmic@27 {
+		compatible = "apple,chestnut-pmic";
+		reg = <0x27>;
+
+		/* ADT multi-touch function-power_ana = dpLE(0x302) */
+		touch_hv: regulator-touch-hv {
+			compatible = "apple,chestnut-touch-hv-regulator";
+		};
+
+		/* ADT lcd function-lcd_ldo = dpLE(0x201) */
+		lcd_ldo: regulator-lcd {
+			compatible = "apple,chestnut-lcd-regulator";
+			regulator-name = "lcd";
+			regulator-boot-on;
+		};
+	};
+};
+
+&smc {
+	regulators {
+		compatible = "apple,t8020-smc-regulator";
+
+		/* ADT multi-touch function-power_ldo = pKW4('rBK3', 0x5020000) */
+		touch_core: touch-core {
+			regulator-name = "touch-core";
+		};
+
+		/* ADT multi-touch function-clock_enable = pKW4('gP00', 0x8000000) */
+		touch_clken: touch-clock {
+			regulator-name = "touch-clock";
+		};
+	};
+};
+
+/*
+ * The touch controller (ADT /arm-io/spi1/multi-touch, "hid-transport,spi"):
+ * chip select on AP GPIO 67, reset on 5. Its interrupt line, AOP GPIO 19,
+ * does not signal reports with this firmware and is left out.
+ */
+&spi1 {
+	cs-gpios = <&pinctrl_ap 67 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	touchscreen: touchscreen@0 {
+		compatible = "apple,n841-touchscreen";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		reset-gpios = <&pinctrl_ap 5 GPIO_ACTIVE_LOW>;
+		hv-supply = <&touch_hv>;
+		core-supply = <&touch_core>;
+		clken-supply = <&touch_clken>;
+		firmware-name = "apple/n841-touch";
+		/* ADT multi-touch interrupts = <0x13 0x06000001>: pin 19, group 6, level low */
+		interrupts-extended = <&pinctrl_aop 19 IRQ_TYPE_LEVEL_LOW>;
+		touchscreen-size-x = <828>;
+		touchscreen-size-y = <1792>;
+	};
+};
+
+/*
+ * Wi-Fi (ADT /arm-io/apcie/pci-bridge2/wlan and /arm-io/uart2/wlan): a
+ * BCM4357 on PCIe port 2 behind dart-apcie2, PERST# on AP GPIO 106, CLKREQ#
+ * on 101, device-wake on 43, and REG_ON on SMC PMU GPIO 14 ("gP0e").
+ * brcmfmac takes the module from the ADT's module-instance.
+ */
+/ {
+	aliases {
+		bluetooth0 = &bluetooth;
+		wifi0 = &wifi0;
+	};
+
+	wlan_vdd: regulator-wlan-vdd {
+		compatible = "regulator-fixed";
+		regulator-name = "wlan-vdd";
+		gpio = <&smc_gpio 14 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		off-on-delay-us = <2500>;
+	};
+};
+
+&pcie0 {
+	iommu-map = <0x100 &dart_apcie2 0 1>;
+	iommu-map-mask = <0xff00>;
+	pinctrl-0 = <&wifi_clkreq>;
+	pinctrl-names = "default";
+	status = "okay";
+
+	port02: pci@2,0 {
+		device_type = "pci";
+		reg = <0x1000 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		max-link-speed = <2>;
+		reset-gpios = <&pinctrl_ap 106 GPIO_ACTIVE_LOW>;
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+				<0 0 0 2 &port02 0 0 0 1>,
+				<0 0 0 3 &port02 0 0 0 2>,
+				<0 0 0 4 &port02 0 0 0 3>;
+
+		wifi0: wifi@0,0 {
+			compatible = "pci14e4,440a";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			device-wake-gpios = <&pinctrl_ap 43 GPIO_ACTIVE_HIGH>;
+			vdd-supply = <&wlan_vdd>;
+			/* ADT /arm-io/uart2/wlan module-instance */
+			brcm,board-type = "apple,yodak";
+			brcm,ccode-map-trivial;
+		};
+	};
+};
+
+&dart_apcie2 {
+	status = "okay";
+};
+
+&pinctrl_ap {
+	wifi_clkreq: wifi-clkreq-pins {
+		pinmux = <APPLE_PINMUX(101, 1)>;
+	};
+};
+
+/*
+ * Bluetooth (ADT /arm-io/uart1/bluetooth, "bluetooth,n88"): on UART1 at
+ * 3 Mbaud, its supply on SMC PMU GPIO 9 ("gP09"), wake on AP GPIO 6. The
+ * ADT names TX (30) and RTS (32); iBoot leaves 31 and 33 muxed to the same
+ * function, which makes them RX and CTS.
+ */
+&pinctrl_ap {
+	bluetooth_uart1_pins: bluetooth-uart1-pins {
+		pinmux = <APPLE_PINMUX(30, 1)>,
+			 <APPLE_PINMUX(31, 1)>,
+			 <APPLE_PINMUX(32, 1)>,
+			 <APPLE_PINMUX(33, 1)>;
+	};
+};
+
+&serial1 {
+	pinctrl-0 = <&bluetooth_uart1_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "brcm,bcm4357-bt";
+		local-bd-address = [00 00 00 00 00 00]; /* To be filled by loader */
+		current-speed = <115200>;
+		max-speed = <3000000>;
+		shutdown-gpios = <&smc_gpio 9 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl_ap 6 GPIO_ACTIVE_HIGH>;
+		apple,wlan = <&wifi0>;
+	};
+};

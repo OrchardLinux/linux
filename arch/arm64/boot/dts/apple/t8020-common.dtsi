@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iPhone XS, iPhone XS Max, iPhone XR, iPad mini 5, iPad Air 3, iPad 8
+ *
+ * This file contains parts common to all Apple A12 devices.
+ *
+ * target-type: D321, D331, D331p, N841, J210, J211, J217, J218, J171a, J172a
+ *
+ * Copyright (c) 2026, dr1408
+ */
+
+/ {
+	aliases {
+		ausbphy0 = &ausbphy0;
+		serial0 = &serial0;
+		/* Used by loader to fill properties */
+		smc = &smc;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			power-domains = <&ps_disp0_be &ps_mipi_dsi &ps_disp0_ppp>;
+			/* Format properties will be added by loader */
+			status = "disabled";
+		};
+	};
+
+	memory@800000000 {
+		device_type = "memory";
+		reg = <0x8 0 0 0>; /* To be filled by loader */
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* To be filled by loader */
+	};
+};
+
+&serial0 {
+	status = "okay";
+};
+
+/* The boot loader set up the display; nothing restores it after power loss. */
+&ps_disp0_be {
+	apple,always-on;
+	apple,manual-pm;
+};
+
+&ps_mipi_dsi {
+	apple,always-on;
+	apple,manual-pm;
+};
+
+&ps_disp0_ppp {
+	apple,always-on;
+	apple,manual-pm;
+};

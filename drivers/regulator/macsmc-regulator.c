@@ -2,9 +2,12 @@
 /*
  * Apple SMC power switches
  *
- * On the A11 iPhones the SMC switches some peripheral supplies on and off
- * through write-only keys: writing 1 turns the rail on, 0 turns it off. A
- * read of these keys fails, so the driver keeps the state it last wrote.
+ * On the A11 and A12 iPhones the SMC switches some peripheral supplies on
+ * and off through write-only keys. A plain key takes 1 for on and 0 for off.
+ * A function key (the ADT's pKW4 functions) takes the function's code from
+ * the ADT with the state in its lowest bit; any other value, a plain 0
+ * included, is an invalid code. A read of these keys fails, so the driver
+ * keeps the state it last wrote.
  *
  * Which keys exist is a property of the SMC firmware, so the table lives
  * here, selected by compatible, instead of in the device tree.
@@ -21,6 +24,8 @@
 struct macsmc_rail {
 	const char *name;
 	smc_key key;
+	u32 on;
+	u32 off;
 };
 
 struct macsmc_regulator {
@@ -32,7 +37,7 @@ struct macsmc_regulator {
 static int macsmc_regulator_write(struct regulator_dev *rdev, bool on)
 {
 	struct macsmc_regulator *reg = rdev_get_drvdata(rdev);
-	u32 val = on;
+	u32 val = on ? reg->rail->on : reg->rail->off;
 	int ret;
 
 	ret = apple_smc_write(reg->smc, reg->rail->key, &val, sizeof(val));
@@ -68,8 +73,21 @@ static const struct regulator_ops macsmc_regulator_ops = {
 
 /* iPhone 8 / 8 Plus: the Touch ID sensor's supplies */
 static const struct macsmc_rail macsmc_t8015_rails[] = {
-	{ .name = "mesa-1v8", .key = SMC_KEY(rLDc) },
-	{ .name = "mesa-3v0", .key = SMC_KEY(rLDa) },
+	{ .name = "mesa-1v8", .key = SMC_KEY(rLDc), .on = 1 },
+	{ .name = "mesa-3v0", .key = SMC_KEY(rLDa), .on = 1 },
+	{ }
+};
+
+/*
+ * iPhone XR: the touch controller's core supply and the enable of its clock,
+ * the ADT multi-touch node's function-power_ldo = pKW4('rBK3', 0x5020000)
+ * and function-clock_enable = pKW4('gP00', 0x8000000).
+ */
+static const struct macsmc_rail macsmc_t8020_rails[] = {
+	{ .name = "touch-core", .key = SMC_KEY(rBK3),
+	  .on = 0x05020001, .off = 0x05020000 },
+	{ .name = "touch-clock", .key = SMC_KEY(gP00),
+	  .on = 0x08000001, .off = 0x08000000 },
 	{ }
 };
 
@@ -120,6 +138,7 @@ static int macsmc_regulator_probe(struct platform_device *pdev)
 
 static const struct of_device_id macsmc_regulator_of_match[] = {
 	{ .compatible = "apple,t8015-smc-regulator", .data = macsmc_t8015_rails },
+	{ .compatible = "apple,t8020-smc-regulator", .data = macsmc_t8020_rails },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, macsmc_regulator_of_match);
