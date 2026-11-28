@@ -36,6 +36,7 @@ properties:
               - infineon,cyw43439-bt
           - const: brcm,bcm4329-bt
       - enum:
+          - apple,d21-bcm4357b1-bt
           - apple,j81-bcm4350c2-bt
           - apple,n66-bcm4350c5-bt
           - apple,n102-bcm4345b1-bt

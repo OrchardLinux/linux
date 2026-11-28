@@ -57,6 +57,10 @@
  * @set_baudrate_before_patch: switch to operational speed before Patchram
  * @broken_read_transmit_power: controller cannot read LE min/max TX power
  * @fixup_le_adv_report_evt_type: controller uses reserved advertising bits
+ * @broken_ext_scan: controller lists the LE extended scan commands but
+ *	rejects them
+ * @broken_ext_create_conn: controller lists LE Extended Create Connection
+ *	but rejects it
  * @use_bdaddr_property: require the unit address supplied by firmware
  * @power_off_on_close: power-cycle and repeat setup across HCI opens
  * @no_uart_clock_set: UART clock set command for >3Mbps mode is unavailable
@@ -72,6 +76,8 @@ struct bcm_device_data {
 	bool	set_baudrate_before_patch;
 	bool	broken_read_transmit_power;
 	bool	fixup_le_adv_report_evt_type;
+	bool	broken_ext_scan;
+	bool	broken_ext_create_conn;
 	bool	use_bdaddr_property;
 	bool	power_off_on_close;
 	bool	no_uart_clock_set;
@@ -131,6 +137,10 @@ struct bcm_apple_data {
  * @set_baudrate_before_patch: switch to operational speed before Patchram
  * @broken_read_transmit_power: controller cannot read LE min/max TX power
  * @fixup_le_adv_report_evt_type: controller uses reserved advertising bits
+ * @broken_ext_scan: controller lists the LE extended scan commands but
+ *	rejects them
+ * @broken_ext_create_conn: controller lists LE Extended Create Connection
+ *	but rejects it
  * @use_bdaddr_property: require the unit address supplied by firmware
  * @no_uart_clock_set: UART clock set command for >3Mbps mode is unavailable
  * @pcm_int_params: keep the initial PCM configuration
@@ -183,6 +193,8 @@ struct bcm_device {
 	bool			set_baudrate_before_patch;
 	bool			broken_read_transmit_power;
 	bool			fixup_le_adv_report_evt_type;
+	bool			broken_ext_scan;
+	bool			broken_ext_create_conn;
 	bool			use_bdaddr_property;
 	bool			power_off_on_close;
 	int			(*hci_open)(struct hci_dev *hdev);
@@ -770,6 +782,12 @@ static int bcm_setup(struct hci_uart *hu)
 	if (bcm->dev && bcm->dev->fixup_le_adv_report_evt_type)
 		hci_set_quirk(hu->hdev,
 			      HCI_QUIRK_FIXUP_LE_ADV_REPORT_EVT_TYPE);
+
+	if (bcm->dev && bcm->dev->broken_ext_scan)
+		hci_set_quirk(hu->hdev, HCI_QUIRK_BROKEN_EXT_SCAN);
+
+	if (bcm->dev && bcm->dev->broken_ext_create_conn)
+		hci_set_quirk(hu->hdev, HCI_QUIRK_BROKEN_EXT_CREATE_CONN);
 
 	if (bcm->dev && bcm->dev->use_bdaddr_property)
 		hci_set_quirk(hu->hdev, HCI_QUIRK_USE_BDADDR_PROPERTY);
@@ -1911,6 +1929,8 @@ static int bcm_serdev_probe(struct serdev_device *serdev)
 			data->broken_read_transmit_power;
 		bcmdev->fixup_le_adv_report_evt_type =
 			data->fixup_le_adv_report_evt_type;
+		bcmdev->broken_ext_scan = data->broken_ext_scan;
+		bcmdev->broken_ext_create_conn = data->broken_ext_create_conn;
 		bcmdev->use_bdaddr_property = data->use_bdaddr_property;
 		bcmdev->power_off_on_close = data->power_off_on_close;
 		bcmdev->no_uart_clock_set = data->no_uart_clock_set;
@@ -1976,6 +1996,20 @@ static struct bcm_device_data bcm4355_j172_device_data = {
  * in the event type (0x10, 0x13, 0x14, 0x20, 0x22-0x24 seen on a J71), as
  * the iPad 6's BCM4355C1 does.
  */
+/*
+ * The iPhone 8 Plus BCM4357B1 lists the LE extended scan and connection
+ * commands in its Supported Commands but answers LE Set Extended Scan
+ * Parameters with Unknown HCI Command, so scan and connect with the legacy
+ * commands. Its legacy advertising reports carry reserved event-type bits
+ * (0x10 and 0x14 seen), as the iPad 6's BCM4355C1 and the A7 iPads'
+ * BCM4324B5 do.
+ */
+static struct bcm_device_data bcm4357b1_d21_device_data = {
+	.broken_ext_scan = true,
+	.broken_ext_create_conn = true,
+	.fixup_le_adv_report_evt_type = true,
+};
+
 static struct bcm_device_data bcm4324b5_a7_device_data = {
 	.fixup_le_adv_report_evt_type = true,
 };
@@ -2010,6 +2044,9 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
 	{ .compatible = "apple,j81-bcm4350c2-bt" },
 	/* The iPhone 6s Plus BCM4350C5, as the iPad Air 2's C2 so far. */
 	{ .compatible = "apple,n66-bcm4350c5-bt" },
+	/* The iPhone 8 Plus BCM4357B1: legacy LE scanning and connections. */
+	{ .compatible = "apple,d21-bcm4357b1-bt",
+	  .data = &bcm4357b1_d21_device_data },
 	/* The iPod touch 6 BCM4345B1 uses the plain sequence at 115,200 baud. */
 	{ .compatible = "apple,n102-bcm4345b1-bt" },
 	/* The A7 iPads' BCM4324B5: the plain sequence, Patchram at 115,200 baud. */
