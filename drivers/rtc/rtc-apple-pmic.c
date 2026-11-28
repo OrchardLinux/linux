@@ -200,7 +200,10 @@ static int apple_pmic_rtc_alarm_irq_enable(struct device *dev,
 {
 	struct apple_pmic_rtc *ap_rtc = dev_get_drvdata(dev);
 
-	/* AppleD2365PMU 0xfffffff006bbbc1c writes these exact values. */
+	/*
+	 * AppleD2365PMU 0xfffffff006bbbc1c writes these exact values, and
+	 * AppleD2186PMU (iOS 12) the same 0x41 and 0x01 to its 0x5c4.
+	 */
 	return regmap_write(ap_rtc->regmap,
 			    ap_rtc->base + ap_rtc->regs->control,
 			    RTC_CONTROL_RUN |
@@ -249,7 +252,10 @@ static int apple_pmic_rtc_set_alarm(struct device *dev,
 		return -ERANGE;
 	put_unaligned_le32(secs, buf);
 
-	/* iOS programs 0x508 first, then enables the one-shot at 0x500. */
+	/*
+	 * iOS programs the alarm seconds first (D2365 0x508, D2186 0x5c0),
+	 * then enables the one-shot in the control byte (0x500, 0x5c4).
+	 */
 	rc = regmap_bulk_write(ap_rtc->regmap,
 			       ap_rtc->base + ap_rtc->regs->alarm,
 			       buf, sizeof(buf));
@@ -298,11 +304,26 @@ static const struct apple_pmic_rtc_regs antigua_regs = {
 	.has_alarm = true,
 };
 
+/*
+ * D2186 (Adi), as iOS 12 AppleD2186PMU uses it: the alarm seconds at
+ * 0x5c0, written as a 32-bit word, the control byte at 0x5c4 (0x41 arms
+ * the alarm, 0x01 disarms it, bit 6 is cleared after it fired) and the
+ * counter at 0x5c6, whose 6 bytes shifted right by 16 are the seconds the
+ * alarm is compared with.
+ */
+static const struct apple_pmic_rtc_regs adi_regs = {
+	.control = 0x4,
+	.counter = 0x6,
+	.alarm = 0x0,
+	.has_alarm = true,
+};
+
 static const struct apple_pmic_rtc_regs calpe_regs = {
 	.counter = 0x5
 };
 
 static const struct of_device_id apple_pmic_id_table[] = {
+	{ .compatible = "apple,adi-pmic-rtc", .data = &adi_regs },
 	{ .compatible = "apple,amber-pmic-rtc", .data = &amber_regs },
 	{ .compatible = "apple,antigua-pmic-rtc", .data = &antigua_regs },
 	{ .compatible = "apple,calpe-pmic-rtc", .data = &calpe_regs },
@@ -383,7 +404,7 @@ static int apple_pmic_rtc_probe(struct platform_device *pdev)
 			ap_rtc->alarm_irq = irq;
 			ap_rtc->rtc->ops = &apple_pmic_rtc_alarm_ops;
 			dev_info(&pdev->dev,
-				 "D2365 alarm at 0x%03x on PMU event IRQ %d\n",
+				 "alarm at 0x%03x on PMU event IRQ %d\n",
 				 ap_rtc->base + ap_rtc->regs->alarm, irq);
 		} else if (irq != -ENXIO) {
 			return irq;
