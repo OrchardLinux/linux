@@ -27,6 +27,7 @@
 #define MS_DUPLICATE_USAGES	BIT(5)
 #define MS_SURFACE_DIAL		BIT(6)
 #define MS_QUIRK_FF		BIT(7)
+#define MS_SHORT_RDESC		BIT(8)
 
 struct ms_data {
 	unsigned long quirks;
@@ -56,6 +57,30 @@ struct xb1s_ff_report {
 	__u8	loop_count;
 } __packed;
 
+/*
+ * The Xbox Wireless Controller (Model 1708) sometimes serves its Bluetooth
+ * report descriptor cut off after 306 bytes: in the middle of the rumble
+ * output report, without the battery report or the last two End
+ * Collections, so the HID core rejects it as unbalanced. The 306 bytes match
+ * the start of the complete descriptor; this is the rest of it.
+ */
+static const __u8 ms_xbox_1708_rdesc_tail[] = {
+	0x26, 0xff, 0x00,	/*     Logical Maximum (255)		*/
+	0x75, 0x08,		/*     Report Size (8)			*/
+	0x95, 0x01,		/*     Report Count (1)			*/
+	0x91, 0x02,		/*     Output (Data,Var,Abs)		*/
+	0xc0,			/*   End Collection			*/
+	0x85, 0x04,		/*   Report ID (4)			*/
+	0x05, 0x06,		/*   Usage Page (Generic Device Controls) */
+	0x09, 0x20,		/*   Usage (Battery Strength)		*/
+	0x15, 0x00,		/*   Logical Minimum (0)		*/
+	0x26, 0xff, 0x00,	/*   Logical Maximum (255)		*/
+	0x75, 0x08,		/*   Report Size (8)			*/
+	0x95, 0x01,		/*   Report Count (1)			*/
+	0x81, 0x02,		/*   Input (Data,Var,Abs)		*/
+	0xc0,			/* End Collection			*/
+};
+
 static const __u8 *ms_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 		unsigned int *rsize)
 {
@@ -71,6 +96,24 @@ static const __u8 *ms_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 		hid_info(hdev, "fixing up Microsoft Wireless Receiver Model 1028 report descriptor\n");
 		rdesc[557] = 0x35;
 		rdesc[559] = 0x45;
+	}
+
+	/* The short descriptor ends with Usage (0x7c), Logical Minimum (0) */
+	if ((quirks & MS_SHORT_RDESC) && *rsize == 306 &&
+	    !memcmp(rdesc + 302, "\x09\x7c\x15\x00", 4)) {
+		__u8 *fixed = devm_kmalloc(&hdev->dev,
+					   *rsize + sizeof(ms_xbox_1708_rdesc_tail),
+					   GFP_KERNEL);
+
+		if (!fixed)
+			return rdesc;
+
+		hid_info(hdev, "fixing up the short Xbox Wireless Controller report descriptor\n");
+		memcpy(fixed, rdesc, *rsize);
+		memcpy(fixed + *rsize, ms_xbox_1708_rdesc_tail,
+		       sizeof(ms_xbox_1708_rdesc_tail));
+		*rsize += sizeof(ms_xbox_1708_rdesc_tail);
+		return fixed;
 	}
 	return rdesc;
 }
@@ -425,7 +468,7 @@ static const struct hid_device_id ms_devices[] = {
 		.driver_data = MS_SURFACE_DIAL },
 
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708),
-		.driver_data = MS_QUIRK_FF },
+		.driver_data = MS_QUIRK_FF | MS_SHORT_RDESC },
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1708_BLE),
 		.driver_data = MS_QUIRK_FF },
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_MICROSOFT, USB_DEVICE_ID_MS_XBOX_CONTROLLER_MODEL_1914),
