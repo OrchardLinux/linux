@@ -64,6 +64,11 @@
 #define APPLE_Z2_CONTROL_GAP_MS          250
 #define APPLE_Z2_CONTROL_RESTARTS        3
 #define APPLE_Z2_CONTROL_RETRY_MS        1000
+/* After a resume boot, until an interrupt has delivered a report. */
+#define APPLE_Z2_WATCH_MS                1000
+#define APPLE_Z2_WATCH_DRAIN             8
+#define APPLE_Z2_WATCH_MISSES            2
+#define APPLE_Z2_WATCH_RESETS            2
 #define APPLE_Z2_CMD_SIZE                16
 #define APPLE_Z2_RAW_XFER_MAX_SIZE       64
 #define APPLE_Z2_GEN2_MIN_RESULT_SIZE    64
@@ -216,6 +221,8 @@ struct apple_z2_n1_info {
  * @cs_inactive_us:	generation-1 chip-select inactive delay
  * @n1:			N1 bootloader and runtime parameters
  * @recover_control_stall: restart after a sustained control-only runtime loop
+ * @resume_watch:	after a resume boot, check that the controller answers
+ *			and that its queued reports raise interrupts
  * @shifted_reply_header: accept an interrupt reply whose header arrives one
  *			byte late, leaving only the low checksum byte
  */
@@ -227,6 +234,7 @@ struct apple_z2_chip_info {
 	unsigned int cs_inactive_us;
 	const struct apple_z2_n1_info *n1;
 	bool recover_control_stall;
+	bool resume_watch;
 	bool shifted_reply_header;
 	unsigned int upload_hz;	/* firmware upload clock, if above the device's */
 };
@@ -272,6 +280,12 @@ struct apple_z2 {
 	int runtime_error;
 	struct work_struct resume_work;
 	bool boot_due;		/* resumed: boot once every device is back */
+	struct delayed_work watch_work;
+	bool watching;
+	unsigned int watch_polls;
+	unsigned int watch_misses;	/* polls in a row that found a report */
+	unsigned int watch_frames;	/* reports the interrupt delivered */
+	unsigned int watch_resets;	/* asked for since the last resume */
 	unsigned int rearm_attempts;
 	unsigned int control_reads;
 	unsigned long control_since;
@@ -295,6 +309,7 @@ struct apple_z2 {
 	bool runtime_frame_valid;
 	bool runtime_queue_empty;
 	bool runtime_control_reply;
+	bool runtime_data_pending;
 	bool irq_type_changed;
 	unsigned int saved_irq_type;
 	bool surface_descriptor_valid;
@@ -1110,6 +1125,7 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 	z2->runtime_frame_valid = false;
 	z2->runtime_queue_empty = false;
 	z2->runtime_control_reply = false;
+	z2->runtime_data_pending = false;
 	memset(z2->tx_buf, 0, APPLE_Z2_CMD_SIZE);
 	memset(z2->rx_buf, 0, APPLE_Z2_CMD_SIZE);
 	z2->tx_buf[0] = APPLE_Z2_CMD_READ_INTERRUPT_DATA;
@@ -1158,6 +1174,7 @@ static int apple_z2_read_packet(struct apple_z2 *z2)
 	}
 
 	payload_len = get_unaligned_le16(z2->rx_buf + 1);
+	z2->runtime_data_pending = payload_len;
 data_phase:
 	if (apple_z2_uses_gen1_data(z2) && !payload_len) {
 		z2->runtime_queue_empty = true;
@@ -2496,6 +2513,130 @@ static void apple_z2_queue_control_recovery(struct apple_z2 *z2)
 	schedule_delayed_work(&z2->rearm_work, 0);
 }
 
+/*
+ * io_lock is held. Watch a controller that has just booted after a resume
+ * (or after a reset the watch asked for) until an interrupt delivers a report.
+ */
+static void apple_z2_watch_arm_locked(struct apple_z2 *z2, bool resumed)
+{
+	if (!z2->info->resume_watch || z2->stopping || !z2->booted)
+		return;
+	if (resumed)
+		z2->watch_resets = 0;
+	z2->watch_polls = 0;
+	z2->watch_misses = 0;
+	z2->watch_frames = 0;
+	z2->watching = true;
+	schedule_delayed_work(&z2->watch_work,
+			      msecs_to_jiffies(APPLE_Z2_WATCH_MS));
+}
+
+/* io_lock is held. Hand the controller to the reset shared with the K1. */
+static void apple_z2_watch_failed_locked(struct apple_z2 *z2, const char *why,
+					 int error)
+{
+	z2->watching = false;
+	if (z2->watch_resets >= APPLE_Z2_WATCH_RESETS) {
+		dev_err(&z2->spidev->dev,
+			"touch check after resume failed again (%s); left as it is until the next resume\n",
+			why);
+		return;
+	}
+	z2->watch_resets++;
+	dev_warn(&z2->spidev->dev, "touch check after resume failed: %s\n",
+		 why);
+	z2->runtime_error = error;
+	if (z2->irq_on) {
+		z2->irq_on = false;
+		disable_irq_nosync(z2->spidev->irq);
+	}
+	mod_delayed_work(system_wq, &z2->stop_work, 0);
+}
+
+/*
+ * The iPad 7 touchscreen can come back from sleep booted without error and
+ * then never interrupt again, with nothing logged. A finger off the screen
+ * raises no interrupts either, so silence alone says nothing. Ask instead:
+ * the controller has to answer a status query, and a report waiting in its
+ * queue must have been announced by an interrupt. Reports found waiting are
+ * read here, as the interrupt would have; if more wait at the next poll with
+ * still no interrupt, or the query goes unanswered, the controller is reset.
+ * The first report an interrupt delivers ends the watch.
+ */
+static void apple_z2_watch_work(struct work_struct *work)
+{
+	struct apple_z2 *z2 = container_of(to_delayed_work(work),
+					   struct apple_z2, watch_work);
+	unsigned int i, frames = 0;
+	bool queued = false;
+	u16 len = 0;
+	u8 status = 0;
+	int error = 0;
+
+	mutex_lock(&z2->io_lock);
+	if (!z2->watching || z2->stopping || !z2->booted || !z2->irq_on)
+		goto out;
+	if (z2->watch_frames) {
+		z2->watching = false;
+		goto out;
+	}
+
+	if (!z2->watch_polls++) {
+		error = apple_z2_read_report_info_locked(z2,
+							 APPLE_Z2_REPORT_SURFACE,
+							 &status, &len, "watch");
+		if (!error &&
+		    (status || len != APPLE_Z2_SURFACE_DESCRIPTOR_SIZE))
+			error = -EPROTO;
+		if (error) {
+			apple_z2_watch_failed_locked(z2,
+						     "no answer to the status query",
+						     error);
+			goto out;
+		}
+	}
+
+	for (i = 0; i < APPLE_Z2_WATCH_DRAIN; i++) {
+		error = apple_z2_read_packet(z2);
+		if (error) {
+			apple_z2_watch_failed_locked(z2,
+						     "report read failed",
+						     error);
+			goto out;
+		}
+		if (!i)
+			dev_dbg(&z2->spidev->dev,
+				"watch poll %u: %*ph queued=%d valid=%d\n",
+				z2->watch_polls, 8, z2->rx_buf,
+				z2->runtime_data_pending,
+				z2->runtime_frame_valid);
+		if (!z2->runtime_data_pending)
+			break;
+		queued = true;
+		if (!z2->runtime_frame_valid)
+			break;
+		frames++;
+	}
+
+	if (!queued) {
+		z2->watch_misses = 0;
+	} else if (++z2->watch_misses >= APPLE_Z2_WATCH_MISSES) {
+		apple_z2_watch_failed_locked(z2, frames ?
+					     "reports queued without an interrupt" :
+					     "unreadable report queued without an interrupt",
+					     -EIO);
+		goto out;
+	} else {
+		dev_dbg(&z2->spidev->dev,
+			"watch read %u queued reports no interrupt announced\n",
+			frames);
+	}
+	schedule_delayed_work(&z2->watch_work,
+			      msecs_to_jiffies(APPLE_Z2_WATCH_MS));
+out:
+	mutex_unlock(&z2->io_lock);
+}
+
 /* Block new runtime work and drain even an IRQ that masked itself on error. */
 static void apple_z2_k1_quiesce_irq(struct apple_z2 *z2)
 {
@@ -2520,11 +2661,14 @@ static void apple_z2_k1_quiesce_irq(struct apple_z2 *z2)
  */
 static void apple_z2_cancel_runtime_stop(struct apple_z2 *z2)
 {
-	if (!apple_z2_is_k1(z2))
+	if (!apple_z2_is_k1(z2) && !z2->info->resume_watch)
 		return;
 	mutex_lock(&z2->io_lock);
 	z2->stopping = true;
+	z2->watching = false;
 	mutex_unlock(&z2->io_lock);
+	/* The watch queues stop_work, which queues reset_work, which arms it. */
+	cancel_delayed_work_sync(&z2->watch_work);
 	cancel_delayed_work_sync(&z2->stop_work);
 	cancel_delayed_work_sync(&z2->reset_work);
 	apple_z2_k1_quiesce_irq(z2);
@@ -2556,7 +2700,7 @@ static void apple_z2_k1_runtime_error(struct work_struct *work)
 		z2->reset_attempt++;
 	else
 		z2->stopping = true;
-	if (z2->k1_input_registered)
+	if (!apple_z2_is_k1(z2) || z2->k1_input_registered)
 		apple_z2_release_contacts(z2);
 	z2->booted = false;
 	mutex_unlock(&z2->io_lock);
@@ -2607,6 +2751,7 @@ static void apple_z2_k1_reset_work(struct work_struct *work)
 			 "touch restarted after attempt %u (%u resets since probe)\n",
 			 z2->reset_attempt, z2->reset_count);
 		z2->reset_attempt = 0;
+		apple_z2_watch_arm_locked(z2, false);
 	} else if (!z2->stopping) {
 		z2->runtime_error = error;
 		mod_delayed_work(system_wq, &z2->stop_work, 0);
@@ -2642,13 +2787,16 @@ static irqreturn_t apple_z2_irq(int irq, void *data)
 		mutex_unlock(&z2->io_lock);
 	} else {
 		mutex_lock(&z2->io_lock);
-		if (z2->info->recover_control_stall &&
+		if ((z2->info->recover_control_stall ||
+		     z2->info->resume_watch) &&
 		    (z2->stopping || !z2->irq_on)) {
 			mutex_unlock(&z2->io_lock);
 			return IRQ_HANDLED;
 		}
 		error = apple_z2_is_gen1(z2) ? apple_z2_gen1_drain(z2) :
 						 apple_z2_read_packet(z2);
+		if (z2->watching && !error && z2->runtime_frame_valid)
+			z2->watch_frames++;
 		if (error == -ETIMEDOUT && z2->info->recover_control_stall)
 			apple_z2_queue_control_recovery(z2);
 		mutex_unlock(&z2->io_lock);
@@ -5520,6 +5668,7 @@ static const struct apple_z2_chip_info apple_z2_j208_info = {
 static const struct apple_z2_chip_info apple_z2_j172_info = {
 	.name = "iPad 7 Touchscreen",
 	.variant = APPLE_Z2_VARIANT_J172,
+	.resume_watch = true,
 };
 
 static const struct apple_z2_chip_info apple_z2_d11_info = {
@@ -5609,8 +5758,10 @@ static int apple_z2_probe(struct spi_device *spi)
 	INIT_DELAYED_WORK(&z2->rearm_work, info->recover_control_stall ?
 			  apple_z2_control_rearm_work : apple_z2_n1_rearm_work);
 	INIT_DELAYED_WORK(&z2->j72_work, apple_z2_j72_work);
-	INIT_DELAYED_WORK(&z2->reset_work, apple_z2_is_k1(z2) ?
+	INIT_DELAYED_WORK(&z2->reset_work,
+			  apple_z2_is_k1(z2) || info->resume_watch ?
 			  apple_z2_k1_reset_work : apple_z2_j72_reset_work);
+	INIT_DELAYED_WORK(&z2->watch_work, apple_z2_watch_work);
 	INIT_WORK(&z2->resume_work, apple_z2_resume_work);
 	INIT_DELAYED_WORK(&z2->stop_work, apple_z2_k1_runtime_error);
 	spi_set_drvdata(spi, z2);
@@ -5994,6 +6145,11 @@ static void apple_z2_resume_work(struct work_struct *work)
 		dev_err(&z2->spidev->dev, "touch did not start after resume: %d\n", error);
 	else if (attempt > 1)
 		dev_info(&z2->spidev->dev, "touch started after resume, attempt %d\n", attempt);
+	if (!error) {
+		mutex_lock(&z2->io_lock);
+		apple_z2_watch_arm_locked(z2, true);
+		mutex_unlock(&z2->io_lock);
+	}
 }
 
 /*
