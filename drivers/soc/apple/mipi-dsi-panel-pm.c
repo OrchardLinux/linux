@@ -143,7 +143,7 @@ static int apple_dsi_resume(struct device *dev)
 {
 	struct apple_dsi_pm *p = dev_get_drvdata(dev);
 
-	queue_work(system_unbound_wq, &p->wake);
+	queue_work(system_dfl_wq, &p->wake);
 	return 0;
 }
 

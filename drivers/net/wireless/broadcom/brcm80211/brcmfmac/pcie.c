@@ -2888,7 +2888,7 @@ static void brcmf_pcie_pm_complete(struct device *dev)
 	INIT_WORK(&r->work, brcmf_pcie_reload_work);
 	r->pdev = pci_dev_get(devinfo->pdev);
 	devinfo->reload_queued = true;
-	queue_work(system_unbound_wq, &r->work);
+	queue_work(system_dfl_wq, &r->work);
 }
 
 static const struct dev_pm_ops brcmf_pciedrvr_pm = {

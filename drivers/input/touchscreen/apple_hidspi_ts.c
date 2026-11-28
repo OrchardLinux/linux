@@ -1197,7 +1197,7 @@ static int ahts_resume(struct device *dev)
 {
 	struct apple_hidspi_ts *ts = dev_get_drvdata(dev);
 
-	queue_work(system_unbound_wq, &ts->resume_work);
+	queue_work(system_dfl_wq, &ts->resume_work);
 	return 0;
 }
 
