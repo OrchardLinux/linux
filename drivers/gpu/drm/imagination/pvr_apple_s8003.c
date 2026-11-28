@@ -257,6 +257,13 @@ struct t7000_soc {
 	bool slc;			/* SLC_CTRL_MISC and 0x3808 in the boot stream */
 	u32 rev_major;			/* CORE_REVISION[23:16] */
 	u32 chip_info[3];		/* without an ID read */
+	/*
+	 * The pause before each group of new accesses in the power-up and
+	 * boot, in ms (T7000_SETTLE_MS). The A8 keeps its bring-up module's
+	 * 100: its first driver probe without them froze, and shorter ones were
+	 * never measured there.
+	 */
+	unsigned int settle_ms;
 };
 
 /*
@@ -3379,7 +3386,18 @@ static int pvr_apple_s8003_prepare_job(struct pvr_apple *apple, struct pvr_job *
  * state 0 after it, before the boot stream and before the release. Every
  * run had these pauses, so the driver keeps them.
  */
-#define T7000_SETTLE_MS			100
+#define T7000_SETTLE_MS			t7000_settle(apple)
+static unsigned int t7000_settle_ms;
+module_param_named(apple_settle_ms, t7000_settle_ms, uint, 0644);
+MODULE_PARM_DESC(apple_settle_ms,
+		 "A8/A7: the pause before each step of the GPU's power-up and firmware boot, in ms (0, the default: the chip's, A8 100, A7 10)");
+
+static unsigned int t7000_settle(struct pvr_apple *apple)
+{
+	const struct pvr_apple_s8003 *s = apple->chip_data;
+
+	return t7000_settle_ms ?: s->v->soc->settle_ms;
+}
 #define T7000_FENDER_SNOOP		0x0014	/* FENDER_WAKE: bit 1 snoop armed */
 #define T7000_FENDER_CTRL_SNOOP		BIT(29)
 
@@ -3718,6 +3736,7 @@ static const struct t7000_soc t7000_soc_a8 = {
 	.slc = true,
 	.rev_major = 3,
 	.chip_info = { 2, 4, 4 },
+	.settle_ms = 100,
 };
 
 /*
@@ -3747,6 +3766,8 @@ static const struct t7000_soc t7000_soc_a7 = {
 	.perf_count = 7,
 	.rev_major = 1,
 	.chip_info = { 1, 4, 4 },
+	/* J71: a boot with 10 ms pauses takes 46 ms, with 100 ms 418 ms */
+	.settle_ms = 10,
 };
 
 /*
