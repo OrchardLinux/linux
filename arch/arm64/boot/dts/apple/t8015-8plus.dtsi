@@ -39,6 +39,8 @@
 / {
 	aliases {
 		aop = &aop; /* m1n1 passes the AOP its boot arguments and calibration */
+		bluetooth0 = &bluetooth; /* m1n1 adds the unit's device address */
+		serial1 = &serial1;
 	};
 };
 
@@ -69,4 +71,35 @@
 	mount-matrix = "1", "0", "0",
 		       "0", "1", "0",
 		       "0", "0", "1";
+};
+
+/*
+ * Bluetooth: the BCM4357's Bluetooth half, on UART1 (ADT uart1/bluetooth).
+ * The pins follow the ADT's function-tx (211, RX next) and function-rts
+ * (213, CTS next); power is the SMC GPIO key gP09, as the Wi-Fi half's is
+ * gP0e, and BT_WAKE is AP GPIO 2.
+ */
+&pinctrl_ap {
+	bluetooth_uart1_pins: bluetooth-uart1-pins {
+		pinmux = <APPLE_PINMUX(211, 1)>,
+			 <APPLE_PINMUX(212, 1)>,
+			 <APPLE_PINMUX(213, 1)>,
+			 <APPLE_PINMUX(214, 1)>;
+	};
+};
+
+&serial1 {
+	pinctrl-0 = <&bluetooth_uart1_pins>;
+	pinctrl-names = "default";
+	uart-has-rtscts;
+	status = "okay";
+
+	bluetooth: bluetooth {
+		compatible = "apple,d21-bcm4357b1-bt";
+		current-speed = <115200>;
+		/* UART1 runs from the 24 MHz reference: 1.5 Mbaud at most */
+		max-speed = <1500000>;
+		shutdown-gpios = <&smc_gpio 9 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&pinctrl_ap 2 GPIO_ACTIVE_HIGH>;
+	};
 };
