@@ -74,8 +74,11 @@ MODULE_PARM_DESC(apple_poll_us, "Apple A10: microseconds between job completion 
  */
 #define PVR_APPLE_FAST_US	1000
 
-/* Idle time before runtime PM powers the GPU off; tunable in sysfs. */
-#define PVR_APPLE_AUTOSUSPEND_MS	1000
+/* Idle time before runtime PM powers the GPU off; tunable in sysfs.
+ * Cold-booting the firmware takes ~500 ms on A8, so stay awake across
+ * brief reading/thinking pauses rather than stalling the next touch.
+ */
+#define PVR_APPLE_AUTOSUSPEND_MS	10000
 
 static unsigned int pvr_apple_perf_state;
 module_param_named(apple_perf_state, pvr_apple_perf_state, uint, 0444);

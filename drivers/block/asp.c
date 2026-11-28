@@ -5,7 +5,6 @@
  * Copyright (c) 2026 Nick Chan <towinchenmi@gmail.com>
  */
 
-#define DEBUG 1
 #include <linux/async.h>
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>

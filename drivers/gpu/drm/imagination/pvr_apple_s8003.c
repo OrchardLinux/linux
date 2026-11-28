@@ -3771,6 +3771,20 @@ static const struct t7000_soc t7000_soc_a7 = {
 };
 
 /*
+ * Performance state floor/ceiling for the A8 firmware governor
+ * (1 = 365 MHz, 2 = 450 MHz, 3 = 500 MHz). Both default to 1 (Apple's
+ * proven start state) until states 2-3 are qualified across boards;
+ * takes effect on firmware boot.
+ */
+static unsigned int a8_perf_min = 1;
+module_param(a8_perf_min, uint, 0644);
+MODULE_PARM_DESC(a8_perf_min, "A8: lowest GPU performance state for firmware DVFS (1=365 MHz, 2=450 MHz, 3=500 MHz; default 1)");
+
+static unsigned int a8_perf_max = 1;
+module_param(a8_perf_max, uint, 0644);
+MODULE_PARM_DESC(a8_perf_max, "A8: highest GPU performance state for firmware DVFS (1=365 MHz, 2=450 MHz, 3=500 MHz; default 1)");
+
+/*
  * The root and shared memory as the A8's firmware finds it when it starts
  * (0x8466578, 0x8467770; values from P4): where its objects are, the heaps'
  * bases, the registers it may use, the interrupt it raises, its thread, the
@@ -3902,8 +3916,13 @@ static void t7000_init_build(struct pvr_apple *apple, u32 q)
 	put32(control + 0x34, 0x78);		/* gpu_temperature_limit */
 	put32(control + 0x4a, 1);
 	put32(control + 0xc66, 1867);		/* power target */
-	put32(control + 0xc6a, 100 * q);	/* the power interface's clock targets */
-	put32(control + 0xc6e, 100 * q);
+	{
+		u32 pmin = clamp(READ_ONCE(a8_perf_min), q, 3u);
+		u32 pmax = max(pmin, clamp(READ_ONCE(a8_perf_max), 1u, 3u));
+
+		put32(control + 0xc6a, 100 * pmin);	/* floor performance state */
+		put32(control + 0xc6e, 100 * pmax);	/* ceiling performance state */
+	}
 	put32(control + 0xd0e, s8003_object_addr(layout, S8003_TAG_HOST));
 	put32(control + 0xd12, s8003_object_addr(layout, S8003_MMU_ROOT));
 	put32(control + 0xd16, 1);
@@ -5385,10 +5404,10 @@ static void t7000_pm_feedback(struct pvr_apple *apple, struct s8003_vm *vm)
 		/* read only, at most once a second a VM: what the A8 reports */
 		if (!vm->fb_at || ktime_ms_delta(ktime_get(), vm->fb_at) >= 1000) {
 			vm->fb_at = ktime_get();
-			dev_info(apple_dev(apple),
-				 "A8 PM usage (pool %u blocks): %u %u %u %u\n", blocks, high,
-				 margin, get32(list + T7000_PM_FEEDBACK + 8),
-				 get32(list + T7000_PM_FEEDBACK + 12));
+			dev_dbg(apple_dev(apple),
+				"A8 PM usage (pool %u blocks): %u %u %u %u\n", blocks, high,
+				margin, get32(list + T7000_PM_FEEDBACK + 8),
+				get32(list + T7000_PM_FEEDBACK + 12));
 		}
 		return;
 	}
@@ -6227,6 +6246,11 @@ static void t7000_debugfs_show(struct pvr_apple *apple, struct seq_file *m)
 	}
 	seq_printf(m, "a8 joint %d (fragment job submitted after its geometry job's submit)\n",
 		   READ_ONCE(a8_joint));
+	seq_printf(m, "a8 perf floor %u ceil %u fender_ps %#x pll5 %#x\n",
+		   clamp(READ_ONCE(a8_perf_min), 1u, 3u),
+		   clamp(READ_ONCE(a8_perf_max), 1u, 3u),
+		   t7000_ps_on(s) ? readl(apple->fender + FENDER_POWER_STATE) : 0,
+		   t7000_ps_on(s) ? pmgr_read(s, T7000_PMGR_PLL5) : 0);
 }
 
 static void t7000_iounmap(void *addr)
@@ -6526,7 +6550,8 @@ const struct pvr_apple_chip pvr_apple_chip_t7000 = {
 	.frag_ext_mask = PVR_STREAM_EXTHDR_FRAG_G5P_REGS,
 	.compute_stream = &pvr_apple_g5p_cmd_compute_stream,
 	.own_pm_pages = true,
-	.gate_off_ms = 10,
+	/* Keep the core awake across consecutive 60 Hz (16.7 ms) frames. */
+	.gate_off_ms = 40,
 	.wait_deadline = true,
 	.fault_skips_done = true,
 	.irq_thread = true,

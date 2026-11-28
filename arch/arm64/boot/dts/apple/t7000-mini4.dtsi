@@ -68,7 +68,7 @@
 	 */
 	smart-cover {
 		compatible = "gpio-keys-polled";
-		poll-interval = <50>;
+		poll-interval = <250>;
 		label = "iPad Smart Cover";
 
 		cover-switch {
