@@ -130,6 +130,8 @@
 		core-supply = <&touch_core>;
 		clken-supply = <&touch_clken>;
 		firmware-name = "apple/n841-touch";
+		/* ADT multi-touch interrupts = <0x13 0x06000001>: pin 19, group 6, level low */
+		interrupts-extended = <&pinctrl_aop 19 IRQ_TYPE_LEVEL_LOW>;
 		touchscreen-size-x = <828>;
 		touchscreen-size-y = <1792>;
 	};

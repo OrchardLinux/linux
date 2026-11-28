@@ -144,6 +144,9 @@ struct apple_hidspi_finger {
  * @cs_delay_us: MTFW "CS Delay"
  * @status_stage: HIDSPI packets are followed by the status stage
  * @idle_fill: what the host clocks out while it only reads
+ * @read_ack: every packet read is answered with a status word (no padding)
+ *	in the same chip-select window; without it the firmware hands out the
+ *	same packet again and keeps its interrupt line asserted
  * @polled: the firmware repeats its newest packet on every read and its
  *	interrupt line announces none: no interrupt is used, a thread reads
  * @max_x: largest X reported, unless the device tree gives the size
@@ -165,6 +168,7 @@ struct ahts_variant {
 	u16 cs_delay_us;
 	bool status_stage;
 	u8 idle_fill;
+	bool read_ack;
 	bool polled;
 	unsigned int max_x, max_y;
 	s16 min_sx, max_sx, min_sy, max_sy;
@@ -189,6 +193,7 @@ struct apple_hidspi_ts {
 	u8 *pkt;
 	size_t pkt_size;
 	struct mutex lock;	/* requests, polled reads and their reload */
+	bool polled;		/* no interrupt: read on a timer */
 	u8 msg_id;
 	bool powered;
 	bool input_ready;
@@ -809,7 +814,7 @@ static void ahts_touch(struct apple_hidspi_ts *ts, const u8 *pl, size_t len)
 	else
 		dev_dbg(&ts->spi->dev, "frame: no fingers\n");
 
-	if (ts->variant->polled) {
+	if (ts->polled) {
 		/* Such a tap goes down where it was lifted, then up below. */
 		for (i = 0; i < nf; i++)
 			missed |= ahts_finger_missed(ts, &f[i]);
@@ -837,14 +842,53 @@ static void ahts_touch(struct apple_hidspi_ts *ts, const u8 *pl, size_t len)
 /* The packet the interrupt announces, into irq_rx. */
 static int ahts_read(struct apple_hidspi_ts *ts, bool *ok)
 {
+	struct spi_controller *ctlr = ts->spi->controller;
+	struct spi_transfer t[2] = {
+		{ .delay = { .value = ts->variant->cs_delay_us,
+			     .unit = SPI_DELAY_UNIT_USECS } },
+		{ .tx_buf = ts->irq_tx, .rx_buf = ts->irq_rx,
+		  .len = HIDSPI_XFER, .cs_change = 1 },
+	};
+	struct spi_transfer st = {
+		.tx_buf = ts->status,
+		.rx_buf = ts->status + HIDSPI_STATUS_LEN,
+		.len = 4,
+	};
+	struct spi_message m;
+	bool pad;
 	int ret;
 
-	ret = ahts_xfer(ts, ts->irq_tx, ts->irq_rx, HIDSPI_XFER);
-	if (ret)
-		return ret;
+	if (!ts->variant->read_ack) {
+		ret = ahts_xfer(ts, ts->irq_tx, ts->irq_rx, HIDSPI_XFER);
+		if (ret)
+			return ret;
+		usleep_range(HIDSPI_GAP_US, HIDSPI_GAP_US + 50);
+		*ok = ahts_packet_ok(ts, ts->irq_rx + HIDSPI_PAD);
+		return 0;
+	}
+
+	/*
+	 * As iOS (AppleHIDTransportSPI): the packet, "Inter Stage Us", then
+	 * the host's status word with chip select still asserted. A packet
+	 * of the firmware (0xdeadbeef padding) is acknowledged even when the
+	 * check below cannot verify it, as its boot message.
+	 */
+	spi_bus_lock(ctlr);
+	spi_message_init_with_transfers(&m, t, ARRAY_SIZE(t));
+	ret = spi_sync_locked(ts->spi, &m);
+	if (!ret) {
+		*ok = ahts_packet_ok(ts, ts->irq_rx + HIDSPI_PAD);
+		pad = get_unaligned_le32(ts->irq_rx) == HIDSPI_PAD_WORD;
+		usleep_range(HIDSPI_STAGE_US, HIDSPI_STAGE_US + 50);
+		put_unaligned_le32((*ok || pad) ? HIDSPI_STATUS_OK : HIDSPI_STATUS_NAK,
+				   ts->status);
+		spi_message_init_with_transfers(&m, &st, 1);
+		ret = spi_sync_locked(ts->spi, &m);
+		*ok = *ok || pad;
+	}
+	spi_bus_unlock(ctlr);
 	usleep_range(HIDSPI_GAP_US, HIDSPI_GAP_US + 50);
-	*ok = ahts_packet_ok(ts, ts->irq_rx + HIDSPI_PAD);
-	return 0;
+	return ret;
 }
 
 /* The valid packet in irq_rx. */
@@ -888,10 +932,6 @@ static int ahts_poll(struct apple_hidspi_ts *ts)
 	int ret;
 
 	guard(mutex)(&ts->lock);
-	/*
-	 * A plain read: with a status word after every packet read the
-	 * firmware hands out its boot message for ever.
-	 */
 	ret = ahts_read(ts, &ok);
 	if (ret)
 		return ret;
@@ -933,10 +973,8 @@ static void ahts_reload(struct apple_hidspi_ts *ts)
 }
 
 /*
- * The iPhone XR's interrupt line (AOP pin 19) was measured not to move with
- * this firmware, whatever waits in it; the ADT's function-set_int_config may
- * be the step that is missing. Until that is known the reports are read on a
- * timer, which costs these reads while nothing touches the screen.
+ * Without an interrupt in the device tree the reports are read on a timer,
+ * which costs these reads while nothing touches the screen.
  */
 static int ahts_poll_thread(void *data)
 {
@@ -1111,7 +1149,8 @@ static int ahts_probe(struct spi_device *spi)
 	if (ret)
 		return ret;
 
-	if (v->polled) {
+	ts->polled = v->polled || spi->irq <= 0;
+	if (ts->polled) {
 		ts->thread = kthread_run(ahts_poll_thread, ts, "apple-hidspi-ts");
 		if (IS_ERR(ts->thread)) {
 			ret = PTR_ERR(ts->thread);
@@ -1183,7 +1222,7 @@ static void ahts_resume_work(struct work_struct *work)
 		dev_err(dev, "firmware not loaded after resume: %d\n", ret);
 		return;
 	}
-	if (ts->variant->polled) {
+	if (ts->polled) {
 		ts->thread = kthread_run(ahts_poll_thread, ts, "apple-hidspi-ts");
 		if (IS_ERR(ts->thread))
 			ts->thread = NULL;
@@ -1230,9 +1269,10 @@ static const struct ahts_variant ahts_d221 = {
  * which runs this controller: blobs of at most 0x3f0 bytes, 20 ms before each
  * acknowledge, a 300 us CS delay, 0xff while reading and the status stage.
  * The bootloader answers in SPI mode 3, as the iPhone X's; in mode 0 its
- * words arrive shifted by one bit. The panel has 828 x 1792 pixels. Measured
- * on an n841: every read returns the newest packet again, and the interrupt
- * line stays low with the boot message, a reply or touch reports waiting.
+ * words arrive shifted by one bit. The panel has 828 x 1792 pixels. As iOS
+ * (AppleHIDTransportSPI) it answers every packet read with a bare status word
+ * in the same chip-select window; unanswered, the firmware returns the same
+ * packet again and holds its interrupt (AOP GPIO 19, level low) asserted.
  */
 static const struct ahts_variant ahts_n841 = {
 	.name = "Apple iPhone XR Touchscreen",
@@ -1245,7 +1285,7 @@ static const struct ahts_variant ahts_n841 = {
 	.cs_delay_us = 300,
 	.status_stage = true,
 	.idle_fill = 0xff,
-	.polled = true,
+	.read_ack = true,
 	.max_x = 827,
 	.max_y = 1791,
 	/* What the firmware's surface descriptor gives on an iPhone XR. */
