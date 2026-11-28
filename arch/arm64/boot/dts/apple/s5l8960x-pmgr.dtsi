@@ -92,6 +92,13 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dwi";
+		/*
+		 * The PMIC's voltage interface, which the GPU's DVFS sequencer
+		 * uses: the GPU's core ID read needs it on (A8X), and switching
+		 * it off right after the GPU powers down hung the J71. Apple's
+		 * ADT flags it 0x03, as the always-on AIC, GPIO and LIO.
+		 */
+		apple,always-on;
 	};
 
 	ps_gpio: power-controller@20040 {

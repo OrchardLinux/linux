@@ -1565,6 +1565,12 @@ static const struct pvr_device_data pvr_device_data_apple_t7000 = {
 	.apple_fw = true,
 	.apple_chip = &pvr_apple_chip_t7000,
 };
+
+static const struct pvr_device_data pvr_device_data_apple_s5l8960x = {
+	.pwr_ops = &pvr_power_sequence_ops_apple,
+	.apple_fw = true,
+	.apple_chip = &pvr_apple_chip_s5l8960x,
+};
 #endif
 
 static const struct of_device_id dt_match[] = {
@@ -1580,6 +1586,10 @@ static const struct of_device_id dt_match[] = {
 	{
 		.compatible = "apple,t7000-gpu",
 		.data = &pvr_device_data_apple_t7000,
+	},
+	{
+		.compatible = "apple,s5l8960x-gpu",
+		.data = &pvr_device_data_apple_s5l8960x,
 	},
 #endif
 	{

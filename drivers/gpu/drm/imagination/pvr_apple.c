@@ -874,11 +874,45 @@ static const struct file_operations pvr_apple_jobs_fops = {
 	.release = single_release,
 };
 
+/*
+ * debugfs apple_start: a write starts the firmware if it is not running, as
+ * the first job after a runtime suspend does, and lets the GPU idle (and
+ * autosuspend) again: a firmware start and power cycle without a job.
+ */
+static ssize_t pvr_apple_start_write(struct file *file, const char __user *buf, size_t len,
+				     loff_t *ppos)
+{
+	struct pvr_apple *apple = file->private_data;
+	struct device *dev = apple_dev(apple);
+	int err;
+
+	err = pm_runtime_resume_and_get(dev);
+	if (err)
+		return err;
+	mutex_lock(&apple->submit_lock);
+	err = READ_ONCE(apple->stopping) ? -ENODEV :
+	      apple->booted ? 0 : pvr_apple_fw_restart(apple);
+	mutex_unlock(&apple->submit_lock);
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+	if (err)
+		dev_err(dev, "apple_start: the firmware did not start: %d\n", err);
+	return err ? err : len;
+}
+
+static const struct file_operations pvr_apple_start_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = pvr_apple_start_write,
+	.llseek = noop_llseek,
+};
+
 void pvr_apple_debugfs_init(struct pvr_device *pvr_dev, struct dentry *root)
 {
-	if (pvr_dev->apple)
-		debugfs_create_file("apple_jobs", 0600, root, pvr_dev->apple,
-				    &pvr_apple_jobs_fops);
+	if (!pvr_dev->apple)
+		return;
+	debugfs_create_file("apple_jobs", 0600, root, pvr_dev->apple, &pvr_apple_jobs_fops);
+	debugfs_create_file("apple_start", 0200, root, pvr_dev->apple, &pvr_apple_start_fops);
 }
 
 static int pvr_apple_wait_engine(struct pvr_apple *apple, enum pvr_apple_engine engine, u32 seq,
