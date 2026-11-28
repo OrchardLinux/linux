@@ -30,6 +30,8 @@
 	};
 
 	cpus {
+		/* PMGR CPU start block (m1n1 smp.c, A12: 0xd4000) */
+		apple,cpu-start = <0x2 0x3b0d4000>;
 		#address-cells = <2>;
 		#size-cells = <0>;
 
