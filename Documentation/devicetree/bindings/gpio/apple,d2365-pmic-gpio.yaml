@@ -24,12 +24,13 @@ description: |
   they are inputs as the boot firmware set them up. It latches 256 PMU
   events, GPIO line N being event 0x30 + N.
 
-  The D2207 and D2365 also latch 112 and 240 PMU events respectively
-  (charger, ADC, GPIO edges and others) in one read-to-clear block and
-  signal them on a single active-low line to the AP. As an interrupt
-  controller the node owns that block: the interrupt specifier is the PMU
-  event number and a flags cell. PMIC GPIO line N is event 0x18 + N on the
-  D2207 and 0x30 + N on the D2365, so GPIO consumers get their interrupt
+  The D2186, D2207 and D2365 also latch 104, 112 and 240 PMU events
+  respectively (charger, ADC, RTC alarm, GPIO edges and others) in one
+  read-to-clear block and signal them on a single active-low line to the
+  AP. As an interrupt controller the node owns that block: the interrupt
+  specifier is the PMU event number and a flags cell. PMIC GPIO line N is
+  event 0x18 + N on the D2186 and D2207 and 0x30 + N on the D2365, so GPIO
+  consumers get their interrupt
   through the GPIO specifier as well. Events are latched; what triggers a
   GPIO event is the line configuration left by the boot firmware, so only
   edge flags are accepted.
@@ -41,11 +42,11 @@ description: |
   has 17 GPIO lines configured as on the D2207 (lines 0-16); its node may
   also be a GPIO controller, whose lines are not mapped to their events.
 
-  Interrupt 112 (D2089, D2207) or 240 (D2365), one past the last event, is
-  the event line itself. Its consumers run on every assertion of the line,
-  before the event block is read, so that a consumer can act before the I2C
-  read that tells which event it was (the Lightning charger withdraws its
-  input-current grant there).
+  Interrupt 104 (D2186), 112 (D2089, D2207) or 240 (D2365), one past the
+  last event, is the event line itself. Its consumers run on every
+  assertion of the line, before the event block is read, so that a consumer
+  can act before the I2C read that tells which event it was (the Lightning
+  charger withdraws its input-current grant there).
 
 properties:
   compatible:
@@ -132,7 +133,6 @@ allOf:
       properties:
         compatible:
           enum:
-            - apple,d2186-pmic-gpio
             - apple,d2255-pmic-gpio
             - apple,d2333-pmic-gpio
             - apple,d2401-pmic-gpio
@@ -141,6 +141,13 @@ allOf:
         interrupt-controller: false
         "#interrupt-cells": false
         interrupts: false
+        apple,wake-events: false
+  - if:
+      properties:
+        compatible:
+          const: apple,d2186-pmic-gpio
+    then:
+      properties:
         apple,wake-events: false
   - if:
       properties:
