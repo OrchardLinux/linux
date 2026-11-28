@@ -600,6 +600,18 @@
 			status = "disabled";
 		};
 
+		/*
+		 * Memory controller: non-plane (global) block and plane block,
+		 * ADT mcc reg[0] and reg[1]; 16 ways is config-data's first entry.
+		 */
+		mcc: memory-controller@200100000 {
+			compatible = "apple,t8020-mcc";
+			reg = <0x2 0x00100000 0x0 0x4000>,
+			      <0x2 0x00000000 0x0 0x100000>;
+			reg-names = "global", "plane";
+			apple,cache-ways = <16>;
+		};
+
 		wdt: watchdog@23d2b0000 {
 			compatible = "apple,t8020-wdt", "apple,wdt";
 			reg = <0x2 0x3d2b0000 0x0 0x4000>;

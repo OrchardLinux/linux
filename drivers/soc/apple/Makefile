@@ -25,3 +25,4 @@ apple-sio-y := apple-sio-core.o
 obj-$(CONFIG_APPLE_T8010_WLAN) += apple-t8010-wlan.o
 obj-$(CONFIG_APPLE_MIPI_DSI_PANEL_PM) += mipi-dsi-panel-pm.o
 obj-$(CONFIG_APPLE_PMP_T8020) += pmp_t8020.o
+obj-$(CONFIG_APPLE_MCC_T8020) += mcc-t8020.o

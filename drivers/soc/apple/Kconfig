@@ -61,6 +61,13 @@ config APPLE_MESA
 
 	  Say 'y' or 'm' here if you have an iPhone 8 Plus.
 
+config APPLE_MCC_T8020
+	bool "Apple A12 memory controller system level cache"
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  Turns on the A12's system level cache, which the boot loader
+	  leaves off, and turns it off again before a restart.
+
 config APPLE_PMP_T8020
 	tristate "Apple T8020 PMP"
 	depends on ARCH_APPLE || COMPILE_TEST
