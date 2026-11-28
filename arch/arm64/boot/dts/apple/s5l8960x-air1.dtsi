@@ -430,9 +430,13 @@
 		reset-gpios = <&pinctrl 66 GPIO_ACTIVE_LOW>;
 		/*
 		 * Measured on a J71: flat screen up z = +1 g, upright (Home
-		 * down) y = -1 g, landscape with Home on the right x = +1 g.
-		 * That is already iio-sensor-proxy's frame: with this matrix
-		 * Omarchy A rotates correctly in all four orientations.
+		 * down) y = -1 g, landscape with Home on the right x = -1 g
+		 * and with Home on the left x = +1 g. So +x points to the left
+		 * edge, +y to the Home end and +z out of the screen. That is
+		 * already iio-sensor-proxy's frame: with this matrix Omarchy A
+		 * rotates correctly in all four orientations. The gyroscope
+		 * has the same axes: a positive rate is a right-hand turn
+		 * about the accelerometer's own axis, on all three.
 		 */
 		mount-matrix = "1", "0", "0",
 			       "0", "1", "0",
