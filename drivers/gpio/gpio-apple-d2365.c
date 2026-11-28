@@ -195,6 +195,12 @@ struct apple_pmic_gpio_info {
 	unsigned int output_update_mask;
 	unsigned int (*config_reg)(unsigned int offset);
 	const struct apple_pmic_event_info *events;
+	/*
+	 * The event mask also decides what powers the PMIC up from standby:
+	 * give the boot firmware's mask back at shutdown, with no power-off
+	 * handler of ours to program it.
+	 */
+	bool restore_mask_at_shutdown;
 };
 
 struct apple_pmic_gpio {
@@ -957,6 +963,24 @@ static int apple_pmic_gpio_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(apple_pmic_gpio_pm_ops, apple_pmic_gpio_suspend,
 				apple_pmic_gpio_resume);
 
+/*
+ * Probe masks every event without a consumer. Before standby iOS writes a
+ * mask of its own that leaves the buttons, USB and the RTC alarm unmasked
+ * (AppleD2186PMU), so a mask left as ours could keep the PMIC from powering
+ * up. Stop the event thread and give the boot firmware's mask back, as the
+ * next kernel or boot loader found it, on power-off, reboot and kexec.
+ */
+static void apple_pmic_gpio_shutdown(struct platform_device *pdev)
+{
+	struct apple_pmic_gpio *gpio = platform_get_drvdata(pdev);
+
+	if (!gpio->domain || !gpio->info->restore_mask_at_shutdown)
+		return;
+
+	apple_d2365_gpio_quiesce(&pdev->dev);
+	apple_pmic_event_restore_mask(gpio);
+}
+
 /* ---- GPIO ---- */
 
 /* D2401: only alter the level/function bits used by native _setGPIOFunction. */
@@ -1203,6 +1227,7 @@ static const struct apple_pmic_gpio_info d2186_gpio_info = {
 	.output_mode = D2186_GPIO_OUTPUT,
 	.config_reg = d2186_gpio_config_reg,
 	.events = &d2186_event_info,
+	.restore_mask_at_shutdown = true,
 };
 
 static const struct apple_pmic_event_info d2207_event_info = {
@@ -1372,6 +1397,7 @@ MODULE_DEVICE_TABLE(of, d2365_gpio_of_match);
 
 static struct platform_driver d2365_gpio_driver = {
 	.probe = apple_pmic_gpio_probe,
+	.shutdown = apple_pmic_gpio_shutdown,
 	.driver = {
 		.name = "apple-d2365-pmic-gpio",
 		.of_match_table = d2365_gpio_of_match,
