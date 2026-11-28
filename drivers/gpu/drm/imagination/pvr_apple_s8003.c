@@ -264,6 +264,15 @@ struct t7000_soc {
 	 * never measured there.
 	 */
 	unsigned int settle_ms;
+	/*
+	 * The render records' chip words, from the kexts' own fillers (iOS
+	 * 12.5.8: AGXG4P 0x847b858 and 0x84760fc, AGXG3 0x8770408 and
+	 * 0x876aef0; the rest of both records and both microsequences is
+	 * shared code, identical in the two kexts).
+	 */
+	u32 te_psg;			/* the TA record's +0x3c8 */
+	u32 pbe_3d;			/* the 3D record's PBE register words, 16 bytes a target */
+	u32 word_3d4;			/* the 3D record's +0x3d4; AGXG3 writes none */
 };
 
 /*
@@ -3737,6 +3746,9 @@ static const struct t7000_soc t7000_soc_a8 = {
 	.rev_major = 3,
 	.chip_info = { 2, 4, 4 },
 	.settle_ms = 100,
+	.te_psg = 0x00022000,
+	.pbe_3d = 0x118,
+	.word_3d4 = 0x00001200,
 };
 
 /*
@@ -3768,6 +3780,9 @@ static const struct t7000_soc t7000_soc_a7 = {
 	.chip_info = { 1, 4, 4 },
 	/* J71: a boot with 10 ms pauses takes 46 ms, with 100 ms 418 ms */
 	.settle_ms = 10,
+	/* J71: geometry jobs and a clear-only render ran with these (28 Nov) */
+	.te_psg = 0x00020000,
+	.pbe_3d = 0xd8,
 };
 
 /*
@@ -5130,7 +5145,7 @@ out:
  * first triangle drew with (Mesa's twiddled-triangle job, recorded on
  * the iPod touch 6).
  */
-static void t7000_fill_ta(u8 *w, const struct pvr_apple_g5p_cmd_geom *cmd,
+static void t7000_fill_ta(u8 *w, const struct t7000_soc *soc, const struct pvr_apple_g5p_cmd_geom *cmd,
 			  const struct pvr_hwrt_data *hwrt, const struct s8003_rt *rt, u64 rgn)
 {
 	const struct pvr_apple_g5p_geom_regs *g = &cmd->g5p;
@@ -5157,7 +5172,7 @@ static void t7000_fill_ta(u8 *w, const struct pvr_apple_g5p_cmd_geom *cmd,
 	put64(w + 0x3b4, rt->ta_tiling[0]);
 	put64(w + 0x3bc, rt->ta_tiling[1]);
 	put32(w + 0x3c4, rt->ta_tiling_word);
-	put32(w + 0x3c8, 0x00022000);
+	put32(w + 0x3c8, soc->te_psg);
 	put64(w + 0x44c, tpc);
 	put32(w + 0x454, rt->tpc);
 	put64(w + 0x470, g->scratch_ptr[0]);
@@ -5172,8 +5187,8 @@ static void t7000_fill_ta(u8 *w, const struct pvr_apple_g5p_cmd_geom *cmd,
  * +0x118 and +0x4c0, set B at +0x540, two qwords per target, as Apple's
  * fillers 0x8475dbc and 0x844aeb0 write them).
  */
-static int t7000_fill_3d(u8 *w, const struct pvr_apple_g5p_cmd_frag *cmd, const struct s8003_rt *rt,
-			 u64 rgn)
+static int t7000_fill_3d(u8 *w, const struct t7000_soc *soc, const struct pvr_apple_g5p_cmd_frag *cmd,
+			 const struct s8003_rt *rt, u64 rgn)
 {
 	/* The register block's ZLS images and their copies further on (as recorded from the first triangle) */
 	static const u16 zls[5][2] = {
@@ -5208,8 +5223,8 @@ static int t7000_fill_3d(u8 *w, const struct pvr_apple_g5p_cmd_frag *cmd, const 
 	for (i = 4; i < 8; i++)
 		put32(w + 0xc0 + (i - 4) * 4, g->background[i]);
 	for (i = 0; i < 8; i++) {
-		put64(w + 0x118 + i * 16, regs->pbe_word[i][0]);
-		put64(w + 0x120 + i * 16, regs->pbe_word[i][1]);
+		put64(w + soc->pbe_3d + i * 16, regs->pbe_word[i][0]);
+		put64(w + soc->pbe_3d + 8 + i * 16, regs->pbe_word[i][1]);
 		put64(w + 0x4c0 + i * 16, regs->pbe_word[i][0]);
 		put64(w + 0x4c8 + i * 16, regs->pbe_word[i][1]);
 		put64(w + 0x540 + i * 16, regs->pbe_word[i][0]);
@@ -5225,7 +5240,7 @@ static int t7000_fill_3d(u8 *w, const struct pvr_apple_g5p_cmd_frag *cmd, const 
 	put32(w + 0x3c4, g->eot[2]);
 	put32(w + 0x3c8, 0x0001700f | BIT(17));	/* ISP_CTL; +PROCESS_EMPTY_TILES, as the A9 (0x0023000f) */
 	put32(w + 0x3cc, 0x000001fc);
-	put32(w + 0x3d4, 0x00001200);
+	put32(w + 0x3d4, soc->word_3d4);
 	put64(w + 0x498, regs->isp_dbias_base);
 	put64(w + 0x4a8, regs->isp_scissor_base);
 	for (i = 0; i < 8; i++)
@@ -5531,7 +5546,7 @@ static int t7000_submit_geom(struct pvr_apple *apple, struct s8003_vm *vm, struc
 	seq = apple->ta_seq + 1;
 	slice_addr = job->hwrt->data.rgn_header_dev_addr +
 		     (dataset->apple_rgn.cursor & (dataset->apple_rgn.ring - 1));
-	t7000_fill_ta(p + T7000_RCH_W, job->cmd, job->hwrt, &rt, slice_addr);
+	t7000_fill_ta(p + T7000_RCH_W, s->v->soc, job->cmd, job->hwrt, &rt, slice_addr);
 	memset(p + T7000_RCH_TIMES, 0, 16);
 	j = (struct t7000_rjob) {
 		.ch = addr, .w = addr + T7000_RCH_W, .useq = addr + T7000_RCH_TA_USEQ,
@@ -5626,7 +5641,7 @@ static int t7000_submit_frag(struct pvr_apple *apple, struct s8003_vm *vm, struc
 		times_off = T7000_RCH_TIMES;
 	}
 	cmd = p + cmd_off;
-	err = t7000_fill_3d(p + w_off, job->cmd, &rt, vm->t7000.rgn_addr);
+	err = t7000_fill_3d(p + w_off, s->v->soc, job->cmd, &rt, vm->t7000.rgn_addr);
 	if (err)
 		return s8003_submit_error(apple, vm, "fragment", err, S8003_REFUSED_FILL,
 					  "3D record fill");
