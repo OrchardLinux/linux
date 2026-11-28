@@ -1996,6 +1996,20 @@ static struct bcm_device_data bcm4355_j172_device_data = {
  * in the event type (0x10, 0x13, 0x14, 0x20, 0x22-0x24 seen on a J71), as
  * the iPad 6's BCM4355C1 does.
  */
+/*
+ * The iPhone 8 Plus BCM4357B1 lists the LE extended scan and connection
+ * commands in its Supported Commands but answers LE Set Extended Scan
+ * Parameters with Unknown HCI Command, so scan and connect with the legacy
+ * commands. Its legacy advertising reports carry reserved event-type bits
+ * (0x10 and 0x14 seen), as the iPad 6's BCM4355C1 and the A7 iPads'
+ * BCM4324B5 do.
+ */
+static struct bcm_device_data bcm4357b1_d21_device_data = {
+	.broken_ext_scan = true,
+	.broken_ext_create_conn = true,
+	.fixup_le_adv_report_evt_type = true,
+};
+
 static struct bcm_device_data bcm4324b5_a7_device_data = {
 	.fixup_le_adv_report_evt_type = true,
 };
@@ -2030,6 +2044,9 @@ static const struct of_device_id bcm_bluetooth_of_match[] = {
 	{ .compatible = "apple,j81-bcm4350c2-bt" },
 	/* The iPhone 6s Plus BCM4350C5, as the iPad Air 2's C2 so far. */
 	{ .compatible = "apple,n66-bcm4350c5-bt" },
+	/* The iPhone 8 Plus BCM4357B1: legacy LE scanning and connections. */
+	{ .compatible = "apple,d21-bcm4357b1-bt",
+	  .data = &bcm4357b1_d21_device_data },
 	/* The iPod touch 6 BCM4345B1 uses the plain sequence at 115,200 baud. */
 	{ .compatible = "apple,n102-bcm4345b1-bt" },
 	/* The A7 iPads' BCM4324B5: the plain sequence, Patchram at 115,200 baud. */
