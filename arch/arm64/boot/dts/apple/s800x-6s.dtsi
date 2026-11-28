@@ -226,6 +226,63 @@
 	};
 };
 
+/*
+ * Headset codec of the iPhone 6s and 6s Plus: CS42L71 on SPI1 (ADT
+ * spi1/audio-codec, CS GPIO 16). Its MCLK is MCA0's 12 MHz MCLK output,
+ * as in iOS, and its main port (XSP) is MCA0's link on pad 0, with the
+ * codec as the clock provider: the headphones. Pad 2 / ASP stays with
+ * the CS35L21 on MCA2. Its digital LDO
+ * pulldown is D2255 line 12 (ADT function-digitalldo_pulldown), which
+ * iOS drives low before it uses the codec; the shared PMU node keeps
+ * that line reserved, these phones free it.
+ */
+&pmu_gpio {
+	gpio-reserved-ranges = <0 8>, <9 1>, <11 1>, <13 8>;
+};
+
+/* ADT mca0 function-i2s_route: aud0 -> pin0 */
+&mca0 {
+	compatible = "apple,s8000-mca-codec";
+	apple,i2s-switch = <&i2s_switch 0 0>;
+	status = "okay";
+};
+
+&spi1 {
+	/* ADT function-spi_cs0: AP GPIO 16, active low */
+	cs-gpios = <&pinctrl_ap 16 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	cs42l71: audio-codec@0 {
+		compatible = "cirrus,cs42l71";
+		reg = <0>;
+		/* ADT bit period 83 ns (~12 MHz); 1 MHz until the port is proven */
+		spi-max-frequency = <1000000>;
+		clocks = <&mca0>;
+		clock-names = "mclk";
+		interrupts-extended = <&pinctrl_ap 139 IRQ_TYPE_LEVEL_LOW>;
+		cirrus,ldo-pulldown-gpios = <&pmu_gpio 12 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+	};
+};
+
+/ {
+	sound-headset {
+		compatible = "simple-audio-card";
+		simple-audio-card,name = "iPhone Headphones";
+		simple-audio-card,format = "dsp_a";
+		simple-audio-card,bitclock-master = <&headset_codec>;
+		simple-audio-card,frame-master = <&headset_codec>;
+
+		simple-audio-card,cpu {
+			sound-dai = <&mca0>;
+		};
+
+		headset_codec: simple-audio-card,codec {
+			sound-dai = <&cs42l71>;
+		};
+	};
+};
+
 &framebuffer0 {
 	power-domains = <&ps_disp0 &ps_mipi_dsi>;
 };

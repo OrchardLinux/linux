@@ -19,7 +19,9 @@ description: |
   speaker link (TDM), apple,t8010-mca-i2s the playback-only stereo I2S link
   to the headphone codec. apple,s8000-mca-tdm is an A9 MCA driving its own
   clocks from an AP NCO channel, the playback-only speaker link (TDM) of the
-  iPhone 6s Plus. The MCAs are the same block; the compatible names
+  iPhone 6s Plus. apple,s8000-mca-codec is the A9 MCA0 link to the iPhone 6s
+  and 6s Plus headset codec, a clock consumer with four 16-bit TDM slots.
+  The MCAs are the same block; the compatible names
   the link setup iOS programs into it. The T7001 (A8X) MCA is the older
   "mca-version 1" register layout with the same fields: apple,t7001-mca is
   the playback-only speaker link (TDM) of the iPad Air 2, clocked from an AP
@@ -62,6 +64,7 @@ properties:
       - apple,s5l8960x-mca
       - apple,s5l8960x-mca-tdm
       - apple,s8000-mca
+      - apple,s8000-mca-codec
       - apple,s8000-mca-tdm
       - apple,t7001-mca
       - apple,t8010-mca

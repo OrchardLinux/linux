@@ -169,6 +169,8 @@ struct apple_pmic_gpio_info {
 	unsigned int function_mask;
 	/* Some PMICs only have a verified, boot-configured output mode. */
 	bool preserve_boot_direction;
+	/* Any mode other than input_mode is a boot-configured output. */
+	bool output_any_mode;
 	/* No known configuration registers: inputs read at input_base only. */
 	bool input_only;
 	/*
@@ -944,6 +946,17 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_pmic_gpio_pm_ops, apple_pmic_gpio_suspend,
 /* ---- GPIO ---- */
 
 /* D2401: only alter the level/function bits used by native _setGPIOFunction. */
+static bool apple_pmic_gpio_is_boot_output(const struct apple_pmic_gpio_info *info,
+					   unsigned int config)
+{
+	unsigned int mode = config & info->direction_mask;
+
+	if (info->output_any_mode)
+		return mode != info->input_mode;
+
+	return mode == info->output_mode;
+}
+
 static int apple_pmic_gpio_set_boot_output(struct apple_pmic_gpio *gpio,
 					   unsigned int offset, int value)
 {
@@ -954,8 +967,11 @@ static int apple_pmic_gpio_set_boot_output(struct apple_pmic_gpio *gpio,
 	ret = regmap_read(gpio->regmap, info->config_reg(offset), &config);
 	if (ret)
 		return ret;
-	if ((config & info->direction_mask) != info->output_mode)
+	if (!apple_pmic_gpio_is_boot_output(info, config))
 		return -EOPNOTSUPP;
+
+	dev_dbg(gpio->chip.parent, "line %u config %#04x, level %d\n",
+		offset, config, !!value);
 
 	return regmap_update_bits(gpio->regmap, info->config_reg(offset),
 				  info->output_update_mask,
@@ -978,9 +994,9 @@ static int apple_pmic_gpio_get_direction(struct gpio_chip *chip,
 		return ret;
 	if (value & info->function_mask)
 		return -EINVAL;
-	if (info->preserve_boot_direction &&
-	    (value & info->direction_mask) != info->output_mode)
-		return -EOPNOTSUPP;
+	if (info->preserve_boot_direction)
+		return apple_pmic_gpio_is_boot_output(info, value) ?
+		       GPIO_LINE_DIRECTION_OUT : -EOPNOTSUPP;
 
 	if (apple_pmic_gpio_is_input(info, value))
 		return GPIO_LINE_DIRECTION_IN;
@@ -1053,10 +1069,13 @@ static int apple_pmic_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	ret = regmap_read(gpio->regmap, info->config_reg(offset), &value);
 	if (ret)
 		return ret;
+	if (info->preserve_boot_direction) {
+		if (!apple_pmic_gpio_is_boot_output(info, value))
+			return -EOPNOTSUPP;
+		return !!(value & info->value_mask);
+	}
 	if ((value & info->direction_mask) == info->output_mode)
 		return !!(value & info->value_mask);
-	if (info->preserve_boot_direction)
-		return -EOPNOTSUPP;
 	if (!apple_pmic_gpio_is_input(info, value))
 		return -EINVAL;
 
@@ -1192,6 +1211,14 @@ static const struct apple_pmic_gpio_info d2255_gpio_info = {
 	.input_mode = D2333_GPIO_INPUT,
 	.output_mode = D2333_GPIO_OUTPUT,
 	.config_reg = d2255_gpio_config_reg,
+	/*
+	 * iOS AppleD2255PMU counts any mode from 0x40 up as an output and
+	 * drives one only through cfg = (cfg & ~0x19) | level; on boards
+	 * without an ADT gpio-pin-config it never writes bits 7:6.
+	 */
+	.preserve_boot_direction = true,
+	.output_any_mode = true,
+	.output_update_mask = BIT(4) | BIT(3) | BIT(0),
 };
 
 static const struct apple_pmic_gpio_info d2333_gpio_info = {

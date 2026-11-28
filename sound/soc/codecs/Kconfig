@@ -85,6 +85,7 @@ config SND_SOC_ALL_CODECS
 	imply SND_SOC_CS42L51_I2C
 	imply SND_SOC_CS42L52
 	imply SND_SOC_CS42L56
+	imply SND_SOC_CS42L71
 	imply SND_SOC_CS42L73
 	imply SND_SOC_CS42L81
 	imply SND_SOC_CS42L84
@@ -1038,6 +1039,15 @@ config SND_SOC_CS42L52
 config SND_SOC_CS42L56
 	tristate "Cirrus Logic CS42L56 CODEC"
 	depends on I2C && INPUT
+
+config SND_SOC_CS42L71
+	tristate "Cirrus Logic CS42L71 CODEC"
+	depends on SPI_MASTER
+	help
+	  Enable support for the Cirrus Logic CS42L71, an Apple-specific
+	  headset codec on the iPhone 6s and 6s Plus. The control port is
+	  Apple's SPIv2 framing, not the CS42L81 6C/6D map. This driver
+	  plays to the headphones through the codec's main port (XSP).
 
 config SND_SOC_CS42L73
 	tristate "Cirrus Logic CS42L73 CODEC"
